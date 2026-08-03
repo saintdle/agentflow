@@ -20,7 +20,7 @@ from agentflow import preflight
 
 class PackagingConfigTests(unittest.TestCase):
     def test_version_and_resources_are_distribution_owned(self) -> None:
-        self.assertEqual(__version__, "0.0.1")
+        self.assertEqual(__version__, "0.0.2")
         self.assertTrue(resources.item("templates", "project", "agentflow.json").is_file())
         self.assertTrue(resources.item("policies", "models-v1.json").is_file())
         self.assertEqual(len(resources.names("skills")), 7)
@@ -64,7 +64,7 @@ class PackagingConfigTests(unittest.TestCase):
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "stale\n")
 
     def test_adapted_skills_install_with_self_contained_attribution(self) -> None:
-        adapted = ("code-review", "diagnosing-bugs", "wayfinder")
+        adapted = ("code-review", "diagnosing-bugs", "to-tickets", "wayfinder")
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(
             Path, "home", return_value=Path(temp)
         ), mock.patch("sys.stdout", new_callable=io.StringIO):

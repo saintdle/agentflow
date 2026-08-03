@@ -22,13 +22,13 @@ integrations without reading their credential stores.
 Install a tagged release with `uv`:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.1"
+uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.2"
 ```
 
 Or with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.1"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.2"
 ```
 
 For a local checkout:
@@ -43,7 +43,7 @@ The repository requires authentication while it remains private. A release
 wheel built by GitHub Actions can be installed without a source checkout:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.1-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.2-py3-none-any.whl
 ```
 
 ## Verify
@@ -103,6 +103,12 @@ agentflow skills doctor
 
 Read `CHANGELOG.md` before every `0.x` upgrade. Back up shared configuration and
 Beads state before applying a documented migration.
+
+If the command and provider integrations currently point into an older source
+checkout, do not overwrite them with a generic installer. Follow the
+[transactional legacy migration](MIGRATION.md), which previews exact ownership,
+keeps a private rollback manifest, and leaves project state outside its write
+boundary.
 
 ## Uninstall
 

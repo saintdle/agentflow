@@ -12,7 +12,7 @@
   upstream project; this package is not represented as a verbatim upstream
   snapshot.
 - Agentflow adaptation: Agentflow's decision-first mapping workflow for efforts too uncertain or large to implement directly.
-- Distribution: bundled with Agentflow 0.0.1 under the Agentflow project's
+- Distribution: bundled with Agentflow 0.0.2 under the Agentflow project's
   Apache-2.0 license, subject to the retained upstream MIT notice.
 - Provenance recorded: 2026-08-03.
 

@@ -40,6 +40,14 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Fetch every branch and tag for historical inspection
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*'
+          git fetch --force --tags origin '+refs/tags/*:refs/tags/*'
       - name: Reject sensitive file types and obvious private keys
         shell: bash
         run: |
@@ -52,3 +60,10 @@ jobs:
             echo "Private key material is tracked." >&2
             exit 1
           fi
+      - name: Scan every historical blob reachable from every ref
+        run: python scripts/ci/scan_git_history.py .
+      - name: Apply the private publication denylist on trusted events
+        if: github.event_name != 'pull_request'
+        env:
+          AGENTFLOW_PUBLICATION_DENYLIST: ${{ secrets.AGENTFLOW_PUBLICATION_DENYLIST }}
+        run: python scripts/ci/scan_git_history.py .

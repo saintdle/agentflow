@@ -18,7 +18,7 @@ from agentflow import project_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ADAPTED_SKILLS = ("code-review", "diagnosing-bugs", "wayfinder")
+ADAPTED_SKILLS = ("code-review", "diagnosing-bugs", "to-tickets", "wayfinder")
 MIT_NOTICE_MARKERS = (
     "MIT License",
     "Copyright (c) 2026 Matt Pocock",

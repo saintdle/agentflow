@@ -12,7 +12,7 @@
   upstream project; this package is not represented as a verbatim upstream
   snapshot.
 - Agentflow adaptation: Agentflow's reproduce, isolate, instrument, fix, and regression-evidence workflow.
-- Distribution: bundled with Agentflow 0.0.1 under the Agentflow project's
+- Distribution: bundled with Agentflow 0.0.2 under the Agentflow project's
   Apache-2.0 license, subject to the retained upstream MIT notice.
 - Provenance recorded: 2026-08-03.
 

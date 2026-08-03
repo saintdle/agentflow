@@ -45,7 +45,7 @@ security. Use exact provider identifiers and review policy changes.
 
 ## Hardened isolation
 
-Hardened subprocess isolation in `0.0.1` is available only on macOS through
+Hardened subprocess isolation in `0.0.2` is available only on macOS through
 `/usr/bin/sandbox-exec`. Process execution, writes, and network access are
 deny-by-default. Reads use a different boundary: the profile permits blanket
 system reads so interpreters and toolchains can start, denies protected home
@@ -69,11 +69,11 @@ Direct `agentflow handoff launch` requires an exact role, model, and effort and
 validates them against model policy. It is not the synchronous isolation path:
 a handoff declaring `isolation_profile: hardened` is rejected rather than
 launched unconfined. Authenticated Herdr/controller launch also rejects hardened
-handoffs in `0.0.1`, because a probe cannot confine the later persistent
+handoffs in `0.0.2`, because a probe cannot confine the later persistent
 provider session. Use `agentflow isolation launch` for synchronous hardened
 commands; persistent-session confinement is not currently provided.
 
-Linux can run the core CLI but has no equivalent hardened isolation in `0.0.1`.
+Linux can run the core CLI but has no equivalent hardened isolation in `0.0.2`.
 Running a command in a shell, virtual environment, worktree, or terminal
 multiplexer is not an isolation boundary.
 
@@ -82,6 +82,34 @@ machine, virtual machine, or reviewed container boundary for genuinely hostile
 code or high-value credentials. Do not place secrets in globally readable
 temporary, toolchain, or mounted-volume paths and rely on Agentflow to hide
 them.
+
+## Publication history gate
+
+The security workflow fetches every branch and tag and scans every reachable
+historical blob, not only the current checkout. It rejects credential
+signatures, personal home paths, sensitive file names, provider transcripts,
+Agentflow runtime state, and Beads database artifacts even if they were later
+deleted from `HEAD`.
+
+Maintainers can configure a newline-delimited
+`AGENTFLOW_PUBLICATION_DENYLIST` repository secret for organization-specific
+names or paths. The scanner reports only a redacted finding code, object ID,
+and repository path; it never echoes a matched marker. The secret-backed pass
+runs only on trusted non-pull-request events so unreviewed PR code never
+receives the private denylist.
+
+Before a repository becomes public, run the same scanner locally with an
+owner-readable denylist file and inspect all fetched refs:
+
+```sh
+git fetch --force --prune origin '+refs/heads/*:refs/remotes/origin/*' \
+  '+refs/tags/*:refs/tags/*'
+python scripts/ci/scan_git_history.py . --denylist-file /private/path/denylist.txt
+```
+
+A finding in published history requires a deliberate credential response and,
+when appropriate, a separately approved history rewrite. Deleting the current
+file is not remediation.
 
 ## Imported assets and skills
 
