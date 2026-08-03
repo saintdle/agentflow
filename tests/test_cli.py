@@ -2212,7 +2212,8 @@ class ControllerResumeCredentialTests(unittest.TestCase):
 
 
 def _spawn_provider_report(fixture, argv: list, *, report_delay: float,
-                           report_done: threading.Event, threads: list) -> None:
+                           report_done: threading.Event, threads: list,
+                           report_gate=None) -> None:
     """Simulate the provider a real launch spawned: after launch, write the
     result and finalize the untrusted ``herdr submit`` inbox.
 
@@ -2244,8 +2245,16 @@ def _spawn_provider_report(fixture, argv: list, *, report_delay: float,
             except (OSError, json.JSONDecodeError, KeyError):
                 pass
             time.sleep(0.01)
-        # Stay "running" for a few controller polls before the result lands.
-        time.sleep(report_delay)
+        # Stay "running" until the test has observed its required controller
+        # state, rather than relying on runner scheduling to fit multiple polls
+        # into an arbitrary wall-clock delay.
+        if report_gate is None:
+            time.sleep(report_delay)
+        else:
+            gate_deadline = time.monotonic() + 5.0
+            while time.monotonic() < gate_deadline and not report_gate():
+                time.sleep(0.005)
+            assert report_gate(), "controller did not reach the provider report gate"
         contract = json.loads(Path(env["AGENTFLOW_RESULT_CONTRACT"]).read_text(encoding="utf-8"))
         result = {"outcome": "completed", "acceptance_results": [
             {"acceptance_id": aid, "status": "passed",
@@ -2453,9 +2462,17 @@ class ControllerRunTests(unittest.TestCase):
             threads: list = []
             report_done = threading.Event()
 
+            real_task_result = cli._herdr_task_result
+            polls = {"n": 0}
+
+            def spy_task_result(root, task_id):
+                polls["n"] += 1
+                return real_task_result(root, task_id)
+
             def on_spawn(argv):
                 _spawn_provider_report(fixture, argv, report_delay=0.05,
-                                       report_done=report_done, threads=threads)
+                                       report_done=report_done, threads=threads,
+                                       report_gate=lambda: polls["n"] >= 2)
 
             claim_calls = {"n": 0}
 
@@ -2468,13 +2485,6 @@ class ControllerRunTests(unittest.TestCase):
 
             def fake_close_issue(cwd, task_id, reason):
                 fixture.task_issue["status"] = "closed"
-
-            real_task_result = cli._herdr_task_result
-            polls = {"n": 0}
-
-            def spy_task_result(root, task_id):
-                polls["n"] += 1
-                return real_task_result(root, task_id)
 
             # Capture payloads via _json_or_status (not stdout parsing): the
             # provider-report thread also emits a result payload, so a shared
@@ -3070,10 +3080,12 @@ class GenuineLifecycleTests(unittest.TestCase):
                         except (OSError, json.JSONDecodeError, KeyError):
                             pass
                         time.sleep(0.01)
-                    # Stay "running" for a few controller polls before the
-                    # result lands, so the autonomous loop is proven to poll
-                    # more than once through a live session (AFREL-020).
-                    time.sleep(0.05)
+                    # Wait for the proof condition itself instead of assuming
+                    # an overloaded runner schedules two polls within 50 ms.
+                    gate_deadline = time.monotonic() + 5.0
+                    while time.monotonic() < gate_deadline and polls["n"] < 2:
+                        time.sleep(0.005)
+                    self.assertGreaterEqual(polls["n"], 2)
                     contract = json.loads(Path(env["AGENTFLOW_RESULT_CONTRACT"]).read_text(encoding="utf-8"))
                     result = {"outcome": "completed", "acceptance_results": [
                         {"acceptance_id": aid, "status": "passed",
