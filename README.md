@@ -59,6 +59,17 @@ by their respective providers. Agentflow does not supply or authenticate them.
 
 ## Install
 
+### Ask a coding agent to do it
+
+You can point a ChatGPT/Codex or Claude coding-agent chat at this repository and
+ask it to install and configure Agentflow. Copy the request in
+[the agent-led setup contract](AGENT_SETUP.md). It tells the agent how to verify
+the package identity, preserve existing provider configuration, handle a legacy
+installation transactionally, initialize the current workspace, and report a
+rollback path.
+
+For manual installation, continue below.
+
 The cleanest installation uses an isolated Python tool environment:
 
 ```sh
@@ -123,6 +134,11 @@ Continue with the executable [first workflow tutorial](docs/FIRST_WORKFLOW.md)
 to create and approve a root/task graph, run the controller, handle a halt, and
 record completion evidence.
 
+If you prefer to work entirely through a ChatGPT/Codex or Claude chat, use the
+[chat-first workflow guide](docs/CHAT_WORKFLOWS.md). It provides copy/paste
+prompts for planning without launch, explicit approval, autonomous persistent
+execution, reconnect-safe resume, read-only status, and bounded PR delivery.
+
 ## Bring your own skills
 
 Bundled Agentflow workflow skills are installed by `agentflow install`. The
@@ -163,6 +179,8 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Documentation
 
+- [Agent-led installation and setup](AGENT_SETUP.md)
+- [Chat-first workflows and copy/paste prompts](docs/CHAT_WORKFLOWS.md)
 - [Installation, upgrades, and legacy migration](docs/INSTALLATION.md)
 - [Transactional legacy cutover and rollback](docs/MIGRATION.md)
 - [First workflow tutorial](docs/FIRST_WORKFLOW.md)

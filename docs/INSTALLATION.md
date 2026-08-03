@@ -5,6 +5,12 @@ the `agentflow` command and the `agentflow` Python import package. Do not instal
 the unrelated `agentflow` or `agentflow-cli` distributions from a package
 index.
 
+To have a ChatGPT/Codex or Claude coding agent perform these steps, send it the
+copy/paste request in the repository's
+[agent-led setup contract](../AGENT_SETUP.md). That contract adds preservation,
+legacy-migration, redaction, verification, and halt requirements around the
+commands below.
+
 ## Prerequisites
 
 Agentflow supports Python 3.10 or later on macOS and Linux. Install these tools

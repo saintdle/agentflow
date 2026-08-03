@@ -1,5 +1,9 @@
 # First workflow
 
+This page exposes the underlying CLI operations for learning and diagnosis. If
+you want a coding-agent chat to operate them for you, follow the
+[chat-first workflow guide](CHAT_WORKFLOWS.md) instead.
+
 This tutorial creates one approved Beads root with one executable task, lets an
 Agentflow controller dispatch it through Herdr, and records evidence before the
 controller declares the goal complete. Run it in an existing Git repository
