@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+# BEGIN agentflow local artifacts
+.agentflow/controller/
+.agentflow/herdr/
+.agentflow/claims/
+.agentflow/runtime/
+.agentflow/handoffs/
+.agentflow/tmp/
+.agentflow/logs/
+.agentflow/worktrees/
+# END agentflow local artifacts
+dist/
+build/
+*.egg-info/
