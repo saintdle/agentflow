@@ -1,12 +1,9 @@
-# Third-party notices
++# Third-party notice
 
-Agentflow includes workflow-skill material adapted from
-[`mattpocock/skills`](https://github.com/mattpocock/skills), distributed under
-the MIT License. The adapted bundled skills are `to-tickets`, `code-review`,
-`diagnosing-bugs`, and `wayfinder`. Skill-local `PROVENANCE.md` files describe
-the upstream paths, inspected revision, relationship, and Agentflow changes.
+This skill includes material adapted from the MIT-licensed
+[mattpocock/skills](https://github.com/mattpocock/skills) project.
 
-The MIT License (MIT)
+MIT License
 
 Copyright (c) 2026 Matt Pocock
 

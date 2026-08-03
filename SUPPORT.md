@@ -1,6 +1,6 @@
 # Support
 
-Agentflow `0.0.1` is a community-supported public preview. There is no warranty,
+Agentflow `0.0.2` is a community-supported development/testing preview. There is no warranty,
 paid support commitment, or guaranteed response time.
 
 Before requesting help:

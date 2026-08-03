@@ -17,6 +17,8 @@ REQUIRED_WHEEL_FILES = {
     "agentflow/__init__.py",
     "agentflow/__main__.py",
     "agentflow/cli.py",
+    "agentflow/migration.py",
+    "agentflow/publication.py",
     "agentflow/resources/agents/claude/agentflow-controller.md",
     "agentflow/resources/agents/claude/agentflow-explorer.md",
     "agentflow/resources/agents/claude/agentflow-pr-gatekeeper.md",
@@ -40,6 +42,8 @@ REQUIRED_WHEEL_FILES = {
     "agentflow/resources/skills/orchestrate-agents/SKILL.md",
     "agentflow/resources/skills/shape-goal/SKILL.md",
     "agentflow/resources/skills/to-tickets/SKILL.md",
+    "agentflow/resources/skills/to-tickets/PROVENANCE.md",
+    "agentflow/resources/skills/to-tickets/THIRD_PARTY_NOTICES.md",
     "agentflow/resources/skills/wayfinder/SKILL.md",
     "agentflow/resources/skills/wayfinder/PROVENANCE.md",
     "agentflow/resources/skills/wayfinder/THIRD_PARTY_NOTICES.md",
@@ -163,7 +167,7 @@ def inspect(dist: Path, expected_version: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist", type=Path)
-    parser.add_argument("--expected-version", default="0.0.1")
+    parser.add_argument("--expected-version", default="0.0.2")
     args = parser.parse_args()
     try:
         inspect(args.dist, args.expected_version)

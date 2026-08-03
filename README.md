@@ -10,8 +10,17 @@ Python import package, and installed command are all named `agentflow`. The
 unqualified `agentflow` and `agentflow-cli` names on package indexes belong to
 unrelated projects.
 
+> [!WARNING]
+> The majority of this code was generated with AI coding agents. Multiple
+> Codex, Claude, and GitHub Copilot agents produced and reviewed it while
+> Agentflow was used to orchestrate its own development. That dogfooding is
+> useful evidence, not a safety guarantee. Agentflow is currently suitable
+> only for development and testing; do not rely on it for production,
+> unattended privileged automation, or irreplaceable data. Review its plans,
+> permissions, diffs, and backups as though untrusted automation may fail.
+
 > [!IMPORTANT]
-> Agentflow `0.0.1` is a public preview. Its commands, configuration schema,
+> Agentflow `0.0.2` is a public preview. Its commands, configuration schema,
 > and compatibility guarantees may change before `1.0`.
 
 ## What it provides
@@ -53,16 +62,16 @@ by their respective providers. Agentflow does not supply or authenticate them.
 The cleanest installation uses an isolated Python tool environment:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.1"
+uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.2"
 # or
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.1"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.2"
 ```
 
 Until the repository is public, an authenticated GitHub checkout or Git
 credential helper is required. To install from a downloaded release wheel:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.1-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.2-py3-none-any.whl
 ```
 
 Verify the installation and prerequisites without exposing credentials:
@@ -143,23 +152,25 @@ locations, and team-safe setup patterns.
 | Platform | Core CLI | Hardened isolation |
 | --- | --- | --- |
 | macOS | Supported | Available through `sandbox-exec`; probes fail closed |
-| Linux | Supported | Not available in `0.0.1`; requests fail closed |
-| Windows | Not supported in `0.0.1` | Not available |
+| Linux | Supported | Not available in `0.0.2`; requests fail closed |
+| Windows | Not supported in `0.0.2` | Not available |
 
 Core coordination can run on macOS and Linux. Hardened isolation is a distinct,
 macOS-only security control; ordinary execution on Linux is not equivalent
-confinement. In `0.0.1`, `agentflow isolation launch` provides synchronous
+confinement. In `0.0.2`, `agentflow isolation launch` provides synchronous
 hardened execution. Direct handoff and persistent Herdr/controller launches
 reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Documentation
 
-- [Installation and upgrades](docs/INSTALLATION.md)
+- [Installation, upgrades, and legacy migration](docs/INSTALLATION.md)
+- [Transactional legacy cutover and rollback](docs/MIGRATION.md)
 - [First workflow tutorial](docs/FIRST_WORKFLOW.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Bring your own skills](docs/SKILLS.md)
 - [Workflow guide](docs/WORKFLOW.md)
 - [Security model](docs/SECURITY.md)
+- [Authorship and third-party provenance](docs/PROVENANCE.md)
 - [Security reporting](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
 - [Support](SUPPORT.md)
@@ -167,7 +178,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Project status and releases
 
-`0.0.1` is intended for evaluation and feedback. Pull requests run validation
+`0.0.2` is intended for development/testing and feedback. Pull requests run validation
 and package-build checks. Merges to `main` build the CLI distribution artifacts;
 tagged releases are the versioned distribution boundary. See
 [the changelog](CHANGELOG.md) and [release process](CONTRIBUTING.md#releases).
@@ -175,7 +186,9 @@ tagged releases are the versioned distribution boundary. See
 ## Licence and trademarks
 
 Agentflow is licensed under the [Apache License 2.0](LICENSE). Third-party
-attributions are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+attributions are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+and the detailed [provenance inventory](docs/PROVENANCE.md). Adapted skills
+also carry provenance and licence notices beside their code.
 
 Agentflow is an independent project. It is not affiliated with or endorsed by
 OpenAI, Anthropic, GitHub, Microsoft, Beads, Herdr, or their owners. All product
