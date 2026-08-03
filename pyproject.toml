@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saintdle-agentflow"
+version = "0.0.1"
+description = "Provider-neutral workflow helpers for Codex, Claude Code, and GitHub Copilot CLI"
+requires-python = ">=3.10"
+dependencies = []
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+keywords = ["agents", "cli", "workflow", "beads"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/saintdle/agentflow"
+Repository = "https://github.com/saintdle/agentflow"
+Issues = "https://github.com/saintdle/agentflow/issues"
+
+[project.optional-dependencies]
+dev = ["PyYAML>=6.0"]
+
+[project.scripts]
+agentflow = "agentflow.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agentflow = ["resources/**/*"]

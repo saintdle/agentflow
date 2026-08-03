@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "~/.local/bin/agentflow hook --provider copilot --event sessionStart",
+        "timeoutSec": 5
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "bash": "~/.local/bin/agentflow hook --provider copilot --event userPromptSubmitted",
+        "timeoutSec": 5
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "~/.local/bin/agentflow hook --provider copilot --event agentStop",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

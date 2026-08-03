@@ -1,0 +1,6 @@
+# Replace with a maintainer team when one exists.
+* @saintdle
+
+# Release and security automation always needs an explicit owner review.
+/.github/workflows/ @saintdle
+/scripts/ci/ @saintdle

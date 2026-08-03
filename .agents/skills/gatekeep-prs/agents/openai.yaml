@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gatekeep Agent Pull Requests"
+  short_description: "Queue and merge agent PRs safely"
+  default_prompt: "Use $gatekeep-prs to inspect and process the agent PR queue."

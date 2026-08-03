@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose an Agentflow capability or compatibility improvement
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user outcome is difficult today? Avoid prescribing an implementation first.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: State observable success and who benefits.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing commands, configuration, or automation you tried.
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and security effects
+      description: Note platforms, providers, config migration, trust boundaries, and possible breaking changes.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched for an existing request.
+          required: true
+        - label: I removed private or account-specific information.
+          required: true

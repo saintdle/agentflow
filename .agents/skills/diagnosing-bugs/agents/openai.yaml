@@ -1,0 +1,4 @@
+interface:
+  display_name: "Diagnose Bugs"
+  short_description: "Build a reproducible, evidence-led debugging loop"
+  default_prompt: "Use $diagnosing-bugs to reproduce, isolate, and fix this defect with regression evidence."

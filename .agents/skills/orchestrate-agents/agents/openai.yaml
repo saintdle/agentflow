@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate Coding Agents"
+  short_description: "Route bounded work across coding agents"
+  default_prompt: "Use $orchestrate-agents to split and route this work efficiently."

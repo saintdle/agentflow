@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agentflow import beads
+from tests import _state_home  # noqa: F401  # external controller authority
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUN_INTEGRATION = os.environ.get("AGENTFLOW_INTEGRATION") == "1"
+
+
+def _issue_from_create(root: Path, *arguments: str) -> dict:
+    result = beads.run(root, "create", *arguments, "--json")
+    value = beads._json_output(result, "bd create")
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    if not isinstance(value, dict) or not value.get("id"):
+        raise AssertionError(f"unexpected bead create result: {value!r}")
+    return value
+
+
+class ProcessBoundaryLifecycleTests(unittest.TestCase):
+    """OS-process proof with real Beads and a deterministic Herdr protocol fake."""
+
+    @unittest.skipUnless(
+        RUN_INTEGRATION and shutil.which("bd"),
+        "set AGENTFLOW_INTEGRATION=1 and install bd to run real-tool integration",
+    )
+    def test_real_beads_herdr_provider_crash_resume_and_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            test_root = Path(temporary).resolve()
+            root = test_root / "workspace"
+            subprocess.run(["git", "init", "-b", "main", str(root)], capture_output=True, check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "process@example.test"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Process Test"], check=True)
+            (root / "README.md").write_text("process boundary\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "init"], capture_output=True, check=True)
+            base = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+            beads.initialize(root, mode="embedded", stealth=True, prefix="af", gitless=True)
+            matrix = {
+                "version": 1,
+                "task_id": "workflow-root",
+                "rows": [{
+                    "id": "R1", "outcome": "provider process exits cleanly", "owner": "controller",
+                    "lane": "local-runtime", "planned_evidence": "provider subprocess report",
+                    "status": "passed", "actual_evidence": "process-boundary test",
+                }],
+            }
+            root_issue = _issue_from_create(
+                root, "Workflow root", "--description", "process boundary root",
+                "--acceptance", "R1 passes", "--labels", "workflow",
+                "--no-inherit-labels",
+            )
+            workflow_root = str(root_issue["id"])
+            matrix["task_id"] = workflow_root
+            beads.update_agentflow_metadata(root, workflow_root, {"acceptance": matrix})
+            task = _issue_from_create(
+                root, "Deterministic provider task", "--description", "run the provider subprocess",
+                "--acceptance", "R1 passes", "--parent", workflow_root,
+                "--labels", "implementation", "--no-inherit-labels",
+            )
+            task_id = str(task["id"])
+            task_matrix = dict(matrix)
+            task_matrix["task_id"] = task_id
+            beads.update_agentflow_metadata(root, task_id, {
+                "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
+                "base": f"main@{base[:12]}",
+                "acceptance": task_matrix,
+                "checks": ["process-boundary"],
+            })
+            second_task = _issue_from_create(
+                root, "Deterministic provider task two", "--description", "run the provider subprocess twice",
+                "--acceptance", "R1 passes", "--parent", workflow_root,
+                "--labels", "implementation", "--no-inherit-labels",
+            )
+            second_task_id = str(second_task["id"])
+            second_matrix = dict(matrix)
+            second_matrix["task_id"] = second_task_id
+            beads.update_agentflow_metadata(root, second_task_id, {
+                "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
+                "base": f"main@{base[:12]}",
+                "acceptance": second_matrix,
+                "checks": ["process-boundary"],
+            })
+
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            provider = bin_dir / "codex"
+            provider.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "root = Path(os.environ['AGENTFLOW_HANDOFF_PATH']).parents[3]\n"
+                "agent = os.environ['AGENTFLOW_HERDR_AGENT_NAME']\n"
+                "pane = ''\n"
+                "deadline = time.time() + 10\n"
+                "while time.time() < deadline and not pane:\n"
+                "    probe = subprocess.run(['herdr', 'agent', 'get', agent], capture_output=True, text=True)\n"
+                "    try:\n"
+                "        data = json.loads(probe.stdout)\n"
+                "        pane = str(data.get('result', {}).get('agent', {}).get('pane_id') or '')\n"
+                "    except (json.JSONDecodeError, AttributeError):\n"
+                "        pass\n"
+                "    if not pane: time.sleep(0.05)\n"
+                "if not pane: raise SystemExit('Herdr pane was not discoverable')\n"
+                "subprocess.run(['herdr', 'pane', 'report-agent-session', pane, '--source', 'process-boundary', '--agent', 'codex', '--agent-session-id', 'provider-process-session'], check=True)\n"
+                "contract_path = Path(os.environ['AGENTFLOW_RESULT_CONTRACT'])\n"
+                "result_path = Path(os.environ['AGENTFLOW_RESULT_FILE'])\n"
+                "contract = json.loads(contract_path.read_text())\n"
+                "task_id = os.environ['AGENTFLOW_TASK_ID']\n"
+                "snapshot = root / '.process-boundary-snapshots' / task_id; snapshot.mkdir(parents=True, exist_ok=True)\n"
+                "result_body = json.dumps({'outcome': 'completed', 'acceptance_results': [{'acceptance_id': item, 'status': 'passed', 'evidence': 'real provider process', 'source': 'provider-process'} for item in contract['acceptance_ids']]})\n"
+                "(snapshot / 'contract').write_bytes(contract_path.read_bytes())\n"
+                "(snapshot / 'result').write_text(result_body)\n"
+                "result_path.write_text(result_body)\n"
+                "report = subprocess.run([sys.executable, '-m', 'agentflow.cli', 'herdr', 'submit', '--contract', str(contract_path), '--file', str(result_path), '--json'], check=False)\n"
+                "raise SystemExit(report.returncode)\n",
+                encoding="utf-8",
+            )
+            provider.chmod(0o700)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{bin_dir}{os.pathsep}{environment.get('PATH', '')}"
+            environment["PYTHONPATH"] = f"{ROOT / 'src'}{os.pathsep}{environment.get('PYTHONPATH', '')}"
+
+            # Herdr-compatible deterministic fallback: installed Herdr needs
+            # a persistent interactive server and provider-specific session
+            # reporting, which a CI provider executable cannot supply. This
+            # executable still crosses the real OS subprocess boundary and
+            # returns the same structured agent-start contract.
+            fake_herdr = bin_dir / "herdr"
+            fake_herdr.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, subprocess, sys\n"
+                "args = sys.argv[1:]\n"
+                "agent = args[2] if len(args) > 2 and args[:2] == ['agent', 'start'] else 'process-boundary-agent'\n"
+                "if args[:2] == ['agent', 'start']:\n"
+                "    child_env = dict(os.environ)\n"
+                "    i = 3\n"
+                "    while i < len(args) and args[i] != '--':\n"
+                "        if args[i] == '--env':\n"
+                "            key, _, value = args[i + 1].partition('='); child_env[key] = value; i += 2\n"
+                "        else: i += 1\n"
+                "    subprocess.Popen(args[i + 1:], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
+                "    agent_data = {'pane_id': 'deterministic-pane', 'agent': 'codex', 'agent_session': {'source': 'process-boundary', 'agent': 'codex', 'kind': 'id', 'value': 'provider-process-session'}}\n"
+                "    print(json.dumps({'id': 'cli:agent:start', 'result': {'type': 'agent_started', 'agent': agent_data}}))\n"
+                "    sys.exit(0)\n"
+                "if args[:2] == ['agent', 'get']:\n"
+                "    agent_data = {'pane_id': 'deterministic-pane', 'agent': 'codex', 'agent_session': {'source': 'process-boundary', 'agent': 'codex', 'kind': 'id', 'value': 'provider-process-session'}}\n"
+                "    print(json.dumps({'id': 'cli:agent:get', 'result': {'type': 'agent_info', 'agent': agent_data}}))\n"
+                "    sys.exit(0)\n"
+                "print(json.dumps({'ok': True}))\n",
+                encoding="utf-8",
+            )
+            fake_herdr.chmod(0o700)
+            runner = root / "agentflow-test-runner.py"
+            runner.write_text(
+                "import sys\n"
+                "from agentflow import cli\n"
+                f"fake = {str(fake_herdr)!r}\n"
+                f"provider = {str(provider)!r}\n"
+                "original = cli._provider_command\n"
+                "cli._provider_command = lambda name: fake if name == 'herdr' else provider if name == 'codex' else original(name)\n"
+                "raise SystemExit(cli.main())\n",
+                encoding="utf-8",
+            )
+
+            handoff_probe = subprocess.run([
+                sys.executable, "-m", "agentflow.cli", "handoff", "from-bead", task_id,
+                "--to", "codex", "--cwd", str(root),
+                "--out", str(root / ".agentflow/tmp/handoffs/probe.md"),
+            ], cwd=root, env=environment, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(handoff_probe.returncode, 0, handoff_probe.stdout + handoff_probe.stderr)
+
+            controller_args = [
+                sys.executable, str(runner), "controller", "resume",
+                "--root", str(root), "--workflow-root", workflow_root,
+                "--poll-interval", "0.05", "--deadline", "120", "--json",
+            ]
+            first = subprocess.run(controller_args + ["--once"], cwd=root, env=environment,
+                                   capture_output=True, text=True, timeout=20, check=False)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_payload = json.loads(first.stdout)
+            herdr_debug = (root / ".agentflow/herdr/sessions.json").read_text() if (root / ".agentflow/herdr/sessions.json").exists() else "<no herdr state>"
+            self.assertEqual(first_payload["result"]["state"], "running", first.stdout + "\n" + herdr_debug)
+
+            # The first controller process is deliberately treated as crashed
+            # after dispatch. A new process consumes the provider's result,
+            # disposes the real Bead, and reaches GOAL_COMPLETE.
+            resumed = subprocess.run(controller_args, cwd=root, env=environment,
+                                     capture_output=True, text=True, timeout=130, check=False)
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            resumed_payload = json.loads(resumed.stdout)
+            self.assertEqual(resumed_payload["stop_reason"], "GOAL_COMPLETE", resumed.stdout)
+
+            state = json.loads((root / ".agentflow/herdr/sessions.json").read_text())
+            record = state["sessions"][task_id]
+            self.assertEqual(record["return_channel"]["state"], "consumed")
+            self.assertEqual(record["result"]["acceptance_results"][0]["acceptance_id"], "R1")
+            second_record = state["sessions"][second_task_id]
+            self.assertEqual(second_record["return_channel"]["state"], "consumed")
+            self.assertEqual(second_record["result"]["acceptance_results"][0]["acceptance_id"], "R1")
+
+            # A separate OS process taking over the reusable controller name
+            # gets a new incarnation identity; it cannot inherit the prior
+            # controller's return authority.
+            time.sleep(0.05)
+            takeover = subprocess.run([
+                sys.executable, str(runner), "controller", "resume", "--root", str(root),
+                "--workflow-root", workflow_root, "--takeover", "--stale-after", "0.01",
+                "--resume-key-file", str(test_root / "different-owner.key"), "--once", "--json",
+            ], cwd=root, env=environment, capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(takeover.returncode, 0, takeover.stdout + takeover.stderr)
+            takeover_payload = json.loads(takeover.stdout)
+            self.assertNotEqual(takeover_payload["lease"]["continuity_id"], resumed_payload["lease"]["continuity_id"])
+
+            # Restore the exact provider-visible files from the subprocess
+            # snapshot. A provider process still cannot invoke the
+            # state-mutating consumer directly; only the controller broker
+            # owns that path.
+            snapshot = root / ".process-boundary-snapshots" / task_id
+            contract_path = Path(record["return_channel"]["contract_path"])
+            result_path = Path(record["return_channel"]["result_path"])
+            contract_path.write_bytes((snapshot / "contract").read_bytes())
+            result_path.write_bytes((snapshot / "result").read_bytes())
+            replay = subprocess.run([
+                sys.executable, str(runner), "herdr", "result",
+                "--contract", str(contract_path), "--file", str(result_path),
+                "--state-path", str(root / ".agentflow/herdr/sessions.json"), "--json",
+            ], cwd=root, env=environment,
+                capture_output=True, text=True, timeout=10, check=False)
+            self.assertEqual(replay.returncode, 2, replay.stdout + replay.stderr)
+            self.assertIn("controller-owned", replay.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wayfinder"
+  short_description: "Map uncertain work as Beads decisions"
+  default_prompt: "Use $wayfinder to map this uncertain effort into a decision-first Beads graph before implementation."

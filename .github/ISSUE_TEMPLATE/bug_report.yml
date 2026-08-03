@@ -1,0 +1,63 @@
+name: Bug report
+description: Report reproducible incorrect Agentflow behavior
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Report security vulnerabilities privately through the Security tab. Remove credentials, private paths, transcripts, customer data, and account details.
+  - type: input
+    id: version
+    attributes:
+      label: Agentflow version
+      placeholder: "0.0.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Other / unsupported
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic data and include the smallest safe command sequence.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Include relevant `agentflow doctor` output and exact errors after removing sensitive data.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Relevant Beads/provider/Herdr versions, configuration, or regression range.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched for existing reports.
+          required: true
+        - label: This is not an undisclosed security vulnerability.
+          required: true
+        - label: I removed credentials, private paths, transcripts, customer data, and account details.
+          required: true

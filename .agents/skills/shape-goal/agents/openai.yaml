@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shape a Measurable Goal"
+  short_description: "Turn rough ideas into testable goal contracts"
+  default_prompt: "Use $shape-goal to turn this idea into a measurable goal before implementation."

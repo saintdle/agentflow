@@ -1,0 +1,57 @@
+{
+  "schema": "agentflow.model_policy",
+  "version": 1,
+  "id": "models-v1",
+  "description": "Exact provider/model/role/effort routes approved for agentflow-launched sessions. Unlisted, generic, or renamed models fail closed.",
+  "roles": ["controller", "judgment", "coding", "review", "exploration"],
+  "routes": [
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["high", "xhigh"]
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "roles": ["coding", "exploration"],
+      "efforts": ["medium", "high"]
+    },
+    {
+      "provider": "claude",
+      "model": "claude-opus-4-8",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["high"]
+    },
+    {
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "roles": ["coding", "exploration"],
+      "efforts": ["medium", "high"]
+    },
+    {
+      "provider": "copilot",
+      "model": "claude-opus-4.8",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["high"]
+    },
+    {
+      "provider": "copilot",
+      "model": "claude-sonnet-4.6",
+      "roles": ["coding", "exploration"],
+      "efforts": ["medium", "high"]
+    }
+  ],
+  "forbidden_models": [
+    "gpt-5.6",
+    "gpt-5.6-terra",
+    "gpt-5.6-auto",
+    "opus",
+    "sonnet",
+    "haiku",
+    "claude-haiku-4-5-20251001",
+    "auto",
+    "Auto",
+    "AUTO"
+  ]
+}

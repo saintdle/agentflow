@@ -1,0 +1,41 @@
+name: Real integration
+
+on:
+  schedule:
+    - cron: "43 7 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  beads:
+    name: Agentflow with Beads 1.1.0
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      AGENTFLOW_INTEGRATION: "1"
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Set up Go for the pinned Beads prerequisite
+        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version: "stable"
+          cache: false
+      - name: Install Agentflow and Beads
+        run: |
+          python -m pip install --disable-pip-version-check .
+          go install github.com/steveyegge/beads/cmd/bd@v1.1.0
+      - name: Run explicitly gated real integration
+        run: scripts/ci/integration_beads.sh

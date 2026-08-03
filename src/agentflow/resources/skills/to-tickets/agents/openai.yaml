@@ -1,0 +1,4 @@
+interface:
+  display_name: "Turn Plans into Tickets"
+  short_description: "Create dependency-aware Beads or GitHub work"
+  default_prompt: "Use $to-tickets to turn this accepted plan into an assignable Beads graph and publish only the GitHub issues required by policy."

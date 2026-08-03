@@ -1,0 +1,175 @@
+formula = "agentflow-controlled-rework"
+description = "Controller-led pull workflow with an approved contract and specification, dynamic sub-primary writers, parallel review/security/CI gates, and one final integration decision."
+version = 2
+type = "workflow"
+
+[vars.work_name]
+description = "Short name for the repository change or learner journey"
+required = true
+
+[[steps]]
+id = "contract"
+title = "Controller: approve {{work_name}} contract"
+labels = ["agentflow", "af:stage:plan", "af:role:controller"]
+description = """
+Act as the primary writer and controller. Record the observable outcome,
+scope, constraints, shared interfaces, authoritative evidence lanes, exact base
+commit, and files reserved for the controller. Do not delegate writing until
+the contract is coherent and approved.
+
+## Acceptance criteria
+
+The approved contract has measurable exit conditions, one owner and
+authoritative lane per material outcome, and no unresolved shared-interface
+decision.
+"""
+
+[[steps]]
+id = "specification"
+title = "Controller: specify {{work_name}} interfaces and evidence"
+needs = ["contract"]
+labels = ["agentflow", "af:stage:spec", "af:role:controller"]
+description = """
+Turn the approved contract into bounded vertical slices, shared-interface
+decisions, required project skills, exact output boundaries, and authoritative
+checks. Attach the acceptance-to-evidence matrix before writer work starts.
+
+Use Beads labels for routing rather than prose-only roles. Reserve shared files
+for the controller. Do not launch work while an interface or evidence owner is
+unresolved.
+
+## Acceptance criteria
+
+Every slice has disjoint ownership, required capabilities, an exact base or
+gitless boundary, measurable acceptance, and a planned validation lane.
+"""
+
+[[steps]]
+id = "writer-swarm"
+title = "Controller: coordinate {{work_name}} sub-primary writers"
+type = "task"
+needs = ["specification"]
+labels = ["agentflow", "af:stage:dispatch", "af:role:controller"]
+description = """
+Create one child bead per complete vertical slice. A sub-primary writer owns
+that slice end to end, including local tests and evidence. Give child beads
+disjoint writable boundaries, explicit entry and exit state, required project
+skills, provider/model budget, exact checks, and a halt contract.
+
+Keep shared files and cross-slice decisions with the controller. Add each slice
+with `bd create --parent=<this-task-id> --no-inherit-labels` and labels `agentflow`,
+`af:stage:code`, `af:role:writer`, plus the smallest required `af:cap:<name>`
+set. Workers pull atomically with `agentflow worker pull --root <root-id>
+--stage code --actor <stable-actor>`. Close this coordination task only after
+the controller has inspected every return, accepted or rejected it, integrated
+accepted work one change at a time, and rerun affected cross-slice checks.
+
+## Acceptance criteria
+
+Every writer return is judged by the controller. Accepted slices are integrated
+with disjoint ownership and cross-slice evidence; rejected work remains with
+its original writer.
+"""
+
+[[steps]]
+id = "pedagogy-review"
+title = "Read-only pedagogy review for {{work_name}}"
+needs = ["writer-swarm"]
+labels = ["agentflow", "af:stage:review", "af:role:reviewer", "af:cap:pedagogy", "af:mode:read-only"]
+description = """
+Review the complete learner or user journey without editing. Return only
+actionable findings with stable IDs, severity, exact evidence, expected and
+actual behavior, proposed correction, authoritative evidence lane, and
+confidence. Return APPROVE when no material issue remains.
+
+## Acceptance criteria
+
+A read-only pedagogy or user-journey verdict is returned to the controller with
+reproducible evidence.
+"""
+
+[[steps]]
+id = "lifecycle-review"
+title = "Read-only lifecycle, check, and secret review for {{work_name}}"
+needs = ["writer-swarm"]
+labels = ["agentflow", "af:stage:security", "af:role:reviewer", "af:cap:lifecycle", "af:cap:security", "af:mode:read-only"]
+description = """
+Review lifecycle behavior, checks, solve or recovery paths, cleanup, secret
+handling, and runtime evidence without editing. Return structured findings or
+APPROVE. Do not accept or integrate writer work.
+
+## Acceptance criteria
+
+A read-only lifecycle and security verdict is returned to the controller with
+reproducible evidence and explicit untested lanes.
+"""
+
+[[steps]]
+id = "ci-validation"
+title = "Deterministic CI validation for {{work_name}}"
+needs = ["writer-swarm"]
+labels = ["agentflow", "af:stage:ci", "af:role:ci", "af:cap:github"]
+description = """
+Run the narrowest repository-owned local CI checks. When an authorized push and
+pull request exist, use `agentflow ci watch --bead <this-id> --pr <number>` so
+no LLM session waits for GitHub checks. A pass closes this bead. A failure
+creates one deduplicated `af:stage:ci-triage` bead for a low-cost CI worker.
+That worker diagnoses without editing product code. Only a confirmed code
+failure is routed back to the original writer with
+`agentflow review route-fix`; the bounded work keeps this bead blocked until
+the correction is complete.
+
+If hosted CI is not authorized or does not exist, record the lane as untested
+or obtain an explicit waiver; do not invent a pass and do not push merely to
+activate this stage.
+
+## Acceptance criteria
+
+Local results and any hosted check state are recorded exactly. No model session
+polls external CI, and failed checks are routed as bounded corrective work.
+"""
+
+[[steps]]
+id = "controller-integration"
+title = "Controller: final judgment for {{work_name}}"
+needs = ["pedagogy-review", "lifecycle-review", "ci-validation"]
+labels = ["agentflow", "af:stage:integration", "af:role:controller"]
+description = """
+Disposition every reviewer finding. Reproduce accepted high and medium
+findings, route fixes to the original writer with `agentflow review route-fix`,
+and rerun affected validation.
+Confirm the integrated result satisfies the complete contract. Reviewer
+approval and writer completion are inputs, not acceptance decisions.
+
+In the user-facing report, write every work item as `<human title> (<bead-id>)`.
+State its stage, why it is ready or blocked, and whether a worker is actually
+claimed. End with one recommended, copy/paste-ready `Next request:`; never make
+the user decode raw identifiers.
+
+## Acceptance criteria
+
+The controller records every finding disposition, verifies every exit condition
+at its authoritative lane, and marks remaining higher lanes untested.
+"""
+
+[[steps]]
+id = "delivery-ready"
+title = "Prepare {{work_name}} delivery"
+needs = ["controller-integration"]
+labels = ["agentflow", "af:stage:delivery", "af:role:controller"]
+description = """
+In a Git repository, prepare or update the pull request with exact head and base
+identities, linked bead, evidence by validation lane, and remaining risks. Do
+not merge. Hand it to the separate gatekeeper only when merge authorization is
+provided.
+
+Outside Git, prepare the requested final artifact or result, list its exact
+paths or references and validation evidence, and leave the folder in a
+resumable state. Do not invent branches, commits, issues, or pull requests.
+
+## Acceptance criteria
+
+The delivery represents the controller-accepted result and contains exact
+validation evidence without claiming unrun lanes. Its summary translates every
+referenced bead ID and gives the operator one unambiguous next request.
+"""

@@ -1,0 +1,40 @@
+{
+  "description": "Minimal Agentflow session logging and context hints.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "~/.local/bin/agentflow hook --provider codex --event SessionStart",
+            "statusMessage": "Loading Agentflow context",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "startup|resume"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "~/.local/bin/agentflow hook --provider codex --event Stop",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "~/.local/bin/agentflow hook --provider codex --event UserPromptSubmit",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}
