@@ -156,7 +156,12 @@ class ValidLaunch:
             yield
 
     def _materialize(self):
-        with self.beads_patches():
+        # Provider binaries are external integration dependencies. Keep this
+        # unit fixture hermetic while still exercising the complete handoff
+        # and root-preflight contract.
+        with self.beads_patches(), mock.patch.object(
+            cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"
+        ):
             handoff_path = cli._materialize_launch_handoff(
                 self.root, self.task_id, self.provider, role=self.role)
             handoff = cli.provider_argv_backend.validate_confined_handoff(

@@ -84,6 +84,9 @@ def run(wheel: Path, expected_version: str) -> None:
             if roles != expected_roles:
                 raise RuntimeError(f"unexpected {provider} profiles: {names!r}")
 
+        home_before_dry_run = {
+            path.relative_to(isolated_home) for path in isolated_home.rglob("*")
+        }
         dry_run = subprocess.run(
             [str(agentflow), "install", "--dry-run"],
             cwd=root,
@@ -100,8 +103,16 @@ def run(wheel: Path, expected_version: str) -> None:
         for skill in expected_skills:
             if sum(skill in line for line in planned) != 3:
                 raise RuntimeError(f"dry run did not plan {skill!r} for all three providers")
-        if any(isolated_home.iterdir()):
-            raise RuntimeError("install --dry-run unexpectedly wrote inside the isolated home")
+        home_after_dry_run = {
+            path.relative_to(isolated_home) for path in isolated_home.rglob("*")
+        }
+        if home_after_dry_run != home_before_dry_run:
+            added = sorted(str(path) for path in home_after_dry_run - home_before_dry_run)
+            removed = sorted(str(path) for path in home_before_dry_run - home_after_dry_run)
+            raise RuntimeError(
+                "install --dry-run changed the isolated home: "
+                f"added={added!r}, removed={removed!r}"
+            )
     print(f"Clean-wheel smoke passed for {wheel.name}.")
 
 
