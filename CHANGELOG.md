@@ -8,7 +8,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Nothing yet.
+- Added an agent-readable installation contract so a user can point a
+  ChatGPT/Codex or Claude coding agent at the repository and request a safe,
+  verified, non-overwriting setup.
+- Added a chat-first walkthrough with copy/paste prompts for goal shaping,
+  approval, persistent autonomous execution, reconnect-safe resume, read-only
+  status, and bounded pull-request delivery without requiring the user to run
+  Agentflow CLI commands directly.
 
 ## [0.0.2] - 2026-08-03
 
