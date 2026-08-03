@@ -89,6 +89,56 @@ class ReliabilityFix5Tests(unittest.TestCase):
                     outside, root=root, provider="codex", task_id="task-auth"
                 )
 
+    def test_direct_handoff_launch_uses_an_exact_approved_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path, handoff = self._handoff(root)
+            args = argparse.Namespace(
+                provider="codex", file=str(path), cwd=str(root), role="coding",
+                model="gpt-5.6-luna", effort="medium", policy="",
+                print_command=False,
+            )
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch.object(cli.subprocess, "call", return_value=0) as launch:
+                self.assertEqual(cli.handoff_launch(args), 0)
+            launch.assert_called_once_with(
+                provider_argv.build_confined_argv(
+                    "codex", "gpt-5.6-luna", "medium", handoff,
+                    command="/fake/codex",
+                ),
+                cwd=str(root),
+            )
+
+    def test_persistent_transports_reject_hardened_handoffs_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path, _ = self._handoff(root)
+            manifest_path = path.with_suffix(".json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["isolation_profile"] = "hardened"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            handoff = provider_argv.validate_confined_handoff(
+                path, root=root, provider="codex", task_id="task-auth"
+            )
+
+            for transport in ("direct launch", "Herdr"):
+                with self.subTest(transport=transport), self.assertRaisesRegex(
+                    ValueError, "refusing a hardened handoff"
+                ):
+                    cli._require_supported_launch_isolation(
+                        handoff, transport=transport
+                    )
+
+            args = argparse.Namespace(
+                provider="codex", file=str(path), cwd=str(root), role="coding",
+                model="gpt-5.6-luna", effort="medium", policy="",
+                print_command=False,
+            )
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch.object(cli.subprocess, "call") as launch:
+                self.assertEqual(cli.handoff_launch(args), 2)
+                launch.assert_not_called()
+
             path.write_bytes(b"# invalid\x00handoff\n")
             with self.assertRaises(provider_argv.ProviderArgvError):
                 provider_argv.validate_confined_handoff(

@@ -110,6 +110,10 @@ instructions and custom hooks, and keeps runtime state out of version control.
 The default Beads setup is local/stealth. Choose tracked or shared-server state
 only when that collaboration model is intentional.
 
+Continue with the executable [first workflow tutorial](docs/FIRST_WORKFLOW.md)
+to create and approve a root/task graph, run the controller, handle a halt, and
+record completion evidence.
+
 ## Bring your own skills
 
 Bundled Agentflow workflow skills are installed by `agentflow install`. The
@@ -128,9 +132,9 @@ agentflow skills doctor
 
 Skill sources may live inside the project or at an explicit external path.
 Project configuration is shareable when it uses repository-relative paths;
-configuration containing a machine-specific absolute path should remain
-untracked. Synchronization never silently overwrites an unrelated installed
-skill. See
+machine-specific sources are stored in the ignored
+`.agentflow/config.local.json` layer. Synchronization never silently overwrites
+an unrelated installed skill. See
 [Skill configuration](docs/SKILLS.md) for config examples, provider discovery
 locations, and team-safe setup patterns.
 
@@ -144,12 +148,14 @@ locations, and team-safe setup patterns.
 
 Core coordination can run on macOS and Linux. Hardened isolation is a distinct,
 macOS-only security control; ordinary execution on Linux is not equivalent
-confinement. Agentflow refuses a handoff that requires hardened isolation when
-the control cannot be verified.
+confinement. In `0.0.1`, `agentflow isolation launch` provides synchronous
+hardened execution. Direct handoff and persistent Herdr/controller launches
+reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Documentation
 
 - [Installation and upgrades](docs/INSTALLATION.md)
+- [First workflow tutorial](docs/FIRST_WORKFLOW.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Bring your own skills](docs/SKILLS.md)
 - [Workflow guide](docs/WORKFLOW.md)

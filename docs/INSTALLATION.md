@@ -94,6 +94,9 @@ Upgrade to an explicit tag, then rerun health checks:
 uv tool upgrade saintdle-agentflow
 # or: pipx upgrade saintdle-agentflow
 agentflow --version
+agentflow install --dry-run
+# After reviewing stale bundled assets and private-state backup behavior:
+agentflow install --refresh-bundled
 agentflow doctor
 agentflow skills doctor
 ```

@@ -18,6 +18,19 @@ from agentflow import project_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ADAPTED_SKILLS = ("code-review", "diagnosing-bugs", "wayfinder")
+MIT_NOTICE_MARKERS = (
+    "MIT License",
+    "Copyright (c) 2026 Matt Pocock",
+    "Permission is hereby granted, free of charge",
+    "THE SOFTWARE IS PROVIDED \"AS IS\"",
+)
+PROVENANCE_MARKERS = (
+    "https://github.com/mattpocock/skills",
+    "Upstream license: MIT",
+    "Relationship: adapted",
+    "Apache-2.0",
+)
 
 
 def _tree_contents(root: Path) -> dict[Path, bytes]:
@@ -52,6 +65,27 @@ def main() -> int:
                 f"{development_tree.relative_to(ROOT)} differs from packaged mirror "
                 f"{packaged_tree.relative_to(ROOT)}"
             )
+
+    packaged_skills = ROOT / "src/agentflow/resources/skills"
+    for name in ADAPTED_SKILLS:
+        skill = packaged_skills / name
+        notice = skill / "THIRD_PARTY_NOTICES.md"
+        provenance = skill / "PROVENANCE.md"
+        for path, markers in (
+            (notice, MIT_NOTICE_MARKERS),
+            (provenance, PROVENANCE_MARKERS),
+        ):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                errors.append(f"{path.relative_to(ROOT)}: {exc}")
+                continue
+            missing = [marker for marker in markers if marker not in text]
+            if missing:
+                errors.append(
+                    f"{path.relative_to(ROOT)}: incomplete attribution; missing "
+                    f"{', '.join(repr(marker) for marker in missing)}"
+                )
 
     for path in sorted(ROOT.rglob("*.json")):
         try:

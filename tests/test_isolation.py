@@ -182,6 +182,14 @@ class ProtectedRootReadPolicyTests(unittest.TestCase):
         # merely to start; it must not come back in place of the blanket allow.
         self.assertFalse(hasattr(isolation, "BASE_READ_SUBPATHS"))
 
+    def test_undeclared_non_protected_reads_are_an_explicit_non_goal(self) -> None:
+        profile = isolation.build_profile(
+            isolation.IsolationSpec(read_roots=("/tmp/declared",)), home=Path("/tmp/home")
+        )
+        self.assertIn("(allow file-read*)", profile)
+        self.assertNotIn('(deny file-read* (subpath "/private/tmp"))', profile)
+        self.assertEqual(isolation.capabilities()["read_policy"], "protected-root-denylist")
+
 
 class FailClosedTests(unittest.TestCase):
     def test_launch_refuses_when_unsupported(self) -> None:

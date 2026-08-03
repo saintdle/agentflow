@@ -113,6 +113,28 @@ def run(wheel: Path, expected_version: str) -> None:
                 "install --dry-run changed the isolated home: "
                 f"added={added!r}, removed={removed!r}"
             )
+        subprocess.run(
+            [str(agentflow), "install"],
+            cwd=root,
+            env=clean_env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        adapted_skills = {"code-review", "diagnosing-bugs", "wayfinder"}
+        for provider_root in (".agents", ".claude", ".copilot"):
+            for skill in adapted_skills:
+                installed = isolated_home / provider_root / "skills" / skill
+                notice = (installed / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+                provenance = (installed / "PROVENANCE.md").read_text(encoding="utf-8")
+                if "Copyright (c) 2026 Matt Pocock" not in notice:
+                    raise RuntimeError(f"incomplete installed MIT notice: {installed}")
+                if "Permission is hereby granted" not in notice:
+                    raise RuntimeError(f"incomplete installed MIT permission: {installed}")
+                if "https://github.com/mattpocock/skills" not in provenance:
+                    raise RuntimeError(f"missing installed upstream provenance: {installed}")
+                if "Upstream license: MIT" not in provenance:
+                    raise RuntimeError(f"missing installed license provenance: {installed}")
     print(f"Clean-wheel smoke passed for {wheel.name}.")
 
 

@@ -95,6 +95,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "platform": platform.system(),
         "sandbox_exec": platform_supported(),
+        "read_policy": "protected-root-denylist",
         "rlimits": True,
         "process_group_teardown": True,
     }

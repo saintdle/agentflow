@@ -11,6 +11,8 @@ __pycache__/
 .agentflow/tmp/
 .agentflow/logs/
 .agentflow/worktrees/
+.agentflow/config.local.json
+.agentflow/managed-skill-links.json
 # END agentflow local artifacts
 dist/
 build/

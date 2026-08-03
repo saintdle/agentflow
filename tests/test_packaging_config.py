@@ -32,12 +32,57 @@ class PackagingConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(Path, "home", return_value=Path(temp)), mock.patch(
             "sys.stdout", new_callable=io.StringIO
         ) as output:
-            result = cli.install(argparse.Namespace(path=str(Path(temp) / "uninitialized"), force=False, dry_run=True))
+            result = cli.install(argparse.Namespace(
+                path=str(Path(temp) / "uninitialized"), force=False, dry_run=True,
+                refresh_bundled=False,
+            ))
             self.assertEqual(result, 0)
             rendered = output.getvalue()
             self.assertEqual(rendered.count("would-install"), 34)
             self.assertIn("agentflow-controller.toml", rendered)
             self.assertIn("shape-goal", rendered)
+
+    def test_bundled_install_is_idempotent_and_refresh_is_explicit_with_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            Path, "home", return_value=Path(temp)
+        ):
+            args = argparse.Namespace(
+                path=str(Path(temp) / "uninitialized"), force=False, dry_run=False,
+                refresh_bundled=False,
+            )
+            self.assertEqual(cli.install(args), 0)
+            self.assertEqual(cli.install(args), 0)
+            profile = Path(temp) / ".codex/agents/agentflow-controller.toml"
+            profile.write_text("stale\n", encoding="utf-8")
+            args.refresh_bundled = True
+            self.assertEqual(cli.install(args), 0)
+            self.assertNotEqual(profile.read_text(encoding="utf-8"), "stale\n")
+            backups = list((Path(temp) / ".local/state/agentflow/backups").rglob(
+                "agentflow-controller.toml"
+            ))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(encoding="utf-8"), "stale\n")
+
+    def test_adapted_skills_install_with_self_contained_attribution(self) -> None:
+        adapted = ("code-review", "diagnosing-bugs", "wayfinder")
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            Path, "home", return_value=Path(temp)
+        ), mock.patch("sys.stdout", new_callable=io.StringIO):
+            result = cli.install(
+                argparse.Namespace(
+                    path=str(Path(temp) / "uninitialized"), force=False, dry_run=False
+                )
+            )
+            self.assertEqual(result, 0)
+            for provider_root in (".agents", ".claude", ".copilot"):
+                for name in adapted:
+                    skill = Path(temp) / provider_root / "skills" / name
+                    notice = (skill / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+                    provenance = (skill / "PROVENANCE.md").read_text(encoding="utf-8")
+                    self.assertIn("Copyright (c) 2026 Matt Pocock", notice)
+                    self.assertIn("Permission is hereby granted", notice)
+                    self.assertIn("https://github.com/mattpocock/skills", provenance)
+                    self.assertIn("Upstream license: MIT", provenance)
 
     def test_init_creates_live_valid_config_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -46,6 +91,192 @@ class PackagingConfigTests(unittest.TestCase):
             data = project_config.load(root)
             self.assertEqual(data["schema"], project_config.SCHEMA)
             self.assertTrue((root / data["model_policy"]).is_file())
+            ignored = (root / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn(".agentflow/config.local.json", ignored)
+            self.assertIn(".agentflow/managed-skill-links.json", ignored)
+
+    def test_local_layer_validates_and_overrides_shared_by_skill_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shared_skill = root / "skills/shared"
+            local_skill = root / "skills/local"
+            for skill in (shared_skill, local_skill):
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("---\nname: layered\ndescription: test\n---\n", encoding="utf-8")
+            shared = project_config.default_data()
+            shared["skills"] = [{"name": "layered", "path": "skills/shared", "providers": ["codex"]}]
+            local = project_config.default_local_data()
+            local["model_policy"] = ".agentflow/local-policy.json"
+            local["skills"] = [{"name": "layered", "path": "skills/local", "providers": ["claude"]}]
+            project_config.write_layer(root, shared, local=False)
+            project_config.write_layer(root, local, local=True)
+            merged = project_config.load(root)
+            self.assertEqual(merged["model_policy"], ".agentflow/local-policy.json")
+            self.assertEqual(merged["skills"], local["skills"])
+            self.assertEqual(project_config.skill_origins(root), {"layered": "local"})
+
+            local["unexpected"] = True
+            (root / ".agentflow/config.local.json").write_text(json.dumps(local), encoding="utf-8")
+            with self.assertRaises(project_config.ConfigError):
+                project_config.load(root)
+
+    def test_add_defaults_repository_skill_shared_and_external_skill_local(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            inside = root / "skills/inside"
+            outside = base / "external/outside"
+            forced = base / "external/forced"
+            for skill in (inside, outside, forced):
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("---\nname: test\ndescription: test\n---\n", encoding="utf-8")
+            self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+            common = {"path": str(root), "provider": ["codex"], "local": False, "shared": False}
+            self.assertEqual(cli.skills_add(argparse.Namespace(source=str(inside), name="inside", **common)), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(source=str(outside), name="outside", **common)), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                source=str(forced), name="forced", path=str(root), provider=["codex"], local=False, shared=True
+            )), 0)
+            shared, local = project_config.load_layers(root)
+            self.assertEqual([entry["name"] for entry in shared["skills"]], ["inside", "forced"])
+            self.assertEqual([entry["name"] for entry in local["skills"]], ["outside"])
+            self.assertEqual(shared["skills"][0]["path"], "skills/inside")
+            self.assertTrue(Path(local["skills"][0]["path"]).is_absolute())
+
+    def test_explicit_local_add_overrides_shared_but_implicit_duplicate_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            shared_source = root / "skills/layered-shared"
+            local_source = base / "external/layered-local"
+            implicit_source = base / "external/layered-implicit"
+            local_first = base / "external/local-first"
+            shared_underlay = root / "skills/shared-underlay"
+            for source in (shared_source, local_source, implicit_source, local_first, shared_underlay):
+                source.mkdir(parents=True)
+                (source / "SKILL.md").write_text(
+                    "---\nname: layered\ndescription: test\n---\n", encoding="utf-8"
+                )
+            self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(shared_source), name="layered", provider=["codex"],
+                local=False, shared=False,
+            )), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(implicit_source), name="layered", provider=["codex"],
+                local=False, shared=False,
+            )), 2)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(local_source), name="layered", provider=["claude"],
+                local=True, shared=False,
+            )), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(implicit_source), name="layered", provider=["copilot"],
+                local=True, shared=False,
+            )), 2)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(local_first), name="underlay", provider=["claude"],
+                local=True, shared=False,
+            )), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(shared_underlay), name="underlay", provider=["codex"],
+                local=False, shared=True,
+            )), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(shared_underlay), name="underlay", provider=["codex"],
+                local=False, shared=True,
+            )), 2)
+            shared, local = project_config.load_layers(root)
+            self.assertEqual([entry["name"] for entry in shared["skills"]], ["layered", "underlay"])
+            self.assertEqual([entry["name"] for entry in local["skills"]], ["layered", "underlay"])
+            merged = project_config.skills(project_config.load(root), root)
+            self.assertEqual(merged, [
+                ("layered", local_source.resolve(), ("claude",)),
+                ("underlay", local_first.resolve(), ("claude",)),
+            ])
+
+    def test_remove_preserves_replaced_and_unowned_destinations_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "project"
+            external = base / "external/safe-skill"
+            external.mkdir(parents=True)
+            (external / "SKILL.md").write_text("---\nname: safe-skill\ndescription: test\n---\n", encoding="utf-8")
+            self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+            add = argparse.Namespace(
+                path=str(root), source=str(external), name="safe-skill", provider=["codex"],
+                local=False, shared=False,
+            )
+            self.assertEqual(cli.skills_add(add), 0)
+            codex_home = root / "provider/codex"
+            claude_home = root / "provider/claude"
+            local = json.loads(project_config.local_config_path(root).read_text(encoding="utf-8"))
+            local["skills"][0]["providers"] = ["codex", "claude"]
+            project_config.write_layer(root, local, local=True)
+            with mock.patch.dict(os.environ, {
+                "CODEX_HOME": str(codex_home), "CLAUDE_HOME": str(claude_home)
+            }):
+                self.assertEqual(cli.skills_sync(argparse.Namespace(path=str(root), force=False, dry_run=False)), 0)
+                destination = codex_home / "skills/safe-skill"
+                destination.unlink()
+                destination.write_text("user-owned\n", encoding="utf-8")
+                directory = claude_home / "skills/safe-skill"
+                directory.unlink()
+                directory.mkdir()
+                remove = argparse.Namespace(
+                    path=str(root), name="safe-skill", local=False, shared=False, keep_links=False
+                )
+                self.assertEqual(cli.skills_remove(remove), 0)
+                self.assertEqual(destination.read_text(encoding="utf-8"), "user-owned\n")
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(cli.skills_remove(remove), 0)
+            self.assertEqual(project_config.load(root)["skills"], [])
+
+    def test_remove_explicit_layer_preserves_same_name_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shared_source = root / "skills/shared"
+            local_source = root / "skills/local"
+            for source in (shared_source, local_source):
+                source.mkdir(parents=True)
+                (source / "SKILL.md").write_text("---\nname: layered\ndescription: test\n---\n", encoding="utf-8")
+            shared = project_config.default_data()
+            shared["skills"] = [{"name": "layered", "path": "skills/shared", "providers": ["codex"]}]
+            local = project_config.default_local_data()
+            local["skills"] = [{"name": "layered", "path": "skills/local", "providers": ["codex"]}]
+            project_config.write_layer(root, shared, local=False)
+            project_config.write_layer(root, local, local=True)
+            args = argparse.Namespace(
+                path=str(root), name="layered", local=False, shared=True, keep_links=False
+            )
+            self.assertEqual(cli.skills_remove(args), 0)
+            remaining_shared, remaining_local = project_config.load_layers(root)
+            self.assertEqual(remaining_shared["skills"], [])
+            self.assertEqual(remaining_local["skills"], local["skills"])
+            self.assertEqual(project_config.skills(project_config.load(root), root)[0][1], local_source.resolve())
+            self.assertEqual(cli.skills_remove(args), 0)
+
+    def test_remove_preserves_unrecorded_matching_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            source = root / "skills/user-linked"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_text("---\nname: user-linked\ndescription: test\n---\n", encoding="utf-8")
+            self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+            self.assertEqual(cli.skills_add(argparse.Namespace(
+                path=str(root), source=str(source), name="user-linked", provider=["codex"],
+                local=False, shared=False,
+            )), 0)
+            codex_home = root / "provider/codex"
+            destination = codex_home / "skills/user-linked"
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(source, target_is_directory=True)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                self.assertEqual(cli.skills_remove(argparse.Namespace(
+                    path=str(root), name="user-linked", local=False, shared=False, keep_links=False
+                )), 0)
+            self.assertTrue(destination.is_symlink())
+            self.assertEqual(destination.resolve(), source.resolve())
 
     def test_add_list_sync_and_doctor_local_skill(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -63,9 +294,49 @@ class PackagingConfigTests(unittest.TestCase):
                 self.assertEqual(cli.skills_sync(args), 0)
                 self.assertEqual(cli.skills_doctor(argparse.Namespace(path=str(root))), 0)
                 self.assertIn("example-skill", output.getvalue())
+                self.assertIn("sha256=", output.getvalue())
             destination = root / "provider/codex/skills/example-skill"
             self.assertTrue(destination.is_symlink())
             self.assertEqual(destination.resolve(), skill.resolve())
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(root / "provider/codex")}):
+                self.assertEqual(
+                    cli.skills_remove(
+                        argparse.Namespace(path=str(root), name="example-skill", keep_links=False)
+                    ),
+                    0,
+                )
+            self.assertFalse(destination.exists())
+            self.assertTrue(skill.is_dir())
+            self.assertEqual(project_config.load(root)["skills"], [])
+
+    def test_unenforced_workflow_switches_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = project_config.default_data()
+            data["require_external_preflight"] = "no"
+            self.assertIn("unknown field(s): require_external_preflight", project_config.validate(data, root))
+
+    def test_doctor_uses_requested_root_and_fails_for_missing_configured_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            cli, "_version", return_value=("missing", "")
+        ), mock.patch.object(cli, "_provider_command", return_value=None), mock.patch.object(
+            cli.beads_backend, "version", return_value=((1, 1, 0), "bd version 1.1.0")
+        ), mock.patch.object(cli.beads_backend, "workspace", return_value=None) as workspace:
+            root = Path(temp)
+            self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+            (root / ".agentflow/models-v1.json").unlink()
+            self.assertEqual(cli.doctor(argparse.Namespace(path=str(root))), 2)
+            workspace.assert_called_once_with(root.resolve())
+
+    def test_release_workflow_is_immutable_and_gated_on_green_main(self) -> None:
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("--clobber", workflow)
+        self.assertIn('git merge-base --is-ancestor "${GITHUB_SHA}" origin/main', workflow)
+        for required in ("ci.yml", "security.yml", "build-main.yml"):
+            self.assertIn(required, workflow)
+        self.assertIn("Release ${GITHUB_REF_NAME} already exists", workflow)
 
     def test_skill_source_symlink_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

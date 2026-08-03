@@ -23,8 +23,9 @@ agentflow skills doctor
 
 `add` records the source in configuration, `sync` makes the configured package
 available through supported provider discovery locations, `list` reports
-configured and resolved skills, and `doctor` checks entrypoints, conflicts, and
-provenance without exposing file contents unnecessarily.
+configured and resolved skills, and `doctor` checks entrypoints, provider links,
+and a content digest without exposing file contents unnecessarily. Asset-lock
+provenance remains a separate `agentflow assets` workflow.
 
 Use a relative path for a skill committed with the project. A team can then
 clone the repository and run `agentflow skills sync` without editing config.
@@ -34,14 +35,16 @@ clone the repository and run `agentflow skills sync` without editing config.
 An individual can register a skill maintained outside the project:
 
 ```sh
-agentflow skills add /path/to/my-skill
+agentflow skills add /path/to/my-skill --local
 agentflow skills sync
 ```
 
-Do not commit another user's absolute path. In `0.0.1`, keep a project config
-containing a machine-specific source untracked. For a shareable team setup, use
-a repository-relative package or a separately versioned imported asset with an
-immutable revision and licence metadata.
+Agentflow stores that registration in the ignored
+`.agentflow/config.local.json` machine-local layer. An external absolute path
+selects the local layer by default; `--local` makes that choice explicit. Local
+entries override shared entries with the same name. For a shareable team setup,
+use a repository-relative package in `.agentflow/config.json` or a separately
+versioned imported asset with an immutable revision and licence metadata.
 
 ## Provider synchronization and discovery
 
@@ -52,7 +55,7 @@ provider user directories below (or their corresponding `CODEX_HOME`,
 
 | Provider | Synchronization destination |
 | --- | --- |
-| Codex | `~/.codex/skills/<name>` |
+| Codex | `~/.agents/skills/<name>` (or `$CODEX_HOME/skills/<name>`) |
 | Claude Code | `~/.claude/skills/<name>` |
 | GitHub Copilot | `~/.copilot/skills/<name>` |
 
@@ -76,7 +79,9 @@ Treat third-party skills as executable supply-chain inputs:
 - pin an immutable revision;
 - record licence and provenance;
 - use Agentflow's asset lock and verification commands;
-- require hardened isolation for untrusted execution where supported.
+- use the separate synchronous `agentflow isolation launch` path for untrusted
+  execution where supported; persistent provider sessions are not confined in
+  `0.0.1`.
 
 Synchronization does not grant a skill controller credentials, provider
 credentials, or permission to bypass handoff preflight.
@@ -90,6 +95,13 @@ agentflow skills sync
 agentflow skills doctor
 ```
 
-Review the reported source and digest before delegating work. Use the CLI's
-documented removal command for your installed version; do not recursively
-delete shared provider directories because they may contain unrelated skills.
+Review the reported source and digest before delegating work. Remove a
+registration and its Agentflow-owned provider links with:
+
+```sh
+agentflow skills remove my-domain-skill
+```
+
+Removal preserves the source package and any provider path no longer pointing
+to the registered source. Use `--local` or `--shared` when the same name exists
+in both layers. Do not recursively delete shared provider directories.

@@ -46,19 +46,32 @@ security. Use exact provider identifiers and review policy changes.
 ## Hardened isolation
 
 Hardened subprocess isolation in `0.0.1` is available only on macOS through
-`/usr/bin/sandbox-exec`. It uses an explicit read/write allowlist, denies
-network by default, bounds resources and runtime, and tears down the process
-group on timeout.
+`/usr/bin/sandbox-exec`. Process execution, writes, and network access are
+deny-by-default. Reads use a different boundary: the profile permits blanket
+system reads so interpreters and toolchains can start, denies protected home
+roots such as `/Users`, and then explicitly re-allows only caller-declared
+read/write roots plus an ephemeral home. Undeclared system paths such as
+`/private/tmp`, `/opt`, or mounted volumes may therefore remain readable. It
+also bounds resources and runtime and tears down the process group on timeout.
 
 ```sh
 agentflow isolation probe --write /path/to/scratch
 agentflow isolation launch --write /path/to/scratch -- python3 script.py
 ```
 
-The probe validates controls against fresh state. A missing control, ambiguous
-network result, unavailable `sandbox-exec`, or non-macOS host fails closed.
-Agentflow does not silently fall back to ordinary execution when a handoff
-requires `hardened` isolation.
+The probe validates controls against fresh state, but a successful probe is not
+confinement for a later process. `agentflow isolation launch` is the separate,
+synchronous path that applies the generated hardened profile to the supplied
+command. A missing control, ambiguous network result, unavailable
+`sandbox-exec`, or non-macOS host fails closed.
+
+Direct `agentflow handoff launch` requires an exact role, model, and effort and
+validates them against model policy. It is not the synchronous isolation path:
+a handoff declaring `isolation_profile: hardened` is rejected rather than
+launched unconfined. Authenticated Herdr/controller launch also rejects hardened
+handoffs in `0.0.1`, because a probe cannot confine the later persistent
+provider session. Use `agentflow isolation launch` for synchronous hardened
+commands; persistent-session confinement is not currently provided.
 
 Linux can run the core CLI but has no equivalent hardened isolation in `0.0.1`.
 Running a command in a shell, virtual environment, worktree, or terminal
@@ -66,7 +79,9 @@ multiplexer is not an isolation boundary.
 
 `sandbox-exec` is a platform facility with its own limitations. Use a dedicated
 machine, virtual machine, or reviewed container boundary for genuinely hostile
-code or high-value credentials.
+code or high-value credentials. Do not place secrets in globally readable
+temporary, toolchain, or mounted-volume paths and rely on Agentflow to hide
+them.
 
 ## Imported assets and skills
 

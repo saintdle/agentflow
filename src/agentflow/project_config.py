@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "agentflow.project@1"
+LOCAL_SCHEMA = "agentflow.project-local@1"
+MANAGED_LINKS_SCHEMA = "agentflow.managed-skill-links@1"
 VERSION = 1
 PROVIDERS = ("codex", "claude", "copilot")
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -22,8 +24,20 @@ def default_data() -> dict[str, Any]:
     return {"schema": SCHEMA, "version": VERSION, "model_policy": ".agentflow/models-v1.json", "skills": []}
 
 
+def default_local_data() -> dict[str, Any]:
+    return {"schema": LOCAL_SCHEMA, "version": VERSION, "skills": []}
+
+
 def config_path(root: Path) -> Path:
     return Path(root).resolve() / ".agentflow/config.json"
+
+
+def local_config_path(root: Path) -> Path:
+    return Path(root).resolve() / ".agentflow/config.local.json"
+
+
+def managed_links_path(root: Path) -> Path:
+    return Path(root).resolve() / ".agentflow/managed-skill-links.json"
 
 
 def _resolve_skill(root: Path, value: str) -> Path:
@@ -43,26 +57,26 @@ def _resolve_skill(root: Path, value: str) -> Path:
     return resolved
 
 
-def validate(data: Any, root: Path) -> list[str]:
+def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     if not isinstance(data, dict):
         return ["configuration root must be an object"]
     errors: list[str] = []
-    allowed = {
-        "schema", "version", "model_policy", "skills", "workflow_mode", "state_backend",
-        "beads_sync_policy", "beads_parallel_mode", "require_approved_goal",
-        "require_durable_work_item_before_implementation", "max_parallel_workers",
-        "max_delegation_depth", "default_execution_lane", "external_session_tool",
-        "direct_human_intervention_on_blocked", "require_external_preflight",
-        "require_acceptance_matrix_for_substantial_work", "queue_scope", "queue_labels",
-        "validation_lanes", "default_reporting", "merge_order",
-    }
+    # Keep the public schema limited to values consumed by runtime code.
+    # Workflow guidance lives in the generated provider instructions; accepting
+    # security-looking but unenforced switches here would create false trust.
+    allowed = {"schema", "version", "model_policy", "skills"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
-    if data.get("schema") != SCHEMA or data.get("version") != VERSION:
-        errors.append(f"schema/version must be {SCHEMA}/{VERSION}")
-    if not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip():
+    expected_schema = LOCAL_SCHEMA if local else SCHEMA
+    if data.get("schema") != expected_schema or data.get("version") != VERSION:
+        errors.append(f"schema/version must be {expected_schema}/{VERSION}")
+    if not local and (not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip()):
         errors.append("model_policy must be a non-empty path")
+    if local and "model_policy" in data and (
+        not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip()
+    ):
+        errors.append("model_policy must be a non-empty path when present")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
@@ -96,18 +110,127 @@ def validate(data: Any, root: Path) -> list[str]:
     return errors
 
 
-def load(root: Path) -> dict[str, Any]:
-    path = config_path(root)
+def _read_layer(path: Path, root: Path, *, local: bool) -> dict[str, Any]:
+    if path.is_symlink():
+        raise ConfigError(f"configuration path must not be a symlink: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ConfigError(f"configuration not found: {path}; run `agentflow init`") from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"configuration is unreadable: {exc}") from exc
-    errors = validate(data, Path(root))
+    errors = validate(data, Path(root), local=local)
+    if errors:
+        raise ConfigError(f"{path}: {'; '.join(errors)}")
+    return data
+
+
+def load_layers(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    root = Path(root).resolve()
+    shared = _read_layer(config_path(root), root, local=False)
+    local_path = local_config_path(root)
+    local = (
+        _read_layer(local_path, root, local=True)
+        if local_path.exists() or local_path.is_symlink()
+        else default_local_data()
+    )
+    return shared, local
+
+
+def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
+    """Merge validated layers; local scalars and same-name skills win."""
+
+    result = dict(shared)
+    if "model_policy" in local:
+        result["model_policy"] = local["model_policy"]
+    merged_skills: dict[str, dict[str, Any]] = {}
+    for entry in shared.get("skills", []):
+        merged_skills[entry["name"]] = dict(entry)
+    for entry in local.get("skills", []):
+        merged_skills[entry["name"]] = dict(entry)
+    result["skills"] = list(merged_skills.values())
+    return result
+
+
+def load(root: Path) -> dict[str, Any]:
+    shared, local = load_layers(root)
+    return merge(shared, local)
+
+
+def skill_origins(root: Path) -> dict[str, str]:
+    shared, local = load_layers(root)
+    origins = {entry["name"]: "shared" for entry in shared["skills"]}
+    origins.update({entry["name"]: "local" for entry in local["skills"]})
+    return origins
+
+
+def write_layer(root: Path, data: dict[str, Any], *, local: bool) -> Path:
+    root = Path(root).resolve()
+    errors = validate(data, root, local=local)
     if errors:
         raise ConfigError("; ".join(errors))
-    return data
+    path = local_config_path(root) if local else config_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
+def load_managed_links(root: Path) -> list[dict[str, str]]:
+    path = managed_links_path(root)
+    if path.is_symlink():
+        raise ConfigError("managed skill-link registry must not be a symlink")
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"managed skill-link registry is unreadable: {exc}") from exc
+    if not isinstance(data, dict) or data.get("schema") != MANAGED_LINKS_SCHEMA or data.get("version") != VERSION:
+        raise ConfigError("managed skill-link registry has an unsupported schema")
+    entries = data.get("links")
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, dict)
+        or set(entry) != {"name", "provider", "source", "destination"}
+        or not all(isinstance(entry[field], str) and entry[field] for field in entry)
+        or not NAME_PATTERN.fullmatch(entry["name"])
+        or entry["provider"] not in PROVIDERS
+        or not Path(entry["source"]).is_absolute()
+        or not Path(entry["destination"]).is_absolute()
+        for entry in entries
+    ):
+        raise ConfigError("managed skill-link registry has invalid links")
+    return [dict(entry) for entry in entries]
+
+
+def write_managed_links(root: Path, entries: list[dict[str, str]]) -> None:
+    path = managed_links_path(root)
+    if path.is_symlink():
+        raise ConfigError("managed skill-link registry must not be a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"schema": MANAGED_LINKS_SCHEMA, "version": VERSION, "links": entries}
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def record_managed_link(root: Path, *, name: str, provider: str, source: Path, destination: Path) -> None:
+    entries = load_managed_links(root)
+    record = {
+        "name": name,
+        "provider": provider,
+        "source": str(source.resolve()),
+        "destination": str(destination.absolute()),
+    }
+    key = (name, provider, str(destination.absolute()))
+    entries = [
+        entry for entry in entries
+        if (entry["name"], entry["provider"], entry["destination"]) != key
+    ]
+    entries.append(record)
+    entries.sort(key=lambda entry: (entry["name"], entry["provider"], entry["destination"]))
+    write_managed_links(root, entries)
 
 
 def skills(data: dict[str, Any], root: Path) -> list[tuple[str, Path, tuple[str, ...]]]:

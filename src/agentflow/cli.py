@@ -100,6 +100,8 @@ GITIGNORE_BLOCK = "\n".join(
         ".agentflow/tmp/",
         ".agentflow/logs/",
         ".agentflow/worktrees/",
+        ".agentflow/config.local.json",
+        ".agentflow/managed-skill-links.json",
         GITIGNORE_END,
     )
 )
@@ -2140,6 +2142,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
         )
         if typed_handoff.manifest.get("provider") != provider:
             raise ValueError("handoff provider does not match launch route")
+        _require_supported_launch_isolation(typed_handoff, transport="Herdr")
 
         root_preflight_report: dict[str, Any] = {}
 
@@ -2160,6 +2163,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 expected_manifest_sha256=typed_handoff.manifest_sha256,
                 expected_preflight_sha256=typed_handoff.preflight_sha256,
             )
+            _require_supported_launch_isolation(typed_handoff, transport="Herdr")
             manifest = typed_handoff.manifest
             machine_contract = manifest.get("machine_return_contract")
             acceptance_ids = tuple(
@@ -3154,15 +3158,85 @@ def _copy_resource(parts: tuple[str, ...], destination: Path, *, refresh: bool =
         if not destination.is_file() or destination.is_symlink():
             return "refused"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(packaged_resources.item(*parts).read_bytes())
+    backup: Path | None = None
+    if existed:
+        backup = _refresh_backup_path(destination)
+        destination.rename(backup)
+    try:
+        destination.write_bytes(packaged_resources.item(*parts).read_bytes())
+    except Exception:
+        if backup is not None:
+            if destination.exists():
+                destination.rename(_refresh_backup_path(destination))
+            backup.rename(destination)
+        raise
     return "updated" if existed else "created"
 
 
-def _copy_resource_tree(parts: tuple[str, ...], destination: Path, *, dry_run: bool = False) -> str:
-    """Install one immutable packaged tree without replacing user content."""
+def _tree_contents(root: Any) -> dict[str, bytes]:
+    contents: dict[str, bytes] = {}
 
-    if destination.exists() or destination.is_symlink():
-        return "exists"
+    def walk(current: Any, prefix: str = "") -> None:
+        for child in sorted(current.iterdir(), key=lambda item: item.name):
+            relative = f"{prefix}/{child.name}" if prefix else child.name
+            if child.is_dir():
+                walk(child, relative)
+            elif child.is_file():
+                contents[relative] = child.read_bytes()
+            else:
+                raise OSError(f"unsupported resource entry: {relative}")
+
+    walk(root)
+    return contents
+
+
+def _resource_tree_status(parts: tuple[str, ...], destination: Path) -> str:
+    if destination.is_symlink() or not destination.is_dir():
+        return "missing" if not destination.exists() else "refused"
+    try:
+        return (
+            "installed"
+            if _tree_contents(destination) == _tree_contents(packaged_resources.item(*parts))
+            else "stale"
+        )
+    except OSError:
+        return "unreadable"
+
+
+def _refresh_backup_path(destination: Path) -> Path:
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    identity = hashlib.sha256(str(destination.absolute()).encode("utf-8")).hexdigest()[:12]
+    backup_root = _state_dir() / "backups" / stamp / identity
+    backup_root.mkdir(parents=True, exist_ok=True)
+    try:
+        backup_root.chmod(0o700)
+    except OSError:
+        pass
+    candidate = backup_root / destination.name
+    suffix = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = backup_root / f"{destination.name}.{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _copy_resource_tree(
+    parts: tuple[str, ...], destination: Path, *, dry_run: bool = False,
+    refresh: bool = False,
+) -> str:
+    """Install a packaged tree; refresh only with a private recovery backup."""
+
+    existed = destination.exists() or destination.is_symlink()
+    if existed:
+        status = _resource_tree_status(parts, destination)
+        if status == "installed":
+            return "unchanged"
+        if not refresh:
+            return "stale" if status == "stale" else "refused"
+        if destination.is_symlink() or not destination.is_dir():
+            return "refused"
+        if dry_run:
+            return "would-refresh"
     if dry_run:
         return "would-install"
 
@@ -3178,8 +3252,19 @@ def _copy_resource_tree(parts: tuple[str, ...], destination: Path, *, dry_run: b
                 raise OSError(f"unsupported packaged resource: {child.name}")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    copy_directory(packaged_resources.item(*parts), destination)
-    return "installed"
+    backup: Path | None = None
+    if existed:
+        backup = _refresh_backup_path(destination)
+        destination.rename(backup)
+    try:
+        copy_directory(packaged_resources.item(*parts), destination)
+    except Exception:
+        if backup is not None:
+            if destination.exists():
+                destination.rename(_refresh_backup_path(destination))
+            backup.rename(destination)
+        raise
+    return "refreshed" if existed else "installed"
 
 
 def _install_beads_formula(
@@ -3447,6 +3532,7 @@ def beads_init(args: argparse.Namespace) -> int:
 
 
 def doctor(args: argparse.Namespace) -> int:
+    healthy = True
     print("Agent CLIs")
     for command in ("codex", "claude", "copilot", "gh"):
         status, version = _version(command)
@@ -3499,10 +3585,15 @@ def doctor(args: argparse.Namespace) -> int:
 
     root = Path(getattr(args, "path", ".")).expanduser().resolve()
     print("\nProject configuration")
+    config_path = project_config_backend.config_path(root)
     try:
         config = project_config_backend.load(root)
+        policy = model_policy_backend.load_policy(
+            _resolve_model_policy(argparse.Namespace(policy="", root=str(root)), root)
+        )
         configured_skills = project_config_backend.skills(config, root)
         print(f"  {'config':<16} {'ok':<7} {_safe_cwd(str(project_config_backend.config_path(root)))}")
+        print(f"  {'model policy':<16} {'ok':<7} {policy.id}@{policy.version}")
         print(f"  {'custom skills':<16} {'ok':<7} {len(configured_skills)} registered")
         missing_links = 0
         for name, source, providers in configured_skills:
@@ -3511,13 +3602,20 @@ def doctor(args: argparse.Namespace) -> int:
                 if not destination.is_symlink() or destination.resolve(strict=False) != source:
                     missing_links += 1
         print(f"  {'skill sync':<16} {'ok' if not missing_links else 'stale':<7} {missing_links} missing/stale links")
-    except project_config_backend.ConfigError as exc:
-        print(f"  {'config':<16} {'invalid':<7} {exc}")
+        healthy = healthy and not missing_links
+    except (project_config_backend.ConfigError, model_policy_backend.ModelPolicyError, OSError) as exc:
+        if config_path.exists() or config_path.is_symlink():
+            print(f"  {'config':<16} {'invalid':<7} {exc}")
+            healthy = False
+        else:
+            print(f"  {'config':<16} {'inactive':<7} run `agentflow init {root}`")
 
     parsed, display = beads_backend.version()
     print("\nDurable coordination")
     print(f"  {'beads':<16} {'ok' if parsed and parsed >= beads_backend.MINIMUM_VERSION else 'missing':<7} {display}")
-    workspace_data = beads_backend.workspace(Path.cwd()) if parsed else None
+    if not parsed or parsed < beads_backend.MINIMUM_VERSION:
+        healthy = False
+    workspace_data = beads_backend.workspace(root) if parsed else None
     if workspace_data:
         formula = _beads_formula_path(workspace_data)
         formula_state = _resource_status(
@@ -3531,9 +3629,10 @@ def doctor(args: argparse.Namespace) -> int:
         )
         print(f"  {'formula':<16} {formula_state:<7} {_safe_cwd(str(formula))}")
         print(f"  {'context':<16} {prime_state:<7} {_safe_cwd(str(prime))}")
+        healthy = healthy and formula_state == "installed" and prime_state == "installed"
     else:
         print(f"  {'workspace':<16} {'inactive':<7} current directory")
-    return 0
+    return 0 if healthy else 2
 
 
 def _link(source: Path, destination: Path, force: bool, dry_run: bool) -> str:
@@ -3557,7 +3656,7 @@ def config_show(args: argparse.Namespace) -> int:
     root = Path(args.path).expanduser().resolve()
     try:
         data = project_config_backend.load(root)
-    except project_config_backend.ConfigError as exc:
+    except (project_config_backend.ConfigError, OSError) as exc:
         print(f"Invalid Agentflow configuration: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(data, indent=2, sort_keys=True))
@@ -3580,30 +3679,41 @@ def skills_list(args: argparse.Namespace) -> int:
 
 def skills_add(args: argparse.Namespace) -> int:
     root = Path(args.path).expanduser().resolve()
-    config_path = project_config_backend.config_path(root)
     try:
-        data = project_config_backend.load(root)
-        source = Path(args.source).expanduser().resolve(strict=True)
+        shared, local = project_config_backend.load_layers(root)
+        requested_source = Path(args.source).expanduser()
+        if requested_source.is_symlink():
+            raise project_config_backend.ConfigError("skill source must not be a symlink")
+        source = requested_source.resolve(strict=True)
     except (project_config_backend.ConfigError, OSError) as exc:
         print(f"Cannot register skill: {exc}", file=sys.stderr)
         return 2
     name = args.name or source.name
     providers = args.provider or list(PROVIDERS)
-    if any(entry.get("name") == name for entry in data["skills"]):
-        print(f"Cannot register skill: name already exists: {name}", file=sys.stderr)
-        return 2
     try:
         relative = source.relative_to(root)
         stored_path = relative.as_posix()
+        default_local = False
     except ValueError:
         stored_path = str(source)
-    data["skills"].append({"name": name, "path": stored_path, "providers": providers})
-    errors = project_config_backend.validate(data, root)
-    if errors:
-        print(f"Cannot register skill: {'; '.join(errors)}", file=sys.stderr)
+        default_local = True
+    use_local = bool(getattr(args, "local", False)) or (
+        default_local and not bool(getattr(args, "shared", False))
+    )
+    target = local if use_local else shared
+    explicit_layer = bool(getattr(args, "local", False) or getattr(args, "shared", False))
+    duplicate_layers = (target,) if explicit_layer else (shared, local)
+    if any(entry.get("name") == name for layer in duplicate_layers for entry in layer["skills"]):
+        scope = ("local" if use_local else "shared") if explicit_layer else "configured"
+        print(f"Cannot register skill: name already exists in {scope} layer: {name}", file=sys.stderr)
         return 2
-    _write_json(config_path, data)
-    print(f"registered {name} -> {stored_path} ({','.join(providers)})")
+    target["skills"].append({"name": name, "path": stored_path, "providers": providers})
+    try:
+        path = project_config_backend.write_layer(root, target, local=use_local)
+    except project_config_backend.ConfigError as exc:
+        print(f"Cannot register skill: {exc}", file=sys.stderr)
+        return 2
+    print(f"registered {name} -> {stored_path} ({','.join(providers)}) [{path.name}]")
     return 0
 
 
@@ -3621,6 +3731,16 @@ def skills_sync(args: argparse.Namespace) -> int:
             result = _link(source, destination, args.force, args.dry_run)
             print(f"{result:<17} {provider:<7} {_safe_cwd(str(destination))} -> {source}")
             failed = failed or result in {"exists", "refused-directory"}
+            if result == "linked" and not args.dry_run:
+                try:
+                    project_config_backend.record_managed_link(
+                        root, name=name, provider=provider, source=source, destination=destination
+                    )
+                except (project_config_backend.ConfigError, OSError) as exc:
+                    if destination.is_symlink() and destination.resolve(strict=False) == source:
+                        destination.unlink()
+                    print(f"Cannot record managed skill link: {exc}", file=sys.stderr)
+                    return 2
     if failed:
         print("Existing destinations were preserved; inspect them before using --force.", file=sys.stderr)
         return 2
@@ -3636,6 +3756,12 @@ def skills_doctor(args: argparse.Namespace) -> int:
         return 2
     stale = 0
     for name, source, providers in registered:
+        try:
+            digest, files = _skill_package_digest(source / "SKILL.md")
+            print(f"digest  {name} sha256={digest} files={files} source={_safe_cwd(str(source))}")
+        except (OSError, ValueError) as exc:
+            print(f"invalid {name} {_safe_cwd(str(source))}: {exc}")
+            stale += 1
         for provider in providers:
             destination = project_config_backend.provider_destination(provider, name)
             ok = destination.is_symlink() and destination.resolve(strict=False) == source
@@ -3644,6 +3770,80 @@ def skills_doctor(args: argparse.Namespace) -> int:
     if not registered:
         print("No custom skills registered.")
     return 2 if stale else 0
+
+
+def skills_remove(args: argparse.Namespace) -> int:
+    root = Path(args.path).expanduser().resolve()
+    try:
+        shared, local = project_config_backend.load_layers(root)
+        records = project_config_backend.load_managed_links(root)
+    except (project_config_backend.ConfigError, OSError) as exc:
+        print(f"Cannot remove skill: {exc}", file=sys.stderr)
+        return 2
+
+    name = args.name
+    requested = "local" if getattr(args, "local", False) else "shared" if getattr(args, "shared", False) else ""
+    layers = {"shared": shared, "local": local}
+    if requested:
+        origin = requested
+    elif any(entry["name"] == name for entry in local["skills"]):
+        origin = "local"
+    elif any(entry["name"] == name for entry in shared["skills"]):
+        origin = "shared"
+    else:
+        print(f"absent {name}")
+        return 0
+
+    layer = layers[origin]
+    removed_entry = next((entry for entry in layer["skills"] if entry["name"] == name), None)
+    before = len(layer["skills"])
+    layer["skills"] = [entry for entry in layer["skills"] if entry["name"] != name]
+    if len(layer["skills"]) == before:
+        print(f"absent {name} [{origin}]")
+        return 0
+    try:
+        project_config_backend.write_layer(root, layer, local=origin == "local")
+    except (project_config_backend.ConfigError, OSError) as exc:
+        print(f"Cannot remove skill: {exc}", file=sys.stderr)
+        return 2
+
+    if removed_entry is None:
+        removed_source = None
+    else:
+        raw_source = Path(str(removed_entry["path"])).expanduser()
+        removed_source = (
+            raw_source if raw_source.is_absolute() else root / raw_source
+        ).resolve(strict=False)
+    retained: list[dict[str, str]] = []
+    unlinked = 0
+    for record in records:
+        destination = Path(record["destination"])
+        expected_destination = project_config_backend.provider_destination(
+            record["provider"], record["name"]
+        ).absolute()
+        if (
+            record["name"] != name
+            or removed_source is None
+            or Path(record["source"]) != removed_source
+            or destination.absolute() != expected_destination
+        ):
+            retained.append(record)
+            continue
+        if (
+            not getattr(args, "keep_links", False)
+            and destination.is_symlink()
+            and destination.resolve(strict=False) == removed_source
+        ):
+            destination.unlink()
+            unlinked += 1
+        # Drop ownership even when the destination was replaced by a user file.
+    try:
+        project_config_backend.write_managed_links(root, retained)
+    except (project_config_backend.ConfigError, OSError) as exc:
+        print(f"Skill configuration was removed but link registry update failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"removed {name} [{origin}]; unlinked {unlinked} managed provider link(s)")
+    return 0
 
 
 def install(args: argparse.Namespace) -> int:
@@ -3669,36 +3869,57 @@ def install(args: argparse.Namespace) -> int:
     failed = False
     for parts, destination, is_tree in mappings:
         if is_tree:
-            result = _copy_resource_tree(parts, destination, dry_run=args.dry_run)
-        elif destination.exists() or destination.is_symlink():
-            result = "exists"
+            result = _copy_resource_tree(
+                parts, destination, dry_run=args.dry_run,
+                refresh=bool(getattr(args, "refresh_bundled", False)),
+            )
         elif args.dry_run:
-            result = "would-install"
+            status = _resource_status(parts, destination)
+            if status == "missing":
+                result = "would-install"
+            elif status == "installed":
+                result = "unchanged"
+            elif getattr(args, "refresh_bundled", False) and destination.is_file() and not destination.is_symlink():
+                result = "would-refresh"
+            else:
+                result = "preserved"
         else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(packaged_resources.item(*parts).read_bytes())
-            result = "installed"
+            result = _copy_resource(
+                parts, destination,
+                refresh=bool(getattr(args, "refresh_bundled", False)),
+            )
         print(f"{result:<17} {_safe_cwd(str(destination))}")
-        failed = failed or result == "exists"
+        failed = failed or result in {"stale", "preserved", "refused", "unreadable"}
 
     hook = Path.home() / ".codex/hooks.json"
-    if hook.exists() or hook.is_symlink():
-        hook_result = "exists"
-    elif args.dry_run:
-        hook_result = "would-install"
+    hook_parts = ("templates", "user", "codex-hooks.json")
+    if args.dry_run:
+        hook_status = _resource_status(hook_parts, hook)
+        if hook_status == "missing":
+            hook_result = "would-install"
+        elif hook_status == "installed":
+            hook_result = "unchanged"
+        elif getattr(args, "refresh_bundled", False) and hook.is_file() and not hook.is_symlink():
+            hook_result = "would-refresh"
+        else:
+            hook_result = "preserved"
     else:
-        hook.parent.mkdir(parents=True, exist_ok=True)
-        hook.write_bytes(packaged_resources.item("templates", "user", "codex-hooks.json").read_bytes())
-        hook_result = "installed"
+        hook_result = _copy_resource(
+            hook_parts, hook, refresh=bool(getattr(args, "refresh_bundled", False))
+        )
     print(f"{hook_result:<17} {_safe_cwd(str(hook))}")
-    failed = failed or hook_result == "exists"
+    failed = failed or hook_result in {"stale", "preserved", "refused", "unreadable"}
 
     root = Path(args.path).expanduser().resolve()
     if project_config_backend.config_path(root).is_file():
         sync_result = skills_sync(args)
         failed = failed or sync_result != 0
     if failed:
-        print("Existing files were preserved. Review them before using --force for custom skills.", file=sys.stderr)
+        print(
+            "Stale or conflicting bundled files were preserved. Review them, then use "
+            "--refresh-bundled; --force applies only to custom skill links.",
+            file=sys.stderr,
+        )
         return 2
     return 0
 
@@ -5516,6 +5737,20 @@ def ci_watch(args: argparse.Namespace) -> int:
         time.sleep(args.interval_seconds)
 
 
+def _require_supported_launch_isolation(
+    handoff: provider_argv_backend.ConfinedHandoff, *, transport: str
+) -> None:
+    profile = str(handoff.manifest.get("isolation_profile") or "none")
+    if profile == "hardened":
+        raise ValueError(
+            f"{transport} cannot yet confine a persistent provider session; refusing a "
+            "hardened handoff instead of launching it unconfined. Use `agentflow isolation "
+            "launch` for synchronous hardened commands."
+        )
+    if profile != "none":
+        raise ValueError(f"unsupported handoff isolation profile: {profile!r}")
+
+
 def handoff_launch(args: argparse.Namespace) -> int:
     path = Path(args.file).expanduser().resolve()
     if not path.is_file():
@@ -5543,7 +5778,22 @@ def handoff_launch(args: argparse.Namespace) -> int:
                 provider=args.provider,
                 task_id=str(manifest.get("task_id") or ""),
             )
-        except provider_argv_backend.ProviderArgvError as exc:
+            _require_supported_launch_isolation(typed_handoff, transport="direct launch")
+            root = Path(args.cwd or manifest.get("cwd") or Path.cwd()).expanduser().resolve()
+            policy = model_policy_backend.load_policy(_resolve_model_policy(args, root))
+            role = str(getattr(args, "role", "") or "")
+            model = str(getattr(args, "model", "") or "")
+            effort = str(getattr(args, "effort", "") or "")
+            route = policy.validate_route(
+                provider=args.provider, role=role, model=model, effort=effort
+            )
+            if not route.ok:
+                raise ValueError(route.reason)
+        except (
+            provider_argv_backend.ProviderArgvError,
+            model_policy_backend.ModelPolicyError,
+            ValueError,
+        ) as exc:
             try:
                 sidecar = path.with_suffix(".json")
                 sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -5559,11 +5809,15 @@ def handoff_launch(args: argparse.Namespace) -> int:
     if not command:
         print(f"CLI not found: {args.provider}", file=sys.stderr)
         return 2
-    argv = [command, typed_handoff.instruction]
-    if args.provider == "copilot":
-        argv = [command, "--interactive", typed_handoff.instruction]
+    try:
+        argv = provider_argv_backend.build_confined_argv(
+            args.provider, model, effort, typed_handoff, command=command
+        )
+    except provider_argv_backend.ProviderArgvError as exc:
+        print(f"Refusing provider launch: {exc}", file=sys.stderr)
+        return 2
     if args.print_command:
-        print(f"{args.provider} < {path}")
+        print(f"{args.provider} --model {model} --effort {effort} < {path}")
         return 0
     return subprocess.call(argv, cwd=args.cwd or Path.cwd())
 
@@ -6061,16 +6315,24 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command_parser.add_argument("--json", action="store_true")
 
-    controller_start_parser = controller_sub.add_parser("start")
+    controller_start_parser = controller_sub.add_parser(
+        "start", help="Acquire the root lease and run until completion or an explicit halt"
+    )
     add_controller_common(controller_start_parser)
     controller_start_parser.set_defaults(func=controller_start)
-    controller_resume_parser = controller_sub.add_parser("resume")
+    controller_resume_parser = controller_sub.add_parser(
+        "resume", help="Reattach to a resumable root and continue its durable workflow"
+    )
     add_controller_common(controller_resume_parser)
     controller_resume_parser.set_defaults(func=controller_resume)
-    controller_status_parser = controller_sub.add_parser("status")
+    controller_status_parser = controller_sub.add_parser(
+        "status", help="Inspect the root lease, phase, active work, and halt reason"
+    )
     add_controller_common(controller_status_parser)
     controller_status_parser.set_defaults(func=controller_status)
-    controller_stop_parser = controller_sub.add_parser("stop")
+    controller_stop_parser = controller_sub.add_parser(
+        "stop", help="Request a clean stop while preserving resumable controller state"
+    )
     add_controller_common(controller_stop_parser)
     controller_stop_parser.set_defaults(func=controller_stop)
     controller_waiver_parser = controller_sub.add_parser(
@@ -6299,6 +6561,10 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("path", nargs="?", default=".")
     install_parser.add_argument("--force", action="store_true", help="Replace conflicting files or symlinks, never directories")
     install_parser.add_argument("--dry-run", action="store_true")
+    install_parser.add_argument(
+        "--refresh-bundled", action="store_true",
+        help="Refresh reviewed stale bundled assets; skill trees are backed up beside their destination",
+    )
     install_parser.set_defaults(func=install)
 
     config_parser = sub.add_parser("config", help="Inspect schema-versioned project configuration")
@@ -6314,6 +6580,9 @@ def build_parser() -> argparse.ArgumentParser:
     skills_add_parser.add_argument("--name", default="")
     skills_add_parser.add_argument("--provider", choices=PROVIDERS, action="append", default=[])
     skills_add_parser.add_argument("--path", default=".", help="Project containing .agentflow/config.json")
+    add_layer = skills_add_parser.add_mutually_exclusive_group()
+    add_layer.add_argument("--local", action="store_true", help="Write machine-local ignored configuration")
+    add_layer.add_argument("--shared", action="store_true", help="Write repository-shared configuration")
     skills_add_parser.set_defaults(func=skills_add)
     skills_list_parser = skills_sub.add_parser("list", help="List validated custom skills")
     skills_list_parser.add_argument("path", nargs="?", default=".")
@@ -6326,6 +6595,16 @@ def build_parser() -> argparse.ArgumentParser:
     skills_doctor_parser = skills_sub.add_parser("doctor", help="Validate registered skill provider links")
     skills_doctor_parser.add_argument("path", nargs="?", default=".")
     skills_doctor_parser.set_defaults(func=skills_doctor)
+    skills_remove_parser = skills_sub.add_parser("remove", help="Remove a registered skill and owned provider links")
+    skills_remove_parser.add_argument("name")
+    skills_remove_parser.add_argument("--path", default=".")
+    remove_layer = skills_remove_parser.add_mutually_exclusive_group()
+    remove_layer.add_argument("--local", action="store_true")
+    remove_layer.add_argument("--shared", action="store_true")
+    skills_remove_parser.add_argument(
+        "--keep-links", action="store_true", help="Leave matching Agentflow-managed provider symlinks in place"
+    )
+    skills_remove_parser.set_defaults(func=skills_remove)
 
     init_parser = sub.add_parser("init", help="Add non-overwriting workflow adapters to a project")
     init_parser.add_argument("path", nargs="?", default=".")
@@ -6533,10 +6812,16 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--cwd", default="")
     preflight_parser.add_argument("--require-matrix", action="store_true")
     preflight_parser.set_defaults(func=handoff_preflight)
-    launch_parser = handoff_sub.add_parser("launch")
+    launch_parser = handoff_sub.add_parser(
+        "launch", help="Launch a typed handoff through an exact approved model route"
+    )
     launch_parser.add_argument("provider", choices=PROVIDERS)
     launch_parser.add_argument("file")
     launch_parser.add_argument("--cwd", default="")
+    launch_parser.add_argument("--role", required=True)
+    launch_parser.add_argument("--model", required=True)
+    launch_parser.add_argument("--effort", required=True)
+    launch_parser.add_argument("--policy", default="")
     launch_parser.add_argument("--print-command", action="store_true")
     launch_parser.set_defaults(func=handoff_launch)
 

@@ -1,9 +1,13 @@
 # Configuration
 
-Agentflow uses repository configuration for workflow decisions that should be
-shared by a team. Initialization places the project file under `.agentflow/`.
-Runtime state, credentials, claims, logs, temporary handoffs, and provider
-sessions must remain ignored.
+Agentflow uses repository configuration for the model-policy path and custom
+skill registrations that should be shared by a team. Workflow rules are kept
+in generated provider instructions rather than accepted as unenforced config
+switches. Initialization places the shared project file at
+`.agentflow/config.json`. `.agentflow/config.local.json` is the ignored
+machine-local layer for absolute skill paths or a local model-policy override;
+local values override same-name shared values. Runtime state, credentials,
+claims, logs, temporary handoffs, and provider sessions must remain ignored.
 
 ## Principles
 
@@ -33,6 +37,30 @@ An initialized project starts with a schema-versioned configuration like this:
 
 Unknown or malformed security-relevant settings should be treated as errors,
 not silently downgraded. Use `agentflow doctor` after changing configuration.
+
+The local layer uses its own schema and normally contains only skills:
+
+```json
+{
+  "schema": "agentflow.project-local@1",
+  "version": 1,
+  "skills": [
+    {
+      "name": "personal-domain-skill",
+      "path": "/path/on/this/machine/personal-domain-skill",
+      "providers": ["codex"]
+    }
+  ]
+}
+```
+
+Prefer the CLI over hand-editing either layer:
+
+```sh
+agentflow skills add ./skills/team-skill --shared
+agentflow skills add /path/on/this/machine/personal-domain-skill --local
+agentflow skills list
+```
 
 ## Beads state
 
@@ -69,6 +97,8 @@ rules or commit their contents:
 .agentflow/tmp/
 .agentflow/logs/
 .agentflow/worktrees/
+.agentflow/config.local.json
+.agentflow/managed-skill-links.json
 # END agentflow local artifacts
 ```
 
