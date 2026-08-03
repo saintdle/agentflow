@@ -15,6 +15,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   approval, persistent autonomous execution, reconnect-safe resume, read-only
   status, and bounded pull-request delivery without requiring the user to run
   Agentflow CLI commands directly.
+- Added Mermaid component, controller-lifecycle, and security trust-boundary
+  diagrams to the README and detailed documentation.
 
 ## [0.0.2] - 2026-08-03
 

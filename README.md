@@ -40,6 +40,39 @@ unrelated projects.
 Agentflow routes skills; it does not replace domain expertise. A repository's
 own skills and instructions remain authoritative.
 
+## How the components fit together
+
+Agentflow is the coordination layer between a human-approved goal, durable
+Beads state, coding-agent providers, and the project being changed. Git and
+GitHub remain the source-of-truth integration boundary.
+
+```mermaid
+flowchart TB
+    Human["Human in IDE or terminal"] --> Chat["Codex, Claude, or Copilot chat"]
+    Chat --> AF["Agentflow CLI and root controller"]
+
+    AF <--> Beads["Beads<br/>goals, graph, claims, decisions, evidence"]
+    AF --> Preflight["Typed preflight<br/>base, policy, skills, scope, budget"]
+    Preflight --> Lane{"Execution lane"}
+
+    Lane --> Native["Native subagent"]
+    Lane --> Herdr["Herdr or tmux<br/>observable external session"]
+    Herdr --> Providers["Codex, Claude Code, or Copilot CLI"]
+
+    Native --> Work["Bounded workspace<br/>Git worktree or Gitless directory"]
+    Providers --> Work
+    Work --> Result["Structured result<br/>checks and acceptance evidence"]
+    Result --> AF
+
+    AF --> Git["Git and GitHub<br/>review, CI, PR, merge"]
+```
+
+The controller is the only component that owns root workflow authority. Worker
+sessions receive a task-scoped handoff and return evidence; they do not decide
+that the overall goal is complete. See the [workflow guide](docs/WORKFLOW.md)
+and [security model](docs/SECURITY.md) for the detailed lifecycle and trust
+boundaries.
+
 ## Requirements
 
 - Python 3.10 or later.

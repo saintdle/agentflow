@@ -22,6 +22,45 @@ Agentflow does not make a coding agent trustworthy, secure a compromised user
 account, replace operating-system access control, inspect provider-side data
 handling, or guarantee that generated code is safe.
 
+```mermaid
+flowchart TB
+    subgraph Trusted["Trusted coordination boundary"]
+        Controller["Root controller<br/>lease, fencing, policy, disposition"]
+        Authority["Controller credentials<br/>outside worker workspaces"]
+        Beads["Beads<br/>durable graph and evidence"]
+        Authority --> Controller
+        Controller <--> Beads
+    end
+
+    subgraph Scoped["Task-scoped worker boundary"]
+        Handoff["Typed handoff<br/>exact claim, base, skills, scope, budget"]
+        Worker["Provider worker session"]
+        Workspace["Bounded output workspace"]
+        Inbox["Authenticated return contract<br/>structured result only"]
+        Handoff --> Worker
+        Worker --> Workspace
+        Worker --> Inbox
+    end
+
+    subgraph External["External trust domains"]
+        Launcher["Herdr, tmux, or native agent runtime"]
+        Provider["Codex, Claude Code, or Copilot service"]
+        Git["Git and GitHub"]
+        Launcher --> Provider
+    end
+
+    Controller --> Handoff
+    Controller --> Launcher
+    Provider --> Worker
+    Inbox -->|"validate and consume"| Controller
+    Workspace --> Git
+    Controller -->|"reviewed integration only"| Git
+```
+
+Controller credentials and raw provider transcripts do not cross into the
+task-scoped worker boundary. The return channel carries a bounded result that
+the controller authenticates and validates before changing durable task state.
+
 ## Controller authority
 
 Controller credentials live outside worker workspaces with restrictive file

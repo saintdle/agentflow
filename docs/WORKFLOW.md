@@ -5,6 +5,51 @@ Beads records goals, tasks, dependencies, claims, decisions, and acceptance
 evidence. Git and GitHub remain authoritative for source history, issues, pull
 requests, reviews, and merges.
 
+## Lifecycle at a glance
+
+The approved root controller advances the graph until the goal is complete or
+a durable decision is required. Provider panes and individual tasks are
+intermediate state, not completion signals.
+
+```mermaid
+stateDiagram-v2
+    state "Shape goal" as ShapeGoal
+    state "Persist graph" as PersistGraph
+    state "Await approval" as AwaitApproval
+    state "Claim task" as ClaimTask
+    state "Collect result" as CollectResult
+    state "User action required" as UserActionRequired
+    state "Goal complete" as GoalComplete
+
+    [*] --> ShapeGoal
+    ShapeGoal --> PersistGraph: measurable contract
+    PersistGraph --> AwaitApproval
+    AwaitApproval --> ShapeGoal: revise
+    AwaitApproval --> Preflight: approved
+
+    Preflight --> ClaimTask: pass
+    Preflight --> UserActionRequired: blocked
+    ClaimTask --> Dispatch
+    Dispatch --> CollectResult
+    Dispatch --> UserActionRequired: durable blocker
+    CollectResult --> Review
+    CollectResult --> UserActionRequired: decision needed
+
+    Review --> Remediate: accepted findings
+    Remediate --> CollectResult
+    Review --> Validate: accepted
+    Validate --> Remediate: failed evidence
+    Validate --> Integrate: passed evidence
+    Integrate --> GoalComplete: root acceptance passes
+
+    UserActionRequired --> Preflight: resolved and resumed
+    GoalComplete --> [*]
+```
+
+`USER_ACTION_REQUIRED` preserves the root, claims, results, and evidence. Resume
+the existing root after resolving the recorded cause; do not create a duplicate
+graph or treat a disconnected chat as a new workflow.
+
 ## Default lifecycle
 
 1. Define an observable goal and approve its exit conditions.
