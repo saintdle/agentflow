@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -494,6 +495,29 @@ class ProcessGroupTeardownTests(unittest.TestCase):
 
 class ResourceLimitTests(unittest.TestCase):
     """Real rlimit enforcement, independent of sandbox-exec."""
+
+    def test_preexec_caps_soft_limits_without_changing_host_hard_limits(self) -> None:
+        spec = isolation.IsolationSpec(
+            cpu_seconds=120, max_processes=4096, max_open_files=256
+        )
+        limits = {
+            resource.RLIMIT_CPU: (60, resource.RLIM_INFINITY),
+            resource.RLIMIT_NPROC: (100, 512),
+            resource.RLIMIT_NOFILE: (128, 1024),
+        }
+        with mock.patch.object(
+            isolation.resource, "getrlimit", side_effect=lambda kind: limits[kind]
+        ), mock.patch.object(isolation.resource, "setrlimit") as setrlimit:
+            isolation._preexec_fn(spec)()
+
+        self.assertEqual(
+            setrlimit.call_args_list,
+            [
+                mock.call(resource.RLIMIT_CPU, (120, resource.RLIM_INFINITY)),
+                mock.call(resource.RLIMIT_NPROC, (512, 512)),
+                mock.call(resource.RLIMIT_NOFILE, (256, 1024)),
+            ],
+        )
 
     def test_max_open_files_rlimit_is_enforced(self) -> None:
         script = (

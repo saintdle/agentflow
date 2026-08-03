@@ -159,10 +159,18 @@ def build_profile(spec: IsolationSpec, *, home: Path) -> str:
 
 
 def _preexec_fn(spec: IsolationSpec) -> Callable[[], None]:
+    def _set_soft_limit(kind: int, requested: int) -> None:
+        _, hard = resource.getrlimit(kind)
+        bounded = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+        # Preserve the host's hard limit. Lowering or attempting to raise it in
+        # a child preexec hook can fail on hosted macOS runners even when the
+        # requested soft limit itself is valid.
+        resource.setrlimit(kind, (bounded, hard))
+
     def _apply() -> None:
-        resource.setrlimit(resource.RLIMIT_CPU, (spec.cpu_seconds, spec.cpu_seconds))
-        resource.setrlimit(resource.RLIMIT_NPROC, (spec.max_processes, spec.max_processes))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (spec.max_open_files, spec.max_open_files))
+        _set_soft_limit(resource.RLIMIT_CPU, spec.cpu_seconds)
+        _set_soft_limit(resource.RLIMIT_NPROC, spec.max_processes)
+        _set_soft_limit(resource.RLIMIT_NOFILE, spec.max_open_files)
 
     return _apply
 
