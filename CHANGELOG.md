@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Added pinned Claude Opus 5 routes for Claude Code and GitHub Copilot. Opus 5
+  is selected only when explicitly requested and defaults to `medium` effort;
+  managed controller and judgment profiles continue to prefer Opus 4.8.
 - Added an agent-readable installation contract so a user can point a
   ChatGPT/Codex or Claude coding agent at the repository and request a safe,
   verified, non-overwriting setup.

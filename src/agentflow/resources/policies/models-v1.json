@@ -25,6 +25,12 @@
     },
     {
       "provider": "claude",
+      "model": "claude-opus-5",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "provider": "claude",
       "model": "claude-sonnet-5",
       "roles": ["coding", "exploration"],
       "efforts": ["medium", "high"]
@@ -34,6 +40,12 @@
       "model": "claude-opus-4.8",
       "roles": ["controller", "judgment", "review"],
       "efforts": ["high"]
+    },
+    {
+      "provider": "copilot",
+      "model": "claude-opus-5",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
     },
     {
       "provider": "copilot",

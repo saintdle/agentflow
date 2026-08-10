@@ -77,6 +77,34 @@ model is available to every user. Teams can maintain a versioned policy for
 their approved providers, exact model identifiers, roles, and effort levels.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
 
+The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
+and review route when a user asks generally for Claude or Opus. Claude Opus 5
+is an explicit opt-in route: select the pinned `claude-opus-5` model only when
+the user specifically asks for Opus 5. Its default effort is `medium`; use a
+different permitted level only when the user states one. Keep routine
+implementation on the configured Sonnet or Codex Luna lanes to limit cost.
+Model availability still depends on the user's provider plan, client version,
+and organization policy.
+
+Newly initialized projects receive these routes automatically. Agentflow does
+not overwrite an existing project's policy during a package upgrade. To adopt
+the route in an existing source checkout, review the bundled policy diff,
+replace the project's configured policy only after approval, and then refresh
+and migrate the managed profiles:
+
+```sh
+diff -u .agentflow/models-v1.json /path/to/agentflow/policies/models-v1.json
+cp /path/to/agentflow/policies/models-v1.json .agentflow/models-v1.json
+agentflow install --refresh-bundled
+agentflow policy migrate --root . --dry-run
+agentflow policy migrate --root .
+agentflow policy audit --root .
+```
+
+The explicit copy is intentional: a team-owned custom policy must never be
+silently replaced by a package upgrade. Agentflow never rewrites unmanaged
+custom agents during profile migration.
+
 ## Skills
 
 Skill sources are configured separately from workflow policy so teams can

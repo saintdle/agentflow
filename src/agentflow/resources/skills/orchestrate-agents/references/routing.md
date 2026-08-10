@@ -8,9 +8,11 @@ values fail closed before lease/claim reservation.
 |---|---|---|
 | Goal shaping, architecture, difficult debugging | Codex `gpt-5.6-sol` | `high` or `xhigh` |
 | File discovery, bounded implementation, exploration | Codex `gpt-5.6-luna` | `medium` or `high` |
-| Judgment, review, and queue integration | Claude `claude-opus-4-8` | `high` |
+| Judgment, review, and queue integration (default when Claude or Opus is requested) | Claude `claude-opus-4-8` | `high` |
+| Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Claude `claude-opus-5` | `medium` unless the user states another level |
 | Bounded Claude execution and exploration | Claude `claude-sonnet-5` | `medium` or `high` |
-| Judgment, review, and queue integration | Copilot `claude-opus-4.8` | `high` |
+| Judgment, review, and queue integration (default when Claude or Opus is requested) | Copilot `claude-opus-4.8` | `high` |
+| Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Copilot `claude-opus-5` | `medium` unless the user states another level |
 | Bounded Copilot execution and exploration | Copilot `claude-sonnet-4.6` | `medium` or `high` |
 
 ## Execution lanes
