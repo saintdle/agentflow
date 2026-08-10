@@ -1,7 +1,7 @@
 ---
 name: agentflow-reviewer
 description: Reviews a bounded diff for correctness, security, regressions, and missing tests without editing.
-model: claude-opus-5
+model: claude-opus-4.8
 effort: high
 policy: models-v1
 ---

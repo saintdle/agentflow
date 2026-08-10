@@ -116,29 +116,32 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_codex_luna_coding_passes(self) -> None:
         self._assert_pass(provider="codex", role="coding", model="gpt-5.6-luna", effort="medium")
 
-    def test_claude_opus_controller_passes(self) -> None:
-        self._assert_pass(provider="claude", role="controller", model="claude-opus-5", effort="high")
+    def test_claude_opus_4_8_controller_passes(self) -> None:
+        self._assert_pass(provider="claude", role="controller", model="claude-opus-4-8", effort="high")
 
-    def test_claude_opus_max_judgment_passes(self) -> None:
-        self._assert_pass(provider="claude", role="judgment", model="claude-opus-5", effort="max")
+    def test_claude_opus_5_medium_judgment_passes(self) -> None:
+        self._assert_pass(provider="claude", role="judgment", model="claude-opus-5", effort="medium")
+
+    def test_claude_opus_5_explicit_low_effort_passes(self) -> None:
+        self._assert_pass(provider="claude", role="judgment", model="claude-opus-5", effort="low")
 
     def test_claude_sonnet_coding_passes(self) -> None:
         self._assert_pass(provider="claude", role="coding", model="claude-sonnet-5", effort="medium")
 
-    def test_copilot_opus_controller_passes(self) -> None:
-        self._assert_pass(provider="copilot", role="controller", model="claude-opus-5", effort="high")
+    def test_copilot_opus_4_8_controller_passes(self) -> None:
+        self._assert_pass(provider="copilot", role="controller", model="claude-opus-4.8", effort="high")
 
-    def test_copilot_opus_xhigh_review_passes(self) -> None:
-        self._assert_pass(provider="copilot", role="review", model="claude-opus-5", effort="xhigh")
+    def test_copilot_opus_5_medium_review_passes(self) -> None:
+        self._assert_pass(provider="copilot", role="review", model="claude-opus-5", effort="medium")
 
     def test_copilot_sonnet_coding_passes(self) -> None:
         self._assert_pass(provider="copilot", role="coding", model="claude-sonnet-4.6", effort="high")
 
-    def test_retired_claude_opus_route_fails(self) -> None:
-        self._assert_fail(provider="claude", role="controller", model="claude-opus-4-8", effort="high")
+    def test_copilot_rejects_direct_claude_4_8_id(self) -> None:
+        self._assert_fail(provider="copilot", role="controller", model="claude-opus-4-8", effort="high")
 
-    def test_retired_copilot_opus_route_fails(self) -> None:
-        self._assert_fail(provider="copilot", role="controller", model="claude-opus-4.8", effort="high")
+    def test_claude_rejects_copilot_4_8_id(self) -> None:
+        self._assert_fail(provider="claude", role="controller", model="claude-opus-4.8", effort="high")
 
     def test_role_omitted_effort_still_resolves(self) -> None:
         self._assert_pass(provider="codex", role="coding", model="gpt-5.6-luna", effort=None)
@@ -192,7 +195,7 @@ class ValidateRouteMatrixTests(unittest.TestCase):
         self._assert_fail(provider="claude", role="controller", model="claude-sonnet-5", effort="high")
 
     def test_wrong_effort_for_model_fails(self) -> None:
-        self._assert_fail(provider="claude", role="controller", model="claude-opus-5", effort="low")
+        self._assert_fail(provider="claude", role="controller", model="claude-opus-5", effort="minimal")
 
     def test_unknown_provider_fails(self) -> None:
         self._assert_fail(provider="gemini", role="coding", model="claude-sonnet-5", effort="medium")
@@ -334,9 +337,9 @@ class MigrationPlanningTests(unittest.TestCase):
 
         # controller role -> the judgment/controller-tier model, not the coding tier.
         self.assertEqual(by_path[".codex/agents/agentflow-controller.toml"].proposed_model, "gpt-5.6-sol")
-        self.assertEqual(by_path[".claude/agents/agentflow-controller.md"].proposed_model, "claude-opus-5")
+        self.assertEqual(by_path[".claude/agents/agentflow-controller.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
-            by_path[".github/agents/agentflow-controller.agent.md"].proposed_model, "claude-opus-5"
+            by_path[".github/agents/agentflow-controller.agent.md"].proposed_model, "claude-opus-4.8"
         )
 
         # exploration role -> the coding/execution-tier model.
@@ -344,14 +347,14 @@ class MigrationPlanningTests(unittest.TestCase):
         self.assertEqual(by_path[".claude/agents/agentflow-explorer.md"].proposed_model, "claude-sonnet-5")
 
         # review role -> the judgment/controller-tier model, same as controller.
-        self.assertEqual(by_path[".claude/agents/agentflow-reviewer.md"].proposed_model, "claude-opus-5")
+        self.assertEqual(by_path[".claude/agents/agentflow-reviewer.md"].proposed_model, "claude-opus-4-8")
 
         # pr-gatekeeper is judgment, not exploration: it migrates to the
         # judgment/controller-tier model (Sol / Opus), never the coding tier.
         self.assertEqual(by_path[".codex/agents/agentflow-pr-gatekeeper.toml"].proposed_model, "gpt-5.6-sol")
-        self.assertEqual(by_path[".claude/agents/agentflow-pr-gatekeeper.md"].proposed_model, "claude-opus-5")
+        self.assertEqual(by_path[".claude/agents/agentflow-pr-gatekeeper.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
-            by_path[".github/agents/agentflow-pr-gatekeeper.agent.md"].proposed_model, "claude-opus-5"
+            by_path[".github/agents/agentflow-pr-gatekeeper.agent.md"].proposed_model, "claude-opus-4.8"
         )
 
         for action in actions:
@@ -382,9 +385,9 @@ class MigrationPlanningTests(unittest.TestCase):
             actions = mp.plan_migration(root, self.policy)
             self.assertEqual(len(actions), 1)
             self.assertEqual(actions[0].action, "propose_update")
-            self.assertEqual(actions[0].proposed_model, "claude-opus-5")
+            self.assertEqual(actions[0].proposed_model, "claude-opus-4-8")
 
-    def test_previous_claude_opus_profile_migrates_to_opus_5(self) -> None:
+    def test_existing_claude_opus_4_8_profile_remains_preferred(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".claude" / "agents").mkdir(parents=True)
@@ -393,10 +396,10 @@ class MigrationPlanningTests(unittest.TestCase):
                 "---\nname: agentflow-reviewer\nmodel: claude-opus-4-8\n---\nbody\n",
                 encoding="utf-8",
             )
-            actions = mp.apply_migration(root, self.policy)
+            actions = mp.plan_migration(root, self.policy)
             self.assertEqual(actions[0].action, "skip_compliant")
-            self.assertEqual(actions[0].current_model, "claude-opus-5")
-            self.assertIn("model: claude-opus-5", path.read_text(encoding="utf-8"))
+            self.assertEqual(actions[0].current_model, "claude-opus-4-8")
+            self.assertIn("model: claude-opus-4-8", path.read_text(encoding="utf-8"))
 
     def test_pr_gatekeeper_migrates_to_judgment_tier_for_copilot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,9 +410,9 @@ class MigrationPlanningTests(unittest.TestCase):
             actions = mp.plan_migration(root, self.policy)
             self.assertEqual(len(actions), 1)
             self.assertEqual(actions[0].action, "propose_update")
-            self.assertEqual(actions[0].proposed_model, "claude-opus-5")
+            self.assertEqual(actions[0].proposed_model, "claude-opus-4.8")
 
-    def test_previous_copilot_opus_profile_migrates_to_opus_5(self) -> None:
+    def test_existing_copilot_opus_4_8_profile_remains_preferred(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".github" / "agents").mkdir(parents=True)
@@ -418,10 +421,10 @@ class MigrationPlanningTests(unittest.TestCase):
                 "---\nname: agentflow-reviewer\nmodel: claude-opus-4.8\n---\nbody\n",
                 encoding="utf-8",
             )
-            actions = mp.apply_migration(root, self.policy)
+            actions = mp.plan_migration(root, self.policy)
             self.assertEqual(actions[0].action, "skip_compliant")
-            self.assertEqual(actions[0].current_model, "claude-opus-5")
-            self.assertIn("model: claude-opus-5", path.read_text(encoding="utf-8"))
+            self.assertEqual(actions[0].current_model, "claude-opus-4.8")
+            self.assertIn("model: claude-opus-4.8", path.read_text(encoding="utf-8"))
 
     def test_never_proposes_update_for_unmanaged_user_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

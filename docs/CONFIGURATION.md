@@ -77,14 +77,16 @@ model is available to every user. Teams can maintain a versioned policy for
 their approved providers, exact model identifiers, roles, and effort levels.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
 
-The bundled policy routes Claude Code and Copilot controller, judgment, and
-review work to the pinned `claude-opus-5` model. It defaults to `high` effort;
-`xhigh` and `max` are permitted for unusually difficult or capability-critical
-judgment. Keep routine implementation on the configured Sonnet or Codex Luna
-lanes to limit cost. Model availability still depends on the user's provider
-plan, client version, and organization policy.
+The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
+and review route when a user asks generally for Claude or Opus. Claude Opus 5
+is an explicit opt-in route: select the pinned `claude-opus-5` model only when
+the user specifically asks for Opus 5. Its default effort is `medium`; use a
+different permitted level only when the user states one. Keep routine
+implementation on the configured Sonnet or Codex Luna lanes to limit cost.
+Model availability still depends on the user's provider plan, client version,
+and organization policy.
 
-Newly initialized projects receive this route automatically. Agentflow does
+Newly initialized projects receive these routes automatically. Agentflow does
 not overwrite an existing project's policy during a package upgrade. To adopt
 the route in an existing source checkout, review the bundled policy diff,
 replace the project's configured policy only after approval, and then refresh

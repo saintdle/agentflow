@@ -8,10 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Upgraded managed Claude Code and GitHub Copilot controller, judgment,
-  reviewer, and PR-gatekeeper profiles from Claude Opus 4.8 to the pinned
-  `claude-opus-5` model. The exact policy permits `high`, `xhigh`, and `max`
-  effort while keeping Sonnet and Codex Luna as the routine execution lanes.
+- Added pinned Claude Opus 5 routes for Claude Code and GitHub Copilot. Opus 5
+  is selected only when explicitly requested and defaults to `medium` effort;
+  managed controller and judgment profiles continue to prefer Opus 4.8.
 - Added an agent-readable installation contract so a user can point a
   ChatGPT/Codex or Claude coding agent at the repository and request a safe,
   verified, non-overwriting setup.

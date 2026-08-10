@@ -19,9 +19,15 @@
     },
     {
       "provider": "claude",
+      "model": "claude-opus-4-8",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["high"]
+    },
+    {
+      "provider": "claude",
       "model": "claude-opus-5",
       "roles": ["controller", "judgment", "review"],
-      "efforts": ["high", "xhigh", "max"]
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
     },
     {
       "provider": "claude",
@@ -31,9 +37,15 @@
     },
     {
       "provider": "copilot",
+      "model": "claude-opus-4.8",
+      "roles": ["controller", "judgment", "review"],
+      "efforts": ["high"]
+    },
+    {
+      "provider": "copilot",
       "model": "claude-opus-5",
       "roles": ["controller", "judgment", "review"],
-      "efforts": ["high", "xhigh", "max"]
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
     },
     {
       "provider": "copilot",
