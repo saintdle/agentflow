@@ -1,7 +1,7 @@
 ---
 name: agentflow-pr-gatekeeper
 description: Processes agent pull requests by priority then FIFO and reports blocked integrations without fixing code.
-model: claude-opus-4.8
+model: claude-opus-5
 effort: high
 policy: models-v1
 ---

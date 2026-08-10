@@ -26,6 +26,14 @@ class ProviderArgvTests(unittest.TestCase):
         argv = build_argv("copilot", "claude-sonnet-4.6", "medium")
         self.assertEqual(argv, ["copilot", "--model", "claude-sonnet-4.6", "--effort", "medium"])
 
+    def test_claude_opus_5_uses_pinned_model_and_max_effort(self) -> None:
+        argv = build_argv("claude", "claude-opus-5", "max")
+        self.assertEqual(argv, ["claude", "--model", "claude-opus-5", "--effort", "max"])
+
+    def test_copilot_opus_5_uses_pinned_model_and_xhigh_effort(self) -> None:
+        argv = build_argv("copilot", "claude-opus-5", "xhigh")
+        self.assertEqual(argv, ["copilot", "--model", "claude-opus-5", "--effort", "xhigh"])
+
     def test_command_override_replaces_argv0(self) -> None:
         argv = build_argv("codex", "gpt-5.6-luna", "high", command="/opt/bin/codex")
         self.assertEqual(argv[0], "/opt/bin/codex")

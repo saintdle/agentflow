@@ -2,7 +2,7 @@
 name: agentflow-reviewer
 description: Review a bounded diff for correctness, security, regressions, and missing tests without editing.
 tools: Read, Grep, Glob, Bash
-model: claude-opus-4-8
+model: claude-opus-5
 effort: high
 policy: models-v1
 permissionMode: plan

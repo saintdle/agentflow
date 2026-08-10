@@ -2,7 +2,7 @@
 name: agentflow-pr-gatekeeper
 description: Process agent pull requests by priority then FIFO and diagnose blocked PRs without modifying code.
 tools: Read, Grep, Glob, Bash(gh *), Skill
-model: claude-opus-4-8
+model: claude-opus-5
 effort: high
 policy: models-v1
 ---
