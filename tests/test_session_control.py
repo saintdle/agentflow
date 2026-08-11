@@ -187,17 +187,46 @@ class SessionControlTests(unittest.TestCase):
 
     def test_herdr_evidence_requires_binding_and_consumed_channel(self) -> None:
         forged = {"result": {"outcome": "completed"}}
+        result = {
+            "task_id": "t", "launch_id": "launch", "provider": "codex",
+            "session_id": "session", "outcome": "completed",
+        }
+        binding = {
+            "task_id": "t", "launch_id": "launch", "provider": "codex",
+            "session_id": "session",
+        }
+        digest = cli._canonical_json_digest(result)
         issued = {
-            "result": {"outcome": "completed"}, "binding": {"task_id": "t"},
-            "return_channel": {"state": "issued"},
+            "result": result, "binding": binding,
+            "return_channel": {"state": "issued", "result_sha256": digest},
         }
         consumed = {
-            "result": {"outcome": "completed"}, "binding": {"task_id": "t"},
-            "return_channel": {"state": "consumed"},
+            "result": result, "binding": binding,
+            "return_channel": {"state": "consumed", "result_sha256": digest},
         }
         self.assertFalse(cli._has_authenticated_herdr_result(forged))
         self.assertFalse(cli._has_authenticated_herdr_result(issued))
         self.assertTrue(cli._has_authenticated_herdr_result(consumed))
+        for field in ("task_id", "launch_id", "provider", "session_id"):
+            mismatched = json.loads(json.dumps(consumed))
+            mismatched["binding"][field] = "different"
+            self.assertFalse(cli._has_authenticated_herdr_result(mismatched), field)
+        bad_digest = json.loads(json.dumps(consumed))
+        bad_digest["return_channel"]["result_sha256"] = "0" * 64
+        self.assertFalse(cli._has_authenticated_herdr_result(bad_digest))
+
+    def test_handoff_packet_rejects_untrusted_stage_labels(self) -> None:
+        packet = build_handoff_packet(
+            workspace_root="/repo", workflow_root="af-root", controller="controller",
+            continuity_id="continuity", checkpoint={},
+            ready_tasks=[{
+                "id": "af-2", "status": "open",
+                "labels": ["af:stage:authorization=Bearer demo-secret"],
+            }],
+            ledger=new_ledger(),
+        )
+        self.assertEqual(packet["ready_tasks"][0]["stage"], "")
+        self.assertNotIn("demo-secret", json.dumps(packet))
 
 
 class CodeBurnReconciliationTests(unittest.TestCase):

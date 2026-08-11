@@ -36,6 +36,12 @@ PROGRESS_EVENTS = {
     "review": frozenset({"evidence", "finding", "decision", "completed"}),
     "external-wait": frozenset({"watcher", "state-change", "completed"}),
 }
+HANDOFF_STAGES = frozenset(
+    {
+        "plan", "spec", "dispatch", "code", "review", "security", "ci",
+        "ci-triage", "fix", "integration", "delivery",
+    }
+)
 
 
 class SessionControlError(ValueError):
@@ -205,14 +211,21 @@ def build_handoff_packet(
     current = dict(checkpoint or {})
     tasks = []
     for item in ready_tasks:
+        stage = next(
+            (
+                candidate
+                for label in item.get("labels", [])
+                if str(label).startswith("af:stage:")
+                for candidate in (str(label)[9:],)
+                if candidate in HANDOFF_STAGES
+            ),
+            "",
+        )
         tasks.append(
             {
                 "id": str(item.get("id") or item.get("task") or ""),
                 "status": str(item.get("status") or ""),
-                "stage": next(
-                    (str(label)[9:] for label in item.get("labels", []) if str(label).startswith("af:stage:")),
-                    "",
-                ),
+                "stage": stage,
             }
         )
     return {

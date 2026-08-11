@@ -536,12 +536,25 @@ def _herdr_task_result(root: Path, task_id: str) -> dict[str, Any] | None:
 def _has_authenticated_herdr_result(record: Mapping[str, Any]) -> bool:
     """True only for a bound result whose return channel was consumed."""
 
+    result = record.get("result")
+    binding = record.get("binding")
     channel = record.get("return_channel")
-    return bool(
-        isinstance(record.get("result"), Mapping)
-        and isinstance(record.get("binding"), Mapping)
+    if not (
+        isinstance(result, Mapping)
+        and isinstance(binding, Mapping)
         and isinstance(channel, Mapping)
         and channel.get("state") == "consumed"
+    ):
+        return False
+    for field in ("task_id", "launch_id", "provider", "session_id"):
+        result_value = str(result.get(field) or "")
+        binding_value = str(binding.get(field) or "")
+        if not result_value or not hmac.compare_digest(result_value, binding_value):
+            return False
+    recorded_digest = str(channel.get("result_sha256") or "")
+    return bool(
+        re.fullmatch(r"[0-9a-f]{64}", recorded_digest)
+        and hmac.compare_digest(recorded_digest, _canonical_json_digest(result))
     )
 
 
