@@ -8,6 +8,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Added task-aware controller-session budgets, repeated-approach halts, and
+  transcript-free `controller rotate` handoff packets.
+- Added advisory CodeBurn optimize reconciliation that preserves managed assets
+  and distinguishes heuristic savings from Agentflow delivery evidence.
 - Added pinned Claude Opus 5 routes for Claude Code and GitHub Copilot. Opus 5
   is selected only when explicitly requested and defaults to `medium` effort;
   managed controller and judgment profiles continue to prefer Opus 4.8.

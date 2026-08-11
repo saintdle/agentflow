@@ -76,6 +76,20 @@ class ControllerTests(unittest.TestCase):
                 # _controller_fence) -- must also be rejected after reattach.
                 first.assert_lease(lease.token)
 
+    def test_sideband_authorization_does_not_fence_live_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = Clock()
+            state = Path(tmp) / "controller.json"
+            live = RootController("root", "controller", state_path=state, clock=clock)
+            lease = live.acquire()
+            sideband = RootController("root", "controller", state_path=state, clock=clock)
+            authorized = sideband.authorize(lease.resume_secret)
+            self.assertEqual(authorized.epoch, lease.epoch)
+            self.assertEqual(authorized.token, lease.token)
+            clock.value = 101
+            renewed = live.heartbeat(lease)
+            self.assertEqual(renewed.epoch, lease.epoch)
+
     def test_resume_proof_is_random_and_not_the_guessable_public_token(self) -> None:
         """AFREL-014: the public token (root/controller/epoch) is derivable;
         it must never work as the reattach credential."""

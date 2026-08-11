@@ -8,6 +8,7 @@
 - For substantial, security-sensitive, visual, or environment-dependent work, create an acceptance-to-evidence matrix with one owner and authoritative validation lane per row before writing.
 - Delegate only when explicitly requested or required by applicable instructions. Use bounded independent tasks, no more than three workers by default, and no nested fan-out.
 - Route pull work below one approved root with `af:stage:*`, `af:role:*`, and `af:cap:*` labels. Prefer assigned work before shared unassigned work.
+- Keep one approved root per controller chat. Resume from Beads and linked files rather than transcripts; use `agentflow controller rotate` when context rotation is recommended, and stop after two failures of the same named approach.
 - Prefer native subagents for fire-and-forget work. Use an external Herdr session only when a long run, cross-provider work, or likely human decisions justify direct observation.
 - If blocked, stop and report the decision needed, what was tried, options, recommendation, and current branch/check state. Record any direct human decision in the bead when active, otherwise in the issue or PR.
 - Preflight external workers for paths, tools, required project domain skills, output boundary, exact base, budget, retries, and delegation mode. Require structured review findings and reproduce accepted high/medium findings.

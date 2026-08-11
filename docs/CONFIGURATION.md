@@ -110,6 +110,39 @@ custom agents during profile migration.
 Skill sources are configured separately from workflow policy so teams can
 bring domain expertise without modifying Agentflow. See [SKILLS.md](SKILLS.md).
 
+## Controller context budgets
+
+Controller context budgets measure durable workflow evidence rather than
+provider token estimates. The current defaults recommend a fresh controller
+chat after four completed tasks or two completed workflow phases, and halt after
+two failures of the same explicitly named approach. Rotation thresholds are
+advisory so the deterministic controller can continue autonomously through its
+approved root. The repeated-approach limit is enforced and creates a durable
+decision point.
+
+Use `agentflow controller progress` to supply different positive thresholds for
+a workflow invocation. The resulting policy and evidence live in the ignored,
+root-namespaced controller state. They are not project-wide instructions and do
+not contain provider transcripts.
+
+## CodeBurn advisory reports
+
+Agentflow can reconcile a local CodeBurn optimize report with its recorded
+delivery evidence:
+
+```sh
+npx --yes codeburn optimize -p 30days --format json > /tmp/codeburn.json
+agentflow usage optimize --codeburn /tmp/codeburn.json \
+  --root . --workflow-root <root-id> --json
+```
+
+This does not install CodeBurn, send its output elsewhere, or accept its savings
+estimate as billing evidence. Agentflow labels the estimate as heuristic,
+reports completed/check evidence from its usage records plus aggregate Beads and
+Herdr delivery evidence for the optional root, and refuses to recommend automatic
+removal of Agentflow-managed skills or agents. Provider usage pages remain
+authoritative for billed usage.
+
 ## Local and generated state
 
 Agentflow manages an ignore block for runtime paths. Do not weaken these ignore

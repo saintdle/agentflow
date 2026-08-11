@@ -11,6 +11,14 @@ The approved root controller advances the graph until the goal is complete or
 a durable decision is required. Provider panes and individual tasks are
 intermediate state, not completion signals.
 
+One controller chat should own one approved root. Related review and remediation
+remain children of that root; a materially different goal starts a new root in a
+fresh chat. Agentflow records a task-aware session budget and can produce a
+minimal `controller rotate` packet so another chat resumes from Beads and
+controller state rather than replaying a transcript. Rotation advice never
+interrupts an autonomous root. Repeating the same named failed approach twice
+does create a durable decision halt.
+
 ```mermaid
 stateDiagram-v2
     state "Shape goal" as ShapeGoal

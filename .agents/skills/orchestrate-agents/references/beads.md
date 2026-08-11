@@ -148,3 +148,11 @@ checks consume no model requests.
 ## Resume cheaply
 
 At a new session, run `bd ready`, inspect only the selected bead with `bd show <id>`, and read linked files. Pass bead IDs and distilled facts between workers, never transcripts. Use Beads search/history for earlier decisions instead of reloading old provider sessions.
+
+Keep one approved workflow root per controller chat. Related review and fixes
+remain under that root; a materially different goal gets a new root and fresh
+chat. When `agentflow controller status` recommends rotation, finish the current
+safe boundary and run `agentflow controller rotate` to generate a transcript-free
+resume packet. Rotation is advisory and must not interrupt an autonomous root.
+After two failures of the same named approach, record a durable blocker or
+decision instead of silently retrying.

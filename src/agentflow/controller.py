@@ -22,6 +22,7 @@ from typing import Any, Callable, Iterable, Mapping
 import uuid
 
 from agentflow import checkpoint
+from agentflow import session_control
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
@@ -401,6 +402,31 @@ class RootController:
             raise FencedLease("controller lease is no longer current")
         return current
 
+    def authorize(self, resume_proof: str) -> Lease:
+        """Authenticate an operator command without reattaching or fencing.
+
+        Progress recording and rotation-packet generation are side-band
+        controller operations.  They may share the current controller lease
+        when the caller proves possession of its private resume secret; unlike
+        ``acquire(resume_proof=...)`` this does not rotate epoch, token, owner,
+        secret, or continuity identity and therefore does not interrupt a live
+        autonomous controller heartbeat.
+        """
+
+        if not resume_proof:
+            raise LeaseConflict("controller resume proof is required")
+        with self._locked():
+            current = self._read_lease(_read_json(self.state_path))
+        if (
+            current is None
+            or current.root != self.root
+            or current.controller != self.controller
+            or not current.verify_resume_proof(resume_proof)
+        ):
+            raise LeaseConflict("controller resume proof is invalid")
+        self._lease = current
+        return current
+
     def heartbeat(self, lease: Lease | str | None = None) -> Lease:
         """Renew the heartbeat as one lease-check-and-write transaction.
 
@@ -747,6 +773,62 @@ class RootController:
             }
         )
         return self._result(self._save_checkpoint(document, lease=current))
+
+    def session_ledger(self) -> dict[str, Any]:
+        """Return the public, non-secret controller-context budget ledger."""
+
+        with self._locked():
+            state = _read_json(self.state_path)
+        value = state.get("session_control")
+        if isinstance(value, Mapping) and value.get("schema") == session_control.SCHEMA:
+            return dict(value)
+        return session_control.new_ledger()
+
+    def record_session_event(
+        self,
+        *,
+        event: str,
+        task_class: str,
+        task: str = "",
+        phase: str = "",
+        approach: str = "",
+        evidence: str = "",
+        budget: session_control.SessionBudget | None = None,
+        lease: Lease | str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a task-aware progress or failure event under the lease."""
+
+        with self.fence(lease):
+            state = _read_json(self.state_path)
+            value = state.get("session_control")
+            ledger = session_control.record_event(
+                value if isinstance(value, Mapping) else None,
+                event=event,
+                task_class=task_class,
+                task=task,
+                phase=phase,
+                approach=approach,
+                evidence=evidence,
+                budget=budget,
+            )
+            state["session_control"] = ledger
+            self._write_state(state)
+            return ledger
+
+    def rotate_session_budget(
+        self, *, lease: Lease | str | None = None
+    ) -> dict[str, Any]:
+        """Begin a fresh context generation while preserving workflow authority."""
+
+        with self.fence(lease):
+            state = _read_json(self.state_path)
+            value = state.get("session_control")
+            ledger = session_control.next_generation(
+                value if isinstance(value, Mapping) else None
+            )
+            state["session_control"] = ledger
+            self._write_state(state)
+            return ledger
 
 
 Controller = RootController
