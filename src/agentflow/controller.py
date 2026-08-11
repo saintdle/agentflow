@@ -402,6 +402,31 @@ class RootController:
             raise FencedLease("controller lease is no longer current")
         return current
 
+    def authorize(self, resume_proof: str) -> Lease:
+        """Authenticate an operator command without reattaching or fencing.
+
+        Progress recording and rotation-packet generation are side-band
+        controller operations.  They may share the current controller lease
+        when the caller proves possession of its private resume secret; unlike
+        ``acquire(resume_proof=...)`` this does not rotate epoch, token, owner,
+        secret, or continuity identity and therefore does not interrupt a live
+        autonomous controller heartbeat.
+        """
+
+        if not resume_proof:
+            raise LeaseConflict("controller resume proof is required")
+        with self._locked():
+            current = self._read_lease(_read_json(self.state_path))
+        if (
+            current is None
+            or current.root != self.root
+            or current.controller != self.controller
+            or not current.verify_resume_proof(resume_proof)
+        ):
+            raise LeaseConflict("controller resume proof is invalid")
+        self._lease = current
+        return current
+
     def heartbeat(self, lease: Lease | str | None = None) -> Lease:
         """Renew the heartbeat as one lease-check-and-write transaction.
 

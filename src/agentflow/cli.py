@@ -533,6 +533,18 @@ def _herdr_task_result(root: Path, task_id: str) -> dict[str, Any] | None:
     return result if isinstance(result, dict) else None
 
 
+def _has_authenticated_herdr_result(record: Mapping[str, Any]) -> bool:
+    """True only for a bound result whose return channel was consumed."""
+
+    channel = record.get("return_channel")
+    return bool(
+        isinstance(record.get("result"), Mapping)
+        and isinstance(record.get("binding"), Mapping)
+        and isinstance(channel, Mapping)
+        and channel.get("state") == "consumed"
+    )
+
+
 def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, str]:
     """Read the exact provider/model/effort/role route a ready task declares.
 
@@ -796,6 +808,16 @@ def _controller_step(
             "workflow_root": workflow_root,
             "session_control": controller.session_ledger(),
         }
+
+    # A durable terminal checkpoint is authoritative. Never inspect or mutate
+    # Beads after a repeated-approach/user-action halt merely because another
+    # descendant is ready.
+    initial_document = controller._load_checkpoint()
+    initial_state = checkpoint_backend.resume_state(initial_document)
+    if initial_state in controller_backend.TERMINAL_STATES:
+        result = controller.resume([], lease=lease)
+        reason = "GOAL_COMPLETE" if initial_state == "completed" else "USER_ACTION_REQUIRED"
+        return _payload(result, reason), True
 
     # Step 1: if a task is already in flight, check its REAL Herdr
     # result instead of blindly trusting the stale checkpoint
@@ -1130,7 +1152,7 @@ def _controller_session_task_class(issue: Mapping[str, Any]) -> str:
     return "coding"
 
 
-def _reattach_controller_command(
+def _authorize_controller_command(
     args: argparse.Namespace,
 ) -> tuple[controller_backend.RootController, Path, controller_backend.Lease]:
     _reject_custom_controller_state_path(args)
@@ -1143,10 +1165,15 @@ def _reattach_controller_command(
         legacy = _legacy_resume_key_path(args)
         if legacy is not None:
             proof = _read_resume_key(legacy)
-    lease = controller.acquire(
-        takeover=bool(getattr(args, "takeover", False)), resume_proof=proof
-    )
-    _controller_credentials(args, lease, key_path=key_path)
+    state = _read_json_value(str(controller.state_path)) if controller.state_path.is_file() else {}
+    has_lease = isinstance(state, Mapping) and isinstance(state.get("lease"), Mapping)
+    if has_lease and not bool(getattr(args, "takeover", False)):
+        lease = controller.authorize(proof)
+    else:
+        lease = controller.acquire(
+            takeover=bool(getattr(args, "takeover", False)), resume_proof=proof
+        )
+        _controller_credentials(args, lease, key_path=key_path)
     return controller, root, lease
 
 
@@ -1154,11 +1181,22 @@ def controller_progress(args: argparse.Namespace) -> int:
     """Record task-aware controller progress; halt after a repeated approach."""
 
     try:
-        controller, root, lease = _reattach_controller_command(args)
+        controller, root, lease = _authorize_controller_command(args)
+        current_budget = controller.session_ledger().get("budget")
+        current_budget = current_budget if isinstance(current_budget, Mapping) else {}
         budget = session_control_backend.SessionBudget(
-            rotate_after_completed_tasks=args.rotate_after_tasks,
-            rotate_after_phases=args.rotate_after_phases,
-            same_approach_failure_limit=args.same_approach_limit,
+            rotate_after_completed_tasks=(
+                args.rotate_after_tasks if args.rotate_after_tasks is not None
+                else int(current_budget.get("rotate_after_completed_tasks", 4))
+            ),
+            rotate_after_phases=(
+                args.rotate_after_phases if args.rotate_after_phases is not None
+                else int(current_budget.get("rotate_after_phases", 2))
+            ),
+            same_approach_failure_limit=(
+                args.same_approach_limit if args.same_approach_limit is not None
+                else int(current_budget.get("same_approach_failure_limit", 2))
+            ),
         )
         ledger = controller.record_session_event(
             event=args.event, task_class=args.task_class, task=args.task,
@@ -1192,7 +1230,7 @@ def controller_rotate(args: argparse.Namespace) -> int:
     """Create a minimal fresh-chat packet and reset only the context budget."""
 
     try:
-        controller, root, lease = _reattach_controller_command(args)
+        controller, root, lease = _authorize_controller_command(args)
         checkpoint = controller._load_checkpoint()
         descendants = beads_backend.root_descendants(root, args.workflow_root)
         descendant_ids = {str(item.get("id") or "") for item in descendants}
@@ -4557,7 +4595,7 @@ def usage_optimize(args: argparse.Namespace) -> int:
                     ]
                     workflow_evidence["herdr_sessions"] = len(relevant)
                     workflow_evidence["authenticated_results"] = sum(
-                        isinstance(item.get("result"), Mapping) for item in relevant
+                        _has_authenticated_herdr_result(item) for item in relevant
                     )
         result = usage_backend.reconcile_codeburn(
             value, records, project=args.project, workflow_evidence=workflow_evidence
@@ -6607,9 +6645,9 @@ def build_parser() -> argparse.ArgumentParser:
     controller_progress_parser.add_argument("--phase", default="")
     controller_progress_parser.add_argument("--approach", default="")
     controller_progress_parser.add_argument("--evidence", default="")
-    controller_progress_parser.add_argument("--rotate-after-tasks", type=int, default=4)
-    controller_progress_parser.add_argument("--rotate-after-phases", type=int, default=2)
-    controller_progress_parser.add_argument("--same-approach-limit", type=int, default=2)
+    controller_progress_parser.add_argument("--rotate-after-tasks", type=int)
+    controller_progress_parser.add_argument("--rotate-after-phases", type=int)
+    controller_progress_parser.add_argument("--same-approach-limit", type=int)
     controller_progress_parser.set_defaults(func=controller_progress)
     controller_rotate_parser = controller_sub.add_parser(
         "rotate",

@@ -208,7 +208,6 @@ def build_handoff_packet(
         tasks.append(
             {
                 "id": str(item.get("id") or item.get("task") or ""),
-                "title": str(item.get("title") or ""),
                 "status": str(item.get("status") or ""),
                 "stage": next(
                     (str(label)[9:] for label in item.get("labels", []) if str(label).startswith("af:stage:")),
