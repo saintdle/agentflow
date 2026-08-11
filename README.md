@@ -27,6 +27,8 @@ unrelated projects.
 
 - A controller workflow built around goals, bounded assignments, claims,
   acceptance evidence, review, and integration.
+- Task-aware controller context budgets and transcript-free fresh-chat rotation,
+  so long workflows resume from durable state instead of accumulating chat history.
 - Provider-neutral handoffs for Codex, Claude Code, and GitHub Copilot CLI.
 - Beads-backed durable coordination, including Git-backed and Gitless work.
 - Seven bundled generic workflow skills and four provider-role profiles for
@@ -171,6 +173,10 @@ If you prefer to work entirely through a ChatGPT/Codex or Claude chat, use the
 [chat-first workflow guide](docs/CHAT_WORKFLOWS.md). It provides copy/paste
 prompts for planning without launch, explicit approval, autonomous persistent
 execution, reconnect-safe resume, read-only status, and bounded PR delivery.
+
+For local optimization evidence, `agentflow usage optimize --codeburn <report>`
+reconciles CodeBurn JSON with Agentflow delivery records while keeping savings
+estimates explicitly advisory.
 
 ## Bring your own skills
 

@@ -39,6 +39,7 @@ from agentflow import history as history_backend
 from agentflow import isolation as isolation_backend
 from agentflow import readiness as readiness_backend
 from agentflow import search as search_backend
+from agentflow import session_control as session_control_backend
 from agentflow import usage as usage_backend
 from agentflow import privacy as privacy_backend
 from agentflow import project_config as project_config_backend
@@ -793,6 +794,7 @@ def _controller_step(
             "controller": lease.controller, "lease": lease.to_dict(),
             "result": result.to_dict(), "stop_reason": reason,
             "workflow_root": workflow_root,
+            "session_control": controller.session_ledger(),
         }
 
     # Step 1: if a task is already in flight, check its REAL Herdr
@@ -901,6 +903,13 @@ def _controller_step(
                 beads_backend.close_issue(
                     cwd, in_flight_task, "agentflow: Herdr result completed with recorded evidence",
                 )
+            task_class = _controller_session_task_class(task_issue)
+            phase = _controller_session_phase(task_issue)
+            controller.record_session_event(
+                event="completed", task_class=task_class, task=in_flight_task,
+                phase=phase, evidence="authenticated Herdr result and acceptance disposition",
+                lease=lease,
+            )
         else:
             beads_backend.add_comment(
                 cwd, in_flight_task, f"agentflow: Herdr result outcome={outcome or 'unknown'}"
@@ -960,6 +969,11 @@ def _controller_step(
         result = controller.resume(
             [selected], dispatch=_dispatch_via_herdr(args, root, cwd, workflow_root, lease), lease=lease,
         )
+        if result.dispatched:
+            controller.record_session_event(
+                event="dispatch", task_class=_controller_session_task_class(claimed),
+                task=task_id, phase=_controller_session_phase(claimed), lease=lease,
+            )
         if result.state == "blocked":
             stop_reason = "TASK_BLOCKED"
         # AFREL-020: a fresh dispatch that is now running/identity_pending
@@ -1049,7 +1063,11 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             lease = controller.heartbeat(lease)
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title=f"CONTROLLER {operation.upper()}")
         return 0
-    except (controller_backend.ControllerError, beads_backend.BeadsError, herdr_backend.HerdrError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        controller_backend.ControllerError, beads_backend.BeadsError,
+        herdr_backend.HerdrError, session_control_backend.SessionControlError,
+        OSError, ValueError, json.JSONDecodeError,
+    ) as exc:
         payload = {"operation": operation, "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title=f"CONTROLLER {operation.upper()} FAILED")
         return 2
@@ -1084,12 +1102,137 @@ def controller_status(args: argparse.Namespace) -> int:
             "lease": lease,
             "checkpoint": checkpoint,
             "state": checkpoint_backend.resume_state(checkpoint) if checkpoint else "idle",
+            "session_control": controller.session_ledger(),
         }
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS")
         return 0
     except (OSError, ValueError, controller_backend.ControllerError, checkpoint_backend.CheckpointError) as exc:
         payload = {"operation": "status", "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS FAILED")
+        return 2
+
+
+def _controller_session_phase(issue: Mapping[str, Any]) -> str:
+    return next(
+        (str(label)[9:] for label in issue.get("labels", []) if str(label).startswith("af:stage:")),
+        str(issue.get("phase") or ""),
+    )
+
+
+def _controller_session_task_class(issue: Mapping[str, Any]) -> str:
+    phase = _controller_session_phase(issue)
+    if phase in {"review", "security"}:
+        return "review"
+    if phase in {"plan", "spec"}:
+        return "research"
+    if phase in {"ci", "ci-triage"}:
+        return "external-wait"
+    return "coding"
+
+
+def _reattach_controller_command(
+    args: argparse.Namespace,
+) -> tuple[controller_backend.RootController, Path, controller_backend.Lease]:
+    _reject_custom_controller_state_path(args)
+    if not str(getattr(args, "workflow_root", "") or "").strip():
+        raise ValueError("--workflow-root is required for controller progress and rotation")
+    controller, root = _controller_instance(args)
+    key_path = _resume_key_path(args)
+    proof = getattr(args, "resume_token", "") or _read_resume_key(key_path)
+    if not proof:
+        legacy = _legacy_resume_key_path(args)
+        if legacy is not None:
+            proof = _read_resume_key(legacy)
+    lease = controller.acquire(
+        takeover=bool(getattr(args, "takeover", False)), resume_proof=proof
+    )
+    _controller_credentials(args, lease, key_path=key_path)
+    return controller, root, lease
+
+
+def controller_progress(args: argparse.Namespace) -> int:
+    """Record task-aware controller progress; halt after a repeated approach."""
+
+    try:
+        controller, root, lease = _reattach_controller_command(args)
+        budget = session_control_backend.SessionBudget(
+            rotate_after_completed_tasks=args.rotate_after_tasks,
+            rotate_after_phases=args.rotate_after_phases,
+            same_approach_failure_limit=args.same_approach_limit,
+        )
+        ledger = controller.record_session_event(
+            event=args.event, task_class=args.task_class, task=args.task,
+            phase=args.phase, approach=args.approach, evidence=args.evidence,
+            budget=budget, lease=lease,
+        )
+        result = None
+        if ledger.get("blocked"):
+            result = controller.halt(
+                "blocked", f"USER_ACTION_REQUIRED: {ledger.get('block_reason')}", lease=lease
+            ).to_dict()
+        payload = {
+            "operation": "progress", "ok": True, "root": str(root),
+            "workflow_root": args.workflow_root, "session_control": ledger,
+            "result": result,
+        }
+        _json_or_status(payload, as_json=args.json, title="CONTROLLER PROGRESS")
+        return 0
+    except (
+        controller_backend.ControllerError, session_control_backend.SessionControlError,
+        OSError, ValueError, json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": "progress", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="CONTROLLER PROGRESS FAILED",
+        )
+        return 2
+
+
+def controller_rotate(args: argparse.Namespace) -> int:
+    """Create a minimal fresh-chat packet and reset only the context budget."""
+
+    try:
+        controller, root, lease = _reattach_controller_command(args)
+        checkpoint = controller._load_checkpoint()
+        descendants = beads_backend.root_descendants(root, args.workflow_root)
+        descendant_ids = {str(item.get("id") or "") for item in descendants}
+        ready_result = beads_backend.run(root, "ready", "--json")
+        if ready_result.returncode:
+            raise beads_backend.BeadsError(
+                (ready_result.stderr or ready_result.stdout).strip() or "bd ready failed"
+            )
+        ready_value = json.loads(ready_result.stdout or "[]")
+        ready = [
+            item for item in ready_value
+            if isinstance(item, Mapping) and str(item.get("id") or "") in descendant_ids
+        ] if isinstance(ready_value, list) else []
+        ledger = controller.session_ledger()
+        packet = session_control_backend.build_handoff_packet(
+            workspace_root=str(root), workflow_root=args.workflow_root,
+            controller=lease.controller, continuity_id=lease.continuity_id,
+            checkpoint=checkpoint, ready_tasks=ready, ledger=ledger,
+        )
+        generation = int(ledger.get("generation", 1))
+        packet_path = controller.state_path.with_name(f"handoff-{generation}.json")
+        _private_atomic_json(packet_path, packet)
+        next_ledger = controller.rotate_session_budget(lease=lease)
+        payload = {
+            "operation": "rotate", "ok": True, "root": str(root),
+            "workflow_root": args.workflow_root, "packet": str(packet_path),
+            "resume_prompt": session_control_backend.render_resume_prompt(packet),
+            "session_control": next_ledger,
+        }
+        _json_or_status(payload, as_json=args.json, title="CONTROLLER ROTATION READY")
+        return 0
+    except (
+        controller_backend.ControllerError, beads_backend.BeadsError,
+        session_control_backend.SessionControlError, OSError, ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": "rotate", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="CONTROLLER ROTATION FAILED",
+        )
         return 2
 
 
@@ -4371,6 +4514,72 @@ def usage_yield(args: argparse.Namespace) -> int:
     return 0
 
 
+def usage_optimize(args: argparse.Namespace) -> int:
+    """Reconcile a local CodeBurn optimize report without trusting its cost estimate."""
+
+    try:
+        value = _read_json_value(args.codeburn)
+        if not isinstance(value, dict):
+            raise ValueError("CodeBurn report must be a JSON object")
+        records = _read_jsonl(_state_dir() / "usage.jsonl")
+        workflow_evidence: dict[str, Any] = {}
+        if args.workflow_root:
+            root = Path(args.root).expanduser().resolve()
+            descendants = beads_backend.root_descendants(root, args.workflow_root)
+            descendant_ids = {str(item.get("id") or "") for item in descendants}
+            terminal = {
+                "closed", "done", "completed", "cancelled", "canceled"
+            }
+            workflow_evidence = {
+                "root": args.workflow_root,
+                "descendants": len(descendants),
+                "terminal_descendants": sum(
+                    str(item.get("status") or "").lower() in terminal
+                    for item in descendants
+                ),
+                "dispositions": sum(
+                    isinstance(item.get("metadata"), Mapping)
+                    and isinstance(item["metadata"].get("agentflow"), Mapping)
+                    and bool(item["metadata"]["agentflow"].get("disposition"))
+                    for item in descendants
+                ),
+                "herdr_sessions": 0,
+                "authenticated_results": 0,
+            }
+            state_path = root / ".agentflow/herdr/sessions.json"
+            if state_path.is_file():
+                state = _load_herdr_state(state_path)
+                sessions = state.get("sessions")
+                if isinstance(sessions, Mapping):
+                    relevant = [
+                        item for task_id, item in sessions.items()
+                        if str(task_id) in descendant_ids and isinstance(item, Mapping)
+                    ]
+                    workflow_evidence["herdr_sessions"] = len(relevant)
+                    workflow_evidence["authenticated_results"] = sum(
+                        isinstance(item.get("result"), Mapping) for item in relevant
+                    )
+        result = usage_backend.reconcile_codeburn(
+            value, records, project=args.project, workflow_evidence=workflow_evidence
+        )
+    except (beads_backend.BeadsError, OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"usage optimize: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        evidence = result["agentflow_evidence"]
+        print("CodeBurn reconciliation (advisory; savings are not verified)")
+        print(
+            f"  Agentflow evidence: {evidence['completed_records']} completed records, "
+            f"{evidence['records_with_checks']} with checks, "
+            f"{evidence['accepted_findings']} accepted findings"
+        )
+        for finding in result["findings"]:
+            print(f"  {finding['id']}: {finding['disposition']} — {finding['recommendation']}")
+    return 0
+
+
 def adapter_evaluate(args: argparse.Namespace) -> int:
     try:
         manifest = _read_json_value(args.manifest)
@@ -4408,7 +4617,9 @@ def hook(args: argparse.Namespace) -> int:
         return 0
     context = (
         "Keep handoffs terse; use measurable done conditions; delegate only bounded independent work; "
-        "load project-owned domain skills when the task requires them."
+        "load project-owned domain skills when the task requires them. Use one approved Agentflow root "
+        "per controller chat; related fixes stay under that root, while a materially different goal or "
+        "a completed root starts in a fresh chat. Resume from durable state, not prior transcripts."
     )
     raw_cwd = payload.get("cwd")
     hook_cwd = (
@@ -6385,6 +6596,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_controller_common(controller_status_parser)
     controller_status_parser.set_defaults(func=controller_status)
+    controller_progress_parser = controller_sub.add_parser(
+        "progress",
+        help="Record task-aware progress or a named approach failure in the durable session budget",
+    )
+    add_controller_common(controller_progress_parser)
+    controller_progress_parser.add_argument("--event", choices=sorted(session_control_backend.EVENTS), required=True)
+    controller_progress_parser.add_argument("--task-class", choices=sorted(session_control_backend.TASK_CLASSES), required=True)
+    controller_progress_parser.add_argument("--task", default="")
+    controller_progress_parser.add_argument("--phase", default="")
+    controller_progress_parser.add_argument("--approach", default="")
+    controller_progress_parser.add_argument("--evidence", default="")
+    controller_progress_parser.add_argument("--rotate-after-tasks", type=int, default=4)
+    controller_progress_parser.add_argument("--rotate-after-phases", type=int, default=2)
+    controller_progress_parser.add_argument("--same-approach-limit", type=int, default=2)
+    controller_progress_parser.set_defaults(func=controller_progress)
+    controller_rotate_parser = controller_sub.add_parser(
+        "rotate",
+        help="Write a transcript-free fresh-chat packet and begin a new context budget generation",
+    )
+    add_controller_common(controller_rotate_parser)
+    controller_rotate_parser.set_defaults(func=controller_rotate)
     controller_stop_parser = controller_sub.add_parser(
         "stop", help="Request a clean stop while preserving resumable controller state"
     )
@@ -6807,6 +7039,15 @@ def build_parser() -> argparse.ArgumentParser:
     yield_parser.add_argument("--file", default="", help="JSON list, or omit to use local usage records")
     yield_parser.add_argument("--json", action="store_true")
     yield_parser.set_defaults(func=usage_yield)
+    optimize_parser = usage_sub.add_parser(
+        "optimize", help="Reconcile CodeBurn optimize JSON with Agentflow delivery evidence"
+    )
+    optimize_parser.add_argument("--codeburn", required=True, help="CodeBurn JSON path, or - for stdin")
+    optimize_parser.add_argument("--project", default="", help="exact Agentflow usage project label")
+    optimize_parser.add_argument("--root", default=".", help="workspace root for optional Beads/Herdr evidence")
+    optimize_parser.add_argument("--workflow-root", default="", help="exact Beads root to reconcile")
+    optimize_parser.add_argument("--json", action="store_true")
+    optimize_parser.set_defaults(func=usage_optimize)
 
     adapter_parser = sub.add_parser("adapter", help="Evaluate fail-closed adapter promotion gates")
     adapter_sub = adapter_parser.add_subparsers(dest="adapter_command", required=True)

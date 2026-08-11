@@ -44,6 +44,7 @@
 - Treat provider-reported dashboards and usage commands as authoritative; label local cost figures as estimates.
 - Record task class, model, effort, allowance or credits, elapsed time, retries, input size, findings, accepted findings, checks, and outcome when available.
 - Run the narrowest relevant checks, inspect the diff, and state anything not verified.
+- Keep one approved root per controller chat. Resume from Beads and linked files rather than transcripts; use `agentflow controller rotate` when context rotation is recommended, and stop after two failures of the same named approach.
 - Preserve unrelated user changes. Do not overwrite existing agent configuration during installation.
 
 ## Repository checks

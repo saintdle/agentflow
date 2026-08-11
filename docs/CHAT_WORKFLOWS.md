@@ -24,6 +24,11 @@ The workflow has one deliberate human approval gate:
 3. Approve it explicitly, then let one persistent controller run until a real
    halt or completion.
 
+Use one approved workflow root per controller chat. Related corrections belong
+under that root; a materially different goal gets a new root and a fresh chat.
+After `GOAL_COMPLETE`, start the next goal in a fresh chat instead of extending
+the completed controller conversation indefinitely.
+
 Do not start a second controller for the same root. Do not interpret a claimed
 Bead, launched pane, or exited provider process as completed work.
 
@@ -129,7 +134,49 @@ A `503`, IDE reconnect, laptop sleep, or closed chat does not itself authorize a
 new graph or duplicate worker. Resume first and let Agentflow determine whether
 an existing provider session is live, complete, blocked, or missing.
 
-## 5. Ask for status without changing anything
+## 5. Rotate an expensive controller context
+
+Agentflow records task-aware controller progress. Coding can progress through an
+edit or check, research and review through evidence or decisions, and an external
+wait through a deterministic watcher or state change. It does not use a generic
+"ten minutes without an edit" halt because that would misclassify legitimate
+read-only and runtime work.
+
+`controller status` includes a `session_control.rotation` advisory after the
+configured number of completed tasks or phases. The deterministic controller is
+allowed to finish its current root; the advisory does not interrupt workers. At
+a safe chat boundary, ask the agent to run:
+
+```sh
+agentflow controller rotate \
+  --root . \
+  --workflow-root <root-id>
+```
+
+The command writes an ignored, public-safe handoff packet under
+`.agentflow/controller/` and prints a copy/paste-ready fresh-chat prompt. The
+packet contains the root, checkpoint, ready task summaries, and continuity
+identity. It never contains the prior transcript, resume secret, signing key, or
+provider credentials. Paste the returned prompt into a fresh agent chat opened
+in the same workspace.
+
+When an approach fails, name it precisely. A controller can record the failure:
+
+```sh
+agentflow controller progress \
+  --root . \
+  --workflow-root <root-id> \
+  --event failure \
+  --task-class coding \
+  --task <task-id> \
+  --approach "<specific hypothesis or correction>"
+```
+
+The second failure of the same named approach produces a durable
+`USER_ACTION_REQUIRED` halt. Change the hypothesis or record a decision instead
+of silently repeating the same fix.
+
+## 6. Ask for status without changing anything
 
 ```text
 Report read-only status for Agentflow root [root-id] in this workspace. Inspect
@@ -140,7 +187,7 @@ Translate every relevant Bead ID into its human title and explain exactly why it
 is ready, active, blocked, or complete. End with the single best next request.
 ```
 
-## 6. Authorize a bounded delivery action
+## 7. Authorize a bounded delivery action
 
 Keep external actions separate from implementation approval. For example:
 
