@@ -20,7 +20,7 @@ from agentflow import preflight
 
 class PackagingConfigTests(unittest.TestCase):
     def test_version_and_resources_are_distribution_owned(self) -> None:
-        self.assertEqual(__version__, "0.0.2")
+        self.assertEqual(__version__, "0.0.3")
         self.assertTrue(resources.item("templates", "project", "agentflow.json").is_file())
         self.assertTrue(resources.item("policies", "models-v1.json").is_file())
         self.assertEqual(len(resources.names("skills")), 7)

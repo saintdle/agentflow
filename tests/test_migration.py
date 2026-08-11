@@ -42,7 +42,7 @@ class LegacyMigrationTests(unittest.TestCase):
 
         new_command = root / "isolated/bin/agentflow"
         new_command.parent.mkdir(parents=True)
-        new_command.write_text("#!/bin/sh\nprintf 'agentflow 0.0.2\\n'\n", encoding="utf-8")
+        new_command.write_text("#!/bin/sh\nprintf 'agentflow 0.0.3\\n'\n", encoding="utf-8")
         new_command.chmod(0o755)
         return home, legacy, state, new_command
 
@@ -171,7 +171,7 @@ class LegacyMigrationTests(unittest.TestCase):
             root = Path(temporary)
             home, legacy, state, new_command = self.fixture(root)
             new_command.write_text("#!/bin/sh\nprintf 'not-agentflow 9.9.9\\n'\n", encoding="utf-8")
-            with self.assertRaisesRegex(migration.MigrationError, "running Agentflow 0.0.2"):
+            with self.assertRaisesRegex(migration.MigrationError, "running Agentflow 0.0.3"):
                 migration.apply(
                     legacy,
                     home=home,
