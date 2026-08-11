@@ -81,7 +81,7 @@ Treat third-party skills as executable supply-chain inputs:
 - use Agentflow's asset lock and verification commands;
 - use the separate synchronous `agentflow isolation launch` path for untrusted
   execution where supported; persistent provider sessions are not confined in
-  `0.0.2`.
+  `0.0.3`.
 
 Synchronization does not grant a skill controller credentials, provider
 credentials, or permission to bypass handoff preflight.
