@@ -42,6 +42,12 @@
       "efforts": ["medium", "high"]
     },
     {
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "roles": ["editing"],
+      "efforts": ["medium"]
+    },
+    {
       "provider": "copilot",
       "model": "claude-opus-4.8",
       "roles": ["controller", "judgment", "review"],
@@ -58,6 +64,12 @@
       "model": "claude-sonnet-4.6",
       "roles": ["coding", "exploration"],
       "efforts": ["medium", "high"]
+    },
+    {
+      "provider": "copilot",
+      "model": "claude-sonnet-4.6",
+      "roles": ["editing"],
+      "efforts": ["medium"]
     }
   ],
   "forbidden_models": [

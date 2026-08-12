@@ -8,7 +8,8 @@ values fail closed before lease/claim reservation.
 |---|---|---|
 | Goal shaping, architecture, difficult debugging | Codex `gpt-5.6-sol` | `high` or `xhigh` |
 | File discovery, bounded implementation, exploration | Codex `gpt-5.6-luna` | `medium` or `high` |
-| Conditional plain-language edit of Claude-authored reader content | Codex `gpt-5.6-luna` | `medium` |
+| Conditional plain-language edit (default) | Codex `gpt-5.6-luna` | `medium` |
+| Conditional edit without OpenAI access | Claude `claude-sonnet-5` or Copilot `claude-sonnet-4.6` | `medium` |
 | Judgment, review, and queue integration (default when Claude or Opus is requested) | Claude `claude-opus-4-8` | `high` |
 | Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Claude `claude-opus-5` | `medium` unless the user states another level |
 | Bounded Claude execution and exploration | Claude `claude-sonnet-5` | `medium` or `high` |

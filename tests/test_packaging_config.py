@@ -90,6 +90,7 @@ class PackagingConfigTests(unittest.TestCase):
             self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
             data = project_config.load(root)
             self.assertEqual(data["schema"], project_config.SCHEMA)
+            self.assertEqual(data["prose"]["editor"], project_config.DEFAULT_PROSE_EDITOR)
             self.assertTrue((root / data["model_policy"]).is_file())
             ignored = (root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".agentflow/config.local.json", ignored)
@@ -107,11 +108,13 @@ class PackagingConfigTests(unittest.TestCase):
             shared["skills"] = [{"name": "layered", "path": "skills/shared", "providers": ["codex"]}]
             local = project_config.default_local_data()
             local["model_policy"] = ".agentflow/local-policy.json"
+            local["prose"] = {"editor": None}
             local["skills"] = [{"name": "layered", "path": "skills/local", "providers": ["claude"]}]
             project_config.write_layer(root, shared, local=False)
             project_config.write_layer(root, local, local=True)
             merged = project_config.load(root)
             self.assertEqual(merged["model_policy"], ".agentflow/local-policy.json")
+            self.assertIsNone(project_config.prose_editor(merged))
             self.assertEqual(merged["skills"], local["skills"])
             self.assertEqual(project_config.skill_origins(root), {"layered": "local"})
 

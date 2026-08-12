@@ -30,10 +30,13 @@ assignment, automatically select the conditional prose-quality lane unless the
 user opts out. Record the classification and writer provider in the handoff.
 After the writer returns, run `agentflow prose prepare` with the matching
 domain profile, required skill, and authoritative domain checks. A passing
-artifact launches no editor. A failing artifact gets exactly one Codex Luna
-`medium` editing pass into a sibling file; verify it and let the controller
-choose whether to replace the source. Never apply this lane to chat, code,
-research notes, reviews, or internal handoffs.
+artifact launches no editor. A failing artifact gets exactly one editing pass
+through the exact route configured in `.agentflow/config.json`; the bundled
+default is Codex Luna `medium`, while approved Claude or Copilot routes can be
+selected when OpenAI access is unavailable. Verify the sibling and let the
+controller choose whether to replace the source. With no configured editor,
+report the deterministic findings without launching anything. Never apply this
+lane to chat, code, research notes, reviews, or internal handoffs.
 
 ## Route domain skills
 

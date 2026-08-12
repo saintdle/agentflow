@@ -17,6 +17,6 @@
 - Link implementation to a bead or required GitHub issue when this repository uses PR mode.
 - Use `agentflow ci watch` instead of an LLM session for pending checks; create one bounded CI-triage bead and return a separate code fix to the original writer only when diagnosis requires it.
 - Prefer faster/lower-cost models for exploration and mechanical work. Reserve high reasoning for planning, hard debugging, and final review.
-- Classify writable artifacts before dispatch. For Claude-authored reader-facing Markdown, automatically use the conditional `agentflow prose prepare` lane unless the user opts out. It launches no editor when checks pass and at most one Codex Luna `medium` edit into a sibling when they fail; the controller validates and accepts any replacement. Exclude code, chat, research notes, reviews, and internal handoffs.
+- Classify writable artifacts before dispatch. For Claude-authored reader-facing Markdown, automatically use the conditional `agentflow prose prepare` lane unless the user opts out. It launches no editor when checks pass and at most one edit through the exact configured, policy-approved route when they fail; the controller validates and accepts any replacement. With no route, report findings without a model call. Exclude code, chat, research notes, reviews, and internal handoffs.
 - Run relevant tests, inspect the diff, and report anything not verified.
 - Preserve unrelated changes and never expose credentials or transcripts.

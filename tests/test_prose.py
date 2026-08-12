@@ -162,13 +162,92 @@ class ProseCliTests(unittest.TestCase):
             handoff = Path(result["handoff"])
             manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["prose"]["editor"], {
-                "provider": "codex", "model": "gpt-5.6-luna", "role": "editing", "effort": "medium",
+                "provider": "codex", "model": "gpt-5.6-luna", "role": "editing",
+                "effort": "medium", "policy": "models-v1",
             })
             self.assertEqual(manifest["prose"]["artifact_kind"], "reader-facing")
             self.assertEqual(manifest["prose"]["max_passes"], 1)
             self.assertIn("never overwrite", handoff.read_text(encoding="utf-8"))
             self.assertEqual(source.read_bytes(), original)
             self.assertFalse((root / "draft.edited.md").exists())
+
+    def test_prepare_accepts_explicit_non_openai_editor_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "draft.md").write_text(LONG, encoding="utf-8")
+            code, output, error = self.run_cli([
+                "prose", "prepare", "draft.md", "--cwd", str(root),
+                "--profile", "technical-blog", "--writer-provider", "claude",
+                "--editor-provider", "copilot", "--editor-model", "claude-sonnet-4.6",
+                "--editor-effort", "medium", "--editor-max-ai-credits", "30",
+                "--require-skill", "domain-skill",
+                "--check", "true", "--json",
+            ])
+            self.assertEqual((code, error), (0, ""))
+            result = json.loads(output)
+            self.assertIn("handoff launch copilot", result["launch"])
+            manifest = json.loads(Path(result["handoff"]).with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["prose"]["editor"]["model"], "claude-sonnet-4.6")
+
+    def test_prepare_uses_configured_non_openai_editor_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(cli.init_project(type("Args", (), {"path": str(root), "beads": False})()), 0)
+            local = {
+                "schema": "agentflow.project-local@1", "version": 1,
+                "prose": {"editor": {
+                    "provider": "claude", "model": "claude-sonnet-5", "effort": "medium",
+                }},
+                "skills": [],
+            }
+            (root / ".agentflow/config.local.json").write_text(json.dumps(local), encoding="utf-8")
+            (root / "draft.md").write_text(LONG, encoding="utf-8")
+            code, output, error = self.run_cli([
+                "prose", "prepare", "draft.md", "--cwd", str(root),
+                "--profile", "technical-blog", "--writer-provider", "claude",
+                "--require-skill", "domain-skill", "--check", "true", "--json",
+            ])
+            self.assertEqual((code, error), (0, ""))
+            result = json.loads(output)
+            self.assertIn("handoff launch claude", result["launch"])
+            manifest = json.loads(Path(result["handoff"]).with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["prose"]["editor"]["model"], "claude-sonnet-5")
+
+    def test_prepare_honors_disabled_editor_without_requiring_domain_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(cli.init_project(type("Args", (), {"path": str(root), "beads": False})()), 0)
+            config = json.loads((root / ".agentflow/config.json").read_text(encoding="utf-8"))
+            config["prose"] = {"editor": None}
+            (root / ".agentflow/config.json").write_text(json.dumps(config), encoding="utf-8")
+            (root / "draft.md").write_text(LONG, encoding="utf-8")
+            code, output, _ = self.run_cli([
+                "prose", "prepare", "draft.md", "--cwd", str(root),
+                "--profile", "technical-blog", "--writer-provider", "claude", "--json",
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(output)["status"], "edit-required-no-route")
+
+    def test_prepare_rejects_partial_or_unapproved_editor_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "draft.md").write_text(LONG, encoding="utf-8")
+            common = [
+                "prose", "prepare", "draft.md", "--cwd", str(root),
+                "--profile", "technical-blog", "--writer-provider", "claude",
+            ]
+            code, _, error = self.run_cli([*common, "--editor-provider", "copilot"])
+            self.assertEqual(code, 2)
+            self.assertIn("must be supplied together", error)
+            code, _, error = self.run_cli([*common, "--editor-max-ai-credits", "30"])
+            self.assertEqual(code, 2)
+            self.assertIn("requires --editor-provider", error)
+            code, _, error = self.run_cli([
+                *common, "--editor-provider", "copilot", "--editor-model", "claude-opus-4.8",
+                "--editor-effort", "high", "--editor-max-ai-credits", "30",
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("not approved", error)
 
     def test_prepare_requires_domain_skill_and_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
