@@ -116,6 +116,15 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_codex_luna_coding_passes(self) -> None:
         self._assert_pass(provider="codex", role="coding", model="gpt-5.6-luna", effort="medium")
 
+    def test_codex_luna_medium_editing_passes(self) -> None:
+        self._assert_pass(provider="codex", role="editing", model="gpt-5.6-luna", effort="medium")
+
+    def test_codex_sol_editing_fails(self) -> None:
+        self._assert_fail(provider="codex", role="editing", model="gpt-5.6-sol", effort="high")
+
+    def test_codex_luna_high_editing_fails(self) -> None:
+        self._assert_fail(provider="codex", role="editing", model="gpt-5.6-luna", effort="high")
+
     def test_claude_opus_4_8_controller_passes(self) -> None:
         self._assert_pass(provider="claude", role="controller", model="claude-opus-4-8", effort="high")
 

@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added an automatic controller classification for Claude-authored
+  reader-facing Markdown and deterministic `prose check`, conditional `prose
+  prepare`, and preservation-aware `prose verify` commands.
+- Added a fail-closed `editing` route pinned to Codex Luna at `medium` effort.
+  Passing prose uses no editor session; failing prose permits one sibling-file
+  edit with required domain skills and checks, never an automatic overwrite.
+
 ## [0.0.3] - 2026-08-11
 
 ### Changed

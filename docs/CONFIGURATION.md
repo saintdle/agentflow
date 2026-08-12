@@ -75,6 +75,7 @@ writes.
 The initialized model policy is a reference safety policy, not an assertion that a
 model is available to every user. Teams can maintain a versioned policy for
 their approved providers, exact model identifiers, roles, and effort levels.
+The bundled `editing` role permits only Codex `gpt-5.6-luna` at `medium`.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
 
 The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
