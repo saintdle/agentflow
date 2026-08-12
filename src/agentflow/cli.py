@@ -42,6 +42,7 @@ from agentflow import search as search_backend
 from agentflow import session_control as session_control_backend
 from agentflow import usage as usage_backend
 from agentflow import privacy as privacy_backend
+from agentflow import prose as prose_backend
 from agentflow import project_config as project_config_backend
 from agentflow import resources as packaged_resources
 from agentflow import wait as wait_backend
@@ -4947,6 +4948,251 @@ def _resolve_required_skills(
     return resolved, errors
 
 
+def _prose_print(report: prose_backend.ProseReport | prose_backend.VerificationReport) -> None:
+    data = report.to_dict()
+    print(f"{'PASS' if data['passed'] else 'NEEDS_EDIT'} {data['profile']}: {data.get('path', data.get('edited'))}")
+    for finding in data["findings"]:
+        location = f"line {finding['line']}: " if finding["line"] else ""
+        print(f"- {finding['code']}: {location}{finding['message']}")
+
+
+def prose_check(args: argparse.Namespace) -> int:
+    try:
+        report = prose_backend.check_file(Path(args.file), profile_name=args.profile)
+    except prose_backend.ProseError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        _prose_print(report)
+    return 0 if report.passed else 1
+
+
+def prose_verify(args: argparse.Namespace) -> int:
+    try:
+        report = prose_backend.verify_files(
+            Path(args.source), Path(args.edited), profile_name=args.profile
+        )
+    except prose_backend.ProseError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        _prose_print(report)
+    return 0 if report.passed else 1
+
+
+def _path_inside(path: Path, boundary: Path, *, label: str) -> Path:
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.relative_to(boundary.resolve())
+    except ValueError as exc:
+        raise prose_backend.ProseError(f"{label} must stay within {boundary.resolve()}") from exc
+
+
+def _prose_editor_route(args: argparse.Namespace, root: Path) -> dict[str, Any] | None:
+    values = {
+        "provider": str(getattr(args, "editor_provider", "") or ""),
+        "model": str(getattr(args, "editor_model", "") or ""),
+        "effort": str(getattr(args, "editor_effort", "") or ""),
+    }
+    if any(values.values()):
+        if not all(values.values()):
+            raise prose_backend.ProseError(
+                "--editor-provider, --editor-model, and --editor-effort must be supplied together"
+            )
+        credits = getattr(args, "editor_max_ai_credits", None)
+        if values["provider"] == "copilot" and (credits is None or credits < 30):
+            raise prose_backend.ProseError(
+                "Copilot editor overrides require --editor-max-ai-credits of at least 30"
+            )
+        if credits is not None:
+            values["max_ai_credits"] = credits
+        return values
+    if getattr(args, "editor_max_ai_credits", None) is not None:
+        raise prose_backend.ProseError(
+            "--editor-max-ai-credits requires --editor-provider, --editor-model, and --editor-effort"
+        )
+    config_path = project_config_backend.config_path(root)
+    try:
+        config = (
+            project_config_backend.load(root)
+            if config_path.exists() or config_path.is_symlink()
+            else project_config_backend.default_data()
+        )
+    except project_config_backend.ConfigError as exc:
+        raise prose_backend.ProseError(f"cannot load prose editor configuration: {exc}") from exc
+    return project_config_backend.prose_editor(config)
+
+
+def prose_prepare(args: argparse.Namespace) -> int:
+    """Create a conditional, bounded editor handoff without launching a model."""
+
+    task_cwd = _task_cwd(args).resolve()
+    source = Path(args.file).expanduser()
+    if not source.is_absolute():
+        source = task_cwd / source
+    try:
+        source_rel = _path_inside(source, task_cwd, label="source")
+        report = prose_backend.check_file(source, profile_name=args.profile)
+    except prose_backend.ProseError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
+
+    claude_writer = args.writer_provider == "claude" or (
+        args.writer_provider == "copilot" and args.writer_model.startswith("claude-")
+    )
+    applicable = claude_writer and args.artifact_kind == "reader-facing"
+    if not applicable or report.passed:
+        result = {
+            "schema": "agentflow.prose-preparation@1",
+            "status": "not-applicable" if not applicable else "not-needed",
+            "source": str(source.resolve()),
+            "profile": args.profile,
+            "writer_provider": args.writer_provider,
+            "writer_model": args.writer_model,
+            "artifact_kind": args.artifact_kind,
+            "handoff": "",
+            "edited": "",
+            "check": report.to_dict(),
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            reason = "outside the Claude reader-facing lane" if not applicable else "deterministic checks passed"
+            print(f"NO_EDIT {source.resolve()}: {reason}")
+        return 0
+
+    try:
+        editor = _prose_editor_route(args, task_cwd)
+    except prose_backend.ProseError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
+    if editor is None:
+        result = {
+            "schema": "agentflow.prose-preparation@1", "status": "edit-required-no-route",
+            "source": str(source.resolve()), "profile": args.profile,
+            "writer_provider": args.writer_provider, "writer_model": args.writer_model,
+            "artifact_kind": args.artifact_kind, "handoff": "", "edited": "",
+            "check": report.to_dict(),
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"EDIT_REQUIRED_NO_ROUTE {source.resolve()}: deterministic findings remain")
+        return 1
+    try:
+        policy = model_policy_backend.load_policy(_resolve_model_policy(args, task_cwd))
+    except (model_policy_backend.ModelPolicyError, project_config_backend.ConfigError) as exc:
+        print(f"ERROR cannot load editor model policy: {exc}", file=sys.stderr)
+        return 2
+    route = policy.validate_route(
+        provider=editor["provider"], model=editor["model"], role="editing", effort=editor["effort"]
+    )
+    if not route.ok:
+        print(f"ERROR configured prose editor route is not approved: {route.reason}", file=sys.stderr)
+        return 2
+
+    if not args.require_skill:
+        print("ERROR a Claude prose edit requires at least one --require-skill", file=sys.stderr)
+        return 2
+    if not args.check:
+        print("ERROR a Claude prose edit requires at least one domain --check", file=sys.stderr)
+        return 2
+
+    edited = Path(args.edited_out).expanduser() if args.edited_out else source.with_name(
+        f"{source.stem}.edited{source.suffix}"
+    )
+    if not edited.is_absolute():
+        edited = task_cwd / edited
+    try:
+        edited_rel = _path_inside(edited, task_cwd, label="edited output")
+    except prose_backend.ProseError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
+    if edited.resolve() == source.resolve():
+        print("ERROR edited output must differ from the source", file=sys.stderr)
+        return 2
+    if edited.exists():
+        print(f"ERROR edited output already exists: {edited}", file=sys.stderr)
+        return 2
+
+    slug = re.sub(r"[^a-z0-9]+", "-", source.stem.casefold()).strip("-") or "artifact"
+    handoff = Path(args.out).expanduser() if args.out else task_cwd / ".agentflow/tmp/handoffs" / f"prose-{slug}-{editor['provider']}.md"
+    if not handoff.is_absolute():
+        handoff = task_cwd / handoff
+    if handoff.exists() or handoff.with_suffix(".json").exists():
+        print(f"ERROR prose handoff already exists: {handoff}", file=sys.stderr)
+        return 2
+
+    finding_summary = "; ".join(f"{item.code} at line {item.line}" for item in report.findings)
+    verify_command = (
+        f"agentflow prose verify {shlex.quote(str(source_rel))} "
+        f"{shlex.quote(str(edited_rel))} --profile {shlex.quote(args.profile)}"
+    )
+    handoff_args = argparse.Namespace(
+        to=editor["provider"], title=f"Plain-language edit: {source_rel}",
+        goal=f"Edit {source_rel} into {edited_rel} so it reads clearly without changing technical meaning.",
+        task_id=f"prose-{slug}", task_class="implementation", role="editing", lane="external",
+        tool_profile="shell-write", output_boundary=str(edited.resolve()), require_tool=[],
+        require_skill=args.require_skill, allow_delegation=False, return_type="result",
+        max_ai_credits=editor.get("max_ai_credits"), acceptance_matrix="",
+        isolation_profile="none", require_asset=[],
+        base="", dependency=[],
+        done_when=["The edited sibling passes deterministic prose verification and every domain check."],
+        context=[str(source_rel)],
+        constraint=[
+            "This is a plain-language edit, not research, redesign, expansion, or claim creation.",
+            "Preserve code, commands, links, numbers, paths, structure, and technical meaning.",
+            f"Write only {edited_rel}; never overwrite {source_rel}.",
+            "Use exactly one editing pass and do not delegate.",
+            f"Initial deterministic findings: {finding_summary}.",
+            f"Required route: {editor['provider']} {editor['model']}, role editing, effort {editor['effort']}, {policy.id}.",
+        ],
+        check=[verify_command, *args.check],
+        budget=["One editing pass; one model session; stop rather than expanding scope."],
+        issue="", branch="", out=str(handoff), cwd=str(task_cwd), transient_required=True,
+        untrusted_task_data=False, artifact_kind="reader-facing", writer_model=editor["model"],
+    )
+    materialized = io.StringIO()
+    with redirect_stdout(materialized):
+        create_status = handoff_create(handoff_args)
+    if create_status != 0:
+        return 2
+    manifest_path = handoff.with_suffix(".json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["prose"] = {
+        "schema": "agentflow.prose-edit@1",
+        "source": str(source.resolve()), "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "edited": str(edited.resolve()), "profile": args.profile,
+        "writer_provider": args.writer_provider, "writer_model": args.writer_model,
+        "artifact_kind": args.artifact_kind,
+        "editor": {**editor, "role": "editing", "policy": policy.id},
+        "max_passes": 1, "check": report.to_dict(),
+    }
+    _write_json(manifest_path, manifest)
+    launch = (
+        f"agentflow handoff launch {editor['provider']} {shlex.quote(str(handoff))} --role editing "
+        f"--model {shlex.quote(editor['model'])} --effort {shlex.quote(editor['effort'])}"
+    )
+    result = {
+        "schema": "agentflow.prose-preparation@1", "status": "handoff-created",
+        "source": str(source.resolve()), "edited": str(edited.resolve()),
+        "profile": args.profile, "handoff": str(handoff.resolve()), "launch": launch,
+        "check": report.to_dict(),
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"EDIT_REQUIRED {source.resolve()}")
+        print(f"Handoff: {handoff.resolve()}")
+        print(f"Preflight: agentflow handoff preflight {shlex.quote(str(handoff))} --cwd {shlex.quote(str(task_cwd))}")
+        print(f"Launch: {launch}")
+    return 0
+
+
 def handoff_create(args: argparse.Namespace) -> int:
     task_cwd = _task_cwd(args)
     workspace_kind = "git" if _is_git_repository(task_cwd) else "directory"
@@ -5006,6 +5252,8 @@ def handoff_create(args: argparse.Namespace) -> int:
     allow_delegation = getattr(args, "allow_delegation", False)
     max_ai_credits = getattr(args, "max_ai_credits", None)
     return_type = getattr(args, "return_type", "result")
+    artifact_kind = getattr(args, "artifact_kind", "")
+    writer_model = getattr(args, "writer_model", "")
     acceptance_path_value = getattr(args, "acceptance_matrix", "")
     acceptance_path: Path | None = None
     acceptance_data: dict[str, Any] | None = None
@@ -5095,6 +5343,8 @@ Created: {_now()}
 Execution lane: {lane}
 Task class: {task_class}
 Role: {role}
+Artifact kind: {artifact_kind or 'not classified'}
+Writer model: {writer_model or 'resolved at launch'}
 Delegation: {'allowed' if allow_delegation else 'disabled'}
 Tool profile: {tool_profile}
 Issue: {args.issue or 'none'}
@@ -5199,6 +5449,8 @@ invoke exactly:
         "tool_profile": tool_profile,
         "output_boundary": output_boundary,
         "return_type": return_type,
+        "artifact_kind": artifact_kind,
+        "writer_model": writer_model,
         "cwd": str(task_cwd),
         "handoff": str(output.resolve()),
         "acceptance_matrix": str(acceptance_path) if acceptance_path else "",
@@ -5321,6 +5573,8 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
         require_skill=required_skills,
         allow_delegation=args.allow_delegation or bool(stored.get("delegation_allowed")),
         return_type=return_type,
+        artifact_kind=getattr(args, "artifact_kind", "") or str(stored.get("artifact_kind") or ""),
+        writer_model=getattr(args, "writer_model", "") or str(stored.get("writer_model") or ""),
         max_ai_credits=(
             args.max_ai_credits
             if args.max_ai_credits is not None
@@ -7112,6 +7366,48 @@ def build_parser() -> argparse.ArgumentParser:
     hook_parser.add_argument("--event", default="")
     hook_parser.set_defaults(func=hook)
 
+    prose_parser = sub.add_parser(
+        "prose", help="Check and conditionally edit Claude-authored reader-facing Markdown"
+    )
+    prose_sub = prose_parser.add_subparsers(dest="prose_command", required=True)
+    prose_check_parser = prose_sub.add_parser("check", help="Run deterministic prose checks")
+    prose_check_parser.add_argument("file")
+    prose_check_parser.add_argument("--profile", choices=tuple(prose_backend.PROFILES), required=True)
+    prose_check_parser.add_argument("--json", action="store_true")
+    prose_check_parser.set_defaults(func=prose_check)
+    prose_prepare_parser = prose_sub.add_parser(
+        "prepare", help="Create one bounded editor handoff only when the artifact needs it"
+    )
+    prose_prepare_parser.add_argument("file")
+    prose_prepare_parser.add_argument("--profile", choices=tuple(prose_backend.PROFILES), required=True)
+    prose_prepare_parser.add_argument("--writer-provider", choices=PROVIDERS, required=True)
+    prose_prepare_parser.add_argument(
+        "--writer-model", default="", help="exact writer model; required to classify Copilot as Claude"
+    )
+    prose_prepare_parser.add_argument("--editor-provider", choices=PROVIDERS, default="")
+    prose_prepare_parser.add_argument("--editor-model", default="")
+    prose_prepare_parser.add_argument("--editor-effort", default="")
+    prose_prepare_parser.add_argument("--editor-max-ai-credits", type=int)
+    prose_prepare_parser.add_argument("--policy", default="")
+    prose_prepare_parser.add_argument(
+        "--artifact-kind", choices=("reader-facing", "internal"), default="reader-facing"
+    )
+    prose_prepare_parser.add_argument("--require-skill", action="append", default=[])
+    prose_prepare_parser.add_argument("--check", action="append", default=[])
+    prose_prepare_parser.add_argument("--edited-out", default="")
+    prose_prepare_parser.add_argument("--out", default="")
+    prose_prepare_parser.add_argument("--cwd", default="")
+    prose_prepare_parser.add_argument("--json", action="store_true")
+    prose_prepare_parser.set_defaults(func=prose_prepare)
+    prose_verify_parser = prose_sub.add_parser(
+        "verify", help="Verify prose quality and preserved technical material"
+    )
+    prose_verify_parser.add_argument("source")
+    prose_verify_parser.add_argument("edited")
+    prose_verify_parser.add_argument("--profile", choices=tuple(prose_backend.PROFILES), required=True)
+    prose_verify_parser.add_argument("--json", action="store_true")
+    prose_verify_parser.set_defaults(func=prose_verify)
+
     handoff_parser = sub.add_parser("handoff", help="Create or launch a terse provider-neutral handoff")
     handoff_sub = handoff_parser.add_subparsers(dest="handoff_command", required=True)
     create_parser = handoff_sub.add_parser("create")
@@ -7121,6 +7417,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--task-id", default="")
     create_parser.add_argument("--task-class", choices=TASK_CLASSES, default="focused-review")
     create_parser.add_argument("--role", default="")
+    create_parser.add_argument("--artifact-kind", choices=("reader-facing", "internal"), default="")
+    create_parser.add_argument("--writer-model", default="")
     create_parser.add_argument("--lane", choices=("native", "external"), default="native")
     create_parser.add_argument(
         "--tool-profile",
@@ -7156,6 +7454,8 @@ def build_parser() -> argparse.ArgumentParser:
     from_bead_parser.add_argument("--cwd", default="")
     from_bead_parser.add_argument("--task-class", choices=TASK_CLASSES, default="")
     from_bead_parser.add_argument("--role", default="")
+    from_bead_parser.add_argument("--artifact-kind", choices=("reader-facing", "internal"), default="")
+    from_bead_parser.add_argument("--writer-model", default="")
     from_bead_parser.add_argument("--lane", choices=("native", "external"), default="")
     from_bead_parser.add_argument(
         "--tool-profile",

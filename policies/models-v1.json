@@ -3,7 +3,7 @@
   "version": 1,
   "id": "models-v1",
   "description": "Exact provider/model/role/effort routes approved for agentflow-launched sessions. Unlisted, generic, or renamed models fail closed.",
-  "roles": ["controller", "judgment", "coding", "review", "exploration"],
+  "roles": ["controller", "judgment", "coding", "editing", "review", "exploration"],
   "routes": [
     {
       "provider": "codex",
@@ -16,6 +16,12 @@
       "model": "gpt-5.6-luna",
       "roles": ["coding", "exploration"],
       "efforts": ["medium", "high"]
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "roles": ["editing"],
+      "efforts": ["medium"]
     },
     {
       "provider": "claude",
@@ -36,6 +42,12 @@
       "efforts": ["medium", "high"]
     },
     {
+      "provider": "claude",
+      "model": "claude-sonnet-5",
+      "roles": ["editing"],
+      "efforts": ["medium"]
+    },
+    {
       "provider": "copilot",
       "model": "claude-opus-4.8",
       "roles": ["controller", "judgment", "review"],
@@ -52,6 +64,12 @@
       "model": "claude-sonnet-4.6",
       "roles": ["coding", "exploration"],
       "efforts": ["medium", "high"]
+    },
+    {
+      "provider": "copilot",
+      "model": "claude-sonnet-4.6",
+      "roles": ["editing"],
+      "efforts": ["medium"]
     }
   ],
   "forbidden_models": [

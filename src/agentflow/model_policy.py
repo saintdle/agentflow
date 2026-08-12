@@ -210,12 +210,16 @@ def parse_policy(data: Any) -> ModelPolicy:
     if not isinstance(routes_raw, list) or not routes_raw:
         raise ModelPolicyError("routes must be a non-empty list")
     routes = tuple(_load_route(route, known_roles=frozenset(roles)) for route in routes_raw)
-    seen_provider_models = set()
+    seen_provider_model_roles: dict[tuple[str, str], set[str]] = {}
     for route in routes:
         key = (route.provider, route.model)
-        if key in seen_provider_models:
-            raise ModelPolicyError(f"duplicate route for provider={route.provider!r} model={route.model!r}")
-        seen_provider_models.add(key)
+        overlap = seen_provider_model_roles.setdefault(key, set()) & set(route.roles)
+        if overlap:
+            raise ModelPolicyError(
+                f"duplicate route for provider={route.provider!r} model={route.model!r} "
+                f"role(s)={','.join(sorted(overlap))}"
+            )
+        seen_provider_model_roles[key].update(route.roles)
 
     forbidden_raw = data.get("forbidden_models", [])
     if not isinstance(forbidden_raw, list):

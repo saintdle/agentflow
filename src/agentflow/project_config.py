@@ -14,6 +14,13 @@ MANAGED_LINKS_SCHEMA = "agentflow.managed-skill-links@1"
 VERSION = 1
 PROVIDERS = ("codex", "claude", "copilot")
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+EFFORT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+DEFAULT_PROSE_EDITOR = {
+    "provider": "codex",
+    "model": "gpt-5.6-luna",
+    "effort": "medium",
+}
 
 
 class ConfigError(ValueError):
@@ -21,7 +28,13 @@ class ConfigError(ValueError):
 
 
 def default_data() -> dict[str, Any]:
-    return {"schema": SCHEMA, "version": VERSION, "model_policy": ".agentflow/models-v1.json", "skills": []}
+    return {
+        "schema": SCHEMA,
+        "version": VERSION,
+        "model_policy": ".agentflow/models-v1.json",
+        "prose": {"editor": dict(DEFAULT_PROSE_EDITOR)},
+        "skills": [],
+    }
 
 
 def default_local_data() -> dict[str, Any]:
@@ -64,7 +77,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Keep the public schema limited to values consumed by runtime code.
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
-    allowed = {"schema", "version", "model_policy", "skills"}
+    allowed = {"schema", "version", "model_policy", "prose", "skills"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
@@ -77,6 +90,41 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
         not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip()
     ):
         errors.append("model_policy must be a non-empty path when present")
+    if "prose" in data:
+        prose = data.get("prose")
+        if not isinstance(prose, dict) or set(prose) != {"editor"}:
+            errors.append("prose must contain exactly an editor field")
+        else:
+            editor = prose.get("editor")
+            if editor is not None:
+                allowed_editor = {"provider", "model", "effort", "max_ai_credits"}
+                if (
+                    not isinstance(editor, dict)
+                    or set(editor) - allowed_editor
+                    or not {"provider", "model", "effort"} <= set(editor)
+                ):
+                    errors.append(
+                        "prose.editor must be null or contain provider, model, effort, "
+                        "and optional max_ai_credits"
+                    )
+                else:
+                    if editor.get("provider") not in PROVIDERS:
+                        errors.append(f"prose.editor.provider must be one of {', '.join(PROVIDERS)}")
+                    model = editor.get("model")
+                    if not isinstance(model, str) or not MODEL_PATTERN.fullmatch(model):
+                        errors.append("prose.editor.model has an invalid shape")
+                    effort = editor.get("effort")
+                    if not isinstance(effort, str) or not EFFORT_PATTERN.fullmatch(effort):
+                        errors.append("prose.editor.effort has an invalid shape")
+                    credits = editor.get("max_ai_credits")
+                    if credits is not None and (
+                        not isinstance(credits, int) or isinstance(credits, bool) or credits < 1
+                    ):
+                        errors.append("prose.editor.max_ai_credits must be a positive integer")
+                    if editor.get("provider") == "copilot" and (
+                        not isinstance(credits, int) or isinstance(credits, bool) or credits < 30
+                    ):
+                        errors.append("Copilot prose.editor requires max_ai_credits of at least 30")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
@@ -143,6 +191,8 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
     result = dict(shared)
     if "model_policy" in local:
         result["model_policy"] = local["model_policy"]
+    if "prose" in local:
+        result["prose"] = local["prose"]
     merged_skills: dict[str, dict[str, Any]] = {}
     for entry in shared.get("skills", []):
         merged_skills[entry["name"]] = dict(entry)
@@ -155,6 +205,16 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
 def load(root: Path) -> dict[str, Any]:
     shared, local = load_layers(root)
     return merge(shared, local)
+
+
+def prose_editor(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the configured exact editor route, defaulting legacy projects safely."""
+
+    prose = data.get("prose")
+    if prose is None:
+        return dict(DEFAULT_PROSE_EDITOR)
+    editor = prose.get("editor")
+    return dict(editor) if isinstance(editor, dict) else None
 
 
 def skill_origins(root: Path) -> dict[str, str]:

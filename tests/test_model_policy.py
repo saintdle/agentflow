@@ -116,6 +116,15 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_codex_luna_coding_passes(self) -> None:
         self._assert_pass(provider="codex", role="coding", model="gpt-5.6-luna", effort="medium")
 
+    def test_codex_luna_medium_editing_passes(self) -> None:
+        self._assert_pass(provider="codex", role="editing", model="gpt-5.6-luna", effort="medium")
+
+    def test_codex_sol_editing_fails(self) -> None:
+        self._assert_fail(provider="codex", role="editing", model="gpt-5.6-sol", effort="high")
+
+    def test_codex_luna_high_editing_fails(self) -> None:
+        self._assert_fail(provider="codex", role="editing", model="gpt-5.6-luna", effort="high")
+
     def test_claude_opus_4_8_controller_passes(self) -> None:
         self._assert_pass(provider="claude", role="controller", model="claude-opus-4-8", effort="high")
 
@@ -128,6 +137,9 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_claude_sonnet_coding_passes(self) -> None:
         self._assert_pass(provider="claude", role="coding", model="claude-sonnet-5", effort="medium")
 
+    def test_claude_sonnet_editing_passes(self) -> None:
+        self._assert_pass(provider="claude", role="editing", model="claude-sonnet-5", effort="medium")
+
     def test_copilot_opus_4_8_controller_passes(self) -> None:
         self._assert_pass(provider="copilot", role="controller", model="claude-opus-4.8", effort="high")
 
@@ -136,6 +148,9 @@ class ValidateRouteMatrixTests(unittest.TestCase):
 
     def test_copilot_sonnet_coding_passes(self) -> None:
         self._assert_pass(provider="copilot", role="coding", model="claude-sonnet-4.6", effort="high")
+
+    def test_copilot_sonnet_editing_passes(self) -> None:
+        self._assert_pass(provider="copilot", role="editing", model="claude-sonnet-4.6", effort="medium")
 
     def test_copilot_rejects_direct_claude_4_8_id(self) -> None:
         self._assert_fail(provider="copilot", role="controller", model="claude-opus-4-8", effort="high")

@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added an automatic controller classification for Claude-authored
+  reader-facing Markdown and deterministic `prose check`, conditional `prose
+  prepare`, and preservation-aware `prose verify` commands.
+- Added fail-closed `editing` routes at `medium` effort. Codex Luna is the
+  default; project or machine configuration can select policy-approved Claude
+  Sonnet or Copilot Claude Sonnet for users without OpenAI access, or `null`
+  for deterministic-only checks. Passing prose uses no editor; failing prose
+  permits one sibling-file edit with domain validation, never an automatic
+  overwrite.
+
 ## [0.0.3] - 2026-08-11
 
 ### Changed

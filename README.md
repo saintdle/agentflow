@@ -38,9 +38,16 @@ unrelated projects.
 - Optional observable external-agent sessions through Herdr.
 - Fail-closed preflight, model policy, imported-asset verification, and
   macOS-only hardened subprocess isolation.
+- A conditional prose-quality lane for Claude-authored reader content: free
+  deterministic checks first, then at most one bounded edit through a
+  configurable exact provider route when needed, with source preservation and
+  domain validation. Luna-medium is the default, not a dependency.
 
 Agentflow routes skills; it does not replace domain expertise. A repository's
 own skills and instructions remain authoritative.
+
+See [Conditional prose quality](docs/PROSE_QUALITY.md) for controller-driven
+blog, documentation, and Instruqt examples.
 
 ## How the components fit together
 

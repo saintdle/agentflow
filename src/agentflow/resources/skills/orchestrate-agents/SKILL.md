@@ -23,6 +23,21 @@ Use native subagents by default for bounded work that should run fire-and-forget
 
 Use an observable external session when work is long-running, crosses providers, needs a separate worktree, or is likely to stop for approval or judgment. Prefer Herdr when available and use tmux as the portable fallback. Treat the session tool as a cockpit only. Beads is authoritative when initialized; otherwise use the repository's issues and PRs. Handoff prompts are always transient.
 
+Before dispatch, classify every writable artifact as `reader-facing` or
+`internal`. When Claude or Copilot Claude is the writer of reader-facing
+Markdown such as a blog post, documentation page, or learner-facing lab
+assignment, automatically select the conditional prose-quality lane unless the
+user opts out. Record the classification and writer provider in the handoff.
+After the writer returns, run `agentflow prose prepare` with the matching
+domain profile, required skill, and authoritative domain checks. A passing
+artifact launches no editor. A failing artifact gets exactly one editing pass
+through the exact route configured in `.agentflow/config.json`; the bundled
+default is Codex Luna `medium`, while approved Claude or Copilot routes can be
+selected when OpenAI access is unavailable. Verify the sibling and let the
+controller choose whether to replace the source. With no configured editor,
+report the deterministic findings without launching anything. Never apply this
+lane to chat, code, research notes, reviews, or internal handoffs.
+
 ## Route domain skills
 
 Agentflow routes skills; it does not own domain expertise. Treat the target repository's skills as authoritative for its domain. Inspect the worker's target directory and identify every skill required to complete or review the assignment. Do not rely on a global skill with similar scope when the repository supplies one.

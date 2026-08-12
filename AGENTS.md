@@ -28,6 +28,7 @@
 - Treat project-local domain skills as authoritative. Agentflow routes skills; it does not own domain expertise.
 - Require structured review findings and record controller dispositions. Reproduce accepted high and medium findings before returning them to the writer.
 - Use a cheaper/faster model at low or medium effort for routine scans. Reserve the strongest model and high effort for ambiguous planning, hard debugging, conflict resolution, or final review.
+- Classify writable artifacts before dispatch. For Claude-authored reader-facing Markdown, automatically use the conditional `agentflow prose prepare` lane unless the user opts out. It launches no editor when checks pass and at most one edit through the exact configured, policy-approved route when they fail; the controller validates and accepts any replacement. With no route, report findings without a model call. Exclude code, chat, research notes, reviews, and internal handoffs.
 
 ## GitHub workflow
 

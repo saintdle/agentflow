@@ -75,6 +75,9 @@ writes.
 The initialized model policy is a reference safety policy, not an assertion that a
 model is available to every user. Teams can maintain a versioned policy for
 their approved providers, exact model identifiers, roles, and effort levels.
+The bundled `editing` role permits Codex `gpt-5.6-luna`, Claude Code
+`claude-sonnet-5`, or Copilot `claude-sonnet-4.6`, each at `medium`. The project
+chooses one exact route under `prose.editor`; Luna is the generated default.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
 
 The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
@@ -85,6 +88,29 @@ different permitted level only when the user states one. Keep routine
 implementation on the configured Sonnet or Codex Luna lanes to limit cost.
 Model availability still depends on the user's provider plan, client version,
 and organization policy.
+
+Configure a machine-local alternative without changing the shared project:
+
+```json
+{
+  "schema": "agentflow.project-local@1",
+  "version": 1,
+  "prose": {
+    "editor": {
+      "provider": "copilot",
+      "model": "claude-sonnet-4.6",
+      "effort": "medium",
+      "max_ai_credits": 30
+    }
+  },
+  "skills": []
+}
+```
+
+Set `"editor": null` to keep deterministic prose findings but disable editor
+launches. Explicit CLI editor flags override configuration for one invocation;
+all three route fields are required, Copilot also requires a cap of at least 30
+AI credits, and the model policy still applies.
 
 Newly initialized projects receive these routes automatically. Agentflow does
 not overwrite an existing project's policy during a package upgrade. To adopt
