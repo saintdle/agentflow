@@ -52,6 +52,14 @@ For external handoffs, add one `--require-skill <name>` per required domain skil
 4. Default to three or fewer workers and one delegation level. Use separate worktrees for concurrent Git writers. Without Git, assign disjoint output paths and serialize overlaps.
 5. Keep the controller responsible for user decisions, sequencing, synthesis, and durable state.
 
+The default root mode is controller-only. The controller must not implement
+product-file changes merely because it can; assign each write to an explicit
+execution task. For native Codex delegation from a Sol controller, select the
+managed Luna worker/explorer profile and use `fork_turns="none"` or the
+smallest bounded positive fork. Never allow an omitted model to inherit Sol
+for coding or exploration. Terra is permitted only as an explicitly recorded
+selective execution route. Keep worker subdelegation disabled by default.
+
 A Beads-enabled pull queue must stay inside one approved root. Label work with
 one `af:stage:<name>`, one `af:role:<name>`, and only material
 `af:cap:<name>` requirements. Use `agentflow worker pull` so an actor claims its

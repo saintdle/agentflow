@@ -35,7 +35,7 @@ class SessionControlTests(unittest.TestCase):
         waiting = record_event(new_ledger(), event="watcher", task_class="external-wait")
         self.assertEqual(waiting["last_progress"]["event"], "watcher")
 
-    def test_rotation_is_advisory_after_tasks_or_phases(self) -> None:
+    def test_rotation_is_required_after_tasks_or_phases(self) -> None:
         budget = SessionBudget(rotate_after_completed_tasks=2, rotate_after_phases=2)
         ledger = new_ledger(budget=budget)
         ledger = record_event(
@@ -46,6 +46,7 @@ class SessionControlTests(unittest.TestCase):
             ledger, event="completed", task_class="review", task="two", phase="review"
         )
         self.assertTrue(ledger["rotation"]["recommended"])
+        self.assertTrue(ledger["rotation"]["required"])
         self.assertFalse(ledger["blocked"])
 
     def test_same_named_approach_blocks_at_limit(self) -> None:

@@ -24,7 +24,7 @@ class LoadPolicyTests(unittest.TestCase):
         policy = mp.load_policy()
         self.assertEqual(policy.schema, mp.SCHEMA)
         self.assertEqual(policy.version, 1)
-        self.assertEqual(policy.id, "models-v1")
+        self.assertEqual(policy.id, "models-v2")
         self.assertIn("controller", policy.roles)
         self.assertTrue(policy.routes)
 
@@ -232,14 +232,17 @@ class ProfileAuditTests(unittest.TestCase):
                 ".codex/agents/agentflow-explorer.toml",
                 ".codex/agents/agentflow-pr-gatekeeper.toml",
                 ".codex/agents/agentflow-reviewer.toml",
+                ".codex/agents/agentflow-worker.toml",
                 ".claude/agents/agentflow-controller.md",
                 ".claude/agents/agentflow-explorer.md",
                 ".claude/agents/agentflow-pr-gatekeeper.md",
                 ".claude/agents/agentflow-reviewer.md",
+                ".claude/agents/agentflow-worker.md",
                 ".github/agents/agentflow-controller.agent.md",
                 ".github/agents/agentflow-explorer.agent.md",
                 ".github/agents/agentflow-pr-gatekeeper.agent.md",
                 ".github/agents/agentflow-reviewer.agent.md",
+                ".github/agents/agentflow-worker.agent.md",
             },
         )
 

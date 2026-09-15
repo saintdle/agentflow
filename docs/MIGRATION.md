@@ -11,7 +11,7 @@ inside the supplied legacy checkout are eligible:
 
 - the user-level `agentflow` executable link;
 - bundled Agentflow skill links in supported provider discovery directories;
-- Agentflow controller, explorer, reviewer, and PR-gatekeeper profile links;
+- Agentflow controller, worker, explorer, reviewer, and PR-gatekeeper profile links;
 - the Agentflow Codex hook link.
 
 The replacement executable must already be a packaged `0.0.4` command in an

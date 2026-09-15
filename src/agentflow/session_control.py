@@ -54,7 +54,7 @@ def _now() -> str:
 
 @dataclass(frozen=True)
 class SessionBudget:
-    """Advisory controller-context limits plus one enforced retry limit."""
+    """Controller-context rotation limits plus one enforced retry limit."""
 
     rotate_after_completed_tasks: int = 4
     rotate_after_phases: int = 2
@@ -90,7 +90,7 @@ def new_ledger(*, budget: SessionBudget | None = None) -> dict[str, Any]:
         "last_progress": {},
         "blocked": False,
         "block_reason": "",
-        "rotation": {"recommended": False, "reasons": []},
+        "rotation": {"recommended": False, "required": False, "reasons": []},
         "budget": policy.to_dict(),
     }
 
@@ -118,9 +118,10 @@ def record_event(
 ) -> dict[str, Any]:
     """Return an updated durable ledger.
 
-    Rotation thresholds are advisory so an autonomous deterministic controller
-    can finish its root.  The same-approach failure limit is a real halt signal:
-    callers must persist a blocker/decision instead of silently retrying.
+    Rotation becomes required only at a completed-task/phase boundary.  The
+    workflow root remains resumable: a new controller invocation acknowledges
+    the durable packet and begins the next context generation.  The
+    same-approach failure limit remains a terminal decision signal.
     """
 
     if event not in EVENTS:
@@ -178,7 +179,11 @@ def record_event(
             f"{len(completed_phases)} phases completed in this controller context "
             f"(budget {policy.rotate_after_phases})"
         )
-    current["rotation"] = {"recommended": bool(reasons), "reasons": reasons}
+    current["rotation"] = {
+        "recommended": bool(reasons),
+        "required": bool(reasons),
+        "reasons": reasons,
+    }
     return current
 
 

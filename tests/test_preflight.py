@@ -26,7 +26,7 @@ def _minimal_spec(**kwargs) -> LaunchSpec:
         provider="copilot",
         role="coding",
         effort="medium",
-        policy_version="models-v1",
+        policy_version="models-v2",
         lease_id="lease-1",
         claim_id="claim-1",
         handoff="handoff-1",

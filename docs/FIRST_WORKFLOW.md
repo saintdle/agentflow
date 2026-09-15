@@ -9,7 +9,7 @@ Agentflow controller dispatch it through Herdr, and records evidence before the
 controller declares the goal complete. Run it in an existing Git repository
 after installing Beads, Herdr, Agentflow, and the selected provider CLI.
 
-The example uses the Codex coding route bundled in `models-v1`. If that route is
+The example uses the Codex coding route bundled in `models-v2`. If that route is
 not available to you, first replace all four launch values—provider, model,
 role, and effort—with one exact route approved by your project policy.
 

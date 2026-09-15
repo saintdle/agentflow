@@ -24,7 +24,28 @@ An initialized project starts with a schema-versioned configuration like this:
 {
   "schema": "agentflow.project@1",
   "version": 1,
-  "model_policy": ".agentflow/models-v1.json",
+  "model_policy": ".agentflow/models-v2.json",
+  "prose": {
+    "editor": {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "medium"
+    }
+  },
+  "execution": {
+    "controller_only": true,
+    "max_parallel_workers": 3,
+    "max_delegation_depth": 1,
+    "max_attempts_per_task": 2,
+    "launch_budget_multiplier": 2,
+    "max_expensive_execution_children": 0
+  },
+  "guidance": {
+    "strategic_compaction": false,
+    "verification": false,
+    "context_pressure_percent": 75,
+    "max_children_per_parent": 12
+  },
   "skills": [
     {
       "name": "my-domain-skill",
@@ -89,6 +110,43 @@ implementation on the configured Sonnet or Codex Luna lanes to limit cost.
 Model availability still depends on the user's provider plan, client version,
 and organization policy.
 
+Codex Terra is permitted, not banned. It is a selective execution route for
+coding or exploration at `medium` or `high`: the approved task must persist the
+exact `gpt-5.6-terra` route, set `selective_model=true`, and explain why Luna is
+not sufficient. An unmarked Terra launch fails closed. Generic, Auto, and Haiku
+routes remain disallowed.
+
+## Controller-only execution policy
+
+The default controller shapes the root, dispatches work, evaluates returned
+evidence, and integrates accepted results; it does not edit product files.
+Routine coding and exploration use Luna or Sonnet worker profiles. A native
+Codex worker should receive `fork_turns="none"` or the smallest bounded context
+fork so it cannot silently inherit an expensive Sol controller context.
+
+Launch admission uses the `execution` values above. The root launch budget is
+the number of planned launchable tasks multiplied by
+`launch_budget_multiplier`; retries consume the same budget as first attempts.
+The parallel-worker, delegation-depth, per-task retry, and expensive execution
+caps are also enforced before Herdr spawn.
+
+A workflow may persist a complete root-specific override in its Beads metadata:
+
+```json
+{
+  "schema": "agentflow.execution-policy@1",
+  "controller_only": true,
+  "max_parallel_workers": 2,
+  "max_delegation_depth": 1,
+  "max_attempts_per_task": 2,
+  "launch_budget_multiplier": 2,
+  "max_expensive_execution_children": 0
+}
+```
+
+Partial or untyped root overrides fail closed. Omit the root override to use the
+project policy.
+
 Configure a machine-local alternative without changing the shared project:
 
 ```json
@@ -119,8 +177,9 @@ replace the project's configured policy only after approval, and then refresh
 and migrate the managed profiles:
 
 ```sh
-diff -u .agentflow/models-v1.json /path/to/agentflow/policies/models-v1.json
-cp /path/to/agentflow/policies/models-v1.json .agentflow/models-v1.json
+diff -u .agentflow/models-v1.json /path/to/agentflow/policies/models-v2.json
+cp /path/to/agentflow/policies/models-v2.json .agentflow/models-v2.json
+# Then set model_policy to .agentflow/models-v2.json in the shared config.
 agentflow install --refresh-bundled
 agentflow policy migrate --root . --dry-run
 agentflow policy migrate --root .
@@ -139,17 +198,51 @@ bring domain expertise without modifying Agentflow. See [SKILLS.md](SKILLS.md).
 ## Controller context budgets
 
 Controller context budgets measure durable workflow evidence rather than
-provider token estimates. The current defaults recommend a fresh controller
-chat after four completed tasks or two completed workflow phases, and halt after
-two failures of the same explicitly named approach. Rotation thresholds are
-advisory so the deterministic controller can continue autonomously through its
-approved root. The repeated-approach limit is enforced and creates a durable
-decision point.
+provider token estimates. The current defaults require rotation after four
+completed tasks or two completed workflow phases, and halt after two failures
+of the same explicitly named approach. Agentflow waits for a safe boundary: the
+current result is authenticated and dispositioned before another wave stops.
+The next authenticated `controller resume` advances only the context generation
+and continues from the protected packet; root, claims, budgets, permissions,
+and evidence remain unchanged.
 
 Use `agentflow controller progress` to supply different positive thresholds for
 a workflow invocation. The resulting policy and evidence live in the ignored,
-root-namespaced controller state. They are not project-wide instructions and do
-not contain provider transcripts.
+root-namespaced controller state and do not contain provider transcripts.
+
+## Context audit and optional guidance
+
+After a metadata-only history sync, audit the last 30 days:
+
+```sh
+agentflow history sync --dry-run
+agentflow history sync
+agentflow context audit --root . --days 30
+```
+
+The audit reads only the sanitized archive manifest. When available, it reports
+provider, exact model, effort, role, lineage depth, recorded token counters, and
+peak context pressure. It flags expensive models used for execution, excessive
+child/depth budgets, ambiguous models, and selective Terra use for review.
+Provider dashboards remain authoritative for billed usage.
+
+`guidance.strategic_compaction` adds transcript-free compaction guidance to the
+audit. `guidance.verification` adds a deterministic, planned-only verification
+section to `controller status`. Both default to `false`; calling
+`agentflow context compact` or `agentflow verify plan` is also an explicit
+one-time opt-in. Verification guidance never runs checks or marks them passed.
+
+Existing schema-v1 configs remain valid when `execution` and `guidance` are
+absent; safe defaults are applied at runtime. To install the new worker profiles
+and refresh only Agentflow-managed profiles, review and run:
+
+```sh
+agentflow install --dry-run
+agentflow install --refresh-bundled
+agentflow policy migrate --root . --dry-run
+agentflow policy migrate --root .
+agentflow policy audit --root .
+```
 
 ## CodeBurn advisory reports
 

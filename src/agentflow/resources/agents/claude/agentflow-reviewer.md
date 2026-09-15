@@ -4,7 +4,7 @@ description: Review a bounded diff for correctness, security, regressions, and m
 tools: Read, Grep, Glob, Bash
 model: claude-opus-4-8
 effort: high
-policy: models-v1
+policy: models-v2
 permissionMode: plan
 ---
 

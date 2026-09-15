@@ -27,15 +27,19 @@ unrelated projects.
 
 - A controller workflow built around goals, bounded assignments, claims,
   acceptance evidence, review, and integration.
-- Task-aware controller context budgets and transcript-free fresh-chat rotation,
-  so long workflows resume from durable state instead of accumulating chat history.
+- Controller-only orchestration with graph-derived launch, parallelism, depth,
+  retry, and expensive-model budgets.
+- Metadata-only context auditing and required safe-boundary rotation, so long
+  workflows resume from durable state instead of accumulating chat history.
 - Provider-neutral handoffs for Codex, Claude Code, and GitHub Copilot CLI.
 - Beads-backed durable coordination, including Git-backed and Gitless work.
-- Seven bundled generic workflow skills and four provider-role profiles for
+- Seven bundled generic workflow skills and five provider-role profiles for
   each supported coding-agent provider.
 - Project initialization that preserves existing agent instructions and hooks.
 - Config-driven discovery and installation of your own skills.
 - Optional observable external-agent sessions through Herdr.
+- Beads/Herdr lifecycle reconciliation for claims, sessions, results, and
+  dispositions.
 - Fail-closed preflight, model policy, imported-asset verification, and
   macOS-only hardened subprocess isolation.
 - A conditional prose-quality lane for Claude-authored reader content: free
@@ -135,8 +139,8 @@ agentflow doctor
 ```
 
 The wheel contains Agentflow's seven generic workflow skills and the controller,
-explorer, reviewer, and pull-request gatekeeper profiles for each supported
-provider. Preview and then install those bundled assets separately:
+worker, explorer, reviewer, and pull-request gatekeeper profiles for each
+supported provider. Preview and then install those bundled assets separately:
 
 ```sh
 agentflow install --dry-run
@@ -185,6 +189,16 @@ For local optimization evidence, `agentflow usage optimize --codeburn <report>`
 reconciles CodeBurn JSON with Agentflow delivery records while keeping savings
 estimates explicitly advisory.
 
+Audit recent model routing, lineage, recorded token counters, and context
+pressure without copying provider transcripts:
+
+```sh
+agentflow history sync --dry-run
+agentflow history sync
+agentflow context audit --root . --days 30
+agentflow herdr reconcile --root . --workflow-root <root-id>
+```
+
 ## Bring your own skills
 
 Bundled Agentflow workflow skills are installed by `agentflow install`. The
@@ -231,6 +245,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 - [Transactional legacy cutover and rollback](docs/MIGRATION.md)
 - [First workflow tutorial](docs/FIRST_WORKFLOW.md)
 - [Configuration](docs/CONFIGURATION.md)
+- [Local session history and context audit](docs/HISTORY.md)
 - [Bring your own skills](docs/SKILLS.md)
 - [Workflow guide](docs/WORKFLOW.md)
 - [Security model](docs/SECURITY.md)

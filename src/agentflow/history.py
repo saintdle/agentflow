@@ -117,6 +117,17 @@ class SessionRecord:
     started_at: str = ""
     ended_at: str = ""
     parent_ref: str = ""
+    models: tuple[str, ...] = ()
+    efforts: tuple[str, ...] = ()
+    role: str = ""
+    thread_source: str = ""
+    delegation_depth: int = 0
+    total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    context_window_tokens: int = 0
+    peak_context_tokens: int = 0
     diagnostics: tuple[str, ...] = ()
 
     @property
@@ -141,6 +152,17 @@ class SessionRecord:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "parent_ref": self.parent_ref,
+            "models": list(self.models),
+            "efforts": list(self.efforts),
+            "role": self.role,
+            "thread_source": self.thread_source,
+            "delegation_depth": self.delegation_depth,
+            "total_tokens": self.total_tokens,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "context_window_tokens": self.context_window_tokens,
+            "peak_context_tokens": self.peak_context_tokens,
             "diagnostics": list(self.diagnostics),
         }
 
@@ -424,6 +446,8 @@ def _copilot_cli_record(directory: Path, *, home: Path | None = None) -> Session
     source_id = _safe_filename_identity(directory.name)
     event_session_id = ""
     terminal = False
+    models: list[str] = []
+    efforts: list[str] = []
     diagnostics: list[str] = []
     if not filename_id:
         diagnostics.append("invalid_directory_session_id")
@@ -449,8 +473,28 @@ def _copilot_cli_record(directory: Path, *, home: Path | None = None) -> Session
                     diagnostics.append("invalid_timestamp")
                 if event_type == "session.start":
                     data = value.get("data")
-                    if isinstance(data, dict) and isinstance(data.get("sessionId"), str):
-                        event_session_id = _canonical_uuid(data["sessionId"])
+                    if isinstance(data, dict):
+                        if isinstance(data.get("sessionId"), str):
+                            event_session_id = _canonical_uuid(data["sessionId"])
+                        raw_model = data.get("selectedModel")
+                        if isinstance(raw_model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", raw_model):
+                            if raw_model not in models:
+                                models.append(raw_model)
+                        raw_effort = data.get("reasoningEffort")
+                        if isinstance(raw_effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", raw_effort):
+                            if raw_effort not in efforts:
+                                efforts.append(raw_effort)
+                if event_type == "session.model_change":
+                    data = value.get("data")
+                    if isinstance(data, dict):
+                        raw_model = data.get("newModel")
+                        if isinstance(raw_model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", raw_model):
+                            if raw_model not in models:
+                                models.append(raw_model)
+                        raw_effort = data.get("reasoningEffort")
+                        if isinstance(raw_effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", raw_effort):
+                            if raw_effort not in efforts:
+                                efforts.append(raw_effort)
                 if event_type in {"session.end", "session.shutdown", "session.stop"}:
                     terminal = True
     except OSError:
@@ -494,6 +538,8 @@ def _copilot_cli_record(directory: Path, *, home: Path | None = None) -> Session
         workspace_refs=tuple(filter(None, (_workspace_yaml_ref(workspace),))),
         started_at=min(timestamps) if timestamps else "",
         ended_at=max(timestamps) if timestamps else "",
+        models=tuple(models),
+        efforts=tuple(efforts),
         diagnostics=tuple(diagnostics),
     )
 
@@ -739,6 +785,19 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
     meta_id = ""
     workspace_ref = ""
     parent_ref = ""
+    models: list[str] = []
+    efforts: list[str] = []
+    role = ""
+    thread_source = ""
+    delegation_depth = 0
+    token_usage = {
+        "total_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    context_window_tokens = 0
+    peak_context_tokens = 0
     timestamps: list[str] = []
     terminal = False
     saw_meta = False
@@ -773,6 +832,22 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                             parent_ref = _normalized_parent(payload.get("parent_thread_id"))
                             if not parent_ref:
                                 diagnostics.append("invalid_parent_ref_dropped")
+                        raw_thread_source = payload.get("thread_source")
+                        if isinstance(raw_thread_source, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", raw_thread_source):
+                            thread_source = raw_thread_source
+                        source = payload.get("source")
+                        subagent = source.get("subagent") if isinstance(source, dict) else None
+                        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                        if isinstance(spawn, dict):
+                            nested_parent = _normalized_parent(spawn.get("parent_thread_id"))
+                            if nested_parent:
+                                parent_ref = nested_parent
+                            raw_role = spawn.get("agent_role")
+                            if isinstance(raw_role, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", raw_role):
+                                role = raw_role
+                            raw_depth = spawn.get("depth")
+                            if isinstance(raw_depth, int) and not isinstance(raw_depth, bool) and raw_depth >= 0:
+                                delegation_depth = raw_depth
                         timestamp = _normalize_timestamp(payload.get("timestamp"))
                         if timestamp:
                             timestamps.append(timestamp)
@@ -783,9 +858,42 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                     timestamps.append(timestamp)
                 elif value.get("timestamp") is not None:
                     diagnostics.append("invalid_timestamp")
+                if value.get("type") == "turn_context" and isinstance(payload, dict):
+                    raw_model = payload.get("model")
+                    if isinstance(raw_model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", raw_model):
+                        if raw_model not in models:
+                            models.append(raw_model)
+                    raw_effort = payload.get("effort")
+                    if isinstance(raw_effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", raw_effort):
+                        if raw_effort not in efforts:
+                            efforts.append(raw_effort)
                 if value.get("type") == "event_msg" and isinstance(payload, dict):
                     if payload.get("type") in {"task_complete", "turn_aborted", "session_configured"}:
                         terminal = payload.get("type") in {"task_complete", "turn_aborted"} or terminal
+                    if payload.get("type") == "token_count" and isinstance(payload.get("info"), dict):
+                        info = payload["info"]
+                        total = info.get("total_token_usage")
+                        last = info.get("last_token_usage")
+                        raw_window = info.get("model_context_window")
+                        if isinstance(raw_window, int) and not isinstance(raw_window, bool) and raw_window > 0:
+                            context_window_tokens = max(context_window_tokens, raw_window)
+                        if isinstance(last, dict):
+                            raw_peak = last.get("total_tokens")
+                            if isinstance(raw_peak, int) and not isinstance(raw_peak, bool) and raw_peak >= 0:
+                                peak_context_tokens = max(peak_context_tokens, raw_peak)
+                        if isinstance(total, dict):
+                            raw_total = total.get("total_tokens")
+                            if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= token_usage["total_tokens"]:
+                                def token_value(name: str) -> int:
+                                    candidate = total.get(name)
+                                    return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0 else 0
+
+                                token_usage = {
+                                    "total_tokens": raw_total,
+                                    "input_tokens": token_value("input_tokens"),
+                                    "output_tokens": token_value("output_tokens"),
+                                    "reasoning_tokens": token_value("reasoning_output_tokens"),
+                                }
     except OSError:
         malformed += 1
     if not saw_meta:
@@ -834,6 +942,17 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
         started_at=min(timestamps) if timestamps else "",
         ended_at=max(timestamps) if timestamps else "",
         parent_ref=parent_ref,
+        models=tuple(models),
+        efforts=tuple(efforts),
+        role=role,
+        thread_source=thread_source,
+        delegation_depth=delegation_depth,
+        total_tokens=token_usage["total_tokens"],
+        input_tokens=token_usage["input_tokens"],
+        output_tokens=token_usage["output_tokens"],
+        reasoning_tokens=token_usage["reasoning_tokens"],
+        context_window_tokens=context_window_tokens,
+        peak_context_tokens=peak_context_tokens,
         diagnostics=tuple(diagnostics),
     )
 
@@ -861,6 +980,13 @@ def _claude_record(path: Path, *, home: Path | None = None) -> SessionRecord:
     canonical_ids: set[str] = set()
     timestamps: list[str] = []
     terminal = False
+    models: list[str] = []
+    efforts: list[str] = []
+    role = ""
+    thread_source = ""
+    input_tokens = 0
+    output_tokens = 0
+    usage_message_ids: set[str] = set()
     diagnostics: list[str] = []
     workspace_ref = _workspace_ref(path.parent.name)
     if not filename_id:
@@ -893,6 +1019,35 @@ def _claude_record(path: Path, *, home: Path | None = None) -> SessionRecord:
                     diagnostics.append("invalid_timestamp")
                 if isinstance(value.get("cwd"), str):
                     workspace_ref = _workspace_ref(value["cwd"])
+                if value.get("isSidechain") is True:
+                    role = "worker"
+                    thread_source = "subagent"
+                message = value.get("message")
+                if value.get("type") == "assistant" and isinstance(message, dict):
+                    raw_model = message.get("model")
+                    if isinstance(raw_model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", raw_model):
+                        if raw_model not in models:
+                            models.append(raw_model)
+                    raw_effort = value.get("effort") or value.get("perTurnEffort")
+                    if isinstance(raw_effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", raw_effort):
+                        if raw_effort not in efforts:
+                            efforts.append(raw_effort)
+                    message_id = message.get("id")
+                    usage_key = message_id if isinstance(message_id, str) and message_id else f"row:{count}"
+                    usage = message.get("usage")
+                    if usage_key not in usage_message_ids and isinstance(usage, dict):
+                        usage_message_ids.add(usage_key)
+
+                        def usage_value(name: str) -> int:
+                            candidate = usage.get(name)
+                            return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0 else 0
+
+                        input_tokens += (
+                            usage_value("input_tokens")
+                            + usage_value("cache_read_input_tokens")
+                            + usage_value("cache_creation_input_tokens")
+                        )
+                        output_tokens += usage_value("output_tokens")
                 if value.get("type") in {"result", "sessionEnd", "last-prompt"}:
                     terminal = True
     except OSError:
@@ -942,6 +1097,13 @@ def _claude_record(path: Path, *, home: Path | None = None) -> SessionRecord:
         workspace_refs=(workspace_ref,),
         started_at=min(timestamps) if timestamps else "",
         ended_at=max(timestamps) if timestamps else "",
+        models=tuple(models),
+        efforts=tuple(efforts),
+        role=role,
+        thread_source=thread_source,
+        total_tokens=input_tokens + output_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         diagnostics=tuple(diagnostics),
     )
 

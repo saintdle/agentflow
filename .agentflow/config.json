@@ -1,6 +1,20 @@
 {
   "schema": "agentflow.project@1",
   "version": 1,
-  "model_policy": "policies/models-v1.json",
+  "model_policy": "policies/models-v2.json",
+  "execution": {
+    "controller_only": true,
+    "max_parallel_workers": 3,
+    "max_delegation_depth": 1,
+    "max_attempts_per_task": 2,
+    "launch_budget_multiplier": 2,
+    "max_expensive_execution_children": 0
+  },
+  "guidance": {
+    "strategic_compaction": false,
+    "verification": false,
+    "context_pressure_percent": 75,
+    "max_children_per_parent": 12
+  },
   "skills": []
 }

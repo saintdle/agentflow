@@ -6,6 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added controller-only execution admission with graph-derived launch budgets,
+  parallel/depth/retry caps, expensive execution limits, and complete typed
+  Beads-root overrides.
+- Added dedicated Luna/Sonnet worker profiles for Codex, Claude Code, and
+  GitHub Copilot, plus bounded native-context routing guidance.
+- Added metadata-only model, effort, lineage, token, and context-pressure audit
+  across the provider history formats that expose those fields.
+- Added Beads/Herdr lifecycle reconciliation and optional transcript-free
+  strategic-compaction and planned-only verification guidance.
+
+### Changed
+
+- Controller rotation is now required at a safe disposition boundary and the
+  next authenticated resume advances the context generation without replacing
+  the workflow root.
+- Codex Terra is an approved selective coding/exploration route; it requires an
+  explicit persisted selection. Generic, Auto, and Haiku routes still fail
+  closed.
+- Legacy schema-v1 project configs remain valid and receive safe runtime
+  defaults for the new execution and guidance sections.
+
 ## [0.0.4] - 2026-08-12
 
 ### Added
