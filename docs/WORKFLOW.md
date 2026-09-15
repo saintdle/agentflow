@@ -11,13 +11,16 @@ The approved root controller advances the graph until the goal is complete or
 a durable decision is required. Provider panes and individual tasks are
 intermediate state, not completion signals.
 
-One controller chat should own one approved root. Related review and remediation
+One controller chat should own one approved root. The default controller is
+controller-only: it shapes, routes, dispositions, and integrates while bounded
+workers perform product-file edits. Related review and remediation
 remain children of that root; a materially different goal starts a new root in a
 fresh chat. Agentflow records a task-aware session budget and can produce a
 minimal `controller rotate` packet so another chat resumes from Beads and
-controller state rather than replaying a transcript. Rotation advice never
-interrupts an autonomous root. Repeating the same named failed approach twice
-does create a durable decision halt.
+controller state rather than replaying a transcript. A required rotation waits
+until the current worker result is safely dispositioned, then stops before the
+next wave. Repeating the same named failed approach twice also creates a durable
+decision halt.
 
 ```mermaid
 stateDiagram-v2
@@ -72,6 +75,12 @@ graph or treat a disconnected chat as a new workflow.
 8. Review changes independently and route accepted corrections to their owner.
 9. Integrate ready work in priority/FIFO order and validate the original goal.
 
+The root execution policy derives its launch budget from graph size and bounds
+parallel workers, delegation depth, per-task attempts, and expensive execution
+children. Luna and Sonnet are the normal coding/exploration routes. Sol and Opus
+remain controller/judgment/review routes. Terra is available only through an
+explicitly selected exact route with a persisted rationale.
+
 ## Execution lanes
 
 Use native subagents for bounded, fire-and-forget work. Use Herdr or `tmux` for
@@ -81,6 +90,9 @@ signal, never proof of correctness or completion.
 
 External launches consume provider allowance and therefore remain explicit
 unless an approved controller is operating within its recorded budget.
+Native Codex workers use a dedicated Luna profile with no inherited controller
+conversation (`fork_turns="none"`) or the smallest context slice that contains
+the task contract.
 
 ## Durable Beads coordination
 
@@ -99,6 +111,17 @@ ready or assigned does not prove that a worker session is live.
 Gitless projects can use Beads and Agentflow runtime state without inventing
 branches, commits, pull requests, or merge gates. Serialize overlapping file
 writes in that mode.
+
+Compare Beads claims and dispositions with Herdr sessions whenever status is
+unclear:
+
+```sh
+agentflow herdr reconcile --root . --workflow-root <root-id>
+```
+
+The report distinguishes claims without sessions, active sessions for terminal
+Beads, results awaiting disposition, and sessions outside the requested root.
+It does not treat a closed Bead or pane exit alone as authenticated completion.
 
 ## Skill routing
 

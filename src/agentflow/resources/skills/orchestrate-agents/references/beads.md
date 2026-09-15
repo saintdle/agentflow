@@ -153,6 +153,8 @@ Keep one approved workflow root per controller chat. Related review and fixes
 remain under that root; a materially different goal gets a new root and fresh
 chat. When `agentflow controller status` recommends rotation, finish the current
 safe boundary and run `agentflow controller rotate` to generate a transcript-free
-resume packet. Rotation is advisory and must not interrupt an autonomous root.
+resume packet. Rotation waits for a safe result-disposition boundary, then
+stops before another wave until an authenticated resume advances the context
+generation.
 After two failures of the same named approach, record a durable blocker or
 decision instead of silently retrying.

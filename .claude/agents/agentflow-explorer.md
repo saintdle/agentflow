@@ -4,7 +4,7 @@ description: Perform fast read-only exploration and return concise evidence with
 tools: Read, Grep, Glob, Bash
 model: claude-sonnet-5
 effort: medium
-policy: models-v1
+policy: models-v2
 permissionMode: plan
 ---
 

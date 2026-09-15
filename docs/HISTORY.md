@@ -8,7 +8,11 @@ sessions. This feature is optional and is not required for orchestration.
 History synchronization fingerprints provider files in place. It does not copy
 prompt text, responses, reasoning, tool input or output, credentials, or full
 transcripts into the archive. Records contain only bounded metadata and
-provenance needed to locate or classify an original session.
+provenance needed to locate or classify an original session. Where provider
+formats expose it, Agentflow also records exact model, effort, role, parent
+identity, delegation depth, and numeric token/context counters. Claude Code and
+Copilot CLI contribute the bounded fields they expose; unavailable fields
+remain empty rather than being inferred.
 
 The archive is private local state. Keep it outside repositories with
 owner-only permissions and never attach it wholesale to an issue or support
@@ -21,6 +25,7 @@ agentflow history status
 agentflow history sync --dry-run
 agentflow history sync
 agentflow history pending --limit 20
+agentflow context audit --root . --days 30
 ```
 
 Dry-run before the first synchronization and after provider upgrades. Provider
@@ -60,3 +65,16 @@ agentflow history schedule uninstall
 
 Scheduling support is platform-specific. Uninstalling the schedule does not
 delete the archive.
+
+## Context and routing audit
+
+`agentflow context audit` reads the sanitized manifest, never the raw provider
+files. It reports aggregate model/role counts and stable history Bead IDs for
+anomalies such as expensive execution routes, excessive child/depth budgets,
+ambiguous models, and high recorded context pressure. Token counters are
+provider metadata and are not billing evidence.
+
+Use `agentflow context compact` for an explicit one-time, transcript-free
+compaction recommendation. It tells the controller to persist decisions and
+evidence, disposition the current result, rotate only at a safe boundary, and
+resume the same root from protected state.

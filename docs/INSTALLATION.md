@@ -66,8 +66,9 @@ It does not authenticate provider tools or guarantee provider allowance.
 ## Install bundled workflow assets
 
 The wheel ships seven generic Agentflow workflow skills plus the controller,
-explorer, reviewer, and pull-request gatekeeper profiles for Codex, Claude Code,
-and GitHub Copilot CLI. Inspect the planned destinations, then install them:
+worker, explorer, reviewer, and pull-request gatekeeper profiles for Codex,
+Claude Code, and GitHub Copilot CLI. Inspect the planned destinations, then
+install them:
 
 ```sh
 agentflow install --dry-run
@@ -106,6 +107,12 @@ agentflow install --refresh-bundled
 agentflow doctor
 agentflow skills doctor
 ```
+
+When an upgrade introduces a new model-policy file, Agentflow preserves the
+project's existing policy. Review the versioned policy diff, copy the new file
+beside the old one, update `model_policy` in `.agentflow/config.json`, and run
+`agentflow policy migrate --root . --dry-run` before applying managed-profile
+changes. See [Configuration](CONFIGURATION.md#model-policy).
 
 Read `CHANGELOG.md` before every `0.x` upgrade. Back up shared configuration and
 Beads state before applying a documented migration.

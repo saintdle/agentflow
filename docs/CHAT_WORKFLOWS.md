@@ -142,10 +142,13 @@ wait through a deterministic watcher or state change. It does not use a generic
 "ten minutes without an edit" halt because that would misclassify legitimate
 read-only and runtime work.
 
-`controller status` includes a `session_control.rotation` advisory after the
-configured number of completed tasks or phases. The deterministic controller is
-allowed to finish its current root; the advisory does not interrupt workers. At
-a safe chat boundary, ask the agent to run:
+`controller status` includes `session_control.rotation`. After the configured
+number of completed tasks or phases it becomes required, but only after the
+current worker result has been authenticated and dispositioned. Agentflow then
+stops before launching another wave and writes a protected, transcript-free
+handoff packet. In the same or a fresh chat, send the normal resume request; an
+authenticated `controller resume` acknowledges the rotation and continues the
+same root. You can also create the packet explicitly at a safe boundary:
 
 ```sh
 agentflow controller rotate \
@@ -159,6 +162,16 @@ packet contains the root, checkpoint, ready task summaries, and continuity
 identity. It never contains the prior transcript, resume secret, signing key, or
 provider credentials. Paste the returned prompt into a fresh agent chat opened
 in the same workspace.
+
+For a read-only cost and context review, ask the chat to run:
+
+```text
+Synchronize Agentflow's local session-history metadata, then run a 30-day
+context audit. Do not read or copy provider transcript content. Explain any
+expensive execution routes, excessive delegation, context pressure, or
+unattributed sessions in plain language, and recommend only bounded policy
+changes. Provider billing pages remain authoritative for cost.
+```
 
 When an approach fails, name it precisely. A controller can record the failure:
 

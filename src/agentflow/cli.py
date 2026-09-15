@@ -30,6 +30,9 @@ from agentflow import audit as audit_backend
 from agentflow import beads as beads_backend
 from agentflow import checkpoint as checkpoint_backend
 from agentflow import controller as controller_backend
+from agentflow import context_budget as context_budget_backend
+from agentflow import execution as execution_backend
+from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
 from agentflow import migration as migration_backend
@@ -38,6 +41,7 @@ from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
 from agentflow import isolation as isolation_backend
 from agentflow import readiness as readiness_backend
+from agentflow import reconciliation as reconciliation_backend
 from agentflow import search as search_backend
 from agentflow import session_control as session_control_backend
 from agentflow import usage as usage_backend
@@ -559,7 +563,7 @@ def _has_authenticated_herdr_result(record: Mapping[str, Any]) -> bool:
     )
 
 
-def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, str]:
+def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
     """Read the exact provider/model/effort/role route a ready task declares.
 
     A launchable descendant must carry ``metadata.agentflow.launch =
@@ -577,6 +581,9 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, str]:
         "model": str(launch.get("model") or ""),
         "effort": str(launch.get("effort") or ""),
         "role": str(launch.get("role") or ""),
+        "selective_model": launch.get("selective_model") is True,
+        "delegation_depth": int(launch.get("delegation_depth") or 0),
+        "fork_context": str(launch.get("fork_context") or ""),
     }
 
 
@@ -638,6 +645,7 @@ def _run_actual_root_preflight(
     model: str,
     effort: str,
     handoff: provider_argv_backend.ConfinedHandoff,
+    selective_model: bool = False,
 ) -> tuple[dict[str, Any], str]:
     """Run the public root preflight against the materialized launch inputs."""
     manifest = handoff.manifest
@@ -662,10 +670,11 @@ def _run_actual_root_preflight(
         root=str(root), base=base, context=list(context_values),
         boundary=str(manifest.get("output_boundary") or ""), matrix=list(acceptance_ids),
         tool=list(required_tools), provider=provider, role=role, model=model, effort=effort,
-        policy_version="models-v1", workflow_root=workflow_root, task=task_id, actor=actor,
+        policy_version="", workflow_root=workflow_root, task=task_id, actor=actor,
         session_id=session_name, lease=lease, claim=claim, handoff=str(handoff.path),
         herdr_session=session_name, herdr_protocol="agentflow.herdr@1", duplicate_session=[],
         external=False, authenticated_confinement=True, json=True,
+        selective_model=selective_model,
     )
     output = io.StringIO()
     with redirect_stdout(output), redirect_stderr(io.StringIO()):
@@ -686,7 +695,7 @@ def _dispatch_via_herdr(
 
     Returned outcomes are always one of ``running`` (an actual Herdr binding
     was recorded) or ``blocked`` (a terminal controller halt: no exact
-    launch route, an unapproved models-v1 route, a failing root preflight,
+    launch route, an unapproved configured-policy route, a failing root preflight,
     or the real Herdr launch failed) -- never a fabricated session or a
     silent skip.
     """
@@ -698,6 +707,51 @@ def _dispatch_via_herdr(
         issue = beads_backend.get_issue(cwd, task_id)
         launch_meta = _launch_task_metadata(issue)
         if not all(launch_meta.get(field) for field in ("provider", "model", "effort", "role")):
+            return {"state": "blocked", "session_id": ""}
+        try:
+            # Projects created before execution policy was introduced may not
+            # have an Agentflow config at all (the lifecycle also supports
+            # ephemeral test and gitless roots).  Absence gets the safe
+            # packaged defaults; an existing malformed config still fails
+            # closed instead of being silently ignored.
+            if project_config_backend.config_path(root).exists():
+                config = project_config_backend.load(root)
+            else:
+                config = project_config_backend.default_data()
+            settings = project_config_backend.execution_settings(config)
+            root_issue = beads_backend.get_issue(cwd, workflow_root)
+            root_metadata = root_issue.get("metadata")
+            root_agentflow = root_metadata.get("agentflow") if isinstance(root_metadata, Mapping) else None
+            root_execution = root_agentflow.get("execution") if isinstance(root_agentflow, Mapping) else None
+            launch_policy = execution_backend.policy_from_root_metadata(
+                root_execution, fallback=settings
+            )
+            current_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+            session_values = [
+                value for value in current_state.get("sessions", {}).values()
+                if isinstance(value, Mapping)
+            ]
+            total_attempts, active_workers, expensive_children = execution_backend.summarize_attempts(session_values)
+            existing = current_state.get("sessions", {}).get(task_id)
+            task_attempt = int(existing.get("attempt") or 0) + 1 if isinstance(existing, Mapping) else 1
+            descendants = beads_backend.root_descendants(cwd, workflow_root)
+            planned_tasks = sum(bool(_launch_task_metadata(item)) for item in descendants)
+            admission = execution_backend.evaluate_launch(
+                policy=launch_policy, model=launch_meta["model"], role=launch_meta["role"],
+                task_attempt=task_attempt, total_attempts=total_attempts,
+                planned_tasks=max(1, planned_tasks), active_workers=active_workers,
+                delegation_depth=int(launch_meta.get("delegation_depth") or 0),
+                selective_model=bool(launch_meta.get("selective_model")),
+                expensive_execution_children=expensive_children,
+            )
+            if not admission.allowed:
+                beads_backend.add_comment(
+                    cwd, task_id,
+                    "agentflow execution admission blocked: "
+                    + "; ".join(finding.message for finding in admission.findings),
+                )
+                return {"state": "blocked", "session_id": ""}
+        except (project_config_backend.ConfigError, execution_backend.ExecutionPolicyError, ValueError):
             return {"state": "blocked", "session_id": ""}
 
         # AFREL-030: every spawn is gated by the SAME mandatory root
@@ -742,6 +796,7 @@ def _dispatch_via_herdr(
                 actor=lease.controller, claim=claim_token or claim_id, lease=lease.token,
                 session_name=session_name, provider=launch_meta["provider"],
                 role=launch_meta["role"], model=launch_meta["model"], effort=launch_meta["effort"],
+                selective_model=bool(launch_meta.get("selective_model")),
                 handoff=handoff,
             )
         except ValueError:
@@ -764,6 +819,7 @@ def _dispatch_via_herdr(
             acceptance_ids=acceptance_ids,
             dry_run=False, json=True, workflow_root=workflow_root,
             actor=lease.controller,
+            selective_model=bool(launch_meta.get("selective_model")),
             _authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
         # herdr_launch prints its own diagnostics; the controller's JSON
@@ -843,6 +899,17 @@ def _controller_step(
     if in_flight_task and in_flight_task != controller.root and in_flight_state in {
         "claimed_no_session", "running", "launched", "identity_pending",
     }:
+        in_flight_issue = beads_backend.get_issue(cwd, in_flight_task)
+        in_flight_terminal = str(in_flight_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+        in_flight_record = _herdr_session_record(root, in_flight_task) or {}
+        if in_flight_terminal and not in_flight_record:
+            result = controller.halt(
+                "blocked",
+                f"USER_ACTION_REQUIRED: task {in_flight_task} is terminal in Beads but "
+                "has no Herdr lifecycle record; reconcile the lifecycle before continuing",
+                lease=lease,
+            )
+            return _payload(result, "USER_ACTION_REQUIRED"), True
         if in_flight_state == "identity_pending":
             # AFREL-025: poll the live pane for its now-available
             # provider session identity instead of relaunching.
@@ -955,6 +1022,21 @@ def _controller_step(
             )
             return _payload(result, "TASK_BLOCKED"), True
         controller.advance(lease=lease)
+
+    # A controller context that crossed its durable task/phase threshold
+    # stops only at this safe boundary: no worker is in flight and the result
+    # has already been dispositioned.  The next authenticated resume starts a
+    # new generation automatically; no transcript or copied message is needed.
+    rotation = controller.session_ledger().get("rotation")
+    if isinstance(rotation, Mapping) and rotation.get("required"):
+        packet, packet_path = _controller_rotation_packet(
+            controller, root, workflow_root, lease
+        )
+        result = controller.resume([], lease=lease)
+        payload = _payload(result, "ROTATION_REQUIRED")
+        payload["rotation_packet"] = str(packet_path)
+        payload["resume_prompt"] = session_control_backend.render_resume_prompt(packet)
+        return payload, True
 
     # Step 2: reconcile any exact-root in-progress work already assigned
     # to this controller that our own checkpoint lost track of
@@ -1077,6 +1159,13 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         # state, environment variable, checkpoint, or user-facing payload.
         args._authority_secret = credentials["authority_secret"]
 
+        # An authenticated resume is the acknowledgement for a required
+        # safe-boundary rotation.  Advance only the context generation; root,
+        # lease continuity, budgets, permissions, and workflow state survive.
+        rotation = controller.session_ledger().get("rotation")
+        if operation == "resume" and isinstance(rotation, Mapping) and rotation.get("required"):
+            controller.rotate_session_budget(lease=lease)
+
         # AFREL-020: one persistent lease-heartbeating loop drives the
         # controller through claim -> preflight -> handoff -> launch ->
         # identity wait -> result -> disposition -> next node all the way
@@ -1140,9 +1229,43 @@ def controller_status(args: argparse.Namespace) -> int:
             "state": checkpoint_backend.resume_state(checkpoint) if checkpoint else "idle",
             "session_control": controller.session_ledger(),
         }
+        try:
+            if project_config_backend.config_path(root).exists():
+                config = project_config_backend.load(root)
+            else:
+                config = project_config_backend.default_data()
+            guidance_settings = project_config_backend.guidance_settings(config)
+            payload["guidance"] = {
+                "strategic_compaction": bool(guidance_settings["strategic_compaction"]),
+                "verification": bool(guidance_settings["verification"]),
+            }
+            if guidance_settings["verification"]:
+                payload["verification_guidance"] = guidance_backend.verification_plan(root)
+        except project_config_backend.ConfigError as exc:
+            payload["guidance"] = {"available": False, "error": str(exc)}
+        workflow_root = getattr(args, "workflow_root", "")
+        if workflow_root:
+            try:
+                descendants = beads_backend.root_descendants(root, workflow_root)
+                herdr_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+                sessions = herdr_state.get("sessions")
+                payload["lifecycle_reconciliation"] = reconciliation_backend.reconcile(
+                    descendants, sessions if isinstance(sessions, Mapping) else {}
+                )
+            except (beads_backend.BeadsError, OSError, ValueError, json.JSONDecodeError) as exc:
+                payload["lifecycle_reconciliation"] = {
+                    "schema": "agentflow.lifecycle-reconciliation@1",
+                    "ok": False,
+                    "available": False,
+                    "error": str(exc),
+                    "findings": [],
+                }
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS")
         return 0
-    except (OSError, ValueError, controller_backend.ControllerError, checkpoint_backend.CheckpointError) as exc:
+    except (
+        OSError, ValueError, controller_backend.ControllerError,
+        checkpoint_backend.CheckpointError, beads_backend.BeadsError,
+    ) as exc:
         payload = {"operation": "status", "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS FAILED")
         return 2
@@ -1240,33 +1363,45 @@ def controller_progress(args: argparse.Namespace) -> int:
         return 2
 
 
+def _controller_rotation_packet(
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    lease: controller_backend.Lease,
+) -> tuple[dict[str, Any], Path]:
+    checkpoint = controller._load_checkpoint()
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    descendant_ids = {str(item.get("id") or "") for item in descendants}
+    ready_result = beads_backend.run(root, "ready", "--json")
+    if ready_result.returncode:
+        raise beads_backend.BeadsError(
+            (ready_result.stderr or ready_result.stdout).strip() or "bd ready failed"
+        )
+    ready_value = json.loads(ready_result.stdout or "[]")
+    ready = [
+        item for item in ready_value
+        if isinstance(item, Mapping) and str(item.get("id") or "") in descendant_ids
+    ] if isinstance(ready_value, list) else []
+    ledger = controller.session_ledger()
+    packet = session_control_backend.build_handoff_packet(
+        workspace_root=str(root), workflow_root=workflow_root,
+        controller=lease.controller, continuity_id=lease.continuity_id,
+        checkpoint=checkpoint, ready_tasks=ready, ledger=ledger,
+    )
+    generation = int(ledger.get("generation", 1))
+    packet_path = controller.state_path.with_name(f"handoff-{generation}.json")
+    _private_atomic_json(packet_path, packet)
+    return packet, packet_path
+
+
 def controller_rotate(args: argparse.Namespace) -> int:
     """Create a minimal fresh-chat packet and reset only the context budget."""
 
     try:
         controller, root, lease = _authorize_controller_command(args)
-        checkpoint = controller._load_checkpoint()
-        descendants = beads_backend.root_descendants(root, args.workflow_root)
-        descendant_ids = {str(item.get("id") or "") for item in descendants}
-        ready_result = beads_backend.run(root, "ready", "--json")
-        if ready_result.returncode:
-            raise beads_backend.BeadsError(
-                (ready_result.stderr or ready_result.stdout).strip() or "bd ready failed"
-            )
-        ready_value = json.loads(ready_result.stdout or "[]")
-        ready = [
-            item for item in ready_value
-            if isinstance(item, Mapping) and str(item.get("id") or "") in descendant_ids
-        ] if isinstance(ready_value, list) else []
-        ledger = controller.session_ledger()
-        packet = session_control_backend.build_handoff_packet(
-            workspace_root=str(root), workflow_root=args.workflow_root,
-            controller=lease.controller, continuity_id=lease.continuity_id,
-            checkpoint=checkpoint, ready_tasks=ready, ledger=ledger,
+        packet, packet_path = _controller_rotation_packet(
+            controller, root, args.workflow_root, lease
         )
-        generation = int(ledger.get("generation", 1))
-        packet_path = controller.state_path.with_name(f"handoff-{generation}.json")
-        _private_atomic_json(packet_path, packet)
         next_ledger = controller.rotate_session_budget(lease=lease)
         payload = {
             "operation": "rotate", "ok": True, "root": str(root),
@@ -1378,6 +1513,7 @@ def preflight_root(args: argparse.Namespace) -> int:
         snapshot = preflight_backend.take_snapshot(root, tools=tools)
         model = getattr(args, "model", "") or " "
         session_id = getattr(args, "session_id", "") or " "
+        policy = model_policy_backend.load_policy(_resolve_model_policy(args, root))
         spec = preflight_backend.LaunchSpec(
             base=getattr(args, "base", "") or " ",
             context=tuple(getattr(args, "context", []) or []),
@@ -1389,7 +1525,7 @@ def preflight_root(args: argparse.Namespace) -> int:
             provider=getattr(args, "provider", ""),
             role=getattr(args, "role", ""),
             effort=getattr(args, "effort", ""),
-            policy_version=getattr(args, "policy_version", "models-v1"),
+            policy_version=getattr(args, "policy_version", "") or policy.id,
             lease_id=getattr(args, "lease", ""),
             claim_id=getattr(args, "claim", ""),
             handoff=getattr(args, "handoff", ""),
@@ -1398,9 +1534,9 @@ def preflight_root(args: argparse.Namespace) -> int:
             herdr_protocol=getattr(args, "herdr_protocol", ""),
             external=bool(getattr(args, "external", False)),
             authenticated_confinement=bool(getattr(args, "authenticated_confinement", False)),
+            selective_model=bool(getattr(args, "selective_model", False)),
             strict=True,
         )
-        policy = model_policy_backend.load_policy(_resolve_model_policy(args, root))
         report = preflight_backend.check_launch(spec, snapshot, policy=policy)
         findings = list(report.findings)
         for field, value in (
@@ -2310,7 +2446,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
         role = getattr(args, "role", "")
         model = getattr(args, "model", "")
         effort = getattr(args, "effort", "")
-        route = policy.validate_route(provider=provider, role=role, model=model, effort=effort)
+        selective_model = bool(getattr(args, "selective_model", False))
+        route = policy.validate_route(
+            provider=provider, role=role, model=model, effort=effort,
+            selective=selective_model,
+        )
         if not route.ok:
             raise ValueError(route.reason)
         session_name = getattr(args, "session_name", "") or getattr(args, "name", "")
@@ -2374,6 +2514,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 root=root, workflow_root=workflow_root, task_id=task_id, actor=actor,
                 claim=claim_id, lease=lease_id, session_name=session_name,
                 provider=provider, role=role, model=model, effort=effort,
+                selective_model=selective_model,
                 handoff=typed_handoff,
             )
             expected_digest = str(getattr(args, "root_preflight_sha256", "") or "")
@@ -2479,7 +2620,8 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         "claim_token_sha256": hashlib.sha256(
                             str(identity.get("claim_token") or "").encode("utf-8")
                         ).hexdigest() if identity.get("claim_token") else "",
-                        "provider": provider, "model": model, "effort": effort,
+                        "provider": provider, "model": model, "effort": effort, "role": role,
+                        "selective_model": selective_model,
                         "policy": policy.id, "policy_version": f"{policy.id}@{policy.version}",
                         "herdr_session": session_name, "agent_name": agent_name,
                         "launch_id": launch_id,
@@ -4632,6 +4774,145 @@ def usage_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def context_audit(args: argparse.Namespace) -> int:
+    """Audit sanitized provider metadata; never open raw session content."""
+
+    try:
+        archive = history_backend.archive_path(getattr(args, "archive", "") or None)
+        manifest = history_backend.load_manifest(archive)
+        root = Path(getattr(args, "root", ".")).expanduser().resolve()
+        try:
+            config = project_config_backend.load(root)
+        except project_config_backend.ConfigError:
+            config = project_config_backend.default_data()
+        settings = project_config_backend.guidance_settings(config)
+        thresholds = context_budget_backend.ContextThresholds(
+            max_children_per_parent=(
+                args.max_children if args.max_children is not None
+                else int(settings["max_children_per_parent"])
+            ),
+            max_delegation_depth=(
+                args.max_depth if args.max_depth is not None
+                else int(project_config_backend.DEFAULT_EXECUTION["max_delegation_depth"])
+            ),
+            context_pressure_percent=(
+                args.context_pressure if args.context_pressure is not None
+                else int(settings["context_pressure_percent"])
+            ),
+        )
+        sessions = [
+            value for value in manifest.get("sessions", {}).values()
+            if isinstance(value, Mapping)
+        ]
+        report = context_budget_backend.audit(
+            sessions, days=args.days, thresholds=thresholds
+        )
+        herdr_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+        herdr_sessions = herdr_state.get("sessions")
+        report = context_budget_backend.add_execution_attempts(
+            report,
+            herdr_sessions if isinstance(herdr_sessions, Mapping) else {},
+            policy=execution_backend.ExecutionPolicy.from_mapping(
+                project_config_backend.execution_settings(config)
+            ),
+        )
+        if settings["strategic_compaction"]:
+            report["strategic_compaction"] = context_budget_backend.compaction_guidance(report)
+    except (history_backend.HistoryError, OSError, ValueError) as exc:
+        print(f"context audit: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Context audit: {report['sessions']} sessions / {args.days} days")
+        print(
+            f"  lineage={report['lineage']['child_links']} child links; "
+            f"recorded-tokens={report['recorded_total_tokens']}; "
+            f"launch-attempts={report['execution']['recorded_attempts']}"
+        )
+        for finding in report["findings"]:
+            print(f"  {finding['severity']:<6} {finding['id']}: {finding['message']} [{finding['session']}]")
+        if not report["findings"]:
+            print("  no context or model-routing anomalies found")
+        print(f"  {report['measurement_note']}")
+    return 0
+
+
+def context_compact(args: argparse.Namespace) -> int:
+    try:
+        archive = history_backend.archive_path(getattr(args, "archive", "") or None)
+        manifest = history_backend.load_manifest(archive)
+        sessions = [
+            value for value in manifest.get("sessions", {}).values()
+            if isinstance(value, Mapping)
+        ]
+        root = Path(getattr(args, "root", ".")).expanduser().resolve()
+        try:
+            config = project_config_backend.load(root)
+        except project_config_backend.ConfigError:
+            config = project_config_backend.default_data()
+        settings = project_config_backend.guidance_settings(config)
+        thresholds = context_budget_backend.ContextThresholds(
+            max_children_per_parent=int(settings["max_children_per_parent"]),
+            context_pressure_percent=int(settings["context_pressure_percent"]),
+        )
+        report = context_budget_backend.audit(sessions, days=args.days, thresholds=thresholds)
+        herdr_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+        herdr_sessions = herdr_state.get("sessions")
+        report = context_budget_backend.add_execution_attempts(
+            report,
+            herdr_sessions if isinstance(herdr_sessions, Mapping) else {},
+            policy=execution_backend.ExecutionPolicy.from_mapping(
+                project_config_backend.execution_settings(config)
+            ),
+        )
+        plan = context_budget_backend.compaction_guidance(report)
+        plan["enabled_by_config"] = bool(settings["strategic_compaction"])
+        plan["invocation_opt_in"] = True
+    except (history_backend.HistoryError, OSError, ValueError) as exc:
+        print(f"context compact: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+    else:
+        print("Strategic compaction recommended" if plan["recommended"] else "Strategic compaction not currently indicated")
+        for action in plan["actions"]:
+            print(f"  - {action}")
+    return 0
+
+
+def verification_guide(args: argparse.Namespace) -> int:
+    plan = guidance_backend.verification_plan(Path(args.root))
+    if args.json:
+        print(json.dumps(plan, indent=2, sort_keys=True))
+    else:
+        print("Verification guidance (planned; no check has been run)")
+        for check in plan["checks"]:
+            print(f"  {check['stage']:<12} {check['command']}")
+    return 0
+
+
+def herdr_reconcile(args: argparse.Namespace) -> int:
+    root = _root_arg(args)
+    try:
+        descendants = beads_backend.root_descendants(root, args.workflow_root)
+        state = _load_herdr_state(_herdr_state_path(args, root))
+        sessions = state.get("sessions")
+        if not isinstance(sessions, Mapping):
+            sessions = {}
+        report = reconciliation_backend.reconcile(descendants, sessions)
+    except (beads_backend.BeadsError, OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"herdr reconcile: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print("LIFECYCLE CONSISTENT" if report["ok"] else "LIFECYCLE ATTENTION REQUIRED")
+        for finding in report["findings"]:
+            print(f"  {finding['severity']:<6} {finding['task']}: {finding['message']}")
+    return 0 if report["ok"] else 1
+
+
 def adapter_evaluate(args: argparse.Namespace) -> int:
     try:
         manifest = _read_json_value(args.manifest)
@@ -6356,7 +6637,8 @@ def handoff_launch(args: argparse.Namespace) -> int:
             model = str(getattr(args, "model", "") or "")
             effort = str(getattr(args, "effort", "") or "")
             route = policy.validate_route(
-                provider=args.provider, role=role, model=model, effort=effort
+                provider=args.provider, role=role, model=model, effort=effort,
+                selective=bool(getattr(args, "selective_model", False)),
             )
             if not route.ok:
                 raise ValueError(route.reason)
@@ -6474,7 +6756,7 @@ def init_project(args: argparse.Namespace) -> int:
         (("templates", "project", "copilot-hooks.json"), target / ".github/hooks/agentflow.json"),
         (("templates", "project", "copilot-instructions.md"), target / ".github/copilot-instructions.md"),
         (("templates", "project", "agentflow.json"), target / ".agentflow/config.json"),
-        (("policies", "models-v1.json"), target / ".agentflow/models-v1.json"),
+        (("policies", "models-v2.json"), target / ".agentflow/models-v2.json"),
     )
     for resource_parts, destination in mappings:
         print(f"{_copy_resource(resource_parts, destination):<8} {destination}")
@@ -6952,8 +7234,15 @@ def build_parser() -> argparse.ArgumentParser:
     root_preflight_parser.add_argument("--role", default="")
     root_preflight_parser.add_argument("--model", default="")
     root_preflight_parser.add_argument("--effort", default="")
+    root_preflight_parser.add_argument(
+        "--selective-model", action="store_true",
+        help="Explicitly select a policy-approved selective model such as Codex Terra",
+    )
     root_preflight_parser.add_argument("--policy", default="")
-    root_preflight_parser.add_argument("--policy-version", default="models-v1")
+    root_preflight_parser.add_argument(
+        "--policy-version", default="",
+        help="exact configured policy id; defaults to the id in the resolved policy",
+    )
     root_preflight_parser.add_argument("--workflow-root", default="")
     root_preflight_parser.add_argument("--task", default="")
     root_preflight_parser.add_argument("--actor", default="")
@@ -6984,6 +7273,7 @@ def build_parser() -> argparse.ArgumentParser:
     herdr_launch_parser.add_argument("--role", required=True)
     herdr_launch_parser.add_argument("--model", required=True)
     herdr_launch_parser.add_argument("--effort", required=True)
+    herdr_launch_parser.add_argument("--selective-model", action="store_true")
     herdr_launch_parser.add_argument("--session-id", default="")
     herdr_launch_parser.add_argument(
         "--handoff", default="",
@@ -7031,6 +7321,14 @@ def build_parser() -> argparse.ArgumentParser:
     herdr_attention_parser.add_argument("--vanished", action="store_true")
     herdr_attention_parser.add_argument("--json", action="store_true")
     herdr_attention_parser.set_defaults(func=herdr_attention)
+    herdr_reconcile_parser = herdr_sub.add_parser(
+        "reconcile", help="Compare exact-root Beads and Herdr lifecycle state"
+    )
+    herdr_reconcile_parser.add_argument("--root", default=".")
+    herdr_reconcile_parser.add_argument("--workflow-root", required=True)
+    herdr_reconcile_parser.add_argument("--state-path", default="")
+    herdr_reconcile_parser.add_argument("--json", action="store_true")
+    herdr_reconcile_parser.set_defaults(func=herdr_reconcile)
 
     policy_parser = sub.add_parser("policy", help="Audit and migrate managed provider profiles")
     policy_sub = policy_parser.add_subparsers(dest="policy_command", required=True)
@@ -7354,6 +7652,37 @@ def build_parser() -> argparse.ArgumentParser:
     optimize_parser.add_argument("--json", action="store_true")
     optimize_parser.set_defaults(func=usage_optimize)
 
+    context_parser = sub.add_parser(
+        "context", help="Audit metadata-only session lineage and context pressure"
+    )
+    context_sub = context_parser.add_subparsers(dest="context_command", required=True)
+    context_audit_parser = context_sub.add_parser("audit")
+    context_audit_parser.add_argument("--archive", default="")
+    context_audit_parser.add_argument("--root", default=".")
+    context_audit_parser.add_argument("--days", type=int, default=30)
+    context_audit_parser.add_argument("--max-children", type=int)
+    context_audit_parser.add_argument("--max-depth", type=int)
+    context_audit_parser.add_argument("--context-pressure", type=int)
+    context_audit_parser.add_argument("--json", action="store_true")
+    context_audit_parser.set_defaults(func=context_audit)
+    context_compact_parser = context_sub.add_parser(
+        "compact", help="Plan a safe transcript-free controller rotation"
+    )
+    context_compact_parser.add_argument("--archive", default="")
+    context_compact_parser.add_argument("--root", default=".")
+    context_compact_parser.add_argument("--days", type=int, default=30)
+    context_compact_parser.add_argument("--json", action="store_true")
+    context_compact_parser.set_defaults(func=context_compact)
+
+    verify_parser = sub.add_parser(
+        "verify", help="Produce deterministic verification guidance without claiming checks passed"
+    )
+    verify_sub = verify_parser.add_subparsers(dest="verify_command", required=True)
+    verify_plan_parser = verify_sub.add_parser("plan")
+    verify_plan_parser.add_argument("--root", default=".")
+    verify_plan_parser.add_argument("--json", action="store_true")
+    verify_plan_parser.set_defaults(func=verification_guide)
+
     adapter_parser = sub.add_parser("adapter", help="Evaluate fail-closed adapter promotion gates")
     adapter_sub = adapter_parser.add_subparsers(dest="adapter_command", required=True)
     adapter_evaluate_parser = adapter_sub.add_parser("evaluate")
@@ -7490,6 +7819,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--role", required=True)
     launch_parser.add_argument("--model", required=True)
     launch_parser.add_argument("--effort", required=True)
+    launch_parser.add_argument("--selective-model", action="store_true")
     launch_parser.add_argument("--policy", default="")
     launch_parser.add_argument("--print-command", action="store_true")
     launch_parser.set_defaults(func=handoff_launch)

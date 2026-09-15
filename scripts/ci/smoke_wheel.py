@@ -72,13 +72,14 @@ def run(wheel: Path, expected_version: str) -> None:
         profiles = manifest["profiles"]
         if set(profiles) != {"codex", "claude", "copilot"}:
             raise RuntimeError(f"unexpected bundled profile providers: {sorted(profiles)!r}")
-        if sum(len(names) for names in profiles.values()) != 12:
-            raise RuntimeError(f"expected 12 bundled profiles, got {profiles!r}")
+        if sum(len(names) for names in profiles.values()) != 15:
+            raise RuntimeError(f"expected 15 bundled profiles, got {profiles!r}")
         expected_roles = {
             "agentflow-controller",
             "agentflow-explorer",
             "agentflow-pr-gatekeeper",
             "agentflow-reviewer",
+            "agentflow-worker",
         }
         for provider, names in profiles.items():
             roles = {name.split(".", 1)[0] for name in names}
@@ -97,9 +98,9 @@ def run(wheel: Path, expected_version: str) -> None:
             check=True,
         )
         planned = [line for line in dry_run.stdout.splitlines() if line.startswith("would-install")]
-        if len(planned) != 34:
+        if len(planned) != 37:
             raise RuntimeError(
-                f"expected 34 bundled install assets, got {len(planned)}:\n{dry_run.stdout}"
+                f"expected 37 bundled install assets, got {len(planned)}:\n{dry_run.stdout}"
             )
         for skill in expected_skills:
             if sum(skill in line for line in planned) != 3:

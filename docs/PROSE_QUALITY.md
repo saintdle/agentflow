@@ -56,7 +56,7 @@ agentflow prose prepare tracks/example/01-start/assignment.md \
 
 If the check passes, the command prints `NO_EDIT` and creates nothing. If it
 fails, it prints exact preflight and launch commands. By default the generated
-launch is pinned by `models-v1` to:
+launch is pinned by the current `models-v2` policy to:
 
 ```text
 provider=codex model=gpt-5.6-luna role=editing effort=medium

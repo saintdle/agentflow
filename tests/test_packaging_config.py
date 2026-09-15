@@ -23,10 +23,11 @@ class PackagingConfigTests(unittest.TestCase):
         self.assertEqual(__version__, "0.0.4")
         self.assertTrue(resources.item("templates", "project", "agentflow.json").is_file())
         self.assertTrue(resources.item("policies", "models-v1.json").is_file())
+        self.assertTrue(resources.item("policies", "models-v2.json").is_file())
         self.assertEqual(len(resources.names("skills")), 7)
-        self.assertEqual(len(resources.names("agents", "codex")), 4)
-        self.assertEqual(len(resources.names("agents", "claude")), 4)
-        self.assertEqual(len(resources.names("agents", "copilot")), 4)
+        self.assertEqual(len(resources.names("agents", "codex")), 5)
+        self.assertEqual(len(resources.names("agents", "claude")), 5)
+        self.assertEqual(len(resources.names("agents", "copilot")), 5)
 
     def test_install_dry_run_enumerates_bundled_assets_without_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(Path, "home", return_value=Path(temp)), mock.patch(
@@ -38,7 +39,7 @@ class PackagingConfigTests(unittest.TestCase):
             ))
             self.assertEqual(result, 0)
             rendered = output.getvalue()
-            self.assertEqual(rendered.count("would-install"), 34)
+            self.assertEqual(rendered.count("would-install"), 37)
             self.assertIn("agentflow-controller.toml", rendered)
             self.assertIn("shape-goal", rendered)
 
@@ -327,7 +328,7 @@ class PackagingConfigTests(unittest.TestCase):
         ), mock.patch.object(cli.beads_backend, "workspace", return_value=None) as workspace:
             root = Path(temp)
             self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
-            (root / ".agentflow/models-v1.json").unlink()
+            (root / ".agentflow/models-v2.json").unlink()
             self.assertEqual(cli.doctor(argparse.Namespace(path=str(root))), 2)
             workspace.assert_called_once_with(root.resolve())
 
@@ -371,7 +372,7 @@ class PackagingConfigTests(unittest.TestCase):
             spec = preflight.LaunchSpec(
                 base="main", context=(), boundary="src", matrix=(), tools=(),
                 model="custom-controller", session_id="session", provider="codex",
-                role="controller", effort="high", policy_version="models-v1",
+                role="controller", effort="high", policy_version="models-v2",
             )
             snapshot = preflight.RootSnapshot(
                 root=str(root), taken_at="now", instructions_entrypoint=None,

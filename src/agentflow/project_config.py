@@ -21,6 +21,20 @@ DEFAULT_PROSE_EDITOR = {
     "model": "gpt-5.6-luna",
     "effort": "medium",
 }
+DEFAULT_EXECUTION = {
+    "controller_only": True,
+    "max_parallel_workers": 3,
+    "max_delegation_depth": 1,
+    "max_attempts_per_task": 2,
+    "launch_budget_multiplier": 2,
+    "max_expensive_execution_children": 0,
+}
+DEFAULT_GUIDANCE = {
+    "strategic_compaction": False,
+    "verification": False,
+    "context_pressure_percent": 75,
+    "max_children_per_parent": 12,
+}
 
 
 class ConfigError(ValueError):
@@ -31,8 +45,10 @@ def default_data() -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "version": VERSION,
-        "model_policy": ".agentflow/models-v1.json",
+        "model_policy": ".agentflow/models-v2.json",
         "prose": {"editor": dict(DEFAULT_PROSE_EDITOR)},
+        "execution": dict(DEFAULT_EXECUTION),
+        "guidance": dict(DEFAULT_GUIDANCE),
         "skills": [],
     }
 
@@ -77,7 +93,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Keep the public schema limited to values consumed by runtime code.
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
-    allowed = {"schema", "version", "model_policy", "prose", "skills"}
+    allowed = {"schema", "version", "model_policy", "prose", "execution", "guidance", "skills"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
@@ -125,6 +141,37 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
                         not isinstance(credits, int) or isinstance(credits, bool) or credits < 30
                     ):
                         errors.append("Copilot prose.editor requires max_ai_credits of at least 30")
+    if "execution" in data:
+        execution = data.get("execution")
+        if not isinstance(execution, dict) or set(execution) != set(DEFAULT_EXECUTION):
+            errors.append("execution must contain exactly the supported controller and launch-budget fields")
+        else:
+            if not isinstance(execution.get("controller_only"), bool):
+                errors.append("execution.controller_only must be a boolean")
+            for field, minimum in (
+                ("max_parallel_workers", 1),
+                ("max_delegation_depth", 0),
+                ("max_attempts_per_task", 1),
+                ("launch_budget_multiplier", 1),
+                ("max_expensive_execution_children", 0),
+            ):
+                value = execution.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                    errors.append(f"execution.{field} must be an integer of at least {minimum}")
+    if "guidance" in data:
+        guidance = data.get("guidance")
+        if not isinstance(guidance, dict) or set(guidance) != set(DEFAULT_GUIDANCE):
+            errors.append("guidance must contain exactly the supported optional guidance fields")
+        else:
+            for field in ("strategic_compaction", "verification"):
+                if not isinstance(guidance.get(field), bool):
+                    errors.append(f"guidance.{field} must be a boolean")
+            pressure = guidance.get("context_pressure_percent")
+            if not isinstance(pressure, int) or isinstance(pressure, bool) or not 1 <= pressure <= 100:
+                errors.append("guidance.context_pressure_percent must be between 1 and 100")
+            children = guidance.get("max_children_per_parent")
+            if not isinstance(children, int) or isinstance(children, bool) or children < 1:
+                errors.append("guidance.max_children_per_parent must be positive")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
@@ -193,6 +240,10 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
         result["model_policy"] = local["model_policy"]
     if "prose" in local:
         result["prose"] = local["prose"]
+    if "execution" in local:
+        result["execution"] = local["execution"]
+    if "guidance" in local:
+        result["guidance"] = local["guidance"]
     merged_skills: dict[str, dict[str, Any]] = {}
     for entry in shared.get("skills", []):
         merged_skills[entry["name"]] = dict(entry)
@@ -215,6 +266,16 @@ def prose_editor(data: dict[str, Any]) -> dict[str, Any] | None:
         return dict(DEFAULT_PROSE_EDITOR)
     editor = prose.get("editor")
     return dict(editor) if isinstance(editor, dict) else None
+
+
+def execution_settings(data: dict[str, Any]) -> dict[str, Any]:
+    value = data.get("execution")
+    return dict(value) if isinstance(value, dict) else dict(DEFAULT_EXECUTION)
+
+
+def guidance_settings(data: dict[str, Any]) -> dict[str, Any]:
+    value = data.get("guidance")
+    return dict(value) if isinstance(value, dict) else dict(DEFAULT_GUIDANCE)
 
 
 def skill_origins(root: Path) -> dict[str, str]:

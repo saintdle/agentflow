@@ -24,7 +24,7 @@ INFO = "info"
 _VALID_SEVERITIES = (BLOCKER, WARNING, INFO)
 
 # Model tokens that indicate a non-specific or disallowed model.
-_FORBIDDEN_MODEL_TOKENS = ("auto", "haiku", "terra", "generic")
+_FORBIDDEN_MODEL_TOKENS = ("auto", "haiku", "generic")
 
 
 class PreflightError(ValueError):
@@ -82,6 +82,7 @@ class LaunchSpec:
     herdr_protocol: str = ""
     external: bool = False
     authenticated_confinement: bool = False
+    selective_model: bool = False
     strict: bool = False
 
     def __post_init__(self) -> None:
@@ -254,10 +255,13 @@ def _filesystem_findings(spec: LaunchSpec, snapshot: RootSnapshot) -> list[Prefl
             "model is empty",
             "Specify an exact model identifier.",
         ))
-    elif any(tok in spec.model.lower() for tok in _FORBIDDEN_MODEL_TOKENS):
+    elif (
+        any(tok in spec.model.lower() for tok in _FORBIDDEN_MODEL_TOKENS)
+        or ("terra" in spec.model.lower() and spec.model != "gpt-5.6-terra")
+    ):
         findings.append(PreflightFinding(
             "model-forbidden", BLOCKER, "model",
-            f"model {spec.model!r} matches a forbidden pattern (auto/haiku/terra/generic)",
+            f"model {spec.model!r} matches a forbidden pattern (auto/haiku/generic)",
             "Specify an exact, non-generic model identifier.",
         ))
 
@@ -312,13 +316,13 @@ def check_launch(spec: LaunchSpec, snapshot: RootSnapshot, *, policy: Any = None
     Neither *spec* nor *snapshot* is mutated. Calling twice with the same
     arguments always returns an equal report. Every finding below is
     unconditional: there is no ``strict``/optional-field escape hatch that
-    lets a caller skip the exact models-v1 provider/role/effort route or the
+    lets a caller skip the exact versioned provider/role/effort route or the
     lease/claim/handoff/herdr binding checks. Callers that only want the
     filesystem subset use :func:`assess_filesystem`.
     """
     findings: list[PreflightFinding] = _filesystem_findings(spec, snapshot)
 
-    # The exact models-v1 route is mandatory for every launch decision; there
+    # The exact configured policy route is mandatory for every launch decision; there
     # is no lenient mode that lets a caller omit provider/role/effort.
     for field, value in (
         ("provider", spec.provider),
@@ -329,7 +333,7 @@ def check_launch(spec: LaunchSpec, snapshot: RootSnapshot, *, policy: Any = None
             findings.append(PreflightFinding(
                 f"{field}-missing", BLOCKER, "policy",
                 f"{field} is required for an authenticated launch",
-                f"Provide the exact {field} from models-v1.",
+                f"Provide the exact {field} from the configured model policy.",
             ))
     try:
         from agentflow.model_policy import load_policy
@@ -340,23 +344,26 @@ def check_launch(spec: LaunchSpec, snapshot: RootSnapshot, *, policy: Any = None
             role=spec.role,
             model=spec.model,
             effort=spec.effort or None,
+            selective=spec.selective_model,
         )
         if not route.ok:
             findings.append(PreflightFinding(
                 "policy-route-invalid", BLOCKER, "policy", route.reason,
-                "Use an exact provider/model/role/effort route from models-v1.",
+                "Use an exact provider/model/role/effort route from the configured policy.",
             ))
     except Exception as exc:
         findings.append(PreflightFinding(
             "policy-unavailable", BLOCKER, "policy", str(exc),
-            "Load and validate the shipped models-v1 policy before launch.",
+            "Load and validate the configured versioned policy before launch.",
         ))
-    if spec.policy_version != "models-v1":
+    expected_policy_id = str(getattr(policy, "id", "") or "")
+    if spec.policy_version != expected_policy_id:
         findings.append(PreflightFinding(
             "policy-version-missing" if not spec.policy_version else "policy-version-invalid",
             BLOCKER, "policy",
-            f"exact policy version models-v1 is required (got {spec.policy_version!r})",
-            "Provide --policy-version models-v1.",
+            f"exact policy id {expected_policy_id or 'unavailable'} is required "
+            f"(got {spec.policy_version!r})",
+            f"Provide --policy-version {expected_policy_id or '<configured-policy-id>'}.",
         ))
     if not spec.lease_id:
         findings.append(PreflightFinding(

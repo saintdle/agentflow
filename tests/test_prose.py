@@ -163,7 +163,7 @@ class ProseCliTests(unittest.TestCase):
             manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["prose"]["editor"], {
                 "provider": "codex", "model": "gpt-5.6-luna", "role": "editing",
-                "effort": "medium", "policy": "models-v1",
+                "effort": "medium", "policy": "models-v2",
             })
             self.assertEqual(manifest["prose"]["artifact_kind"], "reader-facing")
             self.assertEqual(manifest["prose"]["max_passes"], 1)

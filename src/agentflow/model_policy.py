@@ -1,12 +1,11 @@
 """Versioned exact provider/model/role/effort policy, audit, and migration planning.
 
-The policy is a closed, versioned document (see ``policies/models-v1.json``)
+The policy is a closed, versioned document (see ``policies/models-v2.json``)
 listing the only approved (provider, model, role, effort) routes. Anything not
-an exact match fails closed: a generic alias (``opus``), a renamed or
-deprecated tier (``gpt-5.6-terra``), an unresolved placeholder, or a lookalike
-string (wrong case, stray whitespace, homoglyph) is rejected the same way as
-an explicitly forbidden model. This module never writes to disk; the audit
-and migration-planning primitives are read-only.
+an exact match fails closed.  A selective route such as Codex Terra also needs
+an explicit per-launch selection; merely naming the model is insufficient.
+This module never writes to disk; the audit and migration-planning primitives
+are read-only.
 """
 
 from __future__ import annotations
@@ -30,14 +29,16 @@ class ModelPolicyError(ValueError):
 
 SCHEMA = "agentflow.model_policy"
 SUPPORTED_VERSIONS = (1,)
-DEFAULT_POLICY_PATH = resources.item("policies", "models-v1.json")
+DEFAULT_POLICY_PATH = resources.item("policies", "models-v2.json")
 
 _PROVIDER_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 _EFFORT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 
-_TOP_LEVEL_FIELDS = frozenset({"schema", "version", "id", "description", "roles", "routes", "forbidden_models"})
+_TOP_LEVEL_FIELDS = frozenset(
+    {"schema", "version", "id", "description", "roles", "routes", "forbidden_models", "selective_models"}
+)
 _ROUTE_FIELDS = frozenset({"provider", "model", "roles", "efforts"})
 
 # Every shipped agentflow profile agentflow itself ships and knows how to
@@ -49,6 +50,7 @@ MANAGED_PROFILE_STEMS = frozenset(
         "agentflow-explorer",
         "agentflow-pr-gatekeeper",
         "agentflow-reviewer",
+        "agentflow-worker",
     }
 )
 _CODEX_PROFILE_GLOB = ".codex/agents/*.toml"
@@ -64,6 +66,7 @@ PROFILE_ROLES: Mapping[str, str] = {
     "agentflow-explorer": "exploration",
     "agentflow-pr-gatekeeper": "judgment",
     "agentflow-reviewer": "review",
+    "agentflow-worker": "coding",
 }
 
 
@@ -109,11 +112,15 @@ class ModelPolicy:
     roles: tuple[str, ...]
     routes: tuple[ModelRoute, ...]
     forbidden_models: tuple[str, ...]
+    selective_models: tuple[str, ...] = ()
 
     def approved_models(self, provider: str) -> frozenset[str]:
         return frozenset(route.model for route in self.routes if route.provider == provider)
 
-    def validate_route(self, *, provider: Any, role: Any, model: Any, effort: Any = None) -> RouteResult:
+    def validate_route(
+        self, *, provider: Any, role: Any, model: Any, effort: Any = None,
+        selective: bool = False,
+    ) -> RouteResult:
         """Validate an exact (provider, role, model[, effort]) combination.
 
         Returns a :class:`RouteResult` rather than raising: callers (tests,
@@ -129,6 +136,11 @@ class ModelPolicy:
 
         if model in self.forbidden_models:
             return RouteResult(False, f"model {model!r} is forbidden under {self.id}")
+        if model in self.selective_models and not selective:
+            return RouteResult(
+                False,
+                f"model {model!r} is selective under {self.id}; explicit per-launch selection is required",
+            )
         if role not in self.roles:
             return RouteResult(False, f"role {role!r} is not defined by {self.id}")
 
@@ -233,8 +245,26 @@ def parse_policy(data: Any) -> ModelPolicy:
     if overlap:
         raise ModelPolicyError(f"model(s) both approved and forbidden: {', '.join(sorted(overlap))}")
 
+    selective_raw = data.get("selective_models", [])
+    if not isinstance(selective_raw, list):
+        raise ModelPolicyError("selective_models must be a list")
+    selective_models = tuple(_require_str(model, "selective_models[]") for model in selective_raw)
+    if len(set(selective_models)) != len(selective_models):
+        raise ModelPolicyError("selective_models must not contain duplicates")
+    unknown_selective = set(selective_models) - approved_models
+    if unknown_selective:
+        raise ModelPolicyError(
+            f"selective model(s) have no approved route: {', '.join(sorted(unknown_selective))}"
+        )
+    forbidden_selective = set(selective_models) & set(forbidden_models)
+    if forbidden_selective:
+        raise ModelPolicyError(
+            f"model(s) both selective and forbidden: {', '.join(sorted(forbidden_selective))}"
+        )
+
     return ModelPolicy(
-        schema=schema, version=version, id=policy_id, roles=roles, routes=routes, forbidden_models=forbidden_models
+        schema=schema, version=version, id=policy_id, roles=roles, routes=routes,
+        forbidden_models=forbidden_models, selective_models=selective_models,
     )
 
 
