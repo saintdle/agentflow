@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-09-15
+
 ### Added
 
 - Added controller-only execution admission with graph-derived launch budgets,
@@ -129,7 +131,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/saintdle/agentflow/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/saintdle/agentflow/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/saintdle/agentflow/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/saintdle/agentflow/compare/v0.0.1...v0.0.2

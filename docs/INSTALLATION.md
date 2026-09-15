@@ -28,13 +28,13 @@ integrations without reading their credential stores.
 Install a tagged release with `uv`:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.4"
+uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.5"
 ```
 
 Or with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.4"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.5"
 ```
 
 For a local checkout:
@@ -49,7 +49,7 @@ The repository requires authentication while it remains private. A release
 wheel built by GitHub Actions can be installed without a source checkout:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.4-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.5-py3-none-any.whl
 ```
 
 ## Verify

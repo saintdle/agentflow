@@ -203,7 +203,7 @@ def run(wheel: Path, expected_version: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel", type=Path)
-    parser.add_argument("--expected-version", default="0.0.2")
+    parser.add_argument("--expected-version", default="0.0.5")
     args = parser.parse_args()
     run(args.wheel, args.expected_version)
     return 0
