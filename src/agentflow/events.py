@@ -199,6 +199,22 @@ _REFERENCE_HASHES = {
 }
 
 
+def _external_id(prefix: str, value: Any, field: str = "identifier") -> str:
+    """Canonicalize caller-controlled identifiers without retaining their value."""
+    raw = _text(value, field, limit=240)
+    if re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", raw):
+        return raw
+    return prefix + hashlib.sha256(("agentflow." + field + "\0" + raw).encode("utf-8")).hexdigest()
+
+
+def _event_id(value: Any) -> str:
+    """Keep legacy opaque IDs, but hash path/content-like caller IDs."""
+    raw = _text(value, "event_id", limit=192)
+    if _ID_RE.fullmatch(raw) and not any(part in raw for part in ("/", "\\", "~", "..")):
+        return raw
+    return _external_id("evt_", raw, "event_id")
+
+
 def _text(value: Any, field: str, *, limit: int = 240) -> str:
     if not isinstance(value, str) or not value.strip():
         raise EventValidationError(f"{field} must be a non-empty string")
@@ -306,12 +322,17 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
                 if isinstance(raw_value, str) and raw_value.strip():
                     result["workspace_scope"] = _workspace_scope(raw_value)
                 continue
+            if key in {"reason", "source"}:
+                if isinstance(raw_value, str) and raw_value.strip():
+                    result[key] = _external_id(key + "_", raw_value, key)
+                continue
             if key in {"failure_class", "error_class"}:
                 result["failure_class"] = classify_operational_failure(raw_value)
                 continue
             if key in {"failure_ref", "failure_id", "resolves_failure_ref"}:
                 if isinstance(raw_value, str) and raw_value.strip():
-                    result["failure_ref"] = _reference(raw_value, "failure_ref", "fail_")
+                    target = "resolves_failure_ref" if key == "resolves_failure_ref" else "failure_ref"
+                    result[target] = _reference(raw_value, "failure_ref", "fail_")
                 continue
             if key in {"resolution_ref", "resolution_id"}:
                 if isinstance(raw_value, str) and raw_value.strip():
@@ -331,6 +352,8 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
                     # A malformed optional provider field is not an excuse to
                     # persist its contents; safely omit it.
                     continue
+            if key in {"tool_id", "toolid"} and isinstance(raw_value, str) and raw_value.strip():
+                result["tool_id"] = _external_id("tool_", raw_value, "tool_id")
     # Keep the public shape stable for the provider-neutral consumers.
     if "reasoningeffort" in result and "reasoning_effort" not in result:
         result["reasoning_effort"] = result.pop("reasoningeffort")
@@ -363,7 +386,7 @@ class EventEnvelope:
     schema: str = SCHEMA
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "event_id", _text(self.event_id, "event_id", limit=192))
+        object.__setattr__(self, "event_id", _event_id(self.event_id))
         object.__setattr__(self, "session_id", _session_scope(self.session_id))
         if not _ID_RE.fullmatch(self.event_id) or not _ID_RE.fullmatch(self.session_id):
             raise EventValidationError("event_id and session_id contain unsafe characters")
@@ -444,17 +467,41 @@ def normalize_event(
     canonical_event = _canonical_event(raw_event)
     raw_session = session_id or _lookup(payload, "session_id", "sessionId", "sessionID", "session")
     if not raw_session:
-        raise EventValidationError("session_id is required")
+        # A few native hooks omit session identity.  Keep those events isolated
+        # by provider/workspace/event identity rather than sharing one literal
+        # bucket; the seed is immediately hashed by _session_scope.
+        fallback_seed = _lookup(payload, "cwd", "workspace") or "missing"
+        fallback_event_id = _lookup(payload, "event_id", "eventId", "id") or "missing"
+        raw_session = "missing:" + provider_name + ":" + hashlib.sha256(
+            (str(fallback_seed) + "\0" + str(fallback_event_id)).encode("utf-8")
+        ).hexdigest()[:24]
     safe_session = _session_scope(raw_session)
     raw_timestamp = timestamp if timestamp is not None else _lookup(payload, "timestamp", "time", "created_at", "createdAt")
     safe_metadata = _metadata(payload, nested)
     if metadata is not None:
         safe_metadata.update(_metadata(dict(metadata)))
+    # Native providers commonly report only an error/status and a tool call
+    # identifier.  Derive bounded, deterministic links transiently; the error
+    # text itself never crosses the metadata boundary.
+    if canonical_event in {"tool.failure", "tool.success"}:
+        failure_class = classify_operational_failure(payload)
+        if canonical_event == "tool.failure":
+            safe_metadata.setdefault("failure_class", failure_class)
+        identity = _lookup(payload, "tool_id", "toolId", "tool_call_id", "toolCallId", "call_id", "callId", "tool_name", "toolName")
+        if identity is not None:
+            identity_text = str(identity).strip()[:240]
+            if identity_text:
+                failure_ref = _external_id("fail_", f"{provider_name}|{safe_session}|{identity_text}", "tool_failure")
+                if canonical_event == "tool.failure":
+                    safe_metadata.setdefault("failure_ref", failure_ref)
+                else:
+                    safe_metadata.setdefault("resolves_failure_ref", failure_ref)
+                    safe_metadata.setdefault("resolution_ref", _external_id("res_", failure_ref, "resolution_ref"))
     safe_timestamp = _timestamp(raw_timestamp)
     if event_id is None:
         candidate_id = _lookup(payload, "event_id", "eventId", "id")
         if isinstance(candidate_id, str) and candidate_id.strip():
-            event_id = candidate_id
+            event_id = _event_id(candidate_id)
     if event_id is None:
         identity = {"provider": provider_name, "session_id": safe_session, "event": canonical_event, "metadata": safe_metadata}
         event_id = "evt_" + hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:32]
@@ -487,12 +534,18 @@ def classify_operational_failure(value: Any) -> str:
         return FailureClass.TEST_FAILURE.value
     parts: list[str] = []
     if isinstance(value, Mapping):
-        for key in ("failure_class", "failure", "error_class", "category", "class", "code", "status", "kind"):
+        for key in ("failure_class", "failure", "error_class", "error", "error_message", "message", "detail", "reason", "category", "class", "code", "status", "kind"):
             item = value.get(key)
             if isinstance(item, str):
                 parts.append(item)
             elif isinstance(item, int):
                 parts.append(str(item))
+        for nested_key in ("data", "payload", "hookSpecificOutput"):
+            nested = value.get(nested_key)
+            if isinstance(nested, Mapping):
+                nested_class = classify_operational_failure(nested)
+                if nested_class != FailureClass.UNKNOWN.value:
+                    return nested_class
     elif isinstance(value, BaseException):
         parts.extend((type(value).__name__, str(value)))
     elif isinstance(value, str):

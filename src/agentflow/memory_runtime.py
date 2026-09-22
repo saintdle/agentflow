@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -39,10 +40,19 @@ def workspace_scope(root: Path) -> str:
     return "ws_" + hashlib.sha256(("agentflow.workspace.scope\0" + str(root.resolve())).encode()).hexdigest()
 
 
-def state_root(root: Path) -> Path:
+def state_home() -> Path:
+    """Return the one local state root used by CLI hooks and runtime state."""
+    xdg = os.environ.get("XDG_STATE_HOME", "")
+    if xdg:
+        return Path(xdg).expanduser() / "agentflow"
     configured = os.environ.get("AGENTFLOW_STATE_HOME", "")
-    base = Path(configured).expanduser() if configured else Path.home() / ".local/state/agentflow"
-    return base / "memory" / workspace_scope(root)[3:]
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local/state/agentflow"
+
+
+def state_root(root: Path) -> Path:
+    return state_home() / "memory" / workspace_scope(root)[3:]
 
 
 def _private(path: Path) -> None:
@@ -75,6 +85,10 @@ class _Lock:
 
     def __enter__(self) -> "_Lock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.chmod(0o700)
+        except OSError:
+            pass
         self.handle = self.path.open("a+", encoding="utf-8")
         _private(self.path)
         if fcntl is not None:
@@ -95,13 +109,114 @@ def _settings(settings: Mapping[str, Any] | None) -> dict[str, Any]:
     return value
 
 
-def _query(payload: Mapping[str, Any], event: str) -> str:
+def _transient_prompt(payload: Mapping[str, Any], *, depth: int = 0) -> str:
+    if depth > 3:
+        return ""
+    keys = {"prompt", "prompt_text", "user_prompt", "userprompt", "userPrompt", "text", "input", "message", "content"}
+    for key, value in payload.items():
+        if isinstance(key, str) and key in keys and isinstance(value, str) and value.strip():
+            return value.strip()[:400]
+    for value in payload.values():
+        if isinstance(value, Mapping):
+            result = _transient_prompt(value, depth=depth + 1)
+            if result:
+                return result
+    return ""
+
+
+def _query(payload: Mapping[str, Any], event: str, settings: Mapping[str, Any]) -> str:
     # memory_query is transient input only.  It is never passed to the event
     # normalizer or persisted in the event/receipt stores.
     value = payload.get("memory_query")
     if isinstance(value, str) and value.strip():
         return value.strip()[:400]
-    return "agentflow" if event == "session.start" else ""
+    if event == "prompt.submit":
+        return _transient_prompt(payload)
+    if event == "session.start":
+        configured = settings.get("startup_query")
+        return configured.strip()[:400] if isinstance(configured, str) and configured.strip() else ""
+    return ""
+
+
+class ReceiptSpool:
+    """Process-locked, atomic, bounded injection receipts."""
+
+    def __init__(self, path: Path, *, max_events: int, max_bytes: int, retention_days: float) -> None:
+        self.path = Path(path)
+        self.max_events = max(1, int(max_events))
+        self.max_bytes = max(256, int(max_bytes))
+        self.retention_days = max(0.0, float(retention_days))
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
+
+    def _read_unlocked(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                try:
+                    value = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+        except OSError:
+            return []
+        return rows
+
+    def _prune(self, rows: list[dict[str, Any]]) -> int:
+        before = len(rows)
+        cutoff = _now() - dt.timedelta(days=self.retention_days)
+        kept: list[dict[str, Any]] = []
+        for row in rows:
+            stamp = row.get("timestamp")
+            try:
+                parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                parsed = _now()
+            if parsed >= cutoff:
+                kept.append(row)
+        rows[:] = kept[-self.max_events:]
+        while rows:
+            encoded = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in rows)
+            if len(encoded) <= self.max_bytes:
+                break
+            rows.pop(0)
+        return before - len(rows)
+
+    def _write_unlocked(self, rows: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=self.path.name + ".", dir=str(self.path.parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in rows))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(name, 0o600)
+            os.replace(name, self.path)
+        finally:
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
+
+    def append(self, value: Mapping[str, Any]) -> None:
+        with _Lock(self.lock_path):
+            rows = self._read_unlocked()
+            rows.append(dict(value))
+            self._prune(rows)
+            self._write_unlocked(rows)
+
+    def prune(self) -> int:
+        with _Lock(self.lock_path):
+            rows = self._read_unlocked()
+            removed = self._prune(rows)
+            self._write_unlocked(rows)
+            return removed
+
+    def count(self) -> int:
+        with _Lock(self.lock_path):
+            return len(self._read_unlocked())
 
 
 class MemoryRuntime:
@@ -123,6 +238,12 @@ class MemoryRuntime:
         self.database = self.directory / "knowledge.sqlite3"
         self.health_path = self.directory / "health.json"
         self.receipts_path = self.directory / "injections.jsonl"
+        self.receipts = ReceiptSpool(
+            self.receipts_path,
+            max_events=int(self.settings["max_events"]),
+            max_bytes=int(self.settings["max_event_bytes"]),
+            retention_days=float(self.settings["retention_days"]),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -131,9 +252,7 @@ class MemoryRuntime:
     def _record_receipt(self, event: EventEnvelope, plan: RecallPlan) -> None:
         if not plan.items:
             return
-        self.receipts_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.receipts_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps({
+        self.receipts.append({
                 "schema": "agentflow.memory-receipt@1",
                 "timestamp": _iso(),
                 "session_id": event.session_id,
@@ -142,15 +261,14 @@ class MemoryRuntime:
                 "characters": len(plan.text),
                 "source_digests": [item.source_digest for item in plan.items],
                 "privacy": "metadata-only",
-            }, sort_keys=True, separators=(",", ":")) + "\n")
-        _private(self.receipts_path)
+            })
 
     def recall(self, event: EventEnvelope, payload: Mapping[str, Any]) -> RecallPlan | None:
         if not self.enabled:
             return None
         if event.event == "prompt.submit" and not bool(self.settings.get("on_prompt")):
             return None
-        query = _query(payload, event.event)
+        query = _query(payload, event.event, self.settings)
         if not query:
             return None
         try:
@@ -187,6 +305,7 @@ class MemoryRuntime:
             for _attempt in range(2):
                 try:
                     pruned_events = self.spool.prune()
+                    pruned_receipts = self.receipts.prune()
                     pruned_documents = 0
                     pruned_sessions = 0
                     with KnowledgeIndex(self.database) as index:
@@ -199,6 +318,8 @@ class MemoryRuntime:
                         "last_success_at": _iso(now), "last_error": "",
                         "pruned_events": pruned_events, "pruned_documents": pruned_documents,
                         "pruned_sessions": pruned_sessions,
+                        "pruned_receipts": pruned_receipts,
+                        "receipt_count": self.receipts.count(),
                         "next_allowed_at": _iso(now + dt.timedelta(seconds=int(self.settings["maintenance_interval_seconds"]))),
                         "attempts": int(health.get("attempts", 0)) + 1,
                         "privacy": "metadata-only",
@@ -251,4 +372,4 @@ def health(root: Path, settings: Mapping[str, Any] | None = None) -> dict[str, A
     return result or {"status": "not-run", "privacy": "metadata-only"}
 
 
-__all__ = ["MemoryRuntime", "health", "state_root", "workspace_scope"]
+__all__ = ["MemoryRuntime", "ReceiptSpool", "health", "state_home", "state_root", "workspace_scope"]

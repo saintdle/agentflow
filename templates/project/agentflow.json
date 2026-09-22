@@ -37,7 +37,8 @@
     "scope_id": "",
     "scopes": ["project"],
     "session_ledger_limit": 256,
-    "session_retention_days": 30
+    "session_retention_days": 30,
+    "startup_query": "agentflow"
   },
   "skills": []
 }

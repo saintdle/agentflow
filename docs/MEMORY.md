@@ -10,9 +10,14 @@ Provider hooks normalize SessionStart, UserPromptSubmit, tool start/success/
 failure, compaction, and Stop into metadata-only events. Prompt text, commands,
 arguments, tool output, transcripts, paths, and credentials are discarded.
 Hook storage is fail-open and owner-only under the local Agentflow state home.
+Set `XDG_STATE_HOME` for the traditional `XDG_STATE_HOME/agentflow` location;
+`AGENTFLOW_STATE_HOME` provides an explicit isolated state root when XDG is not
+set.
 
 Recall performs candidate lookup followed by a governed fetch. Only approved,
 fresh, in-scope entries are eligible, with strict item and character budgets.
+Prompt hooks use provider-native prompt fields transiently; SessionStart uses
+the validated `memory.startup_query` setting (never a prompt or transcript).
 Source digests are recorded per session so a digest is not injected twice;
 explicit compaction/session reset is the only reset policy. `Stop` maintenance
 is model-free, idempotent, lock-protected, rate-limited, retryable, and reports

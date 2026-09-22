@@ -63,7 +63,8 @@ An initialized project starts with a schema-versioned configuration like this:
     "retention_days": 30,
     "session_retention_days": 30,
     "maintenance_interval_seconds": 300,
-    "session_ledger_limit": 256
+    "session_ledger_limit": 256,
+    "startup_query": "agentflow"
   },
   "skills": [
     {

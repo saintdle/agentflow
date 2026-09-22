@@ -117,8 +117,7 @@ GITIGNORE_BLOCK = "\n".join(
 
 
 def _state_dir() -> Path:
-    root = os.environ.get("XDG_STATE_HOME")
-    return Path(root).expanduser() / "agentflow" if root else Path.home() / ".local/state/agentflow"
+    return memory_runtime_backend.state_home()
 
 
 def _now() -> str:
@@ -3546,7 +3545,11 @@ def _resource_tree_status(parts: tuple[str, ...], destination: Path) -> str:
 def _refresh_backup_path(destination: Path) -> Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     identity = hashlib.sha256(str(destination.absolute()).encode("utf-8")).hexdigest()[:12]
-    backup_root = _state_dir() / "backups" / stamp / identity
+    # Installation backups retain the historical XDG/home location so a
+    # process-scoped AGENTFLOW_STATE_HOME used by hooks cannot strand them.
+    legacy_home = os.environ.get("XDG_STATE_HOME")
+    backup_state = Path(legacy_home).expanduser() / "agentflow" if legacy_home else Path.home() / ".local/state/agentflow"
+    backup_root = backup_state / "backups" / stamp / identity
     backup_root.mkdir(parents=True, exist_ok=True)
     try:
         backup_root.chmod(0o700)
@@ -4980,14 +4983,16 @@ def hook(args: argparse.Namespace) -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
-    event = str(payload.get("hook_event_name") or payload.get("hookEventName") or args.event or "unknown")
+    event = str(
+        payload.get("hook_event_name") or payload.get("hookEventName")
+        or payload.get("event") or payload.get("type") or args.event or "unknown"
+    )
     # The event spine is independent from optional recall.  It stores only a
     # normalized metadata envelope and substitutes a synthetic session bucket
     # when a provider omits its session identity.
     try:
         normalized = events_backend.normalize_event(
-            args.provider, payload, session_id=str(payload.get("session_id") or payload.get("sessionId") or "unknown"),
-            event=event,
+            args.provider, payload, event=event,
         )
         spool = events_backend.EventSpool(_state_dir() / "events.jsonl")
         if not events_backend.record_event_safely(spool, normalized):

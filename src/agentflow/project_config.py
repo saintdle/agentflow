@@ -50,6 +50,7 @@ DEFAULT_MEMORY = {
     "session_retention_days": 30,
     "maintenance_interval_seconds": 300,
     "session_ledger_limit": 256,
+    "startup_query": "agentflow",
 }
 
 
@@ -215,6 +216,9 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
             scope_id = memory.get("scope_id")
             if not isinstance(scope_id, str) or len(scope_id) > 240 or any(ord(c) < 32 for c in scope_id):
                 errors.append("memory.scope_id must be bounded text")
+            startup_query = memory.get("startup_query")
+            if not isinstance(startup_query, str) or len(startup_query) > 400 or any(ord(c) < 32 for c in startup_query):
+                errors.append("memory.startup_query must be bounded text")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
