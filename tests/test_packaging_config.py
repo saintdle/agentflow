@@ -44,8 +44,16 @@ class PackagingConfigTests(unittest.TestCase):
             self.assertIn("shape-goal", rendered)
 
     def test_bundled_install_is_idempotent_and_refresh_is_explicit_with_backup(self) -> None:
-        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
-            Path, "home", return_value=Path(temp)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            tempfile.TemporaryDirectory() as explicit_state,
+            tempfile.TemporaryDirectory() as xdg_state,
+            mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": explicit_state, "XDG_STATE_HOME": xdg_state},
+                clear=False,
+            ),
+            mock.patch.object(Path, "home", return_value=Path(temp)),
         ):
             args = argparse.Namespace(
                 path=str(Path(temp) / "uninitialized"), force=False, dry_run=False,
@@ -58,7 +66,7 @@ class PackagingConfigTests(unittest.TestCase):
             args.refresh_bundled = True
             self.assertEqual(cli.install(args), 0)
             self.assertNotEqual(profile.read_text(encoding="utf-8"), "stale\n")
-            backups = list((Path(os.environ["XDG_STATE_HOME"]) / "agentflow/backups").rglob(
+            backups = list((Path(xdg_state) / "agentflow/backups").rglob(
                 "agentflow-controller.toml"
             ))
             self.assertEqual(len(backups), 1)
