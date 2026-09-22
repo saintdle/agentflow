@@ -463,6 +463,13 @@ class KnowledgeIndex:
             self.connection.rollback()
             raise SearchError("session injection ledger could not acquire the knowledge lock") from exc
 
+    def reset_session(self, session_id: str) -> int:
+        """Forget per-session injection claims after an explicit compaction/reset."""
+        session_id = require_safe_text(session_id, "session_id", limit=240)
+        cursor = self.connection.execute("DELETE FROM session_injections WHERE session_id = ?", (session_id,))
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def _set_status(self, document_id: str, status: str) -> KnowledgeDocument:
         document_id = require_safe_text(document_id, "document_id", limit=240)
         if status not in STATUSES:
@@ -580,6 +587,38 @@ class KnowledgeIndex:
         self.connection.execute("DELETE FROM document_relations WHERE document_id = ? OR target_id = ?", (document_id, document_id))
         self.connection.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
         self.connection.commit()
+
+    def maintenance(self, *, max_age_days: float = 30, session_retention_days: float = 30,
+                    now: dt.datetime | None = None) -> tuple[int, int]:
+        """Prune expired/superseded knowledge and old session claims atomically."""
+        if max_age_days < 0 or session_retention_days < 0:
+            raise SearchError("maintenance retention cannot be negative")
+        instant = now or dt.datetime.now(dt.timezone.utc)
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=dt.timezone.utc)
+        cutoff = (instant - dt.timedelta(days=max_age_days)).isoformat()
+        session_cutoff = (instant - dt.timedelta(days=session_retention_days)).isoformat()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            rows = self.connection.execute(
+                "SELECT document_id FROM documents WHERE "
+                "(expires_at <> '' AND expires_at <= ?) OR status = 'superseded' OR "
+                "(status = 'candidate' AND last_verified_at <> '' AND last_verified_at < ?)",
+                (instant.isoformat(), cutoff),
+            ).fetchall()
+            for row in rows:
+                document_id = row["document_id"]
+                self.connection.execute("DELETE FROM documents_fts WHERE document_id = ?", (document_id,))
+                self.connection.execute("DELETE FROM document_relations WHERE document_id = ? OR target_id = ?", (document_id, document_id))
+                self.connection.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
+            claims = self.connection.execute(
+                "DELETE FROM session_injections WHERE injected_at < ?", (session_cutoff,)
+            ).rowcount
+            self.connection.commit()
+            return len(rows), int(claims)
+        except sqlite3.OperationalError as exc:
+            self.connection.rollback()
+            raise SearchError("maintenance could not acquire the knowledge lock") from exc
 
     def __enter__(self) -> "KnowledgeIndex":
         return self

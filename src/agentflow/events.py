@@ -541,6 +541,10 @@ class _FileLock:
 
     def __enter__(self) -> "_FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.chmod(0o700)
+        except OSError:
+            pass
         self.handle = self.path.open("a+", encoding="utf-8")
         try:
             os.chmod(self.path, 0o600)

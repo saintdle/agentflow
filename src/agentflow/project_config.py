@@ -35,6 +35,22 @@ DEFAULT_GUIDANCE = {
     "context_pressure_percent": 75,
     "max_children_per_parent": 12,
 }
+DEFAULT_MEMORY = {
+    "enabled": False,
+    "on_prompt": False,
+    "capture_failures": True,
+    "max_items": 5,
+    "max_chars": 2000,
+    "max_age_days": 30,
+    "scopes": ["project"],
+    "scope_id": "",
+    "max_events": 10_000,
+    "max_event_bytes": 5 * 1024 * 1024,
+    "retention_days": 30,
+    "session_retention_days": 30,
+    "maintenance_interval_seconds": 300,
+    "session_ledger_limit": 256,
+}
 
 
 class ConfigError(ValueError):
@@ -49,6 +65,7 @@ def default_data() -> dict[str, Any]:
         "prose": {"editor": dict(DEFAULT_PROSE_EDITOR)},
         "execution": dict(DEFAULT_EXECUTION),
         "guidance": dict(DEFAULT_GUIDANCE),
+        "memory": dict(DEFAULT_MEMORY),
         "skills": [],
     }
 
@@ -93,7 +110,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Keep the public schema limited to values consumed by runtime code.
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
-    allowed = {"schema", "version", "model_policy", "prose", "execution", "guidance", "skills"}
+    allowed = {"schema", "version", "model_policy", "prose", "execution", "guidance", "memory", "skills"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
@@ -172,6 +189,32 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
             children = guidance.get("max_children_per_parent")
             if not isinstance(children, int) or isinstance(children, bool) or children < 1:
                 errors.append("guidance.max_children_per_parent must be positive")
+    if "memory" in data:
+        memory = data.get("memory")
+        if not isinstance(memory, dict) or set(memory) != set(DEFAULT_MEMORY):
+            errors.append("memory must contain exactly the supported opt-in retention, recall, and capture fields")
+        elif isinstance(memory, dict):
+            for field in ("enabled", "on_prompt", "capture_failures"):
+                if not isinstance(memory.get(field), bool):
+                    errors.append(f"memory.{field} must be a boolean")
+            for field, minimum, maximum in (
+                ("max_items", 1, 100), ("max_chars", 1, 100_000),
+                ("max_events", 1, 1_000_000), ("max_event_bytes", 256, 100_000_000),
+                ("retention_days", 0, 3650), ("session_retention_days", 0, 3650),
+                ("maintenance_interval_seconds", 0, 86_400), ("session_ledger_limit", 1, 10_000),
+            ):
+                value = memory.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                    errors.append(f"memory.{field} must be an integer between {minimum} and {maximum}")
+            age = memory.get("max_age_days")
+            if not isinstance(age, (int, float)) or isinstance(age, bool) or age < 0 or age > 3650:
+                errors.append("memory.max_age_days must be a non-negative number at most 3650")
+            scopes = memory.get("scopes")
+            if not isinstance(scopes, list) or not scopes or any(item not in {"user", "project", "root", "task"} for item in scopes):
+                errors.append("memory.scopes must be a non-empty list of user, project, root, or task")
+            scope_id = memory.get("scope_id")
+            if not isinstance(scope_id, str) or len(scope_id) > 240 or any(ord(c) < 32 for c in scope_id):
+                errors.append("memory.scope_id must be bounded text")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
@@ -244,6 +287,8 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
         result["execution"] = local["execution"]
     if "guidance" in local:
         result["guidance"] = local["guidance"]
+    if "memory" in local:
+        result["memory"] = local["memory"]
     merged_skills: dict[str, dict[str, Any]] = {}
     for entry in shared.get("skills", []):
         merged_skills[entry["name"]] = dict(entry)
@@ -276,6 +321,17 @@ def execution_settings(data: dict[str, Any]) -> dict[str, Any]:
 def guidance_settings(data: dict[str, Any]) -> dict[str, Any]:
     value = data.get("guidance")
     return dict(value) if isinstance(value, dict) else dict(DEFAULT_GUIDANCE)
+
+
+def memory_settings(data: dict[str, Any]) -> dict[str, Any]:
+    """Return strict memory settings while keeping schema-v1 legacy configs safe."""
+    value = data.get("memory")
+    if not isinstance(value, dict):
+        return dict(DEFAULT_MEMORY)
+    result = dict(DEFAULT_MEMORY)
+    result.update(value)
+    result["scopes"] = list(value.get("scopes", DEFAULT_MEMORY["scopes"]))
+    return result
 
 
 def skill_origins(root: Path) -> dict[str, str]:

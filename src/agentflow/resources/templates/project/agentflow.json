@@ -23,5 +23,21 @@
     "context_pressure_percent": 75,
     "max_children_per_parent": 12
   },
+  "memory": {
+    "capture_failures": true,
+    "enabled": false,
+    "max_age_days": 30,
+    "max_chars": 2000,
+    "max_event_bytes": 5242880,
+    "max_events": 10000,
+    "max_items": 5,
+    "maintenance_interval_seconds": 300,
+    "on_prompt": false,
+    "retention_days": 30,
+    "scope_id": "",
+    "scopes": ["project"],
+    "session_ledger_limit": 256,
+    "session_retention_days": 30
+  },
   "skills": []
 }
