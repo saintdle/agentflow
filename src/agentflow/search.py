@@ -16,7 +16,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from agentflow.privacy import require_safe_mapping, require_safe_text
+from agentflow.privacy import PrivacyError, require_safe_mapping, require_safe_text
 
 
 class SearchError(ValueError):
@@ -25,6 +25,11 @@ class SearchError(ValueError):
 
 SCOPES = frozenset({"user", "project", "root", "task"})
 STATUSES = frozenset({"candidate", "approved", "superseded", "rejected"})
+PROVENANCE_MAX_KEYS = 128
+PROVENANCE_MAX_ITEMS = 256
+PROVENANCE_MAX_BYTES = 8_192
+PROVENANCE_MAX_DEPTH = 4
+SESSION_LEDGER_MAX = 256
 
 
 def _timestamp(value: str, field: str) -> str:
@@ -38,8 +43,57 @@ def _timestamp(value: str, field: str) -> str:
     return value
 
 
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
 def _source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _check_provenance_bounds(value: Any) -> None:
+    """Reject oversized metadata before the shared privacy recursion runs."""
+    if not isinstance(value, dict):
+        raise PrivacyError("provenance must be an object")
+    keys = items = size = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > PROVENANCE_MAX_DEPTH:
+            raise PrivacyError("provenance exceeds the maximum depth")
+        if isinstance(current, dict):
+            keys += len(current)
+            if keys > PROVENANCE_MAX_KEYS:
+                raise PrivacyError("provenance exceeds the key limit")
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise PrivacyError("provenance keys must be strings")
+                size += len(key.encode("utf-8"))
+                stack.append((item, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            items += len(current)
+            if items > PROVENANCE_MAX_ITEMS:
+                raise PrivacyError("provenance exceeds the item limit")
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            items += 1
+            size += len(current.encode("utf-8"))
+        elif current is None or isinstance(current, (bool, int, float)):
+            items += 1
+        else:
+            raise PrivacyError("provenance contains unsupported metadata")
+        if items > PROVENANCE_MAX_ITEMS or size > PROVENANCE_MAX_BYTES:
+            raise PrivacyError("provenance exceeds aggregate limits")
+
+
+def _validate_approver(value: str) -> str:
+    value = require_safe_text(value, "approval_by", limit=240)
+    lowered = value.lower()
+    if not (lowered.startswith("controller:") or lowered.startswith("human:")):
+        raise SearchError("approval_by must identify a controller or human approver")
+    if "worker" in lowered or lowered.startswith("controller:worker") or lowered.startswith("human:worker"):
+        raise SearchError("worker identities cannot approve knowledge")
+    return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +121,9 @@ class KnowledgeDocument:
     conflicts_with: tuple[str, ...] = ()
     use_count: int = 0
     injection_count: int = 0
+    approval_by: str = ""
+    approval_ref: str = ""
+    approved_at: str = ""
 
     def __post_init__(self) -> None:
         for field in ("document_id", "title", "summary", "source", "source_kind"):
@@ -109,7 +166,13 @@ class KnowledgeDocument:
             value = getattr(self, field)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise SearchError(f"{field} must be a non-negative integer")
+        _check_provenance_bounds(self.provenance)
         object.__setattr__(self, "provenance", require_safe_mapping(dict(self.provenance), "provenance"))
+        if self.approval_by:
+            object.__setattr__(self, "approval_by", require_safe_text(self.approval_by, "approval_by", limit=240))
+        if self.approval_ref:
+            object.__setattr__(self, "approval_ref", require_safe_text(self.approval_ref, "approval_ref", limit=240))
+        object.__setattr__(self, "approved_at", _timestamp(self.approved_at, "approved_at"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,6 +210,22 @@ class SearchResult:
         return self.last_verified_at
 
 
+@dataclasses.dataclass(frozen=True)
+class KnowledgeCandidate:
+    """Safe find-stage metadata; summaries are intentionally withheld."""
+
+    document_id: str
+    source_digest: str
+    scope: str
+    scope_id: str
+    authority: int
+    status: str
+    rank: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
 def _query(value: str) -> str:
     value = require_safe_text(value, "query", limit=400)
     tokens = re.findall(r"[\w-]+", value, flags=re.UNICODE)
@@ -166,6 +245,8 @@ def _row_document(row: sqlite3.Row) -> KnowledgeDocument:
         superseded_by=row["superseded_by"] if "superseded_by" in keys else "",
         conflicts_with=tuple(json.loads(row["conflicts_with"])) if "conflicts_with" in keys else (),
         use_count=row["use_count"] if "use_count" in keys else 0, injection_count=row["injection_count"] if "injection_count" in keys else 0,
+        approval_by=row["approval_by"] if "approval_by" in keys else "", approval_ref=row["approval_ref"] if "approval_ref" in keys else "",
+        approved_at=row["approved_at"] if "approved_at" in keys else "",
     )
 
 
@@ -189,12 +270,17 @@ class KnowledgeIndex:
             status TEXT NOT NULL DEFAULT 'candidate', expires_at TEXT NOT NULL DEFAULT '',
             last_verified_at TEXT NOT NULL DEFAULT '', source_digest TEXT NOT NULL DEFAULT '',
             superseded_by TEXT NOT NULL DEFAULT '', conflicts_with TEXT NOT NULL DEFAULT '[]',
-            use_count INTEGER NOT NULL DEFAULT 0, injection_count INTEGER NOT NULL DEFAULT 0
+            use_count INTEGER NOT NULL DEFAULT 0, injection_count INTEGER NOT NULL DEFAULT 0,
+            approval_by TEXT NOT NULL DEFAULT '', approval_ref TEXT NOT NULL DEFAULT '', approved_at TEXT NOT NULL DEFAULT ''
         )""")
         self._migrate_columns()
         self.connection.execute("""CREATE TABLE IF NOT EXISTS document_relations (
             document_id TEXT NOT NULL, relation TEXT NOT NULL, target_id TEXT NOT NULL,
             PRIMARY KEY (document_id, relation, target_id)
+        )""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS session_injections (
+            session_id TEXT NOT NULL, source_digest TEXT NOT NULL, document_id TEXT NOT NULL,
+            injected_at TEXT NOT NULL, PRIMARY KEY (session_id, source_digest)
         )""")
         self.connection.commit()
 
@@ -206,6 +292,8 @@ class KnowledgeIndex:
             "last_verified_at": "TEXT NOT NULL DEFAULT ''", "source_digest": "TEXT NOT NULL DEFAULT ''",
             "superseded_by": "TEXT NOT NULL DEFAULT ''", "conflicts_with": "TEXT NOT NULL DEFAULT '[]'",
             "use_count": "INTEGER NOT NULL DEFAULT 0", "injection_count": "INTEGER NOT NULL DEFAULT 0",
+            "approval_by": "TEXT NOT NULL DEFAULT ''", "approval_ref": "TEXT NOT NULL DEFAULT ''",
+            "approved_at": "TEXT NOT NULL DEFAULT ''",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -220,18 +308,24 @@ class KnowledgeIndex:
     def add(self, document: KnowledgeDocument | Mapping[str, Any]) -> KnowledgeDocument:
         if not isinstance(document, KnowledgeDocument):
             document = KnowledgeDocument(**dict(document))
+        if document.status == "approved":
+            if not (document.approval_by and document.approval_ref and document.approved_at):
+                raise SearchError("approved knowledge requires durable approval evidence")
+            _validate_approver(document.approval_by)
         existing = self.connection.execute("SELECT 1 FROM documents WHERE document_id = ?", (document.document_id,)).fetchone()
         if existing:
             raise SearchError(f"document already exists: {document.document_id}")
         try:
             self.connection.execute("""INSERT INTO documents
             (document_id,title,summary,source,source_kind,freshness,authority,provenance,privacy,
-             scope,scope_id,status,expires_at,last_verified_at,source_digest,superseded_by,conflicts_with,use_count,injection_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+             scope,scope_id,status,expires_at,last_verified_at,source_digest,superseded_by,conflicts_with,use_count,injection_count,
+             approval_by,approval_ref,approved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
             document.document_id, document.title, document.summary, document.source, document.source_kind,
             document.freshness, document.authority, json.dumps(document.provenance, sort_keys=True), document.privacy,
             document.scope, document.scope_id, document.status, document.expires_at, document.last_verified_at,
             document.source_digest, document.superseded_by, json.dumps(list(document.conflicts_with)), document.use_count, document.injection_count,
+            document.approval_by, document.approval_ref, document.approved_at,
             ))
             self.connection.execute("INSERT INTO documents_fts(document_id, title, summary) VALUES (?, ?, ?)", (document.document_id, document.title, document.summary))
             self.connection.commit()
@@ -295,6 +389,80 @@ class KnowledgeIndex:
 
     query = search
 
+    def find_candidates(self, query: str, **kwargs: Any) -> list[KnowledgeCandidate]:
+        """Find IDs and bounded metadata without exposing summaries."""
+        kwargs.setdefault("statuses", ("candidate", "approved"))
+        results = self.search(query, **kwargs)
+        return [KnowledgeCandidate(item.document_id, item.source_digest, item.scope, item.scope_id, item.authority, item.status, item.rank) for item in results]
+
+    candidates = find_candidates
+
+    def fetch_approved(self, document_id: str, *, min_authority: int = 0,
+                       scopes: str | Sequence[str] | None = None, scope: str | Sequence[str] | None = None,
+                       scope_id: str = "", max_age_days: float | None = 30,
+                       now: dt.datetime | None = None) -> SearchResult | None:
+        """Fetch one approved entry after rechecking governance and freshness."""
+        if scope is not None and scopes is not None and scope != scopes:
+            raise SearchError("scope and scopes disagree")
+        selected_scope = scope if scope is not None else scopes
+        # FTS is not an ID lookup; use the primary key so an ID remains the
+        # sole authority for the second, governed fetch stage.
+        row = self.connection.execute("SELECT * FROM documents WHERE document_id = ?", (require_safe_text(document_id, "document_id", limit=240),)).fetchone()
+        if not row:
+            return None
+        doc = _row_document(row)
+        if doc.status != "approved" or not (doc.approval_by and doc.approval_ref and doc.approved_at):
+            return None
+        if doc.authority < min_authority or doc.privacy != "metadata-only":
+            return None
+        if selected_scope is not None:
+            options = [selected_scope] if isinstance(selected_scope, str) else list(selected_scope)
+            if doc.scope not in options:
+                return None
+        if scope_id and doc.scope_id != require_safe_text(scope_id, "scope_id", limit=240):
+            return None
+        instant = now or dt.datetime.now(dt.timezone.utc)
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=dt.timezone.utc)
+        if doc.expires_at:
+            expiry = dt.datetime.fromisoformat(doc.expires_at.replace("Z", "+00:00"))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=dt.timezone.utc)
+            if expiry <= instant:
+                return None
+        if max_age_days is not None:
+            if not doc.last_verified_at:
+                return None
+            verified = dt.datetime.fromisoformat(doc.last_verified_at.replace("Z", "+00:00"))
+            if verified.tzinfo is None:
+                verified = verified.replace(tzinfo=dt.timezone.utc)
+            if verified < instant - dt.timedelta(days=max_age_days):
+                return None
+        return SearchResult(doc.document_id, doc.title, doc.summary, doc.source, doc.source_kind, doc.freshness, doc.authority, doc.provenance, doc.privacy, 0.0, doc.scope, doc.scope_id, doc.status, doc.expires_at, doc.last_verified_at, doc.source_digest, doc.superseded_by, doc.conflicts_with, doc.use_count, doc.injection_count)
+
+    fetch_for_recall = fetch_approved
+
+    def claim_injection(self, session_id: str, source_digest: str, document_id: str, *, limit: int = SESSION_LEDGER_MAX) -> bool:
+        """Atomically claim a digest for a session; repeated claims are suppressed."""
+        session_id = require_safe_text(session_id, "session_id", limit=240)
+        source_digest = require_safe_text(source_digest, "source_digest", limit=128)
+        document_id = require_safe_text(document_id, "document_id", limit=240)
+        if limit < 1 or limit > SESSION_LEDGER_MAX:
+            raise SearchError(f"session ledger limit must be between 1 and {SESSION_LEDGER_MAX}")
+        timestamp = _now()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            cursor = self.connection.execute("INSERT OR IGNORE INTO session_injections(session_id, source_digest, document_id, injected_at) VALUES (?, ?, ?, ?)", (session_id, source_digest, document_id, timestamp))
+            if cursor.rowcount != 1:
+                self.connection.commit()
+                return False
+            self.connection.execute("DELETE FROM session_injections WHERE session_id = ? AND rowid NOT IN (SELECT rowid FROM session_injections WHERE session_id = ? ORDER BY injected_at DESC, source_digest DESC LIMIT ?)", (session_id, session_id, limit))
+            self.connection.commit()
+            return True
+        except sqlite3.OperationalError as exc:
+            self.connection.rollback()
+            raise SearchError("session injection ledger could not acquire the knowledge lock") from exc
+
     def _set_status(self, document_id: str, status: str) -> KnowledgeDocument:
         document_id = require_safe_text(document_id, "document_id", limit=240)
         if status not in STATUSES:
@@ -330,8 +498,33 @@ class KnowledgeIndex:
 
     add_candidate = candidate
 
-    def approve(self, document_id: str) -> KnowledgeDocument:
-        return self._set_status(document_id, "approved")
+    def approve(self, document_id: str, *, approval_by: str, approval_ref: str, approved_at: str) -> KnowledgeDocument:
+        document_id = require_safe_text(document_id, "document_id", limit=240)
+        approver = _validate_approver(approval_by)
+        reference = require_safe_text(approval_ref, "approval_ref", limit=240)
+        timestamp = _timestamp(approved_at, "approved_at")
+        if not timestamp:
+            raise SearchError("approved_at is required")
+        current = self.get(document_id)
+        if not current:
+            raise SearchError(f"document not found: {document_id}")
+        if current.status == "approved":
+            if (current.approval_by, current.approval_ref, current.approved_at) == (approver, reference, timestamp):
+                return current
+            raise SearchError("approved knowledge cannot be re-approved with different evidence")
+        if current.status != "candidate":
+            raise SearchError(f"cannot transition {current.status} to approved")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            cursor = self.connection.execute("UPDATE documents SET status = 'approved', approval_by = ?, approval_ref = ?, approved_at = ? WHERE document_id = ? AND status = 'candidate'", (approver, reference, timestamp, document_id))
+            if cursor.rowcount != 1:
+                self.connection.rollback()
+                raise SearchError("approval lost a concurrent transition")
+            self.connection.commit()
+        except sqlite3.OperationalError as exc:
+            self.connection.rollback()
+            raise SearchError("approval could not acquire the knowledge lock") from exc
+        return self.get(document_id)  # type: ignore[return-value]
 
     mark_approved = approve
 

@@ -105,6 +105,8 @@ def find_first(
     character_budget: int | None = None,
     max_age_days: float | None = 30,
     max_summary_chars: int = 480,
+    session_id: str = "",
+    session_ledger_limit: int = 256,
     now: dt.datetime | None = None,
 ) -> RecallPlan:
     """Return a deterministic, bounded plan of approved fresh memories.
@@ -142,13 +144,14 @@ def find_first(
     instant = now or dt.datetime.now(dt.timezone.utc)
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=dt.timezone.utc)
-    results = index.search(query, limit=min(100, max_items * 4), min_authority=min_authority, scope=selected_scope, scope_id=scope_id, statuses=("approved",))
+    candidates = index.find_candidates(query, limit=min(100, max_items * 4), min_authority=min_authority, scope=selected_scope, scope_id=scope_id)
     items: list[RecallItem] = []
     rendered: list[str] = []
     seen_digests: set[str] = set()
     used = 0
-    for result in results:
-        if not _fresh(result, instant, max_age_days):
+    for candidate in candidates:
+        result = index.fetch_approved(candidate.document_id, min_authority=min_authority, scopes=selected_scope, scope_id=scope_id, max_age_days=max_age_days, now=instant)
+        if result is None:
             continue
         if result.source_digest in seen_digests:
             continue
@@ -170,6 +173,8 @@ def find_first(
             line = _render(item)
         if len(line) > remaining:
             break
+        if session_id and not index.claim_injection(session_id, item.source_digest, item.document_id, limit=session_ledger_limit):
+            continue
         rendered.append(line)
         items.append(item)
         seen_digests.add(item.source_digest)
@@ -198,8 +203,8 @@ class MemoryStore:
     def candidate(self, document: Any) -> Any:
         return self.index.candidate(document)
 
-    def approve(self, document_id: str) -> Any:
-        return self.index.approve(document_id)
+    def approve(self, document_id: str, **kwargs: Any) -> Any:
+        return self.index.approve(document_id, **kwargs)
 
     def reject(self, document_id: str) -> Any:
         return self.index.reject(document_id)
