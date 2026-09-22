@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import multiprocessing
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +14,8 @@ from agentflow.events import (
     EventSpool,
     FailureClass,
     classify_failure,
+    classify_operational_failure,
+    record_event_safely,
     normalize_event,
 )
 
@@ -29,11 +33,68 @@ class EventSpineTests(unittest.TestCase):
         self.assertNotIn("prompt", events[0].metadata)
         self.assertEqual(events[1].metadata["model"], "gpt-5")
 
-    def test_prompt_event_rejected_and_credential_dropped(self) -> None:
-        with self.assertRaises(EventPrivacyError):
-            normalize_event("claude", {"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt": "do not store"})
+    def test_content_events_keep_identity_but_drop_private_fields(self) -> None:
+        payloads = (
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt": "do not store"},
+            {"event": "PreToolUse", "session_id": "s", "tool_name": "shell", "command": "rm -rf /"},
+            {"event": "PostToolUse", "session_id": "s", "tool_output": "secret"},
+            {"event": "PostToolUseFailure", "session_id": "s", "tool_input": {"password": "secret"}, "failure_class": "timeout"},
+            {"event": "PreCompact", "session_id": "s", "context": "private"},
+        )
+        self.assertEqual(
+            [normalize_event("claude", payload).event for payload in payloads],
+            ["prompt.submit", "tool.start", "tool.success", "tool.failure", "context.compact"],
+        )
+        self.assertEqual(normalize_event("claude", payloads[3]).metadata["failure_class"], "timeout")
+        for payload in payloads:
+            result = normalize_event("claude", payload).to_dict()
+            self.assertNotIn("prompt", json.dumps(result["metadata"]))
+            self.assertNotIn("command", json.dumps(result["metadata"]))
+            self.assertNotIn("secret", json.dumps(result["metadata"]))
         with self.assertRaises(EventPrivacyError):
             normalize_event("codex", {"type": "session.start", "session_id": "s", "model": "api_key=secret"})
+
+    def test_workspace_is_hashed_and_operational_classes_are_stable(self) -> None:
+        event = normalize_event("claude", {"event": "SessionStart", "session_id": "s", "cwd": "/srv/customer/private-repo"})
+        record = event.to_dict()
+        self.assertNotIn("cwd", record["metadata"])
+        self.assertEqual(len(record["metadata"]["workspace_scope"]), 64)
+        self.assertNotIn("private-repo", json.dumps(record))
+        expected = {
+            "timeout": "timeout", "permission denied": "permission",
+            "missing capability": "missing_capability", "invalid command": "invalid_command",
+            "test failure": "test_failure", "schema/config drift": "schema_config_drift",
+            "rate limit": "rate_limit", "other": "unknown",
+        }
+        self.assertEqual({key: classify_operational_failure(key) for key in expected}, expected)
+
+    def test_record_is_fail_open_and_state_is_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            event = normalize_event("claude", {"event": "SessionStart", "session_id": "s"})
+            self.assertTrue(record_event_safely(path, event))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertFalse(record_event_safely(path, event))
+            self.assertFalse(record_event_safely(path, {"unsafe": object()}))
+
+    @staticmethod
+    def _subprocess_append(path: str, index: int) -> None:
+        from agentflow.events import EventSpool, normalize_event
+
+        EventSpool(path).append(normalize_event("codex", {"event": "SessionStart", "session_id": "subprocess"}, event_id=f"proc-{index}"))
+
+    def test_subprocess_appends_remain_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "events.jsonl")
+            processes = [multiprocessing.Process(target=self._subprocess_append, args=(path, index)) for index in range(12)]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+            rows = EventSpool(path).read()
+            self.assertEqual(len(rows), 12)
+            self.assertEqual(sorted(row.sequence for row in rows), list(range(1, 13)))
 
     def test_spool_orders_per_session_and_rejects_duplicate_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

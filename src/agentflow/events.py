@@ -57,6 +57,13 @@ class FailureClass(str, enum.Enum):
     STORAGE_FAILURE = "storage_failure"
     UNSUPPORTED_PROVIDER = "unsupported_provider"
     UNSUPPORTED_EVENT = "unsupported_event"
+    TIMEOUT = "timeout"
+    PERMISSION = "permission"
+    MISSING_CAPABILITY = "missing_capability"
+    INVALID_COMMAND = "invalid_command"
+    TEST_FAILURE = "test_failure"
+    SCHEMA_CONFIG_DRIFT = "schema_config_drift"
+    RATE_LIMIT = "rate_limit"
     UNKNOWN = "unknown"
 
 
@@ -112,11 +119,55 @@ _EVENTS = {
     "sessionerror": "session.error",
     "session_error": "session.error",
     "session.error": "session.error",
+    "userpromptsubmit": "prompt.submit",
+    "user_prompt_submit": "prompt.submit",
+    "userpromptsubmitted": "prompt.submit",
+    "prompt.submit": "prompt.submit",
+    "prompt_submit": "prompt.submit",
+    "presubmit": "prompt.submit",
+    "pretooluse": "tool.start",
+    "pre_tool_use": "tool.start",
+    "toolstart": "tool.start",
+    "tool_start": "tool.start",
+    "tool.start": "tool.start",
+    "posttooluse": "tool.success",
+    "post_tool_use": "tool.success",
+    "toolsuccess": "tool.success",
+    "tool_success": "tool.success",
+    "tool.success": "tool.success",
+    "posttoolusefailure": "tool.failure",
+    "post_tool_use_failure": "tool.failure",
+    "toolfailure": "tool.failure",
+    "tool_failure": "tool.failure",
+    "tool.failure": "tool.failure",
+    "toolcall": "tool.start",
+    "tool_call": "tool.start",
+    "toolexecutionstart": "tool.start",
+    "tool_execution_start": "tool.start",
+    "functioncall": "tool.start",
+    "function_call": "tool.start",
+    "toolexecutionend": "tool.success",
+    "tool_execution_end": "tool.success",
+    "functionresult": "tool.success",
+    "function_result": "tool.success",
+    "toolexecutionerror": "tool.failure",
+    "tool_execution_error": "tool.failure",
+    "functionerror": "tool.failure",
+    "function_error": "tool.failure",
+    "precompact": "context.compact",
+    "pre_compact": "context.compact",
+    "postcompact": "context.compact",
+    "post_compact": "context.compact",
+    "contextcompact": "context.compact",
+    "context_compact": "context.compact",
+    "context.compact": "context.compact",
+    "contextcompaction": "context.compact",
+    "context_compaction": "context.compact",
+    "compaction": "context.compact",
 }
 
 _PROMPT_EVENTS = {
-    "userpromptsubmit", "user_prompt_submit", "userpromptsubmitted", "prompt",
-    "message", "messages", "assistantmessage", "tool", "tooluse", "tool_use",
+    "prompt", "message", "messages", "assistantmessage", "tool", "tooluse", "tool_use",
 }
 _UNSAFE_KEY_PARTS = (
     "prompt", "message", "reasoning", "thinking", "transcript", "response",
@@ -128,7 +179,9 @@ _SAFE_KEYS = {
     "reasoningeffort", "reasoning_effort", "cwd", "source", "version", "role",
     "status", "phase", "mode", "permissionmode", "permission_mode", "durationms",
     "duration_ms", "exitcode", "exit_code", "reason", "kind", "attempt", "retry",
-    "success", "error_class", "failure_class", "workspace", "branch",
+    "success", "error_class", "failure_class", "workspace", "workspace_scope", "branch",
+    "tool", "tool_name", "toolname", "tool_id", "toolid", "tool_type", "tooltype",
+    "compaction_id", "compactionid", "tokens_before", "tokensbefore", "tokens_after", "tokensafter",
 }
 
 _SECRET_RE = re.compile(
@@ -159,6 +212,12 @@ def _timestamp(value: Any = None) -> str:
     except ValueError as exc:
         raise EventValidationError("timestamp must be ISO-8601") from exc
     return value
+
+
+def _workspace_scope(value: Any) -> str:
+    """Return a stable scope identifier without retaining a filesystem path."""
+    raw = _text(value, "workspace_scope", limit=2_000)
+    return hashlib.sha256(("agentflow.workspace.scope\0" + raw).encode("utf-8")).hexdigest()
 
 
 def _canonical_provider(value: Any) -> str:
@@ -214,6 +273,13 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
                 continue
             if key not in _SAFE_KEYS or raw_value is None:
                 continue
+            if key in {"cwd", "workspace", "workspace_scope"}:
+                if isinstance(raw_value, str) and raw_value.strip():
+                    result["workspace_scope"] = _workspace_scope(raw_value)
+                continue
+            if key in {"failure_class", "error_class"}:
+                result["failure_class"] = classify_operational_failure(raw_value)
+                continue
             if isinstance(raw_value, bool):
                 result[key] = raw_value
             elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
@@ -235,6 +301,13 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
         result["model"] = result.pop("selectedmodel")
     if "newmodel" in result and "model" not in result:
         result["model"] = result.pop("newmodel")
+    aliases = {
+        "toolname": "tool_name", "toolid": "tool_id", "tooltype": "tool_type",
+        "compactionid": "compaction_id", "tokensbefore": "tokens_before", "tokensafter": "tokens_after",
+    }
+    for source_key, target_key in aliases.items():
+        if source_key in result and target_key not in result:
+            result[target_key] = result.pop(source_key)
     return dict(sorted(result.items()))
 
 
@@ -318,9 +391,8 @@ def normalize_event(
 ) -> EventEnvelope:
     """Normalize Claude, Codex, or Copilot hook payloads.
 
-    Unknown fields are ignored.  Explicit content fields are dropped, while a
-    prompt/message/tool event itself is rejected so callers cannot mistake it
-    for a stored lifecycle event.
+    Unknown fields are ignored.  Explicit content fields are dropped, while
+    prompt, tool, and compaction events retain only safe lifecycle metadata.
     """
     if isinstance(provider, Mapping):
         if payload is not None:
@@ -355,8 +427,51 @@ def normalize_event(
 normalize = normalize_event
 
 
+_OPERATIONAL_TOKENS: tuple[tuple[FailureClass, tuple[str, ...]], ...] = (
+    (FailureClass.TIMEOUT, ("timeout", "timed out", "deadline exceeded")),
+    (FailureClass.PERMISSION, ("permission", "forbidden", "access denied", "not authorized", "eacces")),
+    (FailureClass.MISSING_CAPABILITY, ("missing capability", "capability_missing", "capability unavailable", "not implemented", "unsupported capability")),
+    (FailureClass.INVALID_COMMAND, ("invalid command", "invalid_command", "command not found", "invalid argv", "executable not found", "exit code 127")),
+    (FailureClass.TEST_FAILURE, ("test failure", "test_failure", "test_failed", "tests failed", "assertionerror", "assertion failed")),
+    (FailureClass.SCHEMA_CONFIG_DRIFT, ("schema drift", "config drift", "configuration drift", "schema/config drift", "schema_config_drift", "schema mismatch", "version mismatch")),
+    (FailureClass.RATE_LIMIT, ("rate limit", "rate_limit", "too many requests", "http 429", "status 429", "throttled")),
+)
+
+
+def classify_operational_failure(value: Any) -> str:
+    """Classify an operational outcome without retaining its diagnostic text."""
+    if isinstance(value, TimeoutError):
+        return FailureClass.TIMEOUT.value
+    if isinstance(value, PermissionError):
+        return FailureClass.PERMISSION.value
+    if isinstance(value, NotImplementedError):
+        return FailureClass.MISSING_CAPABILITY.value
+    if isinstance(value, AssertionError):
+        return FailureClass.TEST_FAILURE.value
+    parts: list[str] = []
+    if isinstance(value, Mapping):
+        for key in ("failure_class", "failure", "error_class", "category", "class", "code", "status", "kind"):
+            item = value.get(key)
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, int):
+                parts.append(str(item))
+    elif isinstance(value, BaseException):
+        parts.extend((type(value).__name__, str(value)))
+    elif isinstance(value, str):
+        parts.append(value)
+    text = " ".join(parts).lower()
+    for failure, tokens in _OPERATIONAL_TOKENS:
+        if any(token in text for token in tokens):
+            return failure.value
+    return FailureClass.UNKNOWN.value
+
+
 def classify_failure(error: Any) -> str:
     """Return a stable class without exposing exception/payload text."""
+    operational = classify_operational_failure(error)
+    if operational != FailureClass.UNKNOWN.value:
+        return operational
     if isinstance(error, DuplicateEventError):
         return FailureClass.DUPLICATE_EVENT.value
     if isinstance(error, EventPrivacyError):
@@ -374,6 +489,12 @@ def classify_failure(error: Any) -> str:
 
 
 failure_class = classify_failure
+operational_failure_class = classify_operational_failure
+
+
+def failure_metadata(value: Any) -> dict[str, str]:
+    """Return linkable failure metadata with no diagnostic payload."""
+    return {"failure_class": classify_operational_failure(value), "privacy": PRIVACY}
 
 
 class _FileLock:
@@ -414,6 +535,12 @@ class EventSpool:
     def _read_unlocked(self) -> list[EventEnvelope]:
         if not self.path.exists():
             return []
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            # Read-only or unusual filesystems are handled by the fail-open
+            # recording boundary; never copy or expose their contents here.
+            pass
         rows: list[EventEnvelope] = []
         try:
             with self.path.open("r", encoding="utf-8") as handle:
@@ -477,6 +604,14 @@ class EventSpool:
 
     add = append
     record = append
+
+    def record_safely(self, event: EventEnvelope | Mapping[str, Any]) -> bool:
+        """Best-effort hook recording; lifecycle execution must never depend on it."""
+        try:
+            self.append(event)
+            return True
+        except Exception:  # noqa: BLE001 - this is the explicit fail-open boundary.
+            return False
 
     def _prune_unlocked(self, rows: list[EventEnvelope]) -> None:
         original_count = len(rows)
@@ -554,9 +689,18 @@ class EventSpool:
 BoundedEventSpool = EventSpool
 
 
+def record_event_safely(spool: EventSpool | Path | str, event: EventEnvelope | Mapping[str, Any]) -> bool:
+    """Record metadata without making a provider hook fail closed on I/O."""
+    try:
+        target = spool if isinstance(spool, EventSpool) else EventSpool(spool)
+        return target.record_safely(event)
+    except Exception:  # noqa: BLE001 - recording must not break provider hooks.
+        return False
+
+
 __all__ = [
     "SCHEMA", "PRIVACY", "EventError", "EventPrivacyError", "EventValidationError",
     "DuplicateEventError", "SpoolError", "FailureClass", "EventEnvelope", "LifecycleEvent",
-    "normalize_event", "normalize", "classify_failure", "failure_class", "EventSpool",
-    "BoundedEventSpool",
+    "normalize_event", "normalize", "classify_failure", "failure_class", "classify_operational_failure",
+    "operational_failure_class", "failure_metadata", "EventSpool", "BoundedEventSpool", "record_event_safely",
 ]
