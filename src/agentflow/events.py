@@ -182,6 +182,7 @@ _SAFE_KEYS = {
     "success", "error_class", "failure_class", "workspace", "workspace_scope", "branch",
     "tool", "tool_name", "toolname", "tool_id", "toolid", "tool_type", "tooltype",
     "compaction_id", "compactionid", "tokens_before", "tokensbefore", "tokens_after", "tokensafter",
+    "failure_ref", "resolution_ref", "failure_id", "resolution_id", "resolves_failure_ref",
 }
 
 _SECRET_RE = re.compile(
@@ -190,6 +191,12 @@ _SECRET_RE = re.compile(
     r"|-----BEGIN [^-]*PRIVATE KEY-----"
 )
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
+_SESSION_HASH_RE = re.compile(r"^sess_[0-9a-f]{64}$")
+_WORKSPACE_HASH_RE = re.compile(r"^ws_[0-9a-f]{64}$")
+_REFERENCE_HASHES = {
+    "failure_ref": re.compile(r"^fail_[0-9a-f]{64}$"),
+    "resolution_ref": re.compile(r"^res_[0-9a-f]{64}$"),
+}
 
 
 def _text(value: Any, field: str, *, limit: int = 240) -> str:
@@ -217,7 +224,29 @@ def _timestamp(value: Any = None) -> str:
 def _workspace_scope(value: Any) -> str:
     """Return a stable scope identifier without retaining a filesystem path."""
     raw = _text(value, "workspace_scope", limit=2_000)
-    return hashlib.sha256(("agentflow.workspace.scope\0" + raw).encode("utf-8")).hexdigest()
+    if _WORKSPACE_HASH_RE.fullmatch(raw):
+        return raw
+    # Rows from the first implementation used an unprefixed digest; recognize
+    # it as canonical and add the prefix without hashing it again.
+    if re.fullmatch(r"[0-9a-f]{64}", raw):
+        return "ws_" + raw
+    return "ws_" + hashlib.sha256(("agentflow.workspace.scope\0" + raw).encode("utf-8")).hexdigest()
+
+
+def _session_scope(value: Any) -> str:
+    """Return a stable session identifier that never persists provider IDs."""
+    raw = _text(value, "session_id", limit=192)
+    if _SESSION_HASH_RE.fullmatch(raw):
+        return raw
+    return "sess_" + hashlib.sha256(("agentflow.session\0" + raw).encode("utf-8")).hexdigest()
+
+
+def _reference(value: Any, field: str, prefix: str) -> str:
+    raw = _text(value, field, limit=192)
+    pattern = _REFERENCE_HASHES[field]
+    if pattern.fullmatch(raw):
+        return raw
+    return prefix + hashlib.sha256(("agentflow." + field + "\0" + raw).encode("utf-8")).hexdigest()
 
 
 def _canonical_provider(value: Any) -> str:
@@ -280,6 +309,14 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
             if key in {"failure_class", "error_class"}:
                 result["failure_class"] = classify_operational_failure(raw_value)
                 continue
+            if key in {"failure_ref", "failure_id", "resolves_failure_ref"}:
+                if isinstance(raw_value, str) and raw_value.strip():
+                    result["failure_ref"] = _reference(raw_value, "failure_ref", "fail_")
+                continue
+            if key in {"resolution_ref", "resolution_id"}:
+                if isinstance(raw_value, str) and raw_value.strip():
+                    result["resolution_ref"] = _reference(raw_value, "resolution_ref", "res_")
+                continue
             if isinstance(raw_value, bool):
                 result[key] = raw_value
             elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
@@ -327,7 +364,7 @@ class EventEnvelope:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "event_id", _text(self.event_id, "event_id", limit=192))
-        object.__setattr__(self, "session_id", _text(self.session_id, "session_id", limit=192))
+        object.__setattr__(self, "session_id", _session_scope(self.session_id))
         if not _ID_RE.fullmatch(self.event_id) or not _ID_RE.fullmatch(self.session_id):
             raise EventValidationError("event_id and session_id contain unsafe characters")
         if not isinstance(self.sequence, int) or isinstance(self.sequence, bool) or self.sequence < 0:
@@ -408,7 +445,7 @@ def normalize_event(
     raw_session = session_id or _lookup(payload, "session_id", "sessionId", "sessionID", "session")
     if not raw_session:
         raise EventValidationError("session_id is required")
-    safe_session = _text(raw_session, "session_id", limit=192)
+    safe_session = _session_scope(raw_session)
     raw_timestamp = timestamp if timestamp is not None else _lookup(payload, "timestamp", "time", "created_at", "createdAt")
     safe_metadata = _metadata(payload, nested)
     if metadata is not None:

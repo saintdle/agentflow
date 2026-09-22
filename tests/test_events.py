@@ -58,7 +58,7 @@ class EventSpineTests(unittest.TestCase):
         event = normalize_event("claude", {"event": "SessionStart", "session_id": "s", "cwd": "/srv/customer/private-repo"})
         record = event.to_dict()
         self.assertNotIn("cwd", record["metadata"])
-        self.assertEqual(len(record["metadata"]["workspace_scope"]), 64)
+        self.assertRegex(record["metadata"]["workspace_scope"], r"^ws_[0-9a-f]{64}$")
         self.assertNotIn("private-repo", json.dumps(record))
         expected = {
             "timeout": "timeout", "permission denied": "permission",
@@ -67,6 +67,33 @@ class EventSpineTests(unittest.TestCase):
             "rate limit": "rate_limit", "other": "unknown",
         }
         self.assertEqual({key: classify_operational_failure(key) for key in expected}, expected)
+
+    def test_append_read_round_trip_preserves_canonical_ids_and_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            raw_session = "provider-secret-session-42"
+            raw_workspace = "/srv/customer/private-repo"
+            event = normalize_event(
+                "codex",
+                {
+                    "event": "tool.failure", "session_id": raw_session, "cwd": raw_workspace,
+                    "failure_ref": "failure-42", "resolution_ref": "resolution-42",
+                    "failure_class": "timeout", "command": "private command",
+                },
+                timestamp="2026-09-22T00:00:00Z",
+            )
+            spool = EventSpool(Path(directory) / "events.jsonl")
+            written = spool.append(event).to_dict()
+            first = spool.read()[0].to_dict()
+            second = spool.read()[0].to_dict()
+            self.assertEqual(written, first)
+            self.assertEqual(first, second)
+            self.assertRegex(first["session_id"], r"^sess_[0-9a-f]{64}$")
+            self.assertRegex(first["metadata"]["workspace_scope"], r"^ws_[0-9a-f]{64}$")
+            self.assertRegex(first["metadata"]["failure_ref"], r"^fail_[0-9a-f]{64}$")
+            self.assertRegex(first["metadata"]["resolution_ref"], r"^res_[0-9a-f]{64}$")
+            serialized = json.dumps(first, sort_keys=True)
+            self.assertNotIn(raw_session, serialized)
+            self.assertNotIn(raw_workspace, serialized)
 
     def test_record_is_fail_open_and_state_is_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -134,7 +161,7 @@ class EventSpineTests(unittest.TestCase):
             legacy = directory / "events.jsonl"
             legacy.write_text(json.dumps({"event": "SessionStart", "session_id": "legacy", "model": "m", "prompt": "private"}) + "\n", encoding="utf-8")
             self.assertEqual(spool.import_legacy(legacy, provider="claude"), 1)
-            self.assertEqual(spool.read()[-1].session_id, "legacy")
+            self.assertRegex(spool.read()[-1].session_id, r"^sess_[0-9a-f]{64}$")
 
     def test_spool_reads_existing_hook_rows_without_exposing_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -146,7 +173,7 @@ class EventSpineTests(unittest.TestCase):
             )
             rows = EventSpool(path).read()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0].session_id, "hashed")
+            self.assertRegex(rows[0].session_id, r"^sess_[0-9a-f]{64}$")
             self.assertNotIn("private", json.dumps(rows[0].to_dict()))
 
     def test_failure_taxonomy_has_no_payload_text(self) -> None:
