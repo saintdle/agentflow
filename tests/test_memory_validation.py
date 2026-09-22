@@ -46,10 +46,12 @@ class MemoryValidationTests(unittest.TestCase):
                     self.assertNotIn("blue comet", serialized)
 
     def test_tool_links_and_adversarial_metadata_are_stable(self) -> None:
-        failure = normalize_event("codex", {"event": "PostToolUseFailure", "data": {"sessionId": "nested", "toolId": "call-42", "error": "permission denied /private/path"}, "reason": "/private/path", "source": "/private/source", "eventId": "/tmp/caller-id"})
-        success = normalize_event("codex", {"event": "PostToolUse", "data": {"sessionId": "nested", "toolId": "call-42"}})
+        failure = normalize_event("codex", {"event": "PostToolUseFailure", "data": {"sessionId": "nested", "toolId": "/private/tool-id", "toolName": "/private/tool-name", "error": "permission denied /private/path"}, "tool_id": "/private/top-level-id", "tool_name": "/private/top-level-name", "reason": "/private/path", "source": "/private/source", "eventId": "/tmp/caller-id"})
         self.assertEqual(failure.metadata["failure_class"], "permission")
-        self.assertEqual(failure.metadata["failure_ref"], success.metadata["resolves_failure_ref"])
+        self.assertRegex(failure.metadata["tool_id"], r"^tool_[0-9a-f]{64}$")
+        self.assertRegex(failure.metadata["tool_name"], r"^tool_[0-9a-f]{64}$")
+        self.assertNotIn("toolid", failure.metadata)
+        self.assertNotIn("toolname", failure.metadata)
         self.assertNotIn("/private", json.dumps(failure.to_dict()))
         self.assertNotIn("/tmp/caller-id", failure.event_id)
         self.assertEqual(failure.to_dict(), type(failure).from_dict(failure.to_dict()).to_dict())
@@ -71,8 +73,8 @@ class MemoryValidationTests(unittest.TestCase):
             self.assertEqual(len(receipt.read_text(encoding="utf-8").splitlines()), 5)
 
     def test_state_home_override_is_shared(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": directory}, clear=False):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as xdg:
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": directory, "XDG_STATE_HOME": xdg}, clear=False):
                 self.assertEqual(state_home(), Path(directory))
 
 

@@ -326,6 +326,13 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
                 if isinstance(raw_value, str) and raw_value.strip():
                     result[key] = _external_id(key + "_", raw_value, key)
                 continue
+            if key in {"tool", "tool_id", "toolid", "tool_name", "toolname"}:
+                if isinstance(raw_value, str) and raw_value.strip():
+                    result["tool_name" if key in {"tool", "tool_name", "toolname"} else "tool_id"] = _external_id(
+                        "tool_", raw_value, "tool_name" if key in {"tool", "tool_name", "toolname"} else "tool_id"
+                    )
+                # Never let a raw provider alias reach generic assignment.
+                continue
             if key in {"failure_class", "error_class"}:
                 result["failure_class"] = classify_operational_failure(raw_value)
                 continue
@@ -352,8 +359,6 @@ def _metadata(payload: Mapping[str, Any], nested: Mapping[str, Any] | None = Non
                     # A malformed optional provider field is not an excuse to
                     # persist its contents; safely omit it.
                     continue
-            if key in {"tool_id", "toolid"} and isinstance(raw_value, str) and raw_value.strip():
-                result["tool_id"] = _external_id("tool_", raw_value, "tool_id")
     # Keep the public shape stable for the provider-neutral consumers.
     if "reasoningeffort" in result and "reasoning_effort" not in result:
         result["reasoning_effort"] = result.pop("reasoningeffort")

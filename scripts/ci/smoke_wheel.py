@@ -42,6 +42,34 @@ def run(wheel: Path, expected_version: str) -> None:
         expected_output = f"agentflow {expected_version}"
         if version != expected_output:
             raise RuntimeError(f"unexpected CLI version output: {version!r}")
+        explicit_state = root / "explicit-state"
+        xdg_state = root / "xdg-state"
+        artifact_env = clean_env.copy()
+        artifact_env["AGENTFLOW_STATE_HOME"] = str(explicit_state)
+        artifact_env["XDG_STATE_HOME"] = str(xdg_state)
+        privacy_probe = subprocess.run(
+            [
+                str(python), "-c",
+                "import json; from agentflow.events import normalize_event; "
+                "from agentflow.memory_runtime import state_home; "
+                "e=normalize_event('codex', {'event':'PostToolUseFailure', "
+                "'tool_id':'/tmp/top-id', 'tool_name':'/tmp/top-name', "
+                "'data':{'sessionId':'nested', 'toolId':'/tmp/nested-id', "
+                "'toolName':'/tmp/nested-name', 'error':'permission denied'}}); "
+                "print(json.dumps({'home':str(state_home()), 'metadata':dict(e.metadata)}))",
+            ],
+            cwd=root,
+            env=artifact_env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        privacy_result = json.loads(privacy_probe.stdout)
+        if privacy_result["home"] != str(explicit_state):
+            raise RuntimeError("installed state-home override did not beat XDG_STATE_HOME")
+        metadata_text = json.dumps(privacy_result["metadata"], sort_keys=True)
+        if any(raw in metadata_text for raw in ("/tmp/top-id", "/tmp/top-name", "/tmp/nested-id", "/tmp/nested-name", "toolid", "toolname")):
+            raise RuntimeError("installed provider alias privacy probe retained raw tool metadata")
         subprocess.run([str(agentflow), "--help"], cwd=root, env=clean_env, check=True)
         manifest_result = subprocess.run(
             [

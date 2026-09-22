@@ -58,7 +58,7 @@ class PackagingConfigTests(unittest.TestCase):
             args.refresh_bundled = True
             self.assertEqual(cli.install(args), 0)
             self.assertNotEqual(profile.read_text(encoding="utf-8"), "stale\n")
-            backups = list((Path(temp) / ".local/state/agentflow/backups").rglob(
+            backups = list((Path(os.environ["XDG_STATE_HOME"]) / "agentflow/backups").rglob(
                 "agentflow-controller.toml"
             ))
             self.assertEqual(len(backups), 1)

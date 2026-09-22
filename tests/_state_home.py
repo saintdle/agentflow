@@ -7,4 +7,7 @@ import tempfile
 
 
 _STATE_HOME = tempfile.TemporaryDirectory(prefix="agentflow-test-state-")
-os.environ.setdefault("AGENTFLOW_STATE_HOME", _STATE_HOME.name)
+# Keep the suite's process-scoped default on the compatibility path. Tests
+# that exercise AGENTFLOW_STATE_HOME explicitly can then prove its precedence
+# over this XDG fallback without sharing state with the host.
+os.environ.setdefault("XDG_STATE_HOME", _STATE_HOME.name)

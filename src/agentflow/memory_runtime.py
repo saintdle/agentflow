@@ -42,12 +42,12 @@ def workspace_scope(root: Path) -> str:
 
 def state_home() -> Path:
     """Return the one local state root used by CLI hooks and runtime state."""
-    xdg = os.environ.get("XDG_STATE_HOME", "")
-    if xdg:
-        return Path(xdg).expanduser() / "agentflow"
     configured = os.environ.get("AGENTFLOW_STATE_HOME", "")
     if configured:
         return Path(configured).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME", "")
+    if xdg:
+        return Path(xdg).expanduser() / "agentflow"
     return Path.home() / ".local/state/agentflow"
 
 

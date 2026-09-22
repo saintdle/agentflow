@@ -10,9 +10,9 @@ Provider hooks normalize SessionStart, UserPromptSubmit, tool start/success/
 failure, compaction, and Stop into metadata-only events. Prompt text, commands,
 arguments, tool output, transcripts, paths, and credentials are discarded.
 Hook storage is fail-open and owner-only under the local Agentflow state home.
-Set `XDG_STATE_HOME` for the traditional `XDG_STATE_HOME/agentflow` location;
-`AGENTFLOW_STATE_HOME` provides an explicit isolated state root when XDG is not
-set.
+`AGENTFLOW_STATE_HOME` is the explicit isolated state root and takes precedence;
+`XDG_STATE_HOME` remains the fallback traditional `XDG_STATE_HOME/agentflow`
+location.
 
 Recall performs candidate lookup followed by a governed fetch. Only approved,
 fresh, in-scope entries are eligible, with strict item and character budgets.
