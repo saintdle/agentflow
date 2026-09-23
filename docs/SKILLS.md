@@ -63,6 +63,14 @@ Handoff preflight also understands provider-supported project locations,
 including `.agents/skills`, `.claude/skills`, and `.github/skills`, so a
 repository-owned skill can remain local to that repository.
 
+When a provider link resolves outside the repository and provider skill roots,
+handoff preflight accepts it only when it resolves to the exact source of the
+same skill in the effective project configuration and that registration names
+the selected provider. References from an external package must remain inside
+that package. Sterile packaging reloads the configuration and revalidates the
+source and package digest immediately before copying it, so removed, retargeted,
+or provider-mismatched registrations fail before launch.
+
 Provider conventions can change independently. `agentflow skills doctor` is
 the authoritative check for the installed Agentflow version.
 

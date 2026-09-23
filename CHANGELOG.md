@@ -24,6 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Handoff preflight and sterile packaging now accept exact, provider-approved
+  external skill sources registered through project configuration while still
+  rejecting unregistered, retargeted, or package-escaping skill references.
 - Provider hooks remain fail-open when the protected workspace-binding
   registry is unreadable or malformed.
 - Sterile packaging revalidates the exact approved skill pin before copying

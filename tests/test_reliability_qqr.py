@@ -197,6 +197,59 @@ class SterileLaunchPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "skill pin changed after preflight"):
                 cli._package_handoff_sterile(handoff, directory / "sterile")
 
+    def test_package_rejects_registered_external_skill_config_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / "source"
+            external = directory / "external/domain-skill"
+            replacement = directory / "replacement/domain-skill"
+            root.mkdir()
+            for skill_root in (external, replacement):
+                skill_root.mkdir(parents=True)
+                (skill_root / "SKILL.md").write_text(
+                    "---\nname: domain-skill\ndescription: approved\n---\nOriginal.\n",
+                    encoding="utf-8",
+                )
+            shared = cli.project_config_backend.default_data()
+            local = cli.project_config_backend.default_local_data()
+            local["skills"] = [{
+                "name": "domain-skill", "path": str(external), "providers": ["codex"]
+            }]
+            cli.project_config_backend.write_layer(root, shared, local=False)
+            cli.project_config_backend.write_layer(root, local, local=True)
+            skill_link = root / ".agents/skills/domain-skill"
+            skill_link.parent.mkdir(parents=True)
+            skill_link.symlink_to(external, target_is_directory=True)
+            context = root / "allowed.md"
+            context.write_text("bounded evidence\n", encoding="utf-8")
+            handoff = self._create_external_handoff(
+                root, context, required_skills=["domain-skill"]
+            )
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(
+                    cli.handoff_preflight(
+                        argparse.Namespace(
+                            file=str(handoff), cwd=str(root), require_matrix=False
+                        )
+                    ),
+                    0,
+                )
+
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"):
+                packaged = cli._package_handoff_sterile(
+                    handoff, directory / "sterile-ok"
+                )
+            self.assertEqual(
+                cli._validate_sterile_package(directory / "sterile-ok"), packaged
+            )
+
+            local["skills"][0]["path"] = str(replacement)
+            cli.project_config_backend.write_layer(root, local, local=True)
+            with self.assertRaisesRegex(ValueError, "registered source changed after preflight"):
+                cli._package_handoff_sterile(handoff, directory / "sterile")
+
 
 class NativeDirectHandoffTests(unittest.TestCase):
     def test_native_launch_has_no_unavailable_machine_return_contract(self) -> None:

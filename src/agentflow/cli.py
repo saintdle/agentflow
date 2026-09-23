@@ -5310,8 +5310,17 @@ def _skill_package_digest(entrypoint: Path) -> tuple[str, int]:
     return hashlib.sha256(encoded).hexdigest(), len(records)
 
 
-def _skill_pin(entrypoint: Path, repository_root: Path) -> dict[str, Any]:
-    boundaries = _skill_reference_boundaries(repository_root)
+def _skill_pin(
+    entrypoint: Path,
+    repository_root: Path,
+    *,
+    approved_boundaries: tuple[Path, ...] | None = None,
+) -> dict[str, Any]:
+    boundaries = (
+        tuple(boundary.resolve() for boundary in approved_boundaries)
+        if approved_boundaries is not None
+        else _skill_reference_boundaries(repository_root)
+    )
     packages: list[dict[str, Any]] = []
     visiting: set[Path] = set()
     visited: set[Path] = set()
@@ -5375,6 +5384,64 @@ def _skill_pin(entrypoint: Path, repository_root: Path) -> dict[str, Any]:
     }
 
 
+def _configured_skill_source(
+    provider: str, repository_root: Path, skill_name: str
+) -> Path | None:
+    config_path = project_config_backend.config_path(repository_root)
+    if not config_path.exists() and not config_path.is_symlink():
+        return None
+    try:
+        configured = project_config_backend.skills(
+            project_config_backend.load(repository_root), repository_root
+        )
+    except project_config_backend.ConfigError as exc:
+        raise ValueError(f"configured skill registrations are invalid: {exc}") from exc
+    for name, source, providers in configured:
+        if name != skill_name:
+            continue
+        if provider not in providers:
+            raise ValueError(
+                f"registered skill {skill_name} is not approved for {provider}"
+            )
+        return source.resolve()
+    return None
+
+
+def _required_skill_pin(
+    provider: str, cwd: Path, skill_name: str, entrypoint: Path
+) -> tuple[dict[str, Any], Path | None]:
+    repository_root = _repository_root(cwd)
+    resolved_entrypoint = entrypoint.resolve()
+    if any(
+        _path_within(resolved_entrypoint, boundary.resolve())
+        for boundary in _skill_reference_boundaries(repository_root)
+    ):
+        return _skill_pin(resolved_entrypoint, repository_root), None
+
+    registered_source = _configured_skill_source(
+        provider, repository_root, skill_name
+    )
+    if registered_source is None:
+        raise ValueError(
+            f"required skill {skill_name} resolves outside approved skill roots "
+            "and is not registered in the effective project configuration"
+        )
+    expected_entrypoint = (registered_source / "SKILL.md").resolve()
+    if resolved_entrypoint != expected_entrypoint:
+        raise ValueError(
+            f"required skill {skill_name} does not match registered source "
+            f"{registered_source}"
+        )
+    return (
+        _skill_pin(
+            resolved_entrypoint,
+            repository_root,
+            approved_boundaries=(registered_source,),
+        ),
+        registered_source,
+    )
+
+
 def _resolve_required_skills(
     provider: str, cwd: Path, skill_names: list[str]
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -5402,19 +5469,22 @@ def _resolve_required_skills(
             )
             continue
         try:
-            pin = _skill_pin(entrypoint, _repository_root(cwd))
+            pin, registered_source = _required_skill_pin(
+                provider, cwd, skill_name, entrypoint
+            )
         except (OSError, ValueError) as exc:
             errors.append(f"required skill package cannot be pinned: {entrypoint}: {exc}")
             continue
-        resolved.append(
-            {
-                "name": skill_name,
-                "provider": provider,
-                "entrypoint": str(entrypoint),
-                "source": str(entrypoint.resolve()),
-                **pin,
-            }
-        )
+        record = {
+            "name": skill_name,
+            "provider": provider,
+            "entrypoint": str(entrypoint),
+            "source": str(entrypoint.resolve()),
+            **pin,
+        }
+        if registered_source is not None:
+            record["registered_source"] = str(registered_source)
+        resolved.append(record)
     return resolved, errors
 
 
@@ -6909,7 +6979,26 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
             raise ValueError("sterile packaging requires self-contained skill packages")
         name = str(skill.get("name") or "")
         entrypoint = Path(str(skill.get("entrypoint") or "")).expanduser().resolve()
-        current_pin = _skill_pin(entrypoint, _repository_root(source_root))
+        try:
+            current_pin, registered_source = _required_skill_pin(
+                str(manifest.get("provider") or ""), source_root, name, entrypoint
+            )
+        except (OSError, ValueError) as exc:
+            if skill.get("registered_source"):
+                raise ValueError(
+                    f"sterile skill registered source changed after preflight: "
+                    f"{name or entrypoint.name}: {exc}"
+                ) from exc
+            raise
+        expected_registered_source = str(skill.get("registered_source") or "")
+        actual_registered_source = str(registered_source or "")
+        if not hmac.compare_digest(
+            expected_registered_source, actual_registered_source
+        ):
+            raise ValueError(
+                f"sterile skill registered source changed after preflight: "
+                f"{name or entrypoint.name}"
+            )
         for field in (
             "digest_schema", "entrypoint_sha256", "sha256",
             "package_count", "file_count",

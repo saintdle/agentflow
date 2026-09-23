@@ -1250,6 +1250,98 @@ class AgentflowTests(unittest.TestCase):
                     self.assertEqual(resolved[0]["package_count"], 1)
                     self.assertEqual(resolved[0]["file_count"], 1)
 
+    def test_registered_external_skill_resolution_is_exact_and_provider_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            root = directory / "project"
+            external = directory / "external/domain-skill"
+            root.mkdir()
+            external.mkdir(parents=True)
+            (external / "SKILL.md").write_text(
+                "---\nname: domain-skill\ndescription: External.\n---\n",
+                encoding="utf-8",
+            )
+            shared = cli.project_config_backend.default_data()
+            local = cli.project_config_backend.default_local_data()
+            local["skills"] = [{
+                "name": "domain-skill",
+                "path": str(external),
+                "providers": ["claude"],
+            }]
+            cli.project_config_backend.write_layer(root, shared, local=False)
+            cli.project_config_backend.write_layer(root, local, local=True)
+            claude_link = root / ".claude/skills/domain-skill"
+            claude_link.parent.mkdir(parents=True)
+            claude_link.symlink_to(external, target_is_directory=True)
+
+            resolved, errors = cli._resolve_required_skills(
+                "claude", root, ["domain-skill"]
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(resolved[0]["source"], str(external / "SKILL.md"))
+            self.assertEqual(resolved[0]["registered_source"], str(external))
+
+            codex_link = root / ".agents/skills/domain-skill"
+            codex_link.parent.mkdir(parents=True)
+            codex_link.symlink_to(external, target_is_directory=True)
+            resolved, errors = cli._resolve_required_skills(
+                "codex", root, ["domain-skill"]
+            )
+            self.assertEqual(resolved, [])
+            self.assertTrue(any("not approved for codex" in error for error in errors))
+
+    def test_external_skill_resolution_rejects_unregistered_retarget_and_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp).resolve()
+            root = directory / "project"
+            approved = directory / "external/approved"
+            retargeted = directory / "external/retargeted"
+            sibling = directory / "external/sibling"
+            root.mkdir()
+            for source in (approved, retargeted, sibling):
+                source.mkdir(parents=True)
+                (source / "SKILL.md").write_text(
+                    "---\nname: domain-skill\ndescription: External.\n---\n",
+                    encoding="utf-8",
+                )
+            shared = cli.project_config_backend.default_data()
+            cli.project_config_backend.write_layer(root, shared, local=False)
+            link = root / ".claude/skills/domain-skill"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(retargeted, target_is_directory=True)
+
+            resolved, errors = cli._resolve_required_skills(
+                "claude", root, ["domain-skill"]
+            )
+            self.assertEqual(resolved, [])
+            self.assertTrue(any("is not registered" in error for error in errors))
+
+            local = cli.project_config_backend.default_local_data()
+            local["skills"] = [{
+                "name": "domain-skill",
+                "path": str(approved),
+                "providers": ["claude"],
+            }]
+            cli.project_config_backend.write_layer(root, local, local=True)
+            resolved, errors = cli._resolve_required_skills(
+                "claude", root, ["domain-skill"]
+            )
+            self.assertEqual(resolved, [])
+            self.assertTrue(any("does not match registered source" in error for error in errors))
+
+            link.unlink()
+            link.symlink_to(approved, target_is_directory=True)
+            (approved / "SKILL.md").write_text(
+                "---\nname: domain-skill\ndescription: External.\n---\n"
+                "Read `../sibling/SKILL.md`.\n",
+                encoding="utf-8",
+            )
+            resolved, errors = cli._resolve_required_skills(
+                "claude", root, ["domain-skill"]
+            )
+            self.assertEqual(resolved, [])
+            self.assertTrue(any("escapes approved skill roots" in error for error in errors))
+
     def test_claude_adapter_pin_covers_canonical_skill_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
