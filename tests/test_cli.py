@@ -308,7 +308,12 @@ class AgentflowTests(unittest.TestCase):
             # The fixture's full handoff already passed source preflight. Its
             # declared context is packaged without repository instructions.
             stage = base / "sterile"
-            packaged_path = cli._package_handoff_sterile(fixture.handoff_path, stage)
+            with mock.patch.object(
+                cli, "_provider_command", return_value="/fake/codex"
+            ):
+                packaged_path = cli._package_handoff_sterile(
+                    fixture.handoff_path, stage
+                )
             packaged = cli.provider_argv_backend.validate_confined_handoff(
                 packaged_path, root=stage, provider=fixture.provider, task_id=fixture.task_id
             )

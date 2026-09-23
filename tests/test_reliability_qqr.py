@@ -140,7 +140,10 @@ class SterileLaunchPackageTests(unittest.TestCase):
             context.write_text("bounded evidence\n", encoding="utf-8")
             (root / "AGENTS.md").write_text("must not leak\n", encoding="utf-8")
             handoff = self._create_external_handoff(root, context)
-            packaged = cli._package_handoff_sterile(handoff, stage)
+            with mock.patch.object(
+                cli, "_provider_command", return_value="/fake/codex"
+            ):
+                packaged = cli._package_handoff_sterile(handoff, stage)
             self.assertEqual(cli._validate_sterile_package(stage), packaged)
             names = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()}
             self.assertFalse(any(name.endswith("AGENTS.md") for name in names))
