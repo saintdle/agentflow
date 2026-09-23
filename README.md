@@ -202,6 +202,12 @@ return channel. For restricted outbound context, set `sterile: true` (or
 controller builds and verifies a minimal execution package before Herdr spawn.
 The current sterile lane is read-only and rejects `shell-write` until a
 reviewed import contract exists.
+
+Native handoffs are the bounded direct-session lane. They return their result
+in the provider session and deliberately contain no protected result-file
+contract. `agentflow prose prepare` uses this lane for its one-shot sibling-file
+editing pass. Controller dispatch always materializes an external handoff,
+regardless of an older task's omitted lane metadata.
 You can inspect the same packaging boundary without launching a provider:
 
 ```sh

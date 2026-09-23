@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -150,6 +151,12 @@ class ProseCliTests(unittest.TestCase):
             root = Path(tmp)
             source = root / "draft.md"
             source.write_text(LONG, encoding="utf-8")
+            skill = root / ".agents/skills/isovalent-ai-tme-skill/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "---\nname: isovalent-ai-tme-skill\ndescription: Test editing skill\n---\n",
+                encoding="utf-8",
+            )
             original = source.read_bytes()
             code, output, error = self.run_cli([
                 "prose", "prepare", "draft.md", "--cwd", str(root),
@@ -161,6 +168,11 @@ class ProseCliTests(unittest.TestCase):
             result = json.loads(output)
             handoff = Path(result["handoff"])
             manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["lane"], "native")
+            self.assertNotIn("machine_return_contract", manifest)
+            self.assertNotIn(
+                "AGENTFLOW_RESULT_CONTRACT", handoff.read_text(encoding="utf-8")
+            )
             self.assertEqual(manifest["prose"]["editor"], {
                 "provider": "codex", "model": "gpt-5.6-luna", "role": "editing",
                 "effort": "medium", "policy": "models-v2",
@@ -170,6 +182,24 @@ class ProseCliTests(unittest.TestCase):
             self.assertIn("never overwrite", handoff.read_text(encoding="utf-8"))
             self.assertEqual(source.read_bytes(), original)
             self.assertFalse((root / "draft.edited.md").exists())
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    cli.handoff_preflight(type("Args", (), {
+                        "file": str(handoff), "cwd": str(root), "require_matrix": False,
+                    })()),
+                    0,
+                )
+            launch_args = type("Args", (), {
+                "provider": "codex", "file": str(handoff), "cwd": str(root),
+                "role": "editing", "model": "gpt-5.6-luna", "effort": "medium",
+                "policy": "", "print_command": False, "selective_model": False,
+            })()
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch.object(cli.subprocess, "call", return_value=0) as spawned:
+                self.assertEqual(cli.handoff_launch(launch_args), 0)
+            spawned.assert_called_once()
 
     def test_prepare_accepts_explicit_non_openai_editor_route(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

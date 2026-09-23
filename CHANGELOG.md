@@ -17,8 +17,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - External handoffs now require the leased controller's authenticated Herdr
   result channel; direct external launch fails before provider spawn.
+- Native direct handoffs no longer advertise controller-owned result files;
+  the conditional prose editor uses this bounded direct-session lane.
 - Authenticated results now require native lifecycle evidence that the actual
   provider model exactly matches the signed requested route.
+
+### Fixed
+
+- Provider hooks remain fail-open when the protected workspace-binding
+  registry is unreadable or malformed.
+- Sterile packaging revalidates the exact approved skill pin before copying
+  and verifies the copied package bytes before launch.
+- Root preflight resolves relative output boundaries against the approved
+  execution root rather than the invoking shell's directory.
 
 ## [0.0.5] - 2026-09-15
 

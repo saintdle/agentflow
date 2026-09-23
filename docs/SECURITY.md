@@ -98,12 +98,20 @@ contract. Only a leased root controller can mint that channel. Direct
 `agentflow handoff launch` therefore refuses external handoffs before provider
 spawn instead of promising an unavailable result path.
 
+A native handoff is intentionally different: it is a bounded direct provider
+session, returns through that session, and contains no machine result-file
+contract. This keeps direct utilities such as the conditional prose editor
+usable without falsely advertising controller-owned environment variables.
+Controller dispatch always materializes external mode before Herdr launch.
+
 Tasks whose persisted launch metadata contains `"sterile": true` or
 `"outbound_context": "restricted"` execute from a separate package in the
 Agentflow user-state directory. The package contains only the regenerated typed
 handoff, explicit local context files, its acceptance matrix, and self-contained
-pinned skill packages. Repository instruction files are excluded and cannot be
-declared as context. A complete relative-path/SHA-256 inventory is checked
+pinned skill packages. Agentflow revalidates the source pin immediately before
+copying and verifies the copied package digest. Repository instruction files
+are excluded and cannot be declared as context. A complete relative-path/
+SHA-256 inventory is checked
 before every spawn; extra files, symlinks, missing files, and changed bytes
 block launch. Controller authority, Beads, claims, and result state remain in
 the original workflow workspace.

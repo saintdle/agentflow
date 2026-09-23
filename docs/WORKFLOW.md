@@ -93,6 +93,11 @@ long-running, cross-provider, worktree-owned, or decision-prone sessions where
 observation or direct intervention is useful. A live pane is an attention
 signal, never proof of correctness or completion.
 
+Generated native handoffs are direct-session contracts: they return in the
+provider session and never claim that controller-owned result files exist.
+Generated external handoffs are controller contracts and always require the
+leased controller's authenticated return channel.
+
 External launches consume provider allowance and therefore remain explicit
 unless an approved controller is operating within its recorded budget.
 Native Codex workers use a dedicated Luna profile with no inherited controller

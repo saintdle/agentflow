@@ -13,7 +13,9 @@ The lane is conditional:
 2. Claude writes the artifact with the repository's domain skill.
 3. `agentflow prose prepare` runs deterministic checks without calling a model.
 4. A passing artifact continues unchanged. A failing artifact produces an
-   ignored, preflightable handoff for one exact, policy-approved editor session.
+   ignored, preflightable native handoff for one exact, policy-approved direct
+   editor session. It returns in that session and does not advertise the root
+   controller's protected result files.
 5. The editor writes a sibling file. `agentflow prose verify` checks prose and
    rejects changed code fences, inline code, link destinations, or numbers.
 6. Domain checks still run. The controller reviews the diff and decides whether
@@ -104,9 +106,11 @@ policy-unapproved routes fail closed. To use deterministic checks
 without any editing model, configure `"prose": {"editor": null}`. A failing
 artifact then returns status `edit-required-no-route` and creates no handoff.
 
-The handoff permits only the edited sibling, prohibits research and new claims,
-requires the domain skill, and carries the deterministic findings. Run its
-preflight, then its printed launch command. Finally verify the returned file:
+The native handoff permits only the edited sibling, prohibits research and new
+claims, requires the domain skill, and carries the deterministic findings. Run
+its preflight, then its printed direct launch command. External Beads workers
+remain controller-owned and use authenticated result channels. Finally verify
+the returned file:
 
 ```sh
 agentflow prose verify posts/agentflow.md posts/agentflow.edited.md \

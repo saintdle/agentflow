@@ -258,12 +258,12 @@ def _validated_bound_workspace(provider: str, payload: Mapping[str, Any]) -> Pat
     ).strip()
     if not raw_session:
         return None
-    record = workspace_binding_backend.lookup(
-        _workspace_binding_path(), provider=provider, raw_session_id=raw_session,
-    )
-    if not isinstance(record, Mapping):
-        return None
     try:
+        record = workspace_binding_backend.lookup(
+            _workspace_binding_path(), provider=provider, raw_session_id=raw_session,
+        )
+        if not isinstance(record, Mapping):
+            return None
         root = Path(str(record["workspace_root"])).expanduser().resolve(strict=True)
         workflow_root = str(record["workflow_root"])
         expected_state = _controller_state_dir(root, workflow_root) / "state.json"
@@ -659,7 +659,7 @@ def _materialize_launch_handoff(cwd: Path, task_id: str, provider: str, *, role:
     """
     output = cwd / ".agentflow/tmp/handoffs" / f"{_slug(task_id)}-{provider}.md"
     handoff_args = argparse.Namespace(
-        bead=task_id, to=provider, cwd=str(cwd), task_class="", role=role, lane="",
+        bead=task_id, to=provider, cwd=str(cwd), task_class="", role=role, lane="external",
         tool_profile="", output_boundary="", require_tool=[], require_skill=[],
         allow_delegation=False, return_type="", max_ai_credits=None, base="", branch="",
         context=[], constraint=[], check=[], budget=[], out=str(output),
@@ -721,12 +721,15 @@ def _run_actual_root_preflight(
     required_tools = tuple(
         str(value) for value in manifest.get("required_tools", []) if isinstance(value, str)
     )
+    boundary = Path(str(manifest.get("output_boundary") or ""))
+    if not boundary.is_absolute():
+        boundary = (execution_root or root) / boundary
     base = str(manifest.get("base") or "")
     if not base and not _is_git_repository(root):
         base = "workspace"
     namespace = argparse.Namespace(
         root=str(execution_root or root), authority_root=str(root), base=base, context=list(context_values),
-        boundary=str(manifest.get("output_boundary") or ""), matrix=list(acceptance_ids),
+        boundary=str(boundary), matrix=list(acceptance_ids),
         tool=list(required_tools), provider=provider, role=role, model=model, effort=effort,
         policy_version="", workflow_root=workflow_root, task=task_id, actor=actor,
         session_id=session_name, lease=lease, claim=claim, handoff=str(handoff.path),
@@ -5602,7 +5605,7 @@ def prose_prepare(args: argparse.Namespace) -> int:
     handoff_args = argparse.Namespace(
         to=editor["provider"], title=f"Plain-language edit: {source_rel}",
         goal=f"Edit {source_rel} into {edited_rel} so it reads clearly without changing technical meaning.",
-        task_id=f"prose-{slug}", task_class="implementation", role="editing", lane="external",
+        task_id=f"prose-{slug}", task_class="implementation", role="editing", lane="native",
         tool_profile="shell-write", output_boundary=str(edited.resolve()), require_tool=[],
         require_skill=args.require_skill, allow_delegation=False, return_type="result",
         max_ai_credits=editor.get("max_ai_credits"), acceptance_matrix="",
@@ -5775,22 +5778,49 @@ def handoff_create(args: argparse.Namespace) -> int:
         [str(row.get("id")) for row in acceptance_data.get("rows", []) if row.get("id")]
         if acceptance_data else []
     )
-    machine_return_contract = {
-        "schema": "agentflow.return@1",
-        "result_schema": "agentflow.result@1",
-        "acceptance_ids": acceptance_ids,
-        "approved_waivers": [
-            str(row.get("approval_ref"))
-            for row in (acceptance_data.get("rows", []) if acceptance_data else [])
-            if isinstance(row, Mapping) and row.get("status") == "waived" and row.get("approval_ref")
-        ],
-        "required_result_fields": ["outcome", "acceptance_results"],
-        "protected_paths": [
-            "$AGENTFLOW_RESULT_CONTRACT",
-            "$AGENTFLOW_RESULT_FILE",
-        ],
-        "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
-    }
+    machine_return_contract = (
+        {
+            "schema": "agentflow.return@1",
+            "result_schema": "agentflow.result@1",
+            "acceptance_ids": acceptance_ids,
+            "approved_waivers": [
+                str(row.get("approval_ref"))
+                for row in (acceptance_data.get("rows", []) if acceptance_data else [])
+                if isinstance(row, Mapping) and row.get("status") == "waived" and row.get("approval_ref")
+            ],
+            "required_result_fields": ["outcome", "acceptance_results"],
+            "protected_paths": [
+                "$AGENTFLOW_RESULT_CONTRACT",
+                "$AGENTFLOW_RESULT_FILE",
+            ],
+            "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+        }
+        if lane == "external"
+        else None
+    )
+    machine_return_section = ""
+    if machine_return_contract is not None:
+        machine_return_section = f"""## Machine return contract
+
+```json
+{json.dumps(machine_return_contract, indent=2, sort_keys=True)}
+```
+
+Use only the protected paths exposed as `AGENTFLOW_HANDOFF_PATH`,
+`AGENTFLOW_RESULT_CONTRACT`, and `AGENTFLOW_RESULT_FILE`. The controller
+keeps the return capability private. Write bounded JSON to the result path and
+invoke exactly:
+
+`{machine_return_contract['submit_command']}`
+
+"""
+    else:
+        machine_return_section = """## Direct-session return
+
+This native handoff has no controller-owned result files. Return the bounded
+outcome in the provider session and do not invoke `agentflow herdr submit`.
+
+"""
     authority_boundary = ""
     if untrusted_task_data:
         authority_boundary = """## Authority boundary
@@ -5883,19 +5913,7 @@ Do not wait while consuming allowance. In an external session, the user may atta
 
 {return_contract}
 
-## Machine return contract
-
-```json
-{json.dumps(machine_return_contract, indent=2, sort_keys=True)}
-```
-
-Use only the protected paths exposed as `AGENTFLOW_HANDOFF_PATH`,
-`AGENTFLOW_RESULT_CONTRACT`, and `AGENTFLOW_RESULT_FILE`. The controller
-keeps the return capability private. Write bounded JSON to the result path and
-invoke exactly:
-
-`{machine_return_contract['submit_command']}`
-
+{machine_return_section}
 - Name this work as `{args.title} ({task_id})`; do not present a bare task or bead ID.
 - For every referenced dependency or follow-up, give its human title, stage,
   ready/blocked reason, and whether a worker is actually claimed. Resolve unknown
@@ -5940,8 +5958,9 @@ invoke exactly:
         "state_backend": "file",
         "untrusted_task_data": untrusted_task_data,
         "workspace_kind": workspace_kind,
-        "machine_return_contract": machine_return_contract,
     }
+    if machine_return_contract is not None:
+        manifest["machine_return_contract"] = machine_return_contract
     _write_json(output.with_suffix(".json"), manifest)
     print(output.resolve())
     return 0
@@ -6213,10 +6232,20 @@ def handoff_preflight(args: argparse.Namespace) -> int:
             errors.append(f"required tool is unavailable: {tool}")
     if required_tools:
         checks.append(f"tools={len(required_tools)}")
-    if not output_boundary.is_dir() or not os.access(output_boundary, os.W_OK):
-        errors.append(f"output boundary is not writable: {output_boundary}")
-    else:
+    if output_boundary.is_symlink():
+        errors.append(f"output boundary must not be a symlink: {output_boundary}")
+    elif output_boundary.is_dir() and os.access(output_boundary, os.W_OK):
         checks.append(f"output={output_boundary}")
+    elif output_boundary.is_file() and os.access(output_boundary, os.W_OK):
+        checks.append(f"output={output_boundary}")
+    elif (
+        not output_boundary.exists()
+        and output_boundary.parent.is_dir()
+        and os.access(output_boundary.parent, os.W_OK)
+    ):
+        checks.append(f"output={output_boundary}")
+    else:
+        errors.append(f"output boundary is not writable: {output_boundary}")
     budgets = manifest.get("budget") if isinstance(manifest.get("budget"), list) else []
     if lane == "external" and not budgets:
         errors.append("external handoff requires --budget with time, retry, and stop conditions")
@@ -6868,6 +6897,37 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         raise ValueError("sterile package root must be separate from the workflow workspace")
     if stage.exists() and any(stage.iterdir()):
         raise ValueError("sterile package output must be new or empty")
+
+    resolved = manifest.get("resolved_skills")
+    if manifest.get("required_skills") and not isinstance(resolved, list):
+        raise ValueError("required skills have not passed handoff preflight")
+    prepared_skills: list[tuple[str, Path, str, int]] = []
+    for skill in resolved or []:
+        if not isinstance(skill, Mapping):
+            raise ValueError("resolved skill pin is malformed")
+        if int(skill.get("package_count") or 0) != 1:
+            raise ValueError("sterile packaging requires self-contained skill packages")
+        name = str(skill.get("name") or "")
+        entrypoint = Path(str(skill.get("entrypoint") or "")).expanduser().resolve()
+        current_pin = _skill_pin(entrypoint, _repository_root(source_root))
+        for field in (
+            "digest_schema", "entrypoint_sha256", "sha256",
+            "package_count", "file_count",
+        ):
+            expected = skill.get(field)
+            actual = current_pin.get(field)
+            matches = (
+                hmac.compare_digest(str(expected), str(actual))
+                if isinstance(expected, str) and isinstance(actual, str)
+                else expected == actual
+            )
+            if not matches:
+                raise ValueError(
+                    f"sterile skill pin changed after preflight: {name or entrypoint.name}"
+                )
+        package_sha256, file_count = _skill_package_digest(entrypoint)
+        prepared_skills.append((name, entrypoint, package_sha256, file_count))
+
     stage.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(stage, 0o700)
     (stage / "output").mkdir(mode=0o700)
@@ -6891,16 +6951,7 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         _copy_sterile_file(source_acceptance, destination)
         copied_acceptance = str(destination)
 
-    resolved = manifest.get("resolved_skills")
-    if manifest.get("required_skills") and not isinstance(resolved, list):
-        raise ValueError("required skills have not passed handoff preflight")
-    for skill in resolved or []:
-        if not isinstance(skill, Mapping):
-            raise ValueError("resolved skill pin is malformed")
-        if int(skill.get("package_count") or 0) != 1:
-            raise ValueError("sterile packaging requires self-contained skill packages")
-        name = str(skill.get("name") or "")
-        entrypoint = Path(str(skill.get("entrypoint") or "")).expanduser().resolve()
+    for name, entrypoint, expected_package_sha256, expected_file_count in prepared_skills:
         package_root = entrypoint.parent
         destination = _sterile_skill_root(stage, str(manifest.get("provider")), name)
         for candidate in sorted(package_root.rglob("*")):
@@ -6908,6 +6959,13 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
                 raise ValueError(f"sterile skill package contains a symlink: {candidate}")
             if candidate.is_file():
                 _copy_sterile_file(candidate, destination / candidate.relative_to(package_root), allow_instructions=True)
+        copied_entrypoint = destination / entrypoint.relative_to(package_root)
+        copied_package_sha256, copied_file_count = _skill_package_digest(copied_entrypoint)
+        if (
+            not hmac.compare_digest(expected_package_sha256, copied_package_sha256)
+            or expected_file_count != copied_file_count
+        ):
+            raise ValueError(f"sterile skill package changed while copying: {name}")
 
     output = stage / ".agentflow/tmp/handoffs" / source_handoff.name
     create_args = argparse.Namespace(

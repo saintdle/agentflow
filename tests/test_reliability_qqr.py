@@ -79,16 +79,48 @@ class WorkflowWorkspaceBindingTests(unittest.TestCase):
                     )
                 )
 
+    def test_corrupt_binding_registry_keeps_provider_hook_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state_home = directory / "state"
+            workspace = directory / "workspace"
+            state_home.mkdir()
+            workspace.mkdir()
+            (state_home / "workspace-bindings.json").write_text(
+                "{not-json", encoding="utf-8"
+            )
+            payload = {
+                "event": "session.start",
+                "session_id": "provider-session",
+                "cwd": str(workspace),
+                "model": "gpt-5.6-sol",
+            }
+            runtime = mock.Mock()
+            runtime.process.return_value = (None, None, None)
+            with mock.patch.dict(
+                os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False
+            ), mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch.object(
+                     cli.memory_runtime_backend, "MemoryRuntime", return_value=runtime
+                 ), mock.patch.object(cli.beads_backend, "prime", return_value=""):
+                self.assertEqual(
+                    cli.hook(argparse.Namespace(provider="codex", event="")), 0
+                )
+
 
 class SterileLaunchPackageTests(unittest.TestCase):
-    def _create_external_handoff(self, root: Path, context: Path) -> Path:
+    def _create_external_handoff(
+        self, root: Path, context: Path, *, required_skills: list[str] | None = None
+    ) -> Path:
+        (root / "output").mkdir(exist_ok=True)
         output = root / ".agentflow/handoffs/task.md"
         args = argparse.Namespace(
             to="codex", title="Bounded task", goal="Inspect only declared context",
             task_id="task-sterile", task_class="focused-review", role="reviewer",
             artifact_kind="internal", writer_model="", lane="external",
             tool_profile="shell-readonly", output_boundary=str(root / "output"),
-            require_tool=[], require_skill=[], allow_delegation=False, return_type="result",
+            require_tool=[], require_skill=required_skills or [], allow_delegation=False, return_type="result",
             max_ai_credits=None, acceptance_matrix="", isolation_profile="none",
             require_asset=[], base="main@" + ("a" * 40), dependency=[], done_when=["Return evidence"],
             context=[str(context)], constraint=["Do not inspect other files"], check=[],
@@ -127,6 +159,86 @@ class SterileLaunchPackageTests(unittest.TestCase):
             handoff = self._create_external_handoff(root, instructions)
             with self.assertRaisesRegex(ValueError, "refuses implicit provider instructions"):
                 cli._package_handoff_sterile(handoff, directory / "sterile")
+
+    def test_package_rejects_skill_changed_after_source_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / "source"
+            root.mkdir()
+            context = root / "allowed.md"
+            context.write_text("bounded evidence\n", encoding="utf-8")
+            skill = root / ".agents/skills/domain-skill/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text(
+                "---\nname: domain-skill\ndescription: approved\n---\nOriginal.\n",
+                encoding="utf-8",
+            )
+            handoff = self._create_external_handoff(
+                root, context, required_skills=["domain-skill"]
+            )
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(
+                    cli.handoff_preflight(
+                        argparse.Namespace(
+                            file=str(handoff), cwd=str(root), require_matrix=False
+                        )
+                    ),
+                    0,
+                )
+            skill.write_text(
+                "---\nname: domain-skill\ndescription: changed\n---\nChanged.\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "skill pin changed after preflight"):
+                cli._package_handoff_sterile(handoff, directory / "sterile")
+
+
+class NativeDirectHandoffTests(unittest.TestCase):
+    def test_native_launch_has_no_unavailable_machine_return_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            output = root / "output"
+            output.mkdir()
+            handoff = root / ".agentflow/tmp/handoffs/native.md"
+            args = argparse.Namespace(
+                to="codex", title="Native review", goal="Return a bounded review",
+                task_id="native-task", task_class="focused-review", role="review",
+                artifact_kind="internal", writer_model="", lane="native",
+                tool_profile="shell-readonly", output_boundary=str(output),
+                require_tool=[], require_skill=[], allow_delegation=False,
+                return_type="result", max_ai_credits=None, acceptance_matrix="",
+                isolation_profile="none", require_asset=[], base="", dependency=[],
+                done_when=["Return evidence"], context=[], constraint=[], check=[],
+                budget=[], issue="", branch="", out=str(handoff), cwd=str(root),
+                untrusted_task_data=False,
+            )
+            with mock.patch("sys.stdout", io.StringIO()):
+                self.assertEqual(cli.handoff_create(args), 0)
+            manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertNotIn("machine_return_contract", manifest)
+            self.assertNotIn("AGENTFLOW_RESULT_CONTRACT", handoff.read_text(encoding="utf-8"))
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch("sys.stdout", io.StringIO()), \
+                 mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(
+                    cli.handoff_preflight(
+                        argparse.Namespace(
+                            file=str(handoff), cwd=str(root), require_matrix=False
+                        )
+                    ),
+                    0,
+                )
+            launch = argparse.Namespace(
+                provider="codex", file=str(handoff), cwd=str(root), role="review",
+                model="gpt-5.6-sol", effort="high", policy="",
+                print_command=False, selective_model=False,
+            )
+            with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
+                 mock.patch.object(cli.subprocess, "call", return_value=0) as spawned:
+                self.assertEqual(cli.handoff_launch(launch), 0)
+            spawned.assert_called_once()
 
 
 class ProviderModelFidelityTests(unittest.TestCase):

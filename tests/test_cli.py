@@ -94,6 +94,9 @@ class ValidLaunch:
             "parent": self.workflow_root,
             "metadata": {"agentflow": {
                 "launch": {"provider": provider, "model": model, "effort": effort, "role": role},
+                "lane": "external", "tool_profile": "shell-write",
+                "output_boundary": ".", "context": ["README.md"],
+                "budget": ["20 minutes; one retry; stop on blocker"],
                 "acceptance": self.acceptance,
                 "root": self.workflow_root, "task": self.task_id, "actor": self.actor,
                 "claim_id": "claim-1", "claim_token": claim_token,
