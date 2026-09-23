@@ -109,10 +109,16 @@ agentflow handoff from-bead <bead-id> \
   --budget "20 minutes; one retry; stop on blocker"
 
 agentflow handoff preflight .agentflow/tmp/handoffs/<bead-id>-codex.md
-agentflow handoff launch codex .agentflow/tmp/handoffs/<bead-id>-codex.md
+agentflow controller resume --root . --workflow-root <root-id> \
+  --controller <controller-id>
 ```
 
 `from-bead` stores the provider-neutral contract on the bead and writes only an ignored launch prompt plus sidecar. Preflight pins required skill hashes in the sidecar and records a compact result on the bead. Launch still requires an explicit command because it spends provider allowance.
+The external launch command is the root controller, not `handoff launch`: only
+the controller can mint the authenticated result channel. Set
+`metadata.agentflow.launch.sterile=true` (or
+`outbound_context=restricted`) when the approved task must run from a minimal,
+hash-inventoried outbound package.
 
 Store acceptance directly on a bead:
 

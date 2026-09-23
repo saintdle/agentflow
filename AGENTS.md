@@ -25,6 +25,7 @@
 - Use native subagents for bounded fire-and-forget work. Use an observable Herdr session only when cross-provider work, a long run, or likely human decisions justify it; tmux is the fallback.
 - A blocked external worker must stop with the decision needed, evidence tried, options, recommendation, and current branch/check state. The user may intervene directly, but the decision must be recorded in durable state.
 - Preflight every external handoff for readable context, explicit tool profile, required tools, required project domain skills, output boundary, exact base, budget, retry cap, and delegation mode before launch.
+- Launch external handoffs only through the leased root controller so every worker receives an authenticated result channel. For restricted outbound context, persist `sterile=true` on the task launch and keep declared context and skill packages self-contained.
 - Treat project-local domain skills as authoritative. Agentflow routes skills; it does not own domain expertise.
 - Require structured review findings and record controller dispositions. Reproduce accepted high and medium findings before returning them to the writer.
 - Use a cheaper/faster model at low or medium effort for routine scans. Reserve the strongest model and high effort for ambiguous planning, hard debugging, conflict resolution, or final review.

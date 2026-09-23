@@ -20,6 +20,19 @@ from tests import _state_home  # noqa: F401  # external controller authority
 
 
 class ReliabilityFix5Tests(unittest.TestCase):
+    def _attest_model(self, provider: str, session_id: str, model: str) -> None:
+        cli.events_backend.EventSpool(cli._state_dir() / "events.jsonl").append(
+            cli.events_backend.normalize_event(
+                provider,
+                {
+                    "event": "session.start",
+                    "session_id": session_id,
+                    "model": model,
+                },
+                event_id=f"attest-{session_id}",
+            )
+        )
+
     def _authority(self, root: Path, workflow: str, lease) -> str:
         _, credentials = cli._controller_credentials(
             argparse.Namespace(
@@ -47,6 +60,7 @@ class ReliabilityFix5Tests(unittest.TestCase):
                 {
                     "version": 1,
                     "provider": provider,
+                    "lane": "external",
                     "task_id": task,
                     "handoff": str(path),
                     "context": [],
@@ -89,7 +103,7 @@ class ReliabilityFix5Tests(unittest.TestCase):
                     outside, root=root, provider="codex", task_id="task-auth"
                 )
 
-    def test_direct_handoff_launch_uses_an_exact_approved_route(self) -> None:
+    def test_direct_external_handoff_launch_requires_controller_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             path, handoff = self._handoff(root)
@@ -99,15 +113,9 @@ class ReliabilityFix5Tests(unittest.TestCase):
                 print_command=False,
             )
             with mock.patch.object(cli, "_provider_command", return_value="/fake/codex"), \
-                 mock.patch.object(cli.subprocess, "call", return_value=0) as launch:
-                self.assertEqual(cli.handoff_launch(args), 0)
-            launch.assert_called_once_with(
-                provider_argv.build_confined_argv(
-                    "codex", "gpt-5.6-luna", "medium", handoff,
-                    command="/fake/codex",
-                ),
-                cwd=str(root),
-            )
+                 mock.patch.object(cli.subprocess, "call") as launch:
+                self.assertEqual(cli.handoff_launch(args), 2)
+            launch.assert_not_called()
 
     def test_persistent_transports_reject_hardened_handoffs_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,6 +204,8 @@ class ReliabilityFix5Tests(unittest.TestCase):
                 lease_id=lease.token,
                 launch_id=launch_id,
                 provider=provider,
+                model="gpt-5.6-luna",
+                effort="high",
                 handoff=handoff,
                 acceptance_ids=("AFREL-SMOKE-1",),
                 state_path=state_path,
@@ -213,6 +223,7 @@ class ReliabilityFix5Tests(unittest.TestCase):
                 "session_id": "provider-smoke",
                 "claim_id": "claim-auth",
             }
+            self._attest_model(provider, "provider-smoke", "gpt-5.6-luna")
             cli._herdr_write(
                 state_path,
                 {
@@ -329,7 +340,8 @@ class ReliabilityFix5Tests(unittest.TestCase):
             channel = cli._mint_return_channel(
                 root, workflow, task_id="task-reattach", actor="writer",
                 claim_token="opaque-" + ("x" * 48), lease_id=lease.token,
-                launch_id="launch-reattach", provider="codex", handoff=handoff,
+                launch_id="launch-reattach", provider="codex",
+                model="gpt-5.6-luna", effort="high", handoff=handoff,
                 acceptance_ids=("AFREL-SMOKE-1",), state_path=state_path,
                 controller_id=lease.controller, lease_epoch=lease.epoch,
                 continuity_id=lease.continuity_id,
@@ -354,6 +366,7 @@ class ReliabilityFix5Tests(unittest.TestCase):
                     },
                 }},
             })
+            self._attest_model("codex", "provider-session", "gpt-5.6-luna")
             channel["result_path"].write_text(json.dumps({
                 "outcome": "completed", "session_id": "provider-session",
                 "acceptance_results": [{

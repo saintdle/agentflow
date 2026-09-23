@@ -257,6 +257,12 @@ def _session_scope(value: Any) -> str:
     return "sess_" + hashlib.sha256(("agentflow.session\0" + raw).encode("utf-8")).hexdigest()
 
 
+def session_scope(value: Any) -> str:
+    """Return the privacy-safe session identity used by lifecycle events."""
+
+    return _session_scope(value)
+
+
 def _reference(value: Any, field: str, prefix: str) -> str:
     raw = _text(value, field, limit=192)
     pattern = _REFERENCE_HASHES[field]
@@ -788,6 +794,30 @@ class EventSpool:
 BoundedEventSpool = EventSpool
 
 
+def attested_model(spool: EventSpool, provider: str, raw_session_id: str) -> str:
+    """Return the latest provider-reported model for one exact session.
+
+    Route flags express intent. Only native lifecycle metadata from the bound
+    provider session can attest which model actually ran. An empty value means
+    no usable attestation exists and fidelity-sensitive callers must fail
+    closed.
+    """
+
+    target = _session_scope(raw_session_id)
+    canonical_provider = _canonical_provider(provider)
+    model = ""
+    for row in spool.read():
+        if (
+            row.provider == canonical_provider
+            and row.session_id == target
+            and row.event in {"session.start", "session.model_change"}
+        ):
+            candidate = str(row.metadata.get("model") or "").strip()
+            if candidate:
+                model = candidate
+    return model
+
+
 def record_event_safely(spool: EventSpool | Path | str, event: EventEnvelope | Mapping[str, Any]) -> bool:
     """Record metadata without making a provider hook fail closed on I/O."""
     try:
@@ -802,4 +832,5 @@ __all__ = [
     "DuplicateEventError", "SpoolError", "FailureClass", "EventEnvelope", "LifecycleEvent",
     "normalize_event", "normalize", "classify_failure", "failure_class", "classify_operational_failure",
     "operational_failure_class", "failure_metadata", "EventSpool", "BoundedEventSpool", "record_event_safely",
+    "session_scope", "attested_model",
 ]

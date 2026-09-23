@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added protected provider-session bindings so controller hooks resolve the
+  approved workflow workspace instead of an incidental IDE cwd.
+- Added hash-inventoried sterile launch packages for external tasks that opt
+  into restricted outbound context.
+
+### Changed
+
+- External handoffs now require the leased controller's authenticated Herdr
+  result channel; direct external launch fails before provider spawn.
+- Authenticated results now require native lifecycle evidence that the actual
+  provider model exactly matches the signed requested route.
+
 ## [0.0.5] - 2026-09-15
 
 ### Added

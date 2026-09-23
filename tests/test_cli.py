@@ -214,6 +214,25 @@ class ValidLaunch:
             if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
                 if capture is not None:
                     capture["argv"] = list(argv)
+                # A real provider hook emits native lifecycle metadata before
+                # Agentflow accepts its result. Mirror that process boundary
+                # instead of bypassing the production model-fidelity gate.
+                try:
+                    payload = json.loads(body)
+                    session_id = str(
+                        payload["result"]["agent"]["agent_session"]["value"]
+                    )
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    session_id = ""
+                if session_id:
+                    cli.events_backend.record_event_safely(
+                        cli.events_backend.EventSpool(cli._state_dir() / "events.jsonl"),
+                        cli.events_backend.normalize_event(
+                            self.provider,
+                            {"event": "session.start", "session_id": session_id, "model": self.model},
+                            event_id=f"fixture-model-{self.root}-{session_id}",
+                        ),
+                    )
                 if on_spawn is not None:
                     on_spawn(list(argv))
                 return subprocess.CompletedProcess(argv, returncode, stdout=body, stderr=stderr)
@@ -263,6 +282,60 @@ class AgentflowTests(unittest.TestCase):
             contract = json.loads(Path(record["return_channel"]["contract_path"]).read_text(encoding="utf-8"))
             self.assertEqual(contract["continuity_id"], fixture.lease.continuity_id)
             self.assertEqual(contract["controller_id"], fixture.controller)
+            self.assertEqual(contract["model"], fixture.model)
+            self.assertEqual(contract["effort"], fixture.effort)
+
+    def test_sterile_typed_launch_keeps_authority_in_root_and_spawns_in_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace")
+            fixture.task_issue["metadata"]["agentflow"].update({
+                "lane": "external",
+                "tool_profile": "shell-readonly",
+                "context": ["README.md"],
+                "budget": ["10 minutes; one retry; stop on blocker"],
+                "output_boundary": ".",
+            })
+            with fixture.beads_patches(), mock.patch.object(
+                cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"
+            ):
+                fixture.handoff_path = cli._materialize_launch_handoff(
+                    fixture.root, fixture.task_id, fixture.provider, role=fixture.role
+                )
+            # The fixture's full handoff already passed source preflight. Its
+            # declared context is packaged without repository instructions.
+            stage = base / "sterile"
+            packaged_path = cli._package_handoff_sterile(fixture.handoff_path, stage)
+            packaged = cli.provider_argv_backend.validate_confined_handoff(
+                packaged_path, root=stage, provider=fixture.provider, task_id=fixture.task_id
+            )
+            with fixture.beads_patches(), mock.patch.object(
+                cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"
+            ):
+                _, digest = cli._run_actual_root_preflight(
+                    root=fixture.root, workflow_root=fixture.workflow_root,
+                    task_id=fixture.task_id, actor=fixture.actor,
+                    claim=fixture.claim_token, lease=fixture.lease.token,
+                    session_name=fixture.session_name, provider=fixture.provider,
+                    role=fixture.role, model=fixture.model, effort=fixture.effort,
+                    handoff=packaged, execution_root=stage,
+                )
+            capture: dict = {}
+            args = fixture.launch_args(
+                handoff=str(packaged_path), execution_root=str(stage),
+                handoff_content_sha256=packaged.content_sha256,
+                handoff_manifest_sha256=packaged.manifest_sha256,
+                handoff_preflight_sha256=packaged.preflight_sha256,
+                root_preflight_sha256=digest,
+            )
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                self.assertEqual(cli.herdr_launch(args), 0)
+            argv = capture["argv"]
+            self.assertEqual(argv[argv.index("--cwd") + 1], str(stage))
+            state = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text())
+            self.assertEqual(state["sessions"][fixture.task_id]["execution_root"], str(stage))
 
     def test_failed_spawn_is_private_and_retryable_with_actual_identity(self) -> None:
         """A failing Herdr spawn must persist a private, retryable failure (no

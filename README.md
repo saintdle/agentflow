@@ -32,12 +32,17 @@ unrelated projects.
 - Metadata-only context auditing and required safe-boundary rotation, so long
   workflows resume from durable state instead of accumulating chat history.
 - Provider-neutral handoffs for Codex, Claude Code, and GitHub Copilot CLI.
+- Provider-session bindings keep controller hooks, memory, and Beads scoped to
+  the approved workflow workspace even when the IDE session started elsewhere.
 - Beads-backed durable coordination, including Git-backed and Gitless work.
 - Seven bundled generic workflow skills and five provider-role profiles for
   each supported coding-agent provider.
 - Project initialization that preserves existing agent instructions and hooks.
 - Config-driven discovery and installation of your own skills.
 - Optional observable external-agent sessions through Herdr.
+- Authenticated result channels for every controller-launched external worker,
+  plus hash-verified sterile packages for explicitly restricted outbound
+  context.
 - Beads/Herdr lifecycle reconciliation for claims, sessions, results, and
   dispositions.
 - Fail-closed preflight, model policy, imported-asset verification, and
@@ -69,7 +74,8 @@ flowchart TB
     Preflight --> Lane{"Execution lane"}
 
     Lane --> Native["Native subagent"]
-    Lane --> Herdr["Herdr or tmux<br/>observable external session"]
+    Lane --> Package["Optional sterile package<br/>declared files and pinned skills only"]
+    Package --> Herdr["Herdr<br/>observable external session"]
     Herdr --> Providers["Codex, Claude Code, or Copilot CLI"]
 
     Native --> Work["Bounded workspace<br/>Git worktree or Gitless directory"]
@@ -188,6 +194,19 @@ execution, reconnect-safe resume, read-only status, and bounded PR delivery.
 For local optimization evidence, `agentflow usage optimize --codeburn <report>`
 reconciles CodeBurn JSON with Agentflow delivery records while keeping savings
 estimates explicitly advisory.
+
+External handoffs are controller-owned. `agentflow handoff launch` refuses an
+external handoff because it cannot mint the leased controller's authenticated
+return channel. For restricted outbound context, set `sterile: true` (or
+`outbound_context: restricted`) in the task's `metadata.agentflow.launch`; the
+controller builds and verifies a minimal execution package before Herdr spawn.
+The current sterile lane is read-only and rejects `shell-write` until a
+reviewed import contract exists.
+You can inspect the same packaging boundary without launching a provider:
+
+```sh
+agentflow handoff package .agentflow/tmp/handoffs/<task>-<provider>.md --json
+```
 
 Audit recent model routing, lineage, recorded token counters, and context
 pressure without copying provider transcripts:

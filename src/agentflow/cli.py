@@ -53,6 +53,7 @@ from agentflow import project_config as project_config_backend
 from agentflow import resources as packaged_resources
 from agentflow import wait as wait_backend
 from agentflow import worktree as worktree_backend
+from agentflow import workspace_binding as workspace_binding_backend
 
 
 PROVIDERS = ("codex", "claude", "copilot")
@@ -229,6 +230,60 @@ def _controller_state_dir(root: Path, workflow_root: str) -> Path:
     block dispatch for a later, unrelated root B run from the same repo.
     """
     return root / ".agentflow/controller" / _controller_namespace(workflow_root)
+
+
+def _workspace_binding_path() -> Path:
+    return _state_dir() / "workspace-bindings.json"
+
+
+def _bind_current_controller_sessions(
+    root: Path, workflow_root: str, lease: controller_backend.Lease,
+) -> None:
+    state_path = _controller_state_dir(root, workflow_root) / "state.json"
+    for provider in PROVIDERS:
+        for raw_session in workspace_binding_backend.current_sessions(provider):
+            workspace_binding_backend.bind(
+                _workspace_binding_path(), provider=provider,
+                raw_session_id=raw_session, workspace_root=root,
+                workflow_root=workflow_root, controller_id=lease.controller,
+                continuity_id=lease.continuity_id, controller_state=state_path,
+                bound_at=_now(),
+            )
+
+
+def _validated_bound_workspace(provider: str, payload: Mapping[str, Any]) -> Path | None:
+    raw_session = str(
+        payload.get("session_id") or payload.get("sessionId")
+        or payload.get("sessionID") or payload.get("session") or ""
+    ).strip()
+    if not raw_session:
+        return None
+    record = workspace_binding_backend.lookup(
+        _workspace_binding_path(), provider=provider, raw_session_id=raw_session,
+    )
+    if not isinstance(record, Mapping):
+        return None
+    try:
+        root = Path(str(record["workspace_root"])).expanduser().resolve(strict=True)
+        workflow_root = str(record["workflow_root"])
+        expected_state = _controller_state_dir(root, workflow_root) / "state.json"
+        recorded_state = Path(str(record["controller_state"])).expanduser()
+        if recorded_state.is_symlink() or recorded_state.resolve() != expected_state.resolve():
+            return None
+        if not expected_state.is_file():
+            return None
+        state = json.loads(expected_state.read_text(encoding="utf-8"))
+        lease = state.get("lease") if isinstance(state, Mapping) else None
+        if not isinstance(lease, Mapping):
+            return None
+        for field in ("controller", "continuity_id"):
+            if not hmac.compare_digest(
+                str(lease.get(field) or ""), str(record.get(field if field != "controller" else "controller_id") or ""),
+            ):
+                return None
+        return root
+    except (KeyError, OSError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _controller_paths(args: argparse.Namespace, root: Path) -> tuple[Path, Path]:
@@ -585,6 +640,7 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
         "selective_model": launch.get("selective_model") is True,
         "delegation_depth": int(launch.get("delegation_depth") or 0),
         "fork_context": str(launch.get("fork_context") or ""),
+        "sterile": launch.get("sterile") is True or str(launch.get("outbound_context") or "") == "restricted",
     }
 
 
@@ -647,6 +703,7 @@ def _run_actual_root_preflight(
     effort: str,
     handoff: provider_argv_backend.ConfinedHandoff,
     selective_model: bool = False,
+    execution_root: Path | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Run the public root preflight against the materialized launch inputs."""
     manifest = handoff.manifest
@@ -668,7 +725,7 @@ def _run_actual_root_preflight(
     if not base and not _is_git_repository(root):
         base = "workspace"
     namespace = argparse.Namespace(
-        root=str(root), base=base, context=list(context_values),
+        root=str(execution_root or root), authority_root=str(root), base=base, context=list(context_values),
         boundary=str(manifest.get("output_boundary") or ""), matrix=list(acceptance_ids),
         tool=list(required_tools), provider=provider, role=role, model=model, effort=effort,
         policy_version="", workflow_root=workflow_root, task=task_id, actor=actor,
@@ -764,11 +821,16 @@ def _dispatch_via_herdr(
             handoff_path = _materialize_launch_handoff(
                 cwd, task_id, launch_meta["provider"], role=launch_meta["role"],
             )
+            execution_root = root
+            if launch_meta.get("sterile"):
+                sterile_root = _state_dir() / "sterile" / f"{_slug(task_id)}-{uuid.uuid4()}"
+                handoff_path = _package_handoff_sterile(handoff_path, sterile_root)
+                execution_root = sterile_root.resolve()
         except ValueError:
             return {"state": "blocked", "session_id": ""}
         try:
             handoff = provider_argv_backend.validate_confined_handoff(
-                handoff_path, root=root, provider=launch_meta["provider"], task_id=task_id,
+                handoff_path, root=execution_root, provider=launch_meta["provider"], task_id=task_id,
             )
             manifest = handoff.manifest
         except provider_argv_backend.ProviderArgvError:
@@ -798,7 +860,7 @@ def _dispatch_via_herdr(
                 session_name=session_name, provider=launch_meta["provider"],
                 role=launch_meta["role"], model=launch_meta["model"], effort=launch_meta["effort"],
                 selective_model=bool(launch_meta.get("selective_model")),
-                handoff=handoff,
+                handoff=handoff, execution_root=execution_root,
             )
         except ValueError:
             return {"state": "blocked", "session_id": ""}
@@ -820,6 +882,7 @@ def _dispatch_via_herdr(
             acceptance_ids=acceptance_ids,
             dry_run=False, json=True, workflow_root=workflow_root,
             actor=lease.controller,
+            execution_root=str(execution_root) if execution_root != root else "",
             selective_model=bool(launch_meta.get("selective_model")),
             _authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
@@ -1159,6 +1222,10 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         # Internal-only: never serialized into a handoff, command argv, Herdr
         # state, environment variable, checkpoint, or user-facing payload.
         args._authority_secret = credentials["authority_secret"]
+        if not str(getattr(args, "workflow_root", "") or ""):
+            raise ValueError("--workflow-root is required before binding a controller session")
+        beads_backend.get_issue(root, str(args.workflow_root))
+        _bind_current_controller_sessions(root, str(args.workflow_root), lease)
 
         # An authenticated resume is the acknowledgement for a required
         # safe-boundary rotation.  Advance only the context generation; root,
@@ -1449,6 +1516,10 @@ def controller_stop(args: argparse.Namespace) -> int:
                 lease = controller.acquire(resume_proof=proof)
             controller.release(lease)
             payload = {"operation": "stop", "ok": True, "root": str(root), "released": True, "status": "stopped"}
+        workspace_binding_backend.remove_controller(
+            _workspace_binding_path(), workspace_root=root,
+            workflow_root=str(getattr(args, "workflow_root", "") or ""),
+        )
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STOP")
         return 0
     except (controller_backend.ControllerError, OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1509,12 +1580,16 @@ def _git_base_matches(root: Path, base: str) -> bool:
 
 def preflight_root(args: argparse.Namespace) -> int:
     root = _root_arg(args)
+    authority_root = Path(
+        str(getattr(args, "authority_root", "") or root)
+    ).expanduser().resolve()
     try:
         tools = tuple(getattr(args, "tool", []) or getattr(args, "tools", []) or [])
         snapshot = preflight_backend.take_snapshot(root, tools=tools)
         model = getattr(args, "model", "") or " "
         session_id = getattr(args, "session_id", "") or " "
-        policy = model_policy_backend.load_policy(_resolve_model_policy(args, root))
+        policy_args = argparse.Namespace(root=str(authority_root), policy=getattr(args, "policy", ""))
+        policy = model_policy_backend.load_policy(_resolve_model_policy(policy_args, authority_root))
         spec = preflight_backend.LaunchSpec(
             base=getattr(args, "base", "") or " ",
             context=tuple(getattr(args, "context", []) or []),
@@ -1562,8 +1637,8 @@ def preflight_root(args: argparse.Namespace) -> int:
             ))
         else:
             try:
-                beads_backend.get_issue(root, workflow_root)
-                descendants = beads_backend.root_descendants(root, workflow_root)
+                beads_backend.get_issue(authority_root, workflow_root)
+                descendants = beads_backend.root_descendants(authority_root, workflow_root)
                 if task_id and not any(str(item.get("id") or "") == task_id for item in descendants):
                     findings.append(_preflight_finding(
                         "task-outside-root", "beads",
@@ -1577,13 +1652,13 @@ def preflight_root(args: argparse.Namespace) -> int:
                 ))
         if not spec.base.strip():
             findings.append(_preflight_finding("base-missing", "git", "git base is required", "Provide the approved branch@revision base."))
-        elif not _git_base_matches(root, spec.base):
+        elif not _git_base_matches(authority_root, spec.base):
             findings.append(_preflight_finding("base-invalid", "git", f"git base {spec.base!r} is not present in the root", "Use the exact approved branch@revision base."))
         if spec.strict and task_id and spec.lease_id and spec.claim_id:
             try:
                 _verify_launch_authority(
-                    root, task_id, spec.claim_id, spec.lease_id,
-                    workflow_root=workflow_root, beads_cwd=root,
+                    authority_root, task_id, spec.claim_id, spec.lease_id,
+                    workflow_root=workflow_root, beads_cwd=authority_root,
                     actor=getattr(args, "actor", ""),
                 )
             except (OSError, ValueError, json.JSONDecodeError, beads_backend.BeadsError) as exc:
@@ -1729,6 +1804,8 @@ def _mint_return_channel(
     lease_id: str,
     launch_id: str,
     provider: str,
+    model: str,
+    effort: str,
     handoff: provider_argv_backend.ConfinedHandoff,
     acceptance_ids: tuple[str, ...],
     state_path: Path,
@@ -1762,6 +1839,8 @@ def _mint_return_channel(
         "lease_token_sha256": hashlib.sha256(lease_id.encode("utf-8")).hexdigest(),
         "launch_id": launch_id,
         "provider": provider,
+        "model": model,
+        "effort": effort,
         "session_id": "bound-by-herdr",
         "acceptance_ids": list(acceptance_ids),
         "approved_waivers": list(
@@ -2439,6 +2518,7 @@ def _resolve_pending_identity(root: Path, task_id: str) -> bool:
 
 def herdr_launch(args: argparse.Namespace) -> int:
     root = _root_arg(args)
+    execution_root = root
     workflow_root = getattr(args, "workflow_root", "")
     state_path = _herdr_state_path(args, root)
     try:
@@ -2464,13 +2544,19 @@ def herdr_launch(args: argparse.Namespace) -> int:
         handoff_path = str(getattr(args, "handoff", "") or "")
         if not handoff_path:
             raise ValueError("authenticated provider launch requires a confined typed handoff")
+        execution_root_value = str(getattr(args, "execution_root", "") or "")
+        if execution_root_value:
+            execution_root = Path(execution_root_value).expanduser().resolve(strict=True)
+            packaged_handoff = _validate_sterile_package(execution_root)
+            if packaged_handoff.resolve() != Path(handoff_path).expanduser().resolve():
+                raise ValueError("sterile execution root does not contain the requested handoff")
         for name in ("handoff_content_sha256", "handoff_manifest_sha256", "handoff_preflight_sha256", "root_preflight_sha256"):
             value = str(getattr(args, name, "") or "")
             if not re.fullmatch(r"[0-9a-f]{64}", value):
                 raise ValueError(f"authenticated launch requires a pinned {name}")
         typed_handoff: provider_argv_backend.ConfinedHandoff = provider_argv_backend.validate_confined_handoff(
             handoff_path,
-            root=root,
+            root=execution_root,
             provider=provider,
             task_id=task_id,
             expected_content_sha256=str(getattr(args, "handoff_content_sha256", "") or ""),
@@ -2493,7 +2579,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
             # spawn so tampering cannot land in the validation-to-spawn gap.
             typed_handoff = provider_argv_backend.validate_confined_handoff(
                 typed_handoff.path,
-                root=root,
+                root=execution_root,
                 provider=provider,
                 task_id=task_id,
                 expected_content_sha256=typed_handoff.content_sha256,
@@ -2516,7 +2602,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 claim=claim_id, lease=lease_id, session_name=session_name,
                 provider=provider, role=role, model=model, effort=effort,
                 selective_model=selective_model,
-                handoff=typed_handoff,
+                handoff=typed_handoff, execution_root=execution_root,
             )
             expected_digest = str(getattr(args, "root_preflight_sha256", "") or "")
             if current_digest != expected_digest:
@@ -2598,6 +2684,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     actor=str(identity.get("actor") or actor),
                     claim_token=claim_token, lease_id=lease_id,
                     launch_id=launch_id, provider=provider,
+                    model=model, effort=effort,
                     handoff=typed_handoff, acceptance_ids=acceptance_ids,
                     state_path=state_path, controller_id=lease.controller,
                     lease_epoch=lease.epoch, continuity_id=lease.continuity_id,
@@ -2625,6 +2712,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         "selective_model": selective_model,
                         "policy": policy.id, "policy_version": f"{policy.id}@{policy.version}",
                         "herdr_session": session_name, "agent_name": agent_name,
+                        "execution_root": str(execution_root),
                         "launch_id": launch_id,
                         "handoff": {
                             "path": str(typed_handoff.path),
@@ -2697,7 +2785,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     # Herdr's argv.
                     argv = [
                         herdr, "agent", "start", agent_name,
-                        "--cwd", str(root), "--no-focus",
+                        "--cwd", str(execution_root), "--no-focus",
                         *launch_env,
                         *sum((["--env", value] for value in safe_env), []),
                         "--", *provider_tail,
@@ -2910,12 +2998,29 @@ def _verify_return_contract_binding(
         raise ValueError("lease binding is malformed")
     for field in (
         "controller_id", "continuity_id", "claim_token_sha256", "launch_id",
-        "provider", "handoff_path", "handoff_sha256", "manifest_sha256",
+        "provider", "model", "effort", "handoff_path", "handoff_sha256", "manifest_sha256",
         "result_path", "submission_file",
     ):
         if not str(binding.get(field) or ""):
             raise ValueError(f"return contract binding is missing {field}")
     return binding
+
+
+def _require_attested_model(provider: str, session_id: str, expected_model: str) -> None:
+    actual_model = events_backend.attested_model(
+        events_backend.EventSpool(_state_dir() / "events.jsonl"),
+        provider,
+        session_id,
+    )
+    if not actual_model:
+        raise ValueError(
+            "provider session has no native model attestation; refusing to accept "
+            "a result for an unverified route"
+        )
+    if not hmac.compare_digest(actual_model, expected_model):
+        raise ValueError(
+            f"provider model mismatch: requested {expected_model!r}, actual {actual_model!r}"
+        )
 
 
 def herdr_submit(args: argparse.Namespace) -> int:
@@ -3131,6 +3236,9 @@ def herdr_result(args: argparse.Namespace) -> int:
                     session_id = str(binding_data.get("session_id") or "")
                     if not session_id:
                         raise ValueError("provider session identity is unavailable")
+                    _require_attested_model(
+                        provider, session_id, str(contract.get("model") or "")
+                    )
                     supplied_session = str(raw.get("session_id") or session_id)
                     if not hmac.compare_digest(supplied_session, session_id):
                         raise ValueError("provider session identity mismatch")
@@ -4987,6 +5095,20 @@ def hook(args: argparse.Namespace) -> int:
         payload.get("hook_event_name") or payload.get("hookEventName")
         or payload.get("event") or payload.get("type") or args.event or "unknown"
     )
+    raw_cwd = payload.get("cwd")
+    hook_cwd = (
+        Path(raw_cwd).expanduser().resolve()
+        if isinstance(raw_cwd, str) and raw_cwd
+        else Path.cwd().resolve()
+    )
+    # A leased root controller is the workspace authority for its provider
+    # session. Editor/plugin cwd can point at the skill that launched the
+    # workflow (or another open folder), so prefer a valid protected binding.
+    bound_workspace = _validated_bound_workspace(args.provider, payload)
+    if bound_workspace is not None:
+        hook_cwd = bound_workspace
+        payload = dict(payload)
+        payload["cwd"] = str(bound_workspace)
     # The event spine is independent from optional recall.  It stores only a
     # normalized metadata envelope and substitutes a synthetic session bucket
     # when a provider omits its session identity.
@@ -4999,21 +5121,16 @@ def hook(args: argparse.Namespace) -> int:
             events_backend.record_event_safely(spool, normalized)
     except Exception:  # noqa: BLE001 - event capture must be fail-open
         pass
-    raw_cwd = payload.get("cwd")
-    hook_cwd = (
-        Path(raw_cwd).expanduser().resolve()
-        if isinstance(raw_cwd, str) and raw_cwd
-        else Path.cwd().resolve()
-    )
     try:
-        config_path = project_config_backend.config_path(_repository_root(hook_cwd))
+        workflow_workspace = _repository_root(hook_cwd)
+        config_path = project_config_backend.config_path(workflow_workspace)
         config = (
-            project_config_backend.load(_repository_root(hook_cwd))
+            project_config_backend.load(workflow_workspace)
             if config_path.exists() or config_path.is_symlink()
             else project_config_backend.default_data()
         )
         runtime = memory_runtime_backend.MemoryRuntime(
-            _repository_root(hook_cwd), project_config_backend.memory_settings(config)
+            workflow_workspace, project_config_backend.memory_settings(config)
         )
         _, plan, _ = runtime.process(args.provider, payload, event)
     except Exception:  # noqa: BLE001 - provider hooks must fail open
@@ -5028,7 +5145,7 @@ def hook(args: argparse.Namespace) -> int:
         "a completed root starts in a fresh chat. Resume from durable state, not prior transcripts."
     )
     try:
-        prime = beads_backend.prime(hook_cwd, maximum_characters=8_000)
+        prime = beads_backend.prime(_repository_root(hook_cwd), maximum_characters=8_000)
     except beads_backend.BeadsError:
         prime = ""
     if prime:
@@ -6672,6 +6789,192 @@ def _require_supported_launch_isolation(
         raise ValueError(f"unsupported handoff isolation profile: {profile!r}")
 
 
+_INSTRUCTION_FILENAMES = {"agents.md", "claude.md", "copilot-instructions.md"}
+
+
+def _copy_sterile_file(source: Path, destination: Path, *, allow_instructions: bool = False) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"sterile package input must be a regular file: {source}")
+    if not allow_instructions and source.name.casefold() in _INSTRUCTION_FILENAMES:
+        raise ValueError(f"sterile package refuses implicit provider instructions: {source.name}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def _sterile_skill_root(stage: Path, provider: str, skill_name: str) -> Path:
+    relative = {
+        "codex": Path(".agents/skills"),
+        "claude": Path(".claude/skills"),
+        "copilot": Path(".github/skills"),
+    }[provider]
+    return stage / relative / skill_name
+
+
+def _validate_sterile_package(stage: Path) -> Path:
+    stage = stage.expanduser().resolve(strict=True)
+    manifest_path = stage / ".agentflow/sterile-manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("sterile package has no protected manifest")
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping) or value.get("schema") != "agentflow.sterile-package@1":
+        raise ValueError("unsupported sterile package manifest")
+    files = value.get("files")
+    if not isinstance(files, list):
+        raise ValueError("sterile package manifest has no file inventory")
+    expected: dict[str, str] = {}
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise ValueError("sterile package inventory is malformed")
+        relative = str(item.get("path") or "")
+        digest = str(item.get("sha256") or "")
+        if not relative or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("sterile package inventory entry is malformed")
+        candidate = stage / relative
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"sterile package file is missing or unsafe: {relative}")
+        if not _path_within(candidate.resolve(), stage):
+            raise ValueError(f"sterile package file escapes its root: {relative}")
+        if _file_sha256(candidate) != digest:
+            raise ValueError(f"sterile package digest mismatch: {relative}")
+        expected[relative] = digest
+    actual = {
+        path.relative_to(stage).as_posix()
+        for path in stage.rglob("*")
+        if path.is_file() and path != manifest_path
+    }
+    if any(path.is_symlink() for path in stage.rglob("*")) or actual != set(expected):
+        raise ValueError("sterile package contains unlisted files or symlinks")
+    handoff = stage / str(value.get("handoff") or "")
+    if not _path_within(handoff.resolve(), stage) or not handoff.is_file():
+        raise ValueError("sterile package handoff is unavailable")
+    return handoff
+
+
+def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
+    source_handoff = source_handoff.expanduser().resolve(strict=True)
+    manifest, errors = _handoff_manifest(source_handoff)
+    if errors or not manifest:
+        raise ValueError(errors[0] if errors else "typed handoff manifest is unavailable")
+    if manifest.get("lane") != "external":
+        raise ValueError("sterile packaging is only available for external handoffs")
+    if str(manifest.get("tool_profile") or "") == "shell-write":
+        raise ValueError(
+            "sterile packages are read-only outbound lanes; writable delivery "
+            "requires an explicit import/review contract"
+        )
+    source_root = Path(str(manifest.get("cwd") or source_handoff.parent)).expanduser().resolve()
+    stage = stage.expanduser().resolve()
+    if _path_within(stage, source_root) or _path_within(source_root, stage):
+        raise ValueError("sterile package root must be separate from the workflow workspace")
+    if stage.exists() and any(stage.iterdir()):
+        raise ValueError("sterile package output must be new or empty")
+    stage.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(stage, 0o700)
+    (stage / "output").mkdir(mode=0o700)
+
+    copied_context: list[str] = []
+    for index, raw in enumerate(manifest.get("context", [])):
+        if not isinstance(raw, str) or raw.startswith(("http://", "https://")):
+            raise ValueError("sterile packages require explicit local context files")
+        source = Path(raw).expanduser()
+        if not source.is_absolute():
+            source = source_root / source
+        destination = stage / "context" / f"{index:03d}-{source.name}"
+        _copy_sterile_file(source.resolve(), destination)
+        copied_context.append(str(destination))
+
+    acceptance = str(manifest.get("acceptance_matrix") or "")
+    copied_acceptance = ""
+    if acceptance:
+        source_acceptance = Path(acceptance).expanduser().resolve()
+        destination = stage / "acceptance" / source_acceptance.name
+        _copy_sterile_file(source_acceptance, destination)
+        copied_acceptance = str(destination)
+
+    resolved = manifest.get("resolved_skills")
+    if manifest.get("required_skills") and not isinstance(resolved, list):
+        raise ValueError("required skills have not passed handoff preflight")
+    for skill in resolved or []:
+        if not isinstance(skill, Mapping):
+            raise ValueError("resolved skill pin is malformed")
+        if int(skill.get("package_count") or 0) != 1:
+            raise ValueError("sterile packaging requires self-contained skill packages")
+        name = str(skill.get("name") or "")
+        entrypoint = Path(str(skill.get("entrypoint") or "")).expanduser().resolve()
+        package_root = entrypoint.parent
+        destination = _sterile_skill_root(stage, str(manifest.get("provider")), name)
+        for candidate in sorted(package_root.rglob("*")):
+            if candidate.is_symlink():
+                raise ValueError(f"sterile skill package contains a symlink: {candidate}")
+            if candidate.is_file():
+                _copy_sterile_file(candidate, destination / candidate.relative_to(package_root), allow_instructions=True)
+
+    output = stage / ".agentflow/tmp/handoffs" / source_handoff.name
+    create_args = argparse.Namespace(
+        to=str(manifest.get("provider")), title=source_handoff.stem,
+        goal=str(manifest.get("goal") or ""), task_id=str(manifest.get("task_id") or ""),
+        task_class=str(manifest.get("task_class") or "focused-review"),
+        role=str(manifest.get("role") or ""), artifact_kind=str(manifest.get("artifact_kind") or ""),
+        writer_model=str(manifest.get("writer_model") or ""), lane="external",
+        tool_profile=str(manifest.get("tool_profile") or "provider-default"),
+        output_boundary=str(stage / "output"), require_tool=list(manifest.get("required_tools") or []),
+        require_skill=list(manifest.get("required_skills") or []),
+        allow_delegation=bool(manifest.get("delegation_allowed")),
+        return_type=str(manifest.get("return_type") or "result"),
+        max_ai_credits=manifest.get("max_ai_credits"), acceptance_matrix=copied_acceptance,
+        isolation_profile="none", require_asset=[], base=str(manifest.get("base") or ""),
+        dependency=list(manifest.get("dependencies") or []), done_when=list(manifest.get("done_when") or []),
+        context=copied_context, constraint=list(manifest.get("constraints") or []),
+        check=list(manifest.get("checks") or []), budget=list(manifest.get("budget") or []),
+        issue=str(manifest.get("issue") or ""), branch=str(manifest.get("branch") or ""),
+        out=str(output), cwd=str(stage), untrusted_task_data=bool(manifest.get("untrusted_task_data")),
+    )
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        if handoff_create(create_args) != 0:
+            raise ValueError("failed to create sterile handoff")
+        if handoff_preflight(argparse.Namespace(file=str(output), cwd=str(stage), require_matrix=bool(copied_acceptance))) != 0:
+            raise ValueError("sterile handoff failed preflight")
+    sidecar = output.with_suffix(".json")
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    sidecar_data["sterile_package"] = str(stage / ".agentflow/sterile-manifest.json")
+    _write_json(sidecar, sidecar_data)
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        if handoff_preflight(argparse.Namespace(file=str(output), cwd=str(stage), require_matrix=bool(copied_acceptance))) != 0:
+            raise ValueError("sterile handoff failed final preflight")
+
+    inventory = []
+    sterile_manifest = stage / ".agentflow/sterile-manifest.json"
+    for candidate in sorted(stage.rglob("*")):
+        if candidate.is_symlink():
+            raise ValueError(f"sterile package contains a symlink: {candidate}")
+        if candidate.is_file() and candidate != sterile_manifest:
+            inventory.append({"path": candidate.relative_to(stage).as_posix(), "sha256": _file_sha256(candidate)})
+    _private_atomic_json(sterile_manifest, {
+        "schema": "agentflow.sterile-package@1",
+        "created_at": _now(),
+        "task_id": str(manifest.get("task_id") or ""),
+        "provider": str(manifest.get("provider") or ""),
+        "handoff": output.relative_to(stage).as_posix(),
+        "files": inventory,
+    })
+    return _validate_sterile_package(stage)
+
+
+def handoff_package(args: argparse.Namespace) -> int:
+    try:
+        output = Path(args.out).expanduser() if args.out else _state_dir() / "sterile" / str(uuid.uuid4())
+        handoff = _package_handoff_sterile(Path(args.file), output)
+        payload = {"operation": "package", "ok": True, "root": str(output.resolve()), "handoff": str(handoff)}
+        _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="STERILE HANDOFF PACKAGE")
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _json_or_status(
+            {"operation": "package", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="STERILE HANDOFF PACKAGE FAILED",
+        )
+        return 2
+
+
 def handoff_launch(args: argparse.Namespace) -> int:
     path = Path(args.file).expanduser().resolve()
     if not path.is_file():
@@ -6690,6 +6993,14 @@ def handoff_launch(args: argparse.Namespace) -> int:
             return 2
     elif manifest_errors:
         print(f"Refusing legacy arbitrary handoff: {manifest_errors[0]}", file=sys.stderr)
+        return 2
+    if manifest and manifest.get("lane") == "external":
+        print(
+            "Refusing direct external handoff launch: only the leased root controller "
+            "can mint and bind the authenticated result channel. Resume the workflow "
+            "controller so it can launch this handoff through Herdr.",
+            file=sys.stderr,
+        )
         return 2
     if manifest:
         try:
@@ -7348,6 +7659,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--handoff", default="",
         help="validated confined handoff artifact; required for controller launches",
     )
+    herdr_launch_parser.add_argument(
+        "--execution-root", default="",
+        help="hash-verified sterile package root; authority remains in --root",
+    )
     herdr_launch_parser.add_argument("--handoff-content-sha256", default="")
     herdr_launch_parser.add_argument("--handoff-manifest-sha256", default="")
     herdr_launch_parser.add_argument("--handoff-preflight-sha256", default="")
@@ -7890,6 +8205,13 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--cwd", default="")
     preflight_parser.add_argument("--require-matrix", action="store_true")
     preflight_parser.set_defaults(func=handoff_preflight)
+    package_parser = handoff_sub.add_parser(
+        "package", help="Build a hash-verified sterile external-launch workspace"
+    )
+    package_parser.add_argument("file")
+    package_parser.add_argument("--out", default="")
+    package_parser.add_argument("--json", action="store_true")
+    package_parser.set_defaults(func=handoff_package)
     launch_parser = handoff_sub.add_parser(
         "launch", help="Launch a typed handoff through an exact approved model route"
     )
