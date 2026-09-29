@@ -354,14 +354,14 @@ class MigrationPlanningTests(unittest.TestCase):
         by_path = {action.path: action for action in actions}
 
         # controller role -> the judgment/controller-tier model, not the coding tier.
-        self.assertEqual(by_path[".codex/agents/agentflow-controller.toml"].proposed_model, "gpt-5.6-sol")
+        self.assertEqual(by_path[".codex/agents/agentflow-controller.toml"].proposed_model, "gpt-6-sol")
         self.assertEqual(by_path[".claude/agents/agentflow-controller.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
             by_path[".github/agents/agentflow-controller.agent.md"].proposed_model, "claude-opus-4.8"
         )
 
         # exploration role -> the coding/execution-tier model.
-        self.assertEqual(by_path[".codex/agents/agentflow-explorer.toml"].proposed_model, "gpt-5.6-luna")
+        self.assertEqual(by_path[".codex/agents/agentflow-explorer.toml"].proposed_model, "gpt-6-luna")
         self.assertEqual(by_path[".claude/agents/agentflow-explorer.md"].proposed_model, "claude-sonnet-5")
 
         # review role -> the judgment/controller-tier model, same as controller.
@@ -369,7 +369,7 @@ class MigrationPlanningTests(unittest.TestCase):
 
         # pr-gatekeeper is judgment, not exploration: it migrates to the
         # judgment/controller-tier model (Sol / Opus), never the coding tier.
-        self.assertEqual(by_path[".codex/agents/agentflow-pr-gatekeeper.toml"].proposed_model, "gpt-5.6-sol")
+        self.assertEqual(by_path[".codex/agents/agentflow-pr-gatekeeper.toml"].proposed_model, "gpt-6-sol")
         self.assertEqual(by_path[".claude/agents/agentflow-pr-gatekeeper.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
             by_path[".github/agents/agentflow-pr-gatekeeper.agent.md"].proposed_model, "claude-opus-4.8"

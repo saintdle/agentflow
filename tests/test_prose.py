@@ -162,7 +162,7 @@ class ProseCliTests(unittest.TestCase):
             handoff = Path(result["handoff"])
             manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["prose"]["editor"], {
-                "provider": "codex", "model": "gpt-5.6-luna", "role": "editing",
+                "provider": "codex", "model": "gpt-6-luna", "role": "editing",
                 "effort": "medium", "policy": "models-v2",
             })
             self.assertEqual(manifest["prose"]["artifact_kind"], "reader-facing")

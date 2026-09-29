@@ -46,7 +46,7 @@ TASK_ID=$(bd create "Write the first-run note" \
   --labels "agentflow,af:stage:code,af:role:writer" \
   --description "Create docs/first-run-note.md with one verified setup example." \
   --acceptance "docs/first-run-note.md exists, is non-empty, and contains no private data." \
-  --metadata '{"agentflow":{"launch":{"provider":"codex","model":"gpt-5.6-luna","role":"coding","effort":"medium"},"lane":"external","tool_profile":"shell-write","output_boundary":".","context":["AGENTS.md"],"constraints":["Write only docs/first-run-note.md. Create docs/ if needed. Preserve unrelated files and do not expose secrets."],"checks":["test -s docs/first-run-note.md"],"budget":["20 minutes; one retry; stop if blocked."]}}' \
+  --metadata '{"agentflow":{"launch":{"provider":"codex","model":"gpt-6-luna","role":"coding","effort":"medium"},"lane":"external","tool_profile":"shell-write","output_boundary":".","context":["AGENTS.md"],"constraints":["Write only docs/first-run-note.md. Create docs/ if needed. Preserve unrelated files and do not expose secrets."],"checks":["test -s docs/first-run-note.md"],"budget":["20 minutes; one retry; stop if blocked."]}}' \
   --silent)
 ```
 

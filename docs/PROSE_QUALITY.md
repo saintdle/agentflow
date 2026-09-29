@@ -59,7 +59,7 @@ fails, it prints exact preflight and launch commands. By default the generated
 launch is pinned by the current `models-v2` policy to:
 
 ```text
-provider=codex model=gpt-5.6-luna role=editing effort=medium
+provider=codex model=gpt-6-luna role=editing effort=medium
 ```
 
 ### Use without OpenAI access
