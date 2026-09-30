@@ -7,7 +7,8 @@ values fail closed before lease/claim reservation.
 | Work | Provider/model | Effort |
 |---|---|---|
 | Goal shaping, architecture, difficult debugging | Codex `gpt-6-sol` | `high` or `xhigh` |
-| File discovery, bounded implementation, exploration | Codex `gpt-6-luna` | `medium` or `high` |
+| Bounded coding workers | Codex `gpt-6-luna` | `max` |
+| File discovery and exploration | Codex `gpt-6-luna` | `medium` or `high` |
 | Selective complex implementation or exploration, only when explicitly recorded | Codex `gpt-5.6-terra` | `medium` or `high` |
 | Conditional plain-language edit (default) | Codex `gpt-6-luna` | `medium` |
 | Conditional edit without OpenAI access | Claude `claude-sonnet-5` or Copilot `claude-sonnet-4.6` | `medium` |

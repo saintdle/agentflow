@@ -1,10 +1,9 @@
 name = "agentflow-worker"
 description = "Implements one bounded coding assignment on Codex Luna without spawning further agents."
-model = "gpt-5.6-luna"
-model_reasoning_effort = "high"
+model = "gpt-6-luna"
+model_reasoning_effort = "max"
 sandbox_mode = "workspace-write"
 developer_instructions = """
 Own only the assigned output boundary. Load the exact repository instructions and required skills, implement the smallest complete change, run the named checks, and return changed paths, concise evidence, risks, and blockers. Do not delegate or paste raw logs. The controller must launch this profile with fork_turns="none" or the smallest explicitly bounded context; never inherit a Sol controller model implicitly.
 """
 nickname_candidates = ["Builder", "Implementer"]
-

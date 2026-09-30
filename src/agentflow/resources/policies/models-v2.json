@@ -6,7 +6,8 @@
   "roles": ["controller", "judgment", "coding", "editing", "review", "exploration"],
   "routes": [
     {"provider": "codex", "model": "gpt-6-sol", "roles": ["controller", "judgment", "review"], "efforts": ["high", "xhigh"]},
-    {"provider": "codex", "model": "gpt-6-luna", "roles": ["coding", "exploration"], "efforts": ["medium", "high"]},
+    {"provider": "codex", "model": "gpt-6-luna", "roles": ["coding"], "efforts": ["medium", "high", "max"]},
+    {"provider": "codex", "model": "gpt-6-luna", "roles": ["exploration"], "efforts": ["medium", "high"]},
     {"provider": "codex", "model": "gpt-6-luna", "roles": ["editing"], "efforts": ["medium"]},
     {"provider": "codex", "model": "gpt-5.6-sol", "roles": ["controller", "judgment", "review"], "efforts": ["high", "xhigh"]},
     {"provider": "codex", "model": "gpt-5.6-luna", "roles": ["coding", "exploration"], "efforts": ["medium", "high"]},

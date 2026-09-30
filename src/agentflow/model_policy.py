@@ -69,6 +69,19 @@ PROFILE_ROLES: Mapping[str, str] = {
     "agentflow-worker": "coding",
 }
 
+# Migration candidates are ordered by an explicit policy, not model-name
+# sorting: lexical order would select the compatible GPT-5.6 routes before the
+# preferred GPT-6 routes. GPT-5.6 remains a valid fallback for existing
+# configurations, while Terra is intentionally not a default migration target.
+PREFERRED_MIGRATION_MODELS: Mapping[tuple[str, str], str] = {
+    ("codex", "controller"): "gpt-6-sol",
+    ("codex", "judgment"): "gpt-6-sol",
+    ("codex", "review"): "gpt-6-sol",
+    ("codex", "coding"): "gpt-6-luna",
+    ("codex", "editing"): "gpt-6-luna",
+    ("codex", "exploration"): "gpt-6-luna",
+}
+
 
 def _require_str(value: Any, field: str, pattern: re.Pattern[str] | None = None) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
@@ -422,7 +435,13 @@ class MigrationAction:
 
 
 def _candidates_for_role(policy: ModelPolicy, provider: str, role: str) -> list[str]:
-    return sorted({route.model for route in policy.routes if route.provider == provider and role in route.roles})
+    candidates = {
+        route.model
+        for route in policy.routes
+        if route.provider == provider and role in route.roles and route.model not in policy.selective_models
+    }
+    preferred = PREFERRED_MIGRATION_MODELS.get((provider, role))
+    return sorted(candidates, key=lambda model: (model != preferred, model))
 
 
 def _plan_one(path: Path, provider: str | None, root: Path, policy: ModelPolicy) -> MigrationAction:
