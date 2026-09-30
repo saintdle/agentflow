@@ -6,8 +6,10 @@ you want a coding-agent chat to operate them for you, follow the
 
 This tutorial creates one approved Beads root with one executable task, lets an
 Agentflow controller dispatch it through Herdr, and records evidence before the
-controller declares the goal complete. Run it in an existing Git repository
-after installing Beads, Herdr, Agentflow, and the selected provider CLI.
+controller declares the goal complete. It is a persistent, controller-managed
+external workflow: install Beads, Herdr, Agentflow, and the selected provider
+CLI before starting. Herdr is required for this path; `tmux` is not a transport
+for this controller workflow.
 
 The example uses the Codex coding route bundled in `models-v2`. If that route is
 not available to you, first replace all four launch values—provider, model,

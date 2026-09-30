@@ -1,10 +1,11 @@
 # Use Agentflow from an agent chat
 
 You do not need to type Agentflow's coordination commands yourself. A coding
-agent in ChatGPT/Codex or Claude can inspect the workspace, create the Beads
-graph, operate the controller, collect worker results, and translate durable
-state back into ordinary language. The CLI remains the execution and safety
-boundary underneath the chat.
+agent in ChatGPT/Codex or Claude, or GitHub Copilot Chat in a supported IDE
+Agent mode, can inspect the workspace, create the Beads graph, operate the
+controller, collect worker results, and translate durable state back into
+ordinary language. The CLI remains the execution and safety boundary underneath
+the chat.
 
 Use a chat with terminal access to the target workspace. Open the repository
 you want changed in the IDE before sending these prompts. The agent must read
@@ -13,9 +14,20 @@ Agentflow repository does not provide project expertise.
 
 In a VS Code Codex/ChatGPT chat, paste the prompt into an agent-mode session
 whose workspace is the target repository. In Claude Code, start or resume a
-session from that repository and paste the same prompt. No Agentflow-specific
-slash command is required on either surface; the agent invokes the installed
+session from that repository and paste the same prompt. In
+[GitHub Copilot Chat Agent mode](https://docs.github.com/en/copilot/how-tos/chat-with-copilot/chat-in-ide),
+open the target repository in a supported IDE and use the same prompt when
+workspace and terminal tools are enabled; approve terminal commands as the IDE
+requests. The same guide also works in [GitHub Copilot CLI](https://docs.github.com/en/copilot/get-started/cli-quickstart)
+started from the target directory. Browser-only chat without access to the
+workspace and terminal cannot operate the local Agentflow CLI. No
+Agentflow-specific slash command is required; the agent invokes the installed
 CLI and skills on your behalf.
+
+The persistent external-dispatch path in this guide requires Herdr and the
+selected provider CLI. Herdr is not needed for planning-only sessions or work
+dispatched exclusively through native subagents. `tmux` may be used for manual
+terminal sessions, but is not a controller-managed persistent worker transport.
 
 The workflow has one deliberate human approval gate:
 

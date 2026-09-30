@@ -30,6 +30,34 @@ jobs:
       - name: Run deterministic validation
         run: python scripts/validate.py
 
+  beads-smoke:
+    name: Real Beads 1.1.0 smoke (pull requests)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AGENTFLOW_INTEGRATION: "1"
+      CGO_ENABLED: "0"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Set up Go for Beads 1.1.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.2"
+          cache: false
+      - name: Install Agentflow and pinned Beads
+        run: |
+          python -m pip install --disable-pip-version-check .
+          go install github.com/steveyegge/beads/cmd/bd@v1.1.0
+      - name: Run real integration smoke
+        run: scripts/ci/integration_beads.sh
+
   unit:
     name: Unit (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}

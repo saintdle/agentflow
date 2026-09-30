@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added a bounded pull-request CI smoke against real Beads 1.1.0 while keeping
+  the broader integration run on its scheduled and manual triggers.
+
+### Changed
+
+- Clarified public tagged-source installs and upgrades, the Herdr prerequisite
+  for persistent external controller sessions, and GitHub Copilot Chat setup
+  where IDE Agent mode and terminal access are available.
+
 ## [0.0.5] - 2026-09-15
 
 ### Added

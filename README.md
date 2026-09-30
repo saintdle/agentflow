@@ -69,7 +69,7 @@ flowchart TB
     Preflight --> Lane{"Execution lane"}
 
     Lane --> Native["Native subagent"]
-    Lane --> Herdr["Herdr or tmux<br/>observable external session"]
+    Lane --> Herdr["Herdr<br/>persistent external session"]
     Herdr --> Providers["Codex, Claude Code, or Copilot CLI"]
 
     Native --> Work["Bounded workspace<br/>Git worktree or Gitless directory"]
@@ -94,11 +94,15 @@ boundaries.
 - At least one supported coding-agent CLI for delegated work: Codex, Claude
   Code, or GitHub Copilot CLI.
 
-Optional tools:
+Persistent external worker sessions launched by an Agentflow controller require
+[Herdr](https://github.com/herdrdev/herdr). Planning, local Beads tracking,
+and native-subagent workflows do not require Herdr.
 
-- [Herdr](https://github.com/ogulcancelik/herdr) for observable external sessions.
+Other optional tools:
+
 - GitHub CLI (`gh`) for GitHub issue and pull-request workflows.
-- `tmux` as a portable fallback for external sessions.
+- `tmux` for manually managed terminal sessions; it is not a controller-managed
+  persistent worker transport.
 
 Provider subscriptions, credentials, usage allowances, and terms are managed
 by their respective providers. Agentflow does not supply or authenticate them.
@@ -107,8 +111,10 @@ by their respective providers. Agentflow does not supply or authenticate them.
 
 ### Ask a coding agent to do it
 
-You can point a ChatGPT/Codex or Claude coding-agent chat at this repository and
-ask it to install and configure Agentflow. Copy the request in
+You can point a ChatGPT/Codex or Claude coding-agent chat—or
+[GitHub Copilot Chat in IDE Agent mode](https://docs.github.com/en/copilot/how-tos/chat-with-copilot/chat-in-ide)
+with terminal access—at this repository and ask it to install and configure
+Agentflow. Copy the request in
 [the agent-led setup contract](AGENT_SETUP.md). It tells the agent how to verify
 the package identity, preserve existing provider configuration, handle a legacy
 installation transactionally, initialize the current workspace, and report a
@@ -124,8 +130,9 @@ uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.5"
 pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.5"
 ```
 
-Until the repository is public, an authenticated GitHub checkout or Git
-credential helper is required. To install from a downloaded release wheel:
+The source repository is public, so direct GitHub installs do not require an
+authenticated checkout. If your network blocks GitHub, install from a downloaded
+release wheel:
 
 ```sh
 pipx install ./saintdle_agentflow-0.0.5-py3-none-any.whl
@@ -180,7 +187,9 @@ Continue with the executable [first workflow tutorial](docs/FIRST_WORKFLOW.md)
 to create and approve a root/task graph, run the controller, handle a halt, and
 record completion evidence.
 
-If you prefer to work entirely through a ChatGPT/Codex or Claude chat, use the
+If you prefer to work entirely through a ChatGPT/Codex or Claude chat, or a
+[GitHub Copilot Chat agent-mode session](https://docs.github.com/en/copilot/how-tos/chat-with-copilot/chat-in-ide)
+in an IDE that can access the workspace and terminal, use the
 [chat-first workflow guide](docs/CHAT_WORKFLOWS.md). It provides copy/paste
 prompts for planning without launch, explicit approval, autonomous persistent
 execution, reconnect-safe resume, read-only status, and bounded PR delivery.
