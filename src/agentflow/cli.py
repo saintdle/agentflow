@@ -2537,6 +2537,14 @@ def herdr_launch(args: argparse.Namespace) -> int:
         )
         if not route.ok:
             raise ValueError(route.reason)
+        if provider == "copilot":
+            raise ValueError(
+                "persistent Herdr Copilot actual-model attestation is unsupported: Copilot's "
+                "native sessionStart omits the resolved "
+                "model, and its local OTel JSONL exporter is writable by the same-UID worker. "
+                "Refusing before provider spawn or cost; use a provider runtime with a "
+                "controller-verifiable model source or an OS-isolated telemetry collector."
+            )
         session_name = getattr(args, "session_name", "") or getattr(args, "name", "")
         task_id = getattr(args, "task", "") or getattr(args, "task_id", "")
         claim_id = getattr(args, "claim", "") or getattr(args, "claim_id", "")
@@ -3010,11 +3018,29 @@ def _verify_return_contract_binding(
 
 
 def _require_attested_model(provider: str, session_id: str, expected_model: str) -> None:
-    actual_model = events_backend.attested_model(
-        events_backend.EventSpool(_state_dir() / "events.jsonl"),
-        provider,
-        session_id,
-    )
+    if provider == "copilot":
+        raise ValueError(
+            "Copilot actual-model attestation is unsupported for persistent Herdr results: "
+            "native sessionStart has no resolved model, and same-UID OTel files are worker-writable"
+        )
+    spool = events_backend.EventSpool(_state_dir() / "events.jsonl")
+    if provider == "claude":
+        target_session = events_backend.session_scope(session_id)
+        session_events = [
+            row for row in spool.read()
+            if row.provider == "claude"
+            and row.session_id == target_session
+            and row.event in {"session.start", "session.model_change"}
+        ]
+        # A later SessionStart without its optional model (e.g. after resume)
+        # invalidates an earlier value until a native PostModelSwitch reports
+        # the model that is now active.
+        actual_model = (
+            str(session_events[-1].metadata.get("model") or "").strip()
+            if session_events else ""
+        )
+    else:
+        actual_model = events_backend.attested_model(spool, provider, session_id)
     if not actual_model:
         raise ValueError(
             "provider session has no native model attestation; refusing to accept "
@@ -5116,8 +5142,31 @@ def hook(args: argparse.Namespace) -> int:
     # normalized metadata envelope and substitutes a synthetic session bucket
     # when a provider omits its session identity.
     try:
+        event_payload = dict(payload)
+        event_for_spool = event
+        event_metadata: dict[str, Any] = {}
+        if args.provider == "copilot":
+            # Copilot documents sessionStart.timestamp as milliseconds since
+            # the Unix epoch. The event spine stores ISO-8601 timestamps.
+            native_timestamp = event_payload.get("timestamp")
+            if isinstance(native_timestamp, (int, float)) and not isinstance(native_timestamp, bool):
+                event_payload["timestamp"] = dt.datetime.fromtimestamp(
+                    native_timestamp / 1000, dt.timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        elif args.provider == "claude" and event.casefold() == "postmodelswitch":
+            # Claude's PostModelSwitch is the native source of truth after a
+            # user change, automatic fallback, or resume. Its `to_model` is
+            # the active model; `from_model` is intentionally not attested.
+            event_for_spool = "session.model_change"
+            native_data = event_payload.get("data")
+            new_model = event_payload.get("to_model")
+            if new_model is None and isinstance(native_data, Mapping):
+                new_model = native_data.get("to_model")
+            if isinstance(new_model, str):
+                event_metadata["model"] = new_model
         normalized = events_backend.normalize_event(
-            args.provider, payload, event=event,
+            args.provider, event_payload, event=event_for_spool,
+            metadata=event_metadata,
         )
         spool = events_backend.EventSpool(_state_dir() / "events.jsonl")
         if not events_backend.record_event_safely(spool, normalized):
@@ -6910,13 +6959,14 @@ def _sterile_skill_root(stage: Path, provider: str, skill_name: str) -> Path:
 
 
 def _sterile_session_hook(provider: str) -> tuple[Path, bytes] | None:
-    """Return the bundled project hook that captures a native session start.
+    """Return bundled project hooks for native session/model lifecycle events.
 
     Claude Code and Copilot discover project-local hooks from the worker cwd,
-    which is the sterile package for restricted launches.  Copy only the
-    bundled SessionStart/sessionStart handler: source-project hook files may
-    contain arbitrary commands and are never trusted as package inputs.  Codex
-    uses its user-level hook file, so it has no project-local file to stage.
+    which is the sterile package for restricted launches. Copy only bundled
+    handlers: source-project hook files may contain arbitrary commands and are
+    never trusted as package inputs. Claude also needs PostModelSwitch to
+    track fallbacks and resumed model changes. Codex uses its user-level hook
+    file, so it has no project-local file to stage.
     """
 
     resources = {
@@ -6943,8 +6993,35 @@ def _sterile_session_hook(provider: str) -> tuple[Path, bytes] | None:
     event_hooks = hooks.get(event_name) if isinstance(hooks, Mapping) else None
     if not isinstance(event_hooks, list) or not event_hooks:
         raise ValueError(f"bundled {provider} session hook is malformed")
-    # Retain Copilot's version field, but no unrelated project settings/hooks.
+    # Retain only the bundled native-session handler, plus Claude's model
+    # switch event. No unrelated project settings/hooks are package inputs.
     config: dict[str, Any] = {"hooks": {event_name: event_hooks}}
+    if provider == "claude":
+        model_switch_hooks: list[dict[str, Any]] = []
+        event_suffix = f"--event {event_name}"
+        for event_hook in event_hooks:
+            if not isinstance(event_hook, Mapping):
+                raise ValueError("bundled claude session hook is malformed")
+            commands = event_hook.get("hooks")
+            if not isinstance(commands, list) or not commands:
+                raise ValueError("bundled claude session hook is malformed")
+            translated_commands: list[dict[str, Any]] = []
+            for command in commands:
+                if not isinstance(command, Mapping):
+                    raise ValueError("bundled claude session hook is malformed")
+                command_line = command.get("command")
+                if not isinstance(command_line, str) or not command_line.endswith(event_suffix):
+                    raise ValueError("bundled claude session hook is malformed")
+                translated_commands.append({
+                    **command,
+                    "command": command_line[:-len(event_suffix)] + "--event PostModelSwitch",
+                })
+            translated_hook = {
+                key: value for key, value in event_hook.items() if key != "matcher"
+            }
+            translated_hook["hooks"] = translated_commands
+            model_switch_hooks.append(translated_hook)
+        config["hooks"]["PostModelSwitch"] = model_switch_hooks
     if provider == "copilot":
         config["version"] = template.get("version", 1)
     encoded = (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")

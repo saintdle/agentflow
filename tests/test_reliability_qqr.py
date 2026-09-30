@@ -193,6 +193,14 @@ class SterileLaunchPackageTests(unittest.TestCase):
                     cli.packaged_resources.item(*resource_parts).read_text(encoding="utf-8")
                 )
                 expected = {"hooks": {event_name: bundled["hooks"][event_name]}}
+                if provider == "claude":
+                    expected["hooks"]["PostModelSwitch"] = [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "~/.local/bin/agentflow hook --provider claude --event PostModelSwitch",
+                            "timeout": 5,
+                        }],
+                    }]
                 if provider == "copilot":
                     expected["version"] = bundled["version"]
                 hook_path = stage / relative_hook
@@ -210,7 +218,7 @@ class SterileLaunchPackageTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     set(json.loads(hook_path.read_text(encoding="utf-8"))["hooks"]),
-                    {event_name},
+                    ({event_name, "PostModelSwitch"} if provider == "claude" else {event_name}),
                 )
 
     def test_package_rejects_instruction_file_as_context(self) -> None:
@@ -359,7 +367,7 @@ class NativeDirectHandoffTests(unittest.TestCase):
 
 
 class ProviderModelFidelityTests(unittest.TestCase):
-    def test_result_model_attestation_matches_exact_route_or_fails_closed(self) -> None:
+    def test_copilot_model_attestation_fails_closed_even_for_forged_hook_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
             os.environ, {"AGENTFLOW_STATE_HOME": temporary}, clear=False
         ):
@@ -367,13 +375,56 @@ class ProviderModelFidelityTests(unittest.TestCase):
             spool.append(events.normalize_event(
                 "copilot",
                 {"event": "session.start", "session_id": "session-1", "model": "claude-sonnet-5"},
-                event_id="model-attestation",
+                event_id="forged-model-attestation",
             ))
-            cli._require_attested_model("copilot", "session-1", "claude-sonnet-5")
-            with self.assertRaisesRegex(ValueError, "provider model mismatch"):
-                cli._require_attested_model("copilot", "session-1", "claude-sonnet-4.6")
-            with self.assertRaisesRegex(ValueError, "no native model attestation"):
+            with self.assertRaisesRegex(ValueError, "Copilot.*actual-model attestation.*unsupported"):
+                cli._require_attested_model("copilot", "session-1", "claude-sonnet-5")
+            with self.assertRaisesRegex(ValueError, "Copilot.*actual-model attestation.*unsupported"):
                 cli._require_attested_model("copilot", "session-missing", "claude-sonnet-5")
+
+    def test_claude_missing_model_on_latest_session_event_invalidates_stale_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"AGENTFLOW_STATE_HOME": temporary}, clear=False
+        ):
+            spool = events.EventSpool(Path(temporary) / "events.jsonl")
+            spool.append(events.normalize_event(
+                "claude",
+                {"event": "session.start", "session_id": "session-1", "model": "claude-sonnet-5"},
+                event_id="claude-model-attestation",
+            ))
+            spool.append(events.normalize_event(
+                "claude",
+                {"event": "session.start", "session_id": "session-1"},
+                event_id="claude-model-omitted-on-resume",
+            ))
+            with self.assertRaisesRegex(ValueError, "no native model attestation"):
+                cli._require_attested_model("claude", "session-1", "claude-sonnet-5")
+
+    def test_copilot_herdr_launch_is_rejected_before_provider_lookup_or_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            policy = mock.Mock(id="test-policy", version=1)
+            policy.validate_route.return_value = mock.Mock(ok=True, reason="")
+            payloads: list[dict] = []
+            args = argparse.Namespace(
+                root=str(root), provider="copilot", role="coding",
+                model="claude-sonnet-5", effort="medium", selective_model=False,
+                json=True,
+            )
+            with mock.patch.object(cli.model_policy_backend, "load_policy", return_value=policy), \
+                 mock.patch.object(cli, "_provider_command") as provider_command, \
+                 mock.patch.object(cli.subprocess, "run") as spawn, \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)):
+                self.assertEqual(cli.herdr_launch(args), 2)
+            provider_command.assert_not_called()
+            spawn.assert_not_called()
+            self.assertEqual(len(payloads), 1)
+            self.assertFalse(payloads[0]["ok"])
+            self.assertRegex(
+                payloads[0]["error"],
+                r"Copilot.*actual-model attestation.*unsupported.*before provider spawn",
+            )
+            self.assertFalse((root / ".agentflow/herdr/sessions.json").exists())
 
 
 if __name__ == "__main__":
