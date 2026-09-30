@@ -44,6 +44,16 @@ Agentflow routes skills; it does not own domain expertise. Treat the target repo
 
 For external handoffs, add one `--require-skill <name>` per required domain skill. Preflight from the worker's actual `--cwd`; it must resolve a readable provider entrypoint and record its path and SHA-256 in the handoff sidecar. Stop before launch if a required skill is unavailable. For native workers, name the required skills explicitly in the assignment and verify that their target working directory exposes them.
 
+Every external worker must be launched by the leased root controller so it
+receives a minted authenticated result channel. Never use direct `agentflow
+handoff launch` for an external handoff. When the approved outbound file set
+must exclude repository instructions or unrelated source, persist
+`sterile=true` (or `outbound_context=restricted`) in the task's launch metadata.
+The controller then launches from a hash-inventoried package. Sterile skills
+must be self-contained; stop rather than widening a package for unresolved
+transitive references. The current sterile lane is read-only; never select it
+for `shell-write` work.
+
 ## Partition work
 
 1. Confirm an approved goal and its exit conditions.
@@ -96,7 +106,9 @@ return: outcome, branch/commit, checks, risks, refs; no raw logs
 2. Run `agentflow handoff preflight <handoff>`. Add `--require-matrix` for substantial or environment-dependent work.
 3. Run preflight with `--cwd <worker-worktree>` when the handoff was created elsewhere. Confirm that every required skill resolves to the intended project/provider entrypoint.
 4. Do not launch until preflight passes. Treat it as a launcher capability check, not proof of the provider's later reasoning.
-5. If the task is direct review, keep delegation disabled.
+5. Resume the leased root controller to launch. It owns the authenticated
+   return channel and rejects missing or mismatched runtime model evidence.
+6. If the task is direct review, keep delegation disabled.
 
 Workers reply with one leading verb: `REPORTED`, `BLOCKED`, `ADVICE`, `REVIEW`, `FIXED`, or `APPROVE`. Require factual claims to include a file/line, commit, command result, URL, or `untested`.
 

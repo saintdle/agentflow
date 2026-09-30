@@ -121,6 +121,10 @@ The bundled `editing` role permits Codex `gpt-6-luna` (and retained
 `claude-sonnet-5`, or Copilot `claude-sonnet-4.6`, each at `medium`. The project
 chooses one exact route under `prose.editor`; Luna is the generated default.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
+The requested route is also bound into the authenticated return contract.
+Agentflow accepts the result only when native provider lifecycle metadata for
+the Herdr-bound session reports the same exact model; missing or mismatched
+runtime evidence fails closed.
 
 The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
 and review route when a user asks generally for Claude or Opus. Claude Opus 5
@@ -170,6 +174,30 @@ A workflow may persist a complete root-specific override in its Beads metadata:
 
 Partial or untyped root overrides fail closed. Omit the root override to use the
 project policy.
+
+Per-task launch metadata may opt into restricted outbound packaging:
+
+```json
+{
+  "agentflow": {
+    "launch": {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "role": "coding",
+      "effort": "medium",
+      "sterile": true
+    }
+  }
+}
+```
+
+`"outbound_context": "restricted"` is an equivalent explicit spelling. The
+task must list every local context file it needs, and referenced skill packages
+must be self-contained. Agentflow refuses instruction files, directories,
+symlinks, transitive multi-package skills, or changed/unlisted package files
+instead of broadening the outbound boundary. The current sterile lane also
+rejects `shell-write`; writable results need a future explicit import/review
+contract rather than implicit copying back into the source workspace.
 
 Configure a machine-local alternative without changing the shared project:
 

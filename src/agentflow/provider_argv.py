@@ -140,11 +140,20 @@ def validate_confined_handoff(
         raise ProviderArgvError("handoff provider does not match launch provider")
     if task_id and str(manifest.get("task_id") or "") != task_id:
         raise ProviderArgvError("handoff task does not match launch task")
+    lane = str(manifest.get("lane") or "")
     machine_contract = manifest.get("machine_return_contract")
-    if not isinstance(machine_contract, dict) or machine_contract.get("schema") != "agentflow.return@1":
-        raise ProviderArgvError("handoff machine return contract is required")
-    if machine_contract.get("submit_command") != _FIXED_SUBMIT_COMMAND:
-        raise ProviderArgvError("handoff submit command is not the fixed return command")
+    if lane == "external":
+        if not isinstance(machine_contract, dict) or machine_contract.get("schema") != "agentflow.return@1":
+            raise ProviderArgvError("external handoff machine return contract is required")
+        if machine_contract.get("submit_command") != _FIXED_SUBMIT_COMMAND:
+            raise ProviderArgvError("handoff submit command is not the fixed return command")
+    elif lane == "native":
+        if machine_contract is not None:
+            raise ProviderArgvError(
+                "native handoff must not advertise a controller-owned return contract"
+            )
+    else:
+        raise ProviderArgvError("handoff lane must be native or external")
     handoff_path = Path(str(manifest.get("handoff") or "")).expanduser().resolve()
     if handoff_path != resolved:
         raise ProviderArgvError("handoff manifest path does not match artifact")
