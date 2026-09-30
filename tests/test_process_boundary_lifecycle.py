@@ -348,7 +348,9 @@ class SterileSessionHookLifecycleTests(unittest.TestCase):
                         cli._require_attested_model(
                             "claude", native_session, "claude-sonnet-4.6"
                         )
-                        with self.assertRaisesRegex(ValueError, "no native model attestation"):
+                        with self.assertRaisesRegex(
+                            ValueError, "no usable local lifecycle model evidence"
+                        ):
                             cli._require_attested_model(
                                 "claude", "missing-session", "claude-sonnet-5"
                             )
@@ -382,7 +384,7 @@ class SterileSessionHookLifecycleTests(unittest.TestCase):
                     with mock.patch.dict(
                         os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False
                     ), self.assertRaisesRegex(
-                        ValueError, "Copilot.*actual-model attestation.*unsupported"
+                        ValueError, "Copilot.*resolved-model evidence.*unsupported"
                     ):
                         cli._require_attested_model(
                             "copilot", native_session, "claude-sonnet-5"

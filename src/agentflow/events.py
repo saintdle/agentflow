@@ -795,12 +795,12 @@ BoundedEventSpool = EventSpool
 
 
 def attested_model(spool: EventSpool, provider: str, raw_session_id: str) -> str:
-    """Return the latest provider-reported model for one exact session.
+    """Return the latest locally observed lifecycle model for one exact session.
 
-    Route flags express intent. Only native lifecycle metadata from the bound
-    provider session can attest which model actually ran. An empty value means
-    no usable attestation exists and fidelity-sensitive callers must fail
-    closed.
+    This is cooperative hook evidence, not provider-authenticated or
+    cryptographically protected proof: a same-UID process can forge or alter
+    the local spool. An empty value means no usable observation exists and
+    fidelity-sensitive callers must fail closed.
     """
 
     target = _session_scope(raw_session_id)

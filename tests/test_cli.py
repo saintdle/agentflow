@@ -486,6 +486,77 @@ class AgentflowTests(unittest.TestCase):
                     self.assertEqual(len(payloads), 1)
                     self.assertIn(disabling_setting, payloads[0]["error"])
 
+    def test_nonsterile_launch_blocks_known_hook_suppression_sources_before_spawn(self) -> None:
+        cases = (
+            ("project-local", ".claude/settings.local.json", "disableAllHooks"),
+            ("user", "claude-config/settings.json", "disableAllHooks"),
+            ("managed", "managed/managed-settings.json", "allowManagedHooksOnly"),
+        )
+        for label, relative_path, setting_name in cases:
+            with self.subTest(source=label), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                managed_path = base / "managed/managed-settings.json"
+                env = {
+                    "AGENTFLOW_STATE_HOME": str(base / "state"),
+                    "CLAUDE_CONFIG_DIR": str(base / "claude-config"),
+                }
+                with mock.patch.dict(os.environ, env, clear=False):
+                    fixture = ValidLaunch(base / "workspace")
+                    settings_path = (
+                        fixture.root / relative_path
+                        if label == "project-local"
+                        else base / relative_path
+                    )
+                    settings_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings_path.write_text(
+                        json.dumps({setting_name: True}) + "\n", encoding="utf-8"
+                    )
+                    payloads: list[dict] = []
+                    captured: dict = {}
+                    with fixture.beads_patches(), \
+                         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                         mock.patch.object(
+                             cli, "_claude_managed_settings_paths",
+                             return_value=(managed_path,) if label == "managed" else (),
+                         ), \
+                         mock.patch.object(
+                             cli.subprocess,
+                             "run",
+                             side_effect=fixture.herdr_run(capture=captured),
+                         ), \
+                         mock.patch.object(
+                             cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)
+                         ):
+                        self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                    self.assertNotIn("argv", captured)
+                    self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+                    self.assertEqual(len(payloads), 1)
+                    self.assertIn(setting_name, payloads[0]["error"])
+
+    def test_nonsterile_launch_checks_main_checkout_local_settings_from_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AGENTFLOW_STATE_HOME": str(base / "state"),
+                    "CLAUDE_CONFIG_DIR": str(base / "claude-config"),
+                },
+                clear=False,
+            ):
+                fixture = ValidLaunch(base / "main")
+                (fixture.root / ".claude/settings.local.json").write_text(
+                    json.dumps({"disableAllHooks": True}) + "\n", encoding="utf-8"
+                )
+                worktree = base / "linked-worktree"
+                subprocess.run(
+                    ["git", "-C", str(fixture.root), "worktree", "add", "--detach", str(worktree), "HEAD"],
+                    capture_output=True, check=True,
+                )
+                with mock.patch.object(cli, "_claude_managed_settings_paths", return_value=()):
+                    with self.assertRaisesRegex(ValueError, "project-local.*disableAllHooks"):
+                        cli._require_claude_model_switch_hooks(worktree)
+
     def test_nonsterile_launch_rechecks_claude_hooks_before_reservation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.dict(

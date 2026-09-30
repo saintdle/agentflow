@@ -2600,11 +2600,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
             )
             _require_supported_launch_isolation(typed_handoff, transport="Herdr")
             if provider == "claude":
-                # Model attestation for a persistent Claude session depends on
-                # both native lifecycle events. Recheck project settings at
-                # every contract fence so edits between validation and spawn
+                # Model matching for a persistent Claude session depends on
+                # local observations of both native lifecycle events. Recheck
+                # known settings at every contract fence so edits between validation and spawn
                 # cannot silently remove either controlled hook.
-                _require_claude_model_switch_hooks(execution_root)
+                _require_claude_model_switch_hooks(execution_root, project_root=root)
                 if not claude_model_switch_version_verified:
                     _require_claude_model_switch_version()
                     claude_model_switch_version_verified = True
@@ -3048,9 +3048,11 @@ def _verify_return_contract_binding(
 
 
 def _require_attested_model(provider: str, session_id: str, expected_model: str) -> None:
+    """Require matching local lifecycle evidence, not provider-authenticated proof."""
+
     if provider == "copilot":
         raise ValueError(
-            "Copilot actual-model attestation is unsupported for persistent Herdr results: "
+            "Copilot resolved-model evidence is unsupported for persistent Herdr results: "
             "native sessionStart has no resolved model, and same-UID OTel files are worker-writable"
         )
     spool = events_backend.EventSpool(_state_dir() / "events.jsonl")
@@ -3073,7 +3075,7 @@ def _require_attested_model(provider: str, session_id: str, expected_model: str)
         actual_model = events_backend.attested_model(spool, provider, session_id)
     if not actual_model:
         raise ValueError(
-            "provider session has no native model attestation; refusing to accept "
+            "provider session has no usable local lifecycle model evidence; refusing to accept "
             "a result for an unverified route"
         )
     if not hmac.compare_digest(actual_model, expected_model):
@@ -5184,9 +5186,9 @@ def hook(args: argparse.Namespace) -> int:
                     native_timestamp / 1000, dt.timezone.utc
                 ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         elif args.provider == "claude" and event.casefold() == "postmodelswitch":
-            # Claude's PostModelSwitch is the native source of truth after a
-            # user change, automatic fallback, or resume. Its `to_model` is
-            # the active model; `from_model` is intentionally not attested.
+            # Claude's PostModelSwitch reports the model after a session-level
+            # change, fallback, or resume. Its `to_model` is the observed model;
+            # the local spool is cooperative evidence, not provider-signed proof.
             event_for_spool = "session.model_change"
             native_data = event_payload.get("data")
             new_model = event_payload.get("to_model")
@@ -6967,51 +6969,187 @@ def _require_supported_launch_isolation(
         raise ValueError(f"unsupported handoff isolation profile: {profile!r}")
 
 
-def _require_claude_model_switch_hooks(provider_root: Path) -> None:
-    """Require the controlled native hooks without changing project settings."""
+def _claude_main_checkout_root(root: Path) -> Path | None:
+    """Find a linked worktree's main checkout from its local Git metadata."""
+
+    marker = root / ".git"
+    try:
+        marker_stat = marker.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("cannot inspect Git metadata to check Claude local settings") from exc
+    if marker.is_symlink():
+        raise ValueError("cannot safely inspect Claude settings for a symlinked Git marker")
+    if marker.is_dir():
+        return root
+    if not marker.is_file() or marker_stat.st_size > 4096:
+        raise ValueError("cannot safely inspect Claude settings for this Git worktree")
+    try:
+        marker_text = marker.read_text(encoding="utf-8").strip()
+        match = re.fullmatch(r"gitdir:\s*(.+)", marker_text, flags=re.IGNORECASE)
+        if not match:
+            raise ValueError("invalid Git worktree marker")
+        git_dir = Path(match.group(1)).expanduser()
+        if not git_dir.is_absolute():
+            git_dir = root / git_dir
+        git_dir = git_dir.resolve(strict=True)
+        common_file = git_dir / "commondir"
+        if common_file.exists():
+            if (
+                common_file.is_symlink()
+                or not common_file.is_file()
+                or common_file.stat().st_size > 4096
+            ):
+                raise ValueError("invalid Git common-directory marker")
+            common_text = common_file.read_text(encoding="utf-8").strip()
+            common_dir = Path(common_text).expanduser()
+            if not common_dir.is_absolute():
+                common_dir = git_dir / common_dir
+            common_dir = common_dir.resolve(strict=True)
+        else:
+            common_dir = git_dir
+        if common_dir.name != ".git":
+            raise ValueError("cannot determine the main checkout for this Git worktree")
+        main_root = common_dir.parent.resolve(strict=True)
+        if not (main_root / ".git").is_dir():
+            raise ValueError("cannot verify the main checkout for this Git worktree")
+        return main_root
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise ValueError("cannot safely inspect the main checkout's Claude settings") from exc
+
+
+def _claude_managed_settings_paths() -> tuple[Path, ...]:
+    """Return documented file-managed settings locations for this platform."""
+
+    if sys.platform == "darwin":
+        directory = Path("/Library/Application Support/ClaudeCode")
+    elif sys.platform.startswith("linux"):
+        directory = Path("/etc/claude-code")
+    else:
+        return ()
+    paths = [directory / "managed-settings.json"]
+    dropins = directory / "managed-settings.d"
+    try:
+        dropins.lstat()
+    except FileNotFoundError:
+        return tuple(paths)
+    except OSError as exc:
+        raise ValueError("cannot inspect Claude file-managed hook settings") from exc
+    if dropins.is_symlink() or not dropins.is_dir():
+        raise ValueError("cannot safely inspect Claude file-managed hook settings")
+    try:
+        with os.scandir(dropins) as entries:
+            paths.extend(sorted(
+                (Path(entry.path) for entry in entries if entry.name.endswith(".json")),
+                key=str,
+            ))
+    except OSError as exc:
+        raise ValueError("cannot read Claude file-managed hook settings") from exc
+    return tuple(paths)
+
+
+def _claude_settings_paths(
+    provider_root: Path, *, project_root: Path | None = None
+) -> tuple[tuple[str, Path], ...]:
+    """Known settings that can suppress the project lifecycle hooks."""
+
+    roots = {provider_root}
+    if project_root is not None:
+        roots.add(project_root)
+    for project in tuple(roots):
+        main_root = _claude_main_checkout_root(project)
+        if main_root is not None:
+            roots.add(main_root)
+    paths: list[tuple[str, Path]] = [
+        ("project-local", root / ".claude" / "settings.local.json")
+        for root in sorted(roots, key=str)
+    ]
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    user_dir = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
+    paths.append(("user", user_dir / "settings.json"))
+    paths.extend(("managed", path) for path in _claude_managed_settings_paths())
+    return tuple(paths)
+
+
+def _read_claude_settings(
+    path: Path, *, label: str, required: bool = False
+) -> Mapping[str, Any] | None:
+    try:
+        file_stat = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise ValueError(f"Claude {label} settings are missing: {path.name}")
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot inspect Claude {label} settings: {path.name}") from exc
+    if path.is_symlink() or not path.is_file() or file_stat.st_size > 1024 * 1024:
+        raise ValueError(f"cannot safely validate Claude {label} settings: {path.name}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot parse Claude {label} settings: {path.name}") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"cannot validate Claude {label} settings: {path.name} must be an object")
+    return value
+
+
+def _require_claude_hooks_not_suppressed(
+    settings: Mapping[str, Any], *, label: str, path: Path
+) -> None:
+    for key in ("disableAllHooks", "allowManagedHooksOnly"):
+        if settings.get(key) is True:
+            raise ValueError(
+                f"Claude lifecycle hooks may be suppressed by {label} ({path.name}: {key}); "
+                "remove that setting or configure managed hooks so Agentflow's controlled "
+                "SessionStart and PostModelSwitch hooks can run."
+            )
+
+
+def _require_claude_model_switch_hooks(
+    provider_root: Path, *, project_root: Path | None = None
+) -> None:
+    """Require controlled hooks and reject suppression in known settings."""
 
     root = provider_root.expanduser().resolve()
     settings_dir = root / ".claude"
     settings_path = settings_dir / "settings.json"
     if settings_dir.is_symlink() or settings_path.is_symlink() or not settings_path.is_file():
         raise ValueError(
-            "Claude model-attested Herdr launch requires existing controlled SessionStart "
+            "Claude lifecycle-evidence Herdr launch requires existing controlled SessionStart "
             "and PostModelSwitch hooks in .claude/settings.json; add the bundled Agentflow "
             "hook commands before launching. Existing project settings are not overwritten."
         )
     try:
         resolved_settings = settings_path.resolve(strict=True)
         resolved_settings.relative_to(root)
-        if settings_path.stat().st_size > 1024 * 1024:
-            raise ValueError("Claude project settings are too large to validate")
-        settings = json.loads(resolved_settings.read_text(encoding="utf-8"))
+        settings = _read_claude_settings(resolved_settings, label="project", required=True)
         bundled = json.loads(
             packaged_resources.item(
                 "templates", "project", "claude-settings.json"
             ).read_text(encoding="utf-8")
         )
+        for label, path in _claude_settings_paths(
+            root, project_root=project_root.expanduser().resolve() if project_root else None
+        ):
+            optional_settings = _read_claude_settings(path, label=label)
+            if optional_settings is not None:
+                _require_claude_hooks_not_suppressed(optional_settings, label=label, path=path)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(
-            "Claude model-attested Herdr launch cannot validate .claude/settings.json; "
-            "repair the settings file and preserve its custom entries while adding the "
-            "bundled Agentflow SessionStart and PostModelSwitch hooks."
+            "Claude Herdr launch cannot validate known lifecycle-hook settings "
+            f"({exc}); repair the reported source and preserve custom entries "
+            "while allowing Agentflow's SessionStart and PostModelSwitch hooks."
         ) from exc
 
-    settings_hooks = settings.get("hooks") if isinstance(settings, Mapping) else None
+    if settings is None:
+        raise ValueError("Claude project settings are unavailable")
+    _require_claude_hooks_not_suppressed(settings, label="project", path=settings_path)
+    settings_hooks = settings.get("hooks")
     bundled_hooks = bundled.get("hooks") if isinstance(bundled, Mapping) else None
     if not isinstance(settings_hooks, Mapping) or not isinstance(bundled_hooks, Mapping):
-        raise ValueError("Claude model-attested Herdr launch cannot validate project hook settings")
-    if settings.get("disableAllHooks") is True:
         raise ValueError(
-            "Claude model-attested Herdr launch cannot use .claude/settings.json with "
-            "disableAllHooks enabled; remove that setting while preserving the controlled "
-            "SessionStart and PostModelSwitch hooks."
-        )
-    if settings.get("allowManagedHooksOnly") is True:
-        raise ValueError(
-            "Claude model-attested Herdr launch cannot use .claude/settings.json with "
-            "allowManagedHooksOnly enabled because project hooks would not run; remove that "
-            "setting while preserving the controlled SessionStart and PostModelSwitch hooks."
+            "Claude lifecycle-evidence Herdr launch cannot validate project hook settings"
         )
 
     for event_name in ("SessionStart", "PostModelSwitch"):
@@ -7065,7 +7203,7 @@ def _require_claude_model_switch_hooks(provider_root: Path) -> None:
                     break
         if not functional:
             raise ValueError(
-                f"Claude model-attested Herdr launch requires the controlled "
+                f"Claude lifecycle-evidence Herdr launch requires the controlled "
                 f"{event_name} hook in .claude/settings.json; add `{expected_command}` "
                 "while preserving existing project settings."
             )
@@ -7078,7 +7216,7 @@ def _require_claude_model_switch_version() -> None:
     command = _provider_command("claude")
     if not command:
         raise ValueError(
-            "Claude Code 2.1.251 or newer is required for model-attested Herdr launches; "
+            "Claude Code 2.1.251 or newer is required for Claude lifecycle-evidence Herdr launches; "
             "install or place `claude` on PATH and retry."
         )
     try:
@@ -7088,21 +7226,21 @@ def _require_claude_model_switch_version() -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(
-            "could not verify Claude Code version; model-attested Herdr launches require "
+            "could not verify Claude Code version; Claude lifecycle-evidence Herdr launches require "
             "Claude Code 2.1.251 or newer"
         ) from exc
     version_text = f"{result.stdout or ''}\n{result.stderr or ''}"[:2048]
     match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", version_text)
     if result.returncode != 0 or not match:
         raise ValueError(
-            "could not verify Claude Code version; model-attested Herdr launches require "
+            "could not verify Claude Code version; Claude lifecycle-evidence Herdr launches require "
             "Claude Code 2.1.251 or newer"
         )
     actual = tuple(int(part) for part in match.groups())
     if actual < minimum:
         found = ".".join(match.groups())
         raise ValueError(
-            f"Claude Code {found} is too old for native PostModelSwitch attestation; "
+            f"Claude Code {found} is too old for native PostModelSwitch lifecycle events; "
             "upgrade to 2.1.251 or newer before launching."
         )
 

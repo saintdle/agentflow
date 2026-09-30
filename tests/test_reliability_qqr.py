@@ -377,9 +377,9 @@ class ProviderModelFidelityTests(unittest.TestCase):
                 {"event": "session.start", "session_id": "session-1", "model": "claude-sonnet-5"},
                 event_id="forged-model-attestation",
             ))
-            with self.assertRaisesRegex(ValueError, "Copilot.*actual-model attestation.*unsupported"):
+            with self.assertRaisesRegex(ValueError, "Copilot.*resolved-model evidence.*unsupported"):
                 cli._require_attested_model("copilot", "session-1", "claude-sonnet-5")
-            with self.assertRaisesRegex(ValueError, "Copilot.*actual-model attestation.*unsupported"):
+            with self.assertRaisesRegex(ValueError, "Copilot.*resolved-model evidence.*unsupported"):
                 cli._require_attested_model("copilot", "session-missing", "claude-sonnet-5")
 
     def test_claude_missing_model_on_latest_session_event_invalidates_stale_attestation(self) -> None:
@@ -397,7 +397,7 @@ class ProviderModelFidelityTests(unittest.TestCase):
                 {"event": "session.start", "session_id": "session-1"},
                 event_id="claude-model-omitted-on-resume",
             ))
-            with self.assertRaisesRegex(ValueError, "no native model attestation"):
+            with self.assertRaisesRegex(ValueError, "no usable local lifecycle model evidence"):
                 cli._require_attested_model("claude", "session-1", "claude-sonnet-5")
 
     def test_copilot_herdr_launch_is_rejected_before_provider_lookup_or_spawn(self) -> None:

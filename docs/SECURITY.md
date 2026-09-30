@@ -85,11 +85,20 @@ required skills, output boundary, and budget. Missing or ambiguous
 security-relevant input blocks launch.
 
 A model policy is local governance, not proof of provider identity or service
-security. Agentflow therefore signs the requested model into each return
-contract and accepts a result only when native lifecycle metadata for the bound
-provider session attests the same exact model. Missing evidence or provider
-fallback to a different model fails closed. Use exact provider identifiers,
-install the provider hooks, and review policy changes.
+security. Agentflow records the requested model in the return contract and
+compares it with lifecycle events written to its local event spool for the
+bound provider session. Claude's SessionStart and PostModelSwitch events are
+cooperative observations, not provider-signed or cryptographically protected
+proof; a same-UID process that can alter the spool or hook delivery can forge
+or change them. Missing evidence or a recorded mismatch fails closed. Claude
+launch checks known project, user, and file-managed settings for hook
+suppression before launch, but dynamic server-managed or MDM policy is not
+reliably observable by that preflight and may change during a session. This is
+not a guarantee that the effective hook policy was proven before provider cost
+was incurred. Claude's session-level fallback is constrained to the requested
+primary model; PostModelSwitch is not a per-response model attestation. Use
+exact provider identifiers, install the provider hooks, and review policy
+changes.
 
 ## External return channels and sterile packages
 
