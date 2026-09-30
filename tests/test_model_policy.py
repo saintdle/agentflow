@@ -7,12 +7,12 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from agentflow import model_policy as mp
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from sync_resources import check_resources, sync_resources
 
 
 def _base_document() -> dict:
@@ -21,27 +21,58 @@ def _base_document() -> dict:
 
 class ResourceMirrorTests(unittest.TestCase):
     def test_repository_resources_match_packaged_mirrors(self) -> None:
-        mirrors = (
-            (".codex/agents", "src/agentflow/resources/agents/codex"),
-            (".claude/agents", "src/agentflow/resources/agents/claude"),
-            (".github/agents", "src/agentflow/resources/agents/copilot"),
-            ("policies", "src/agentflow/resources/policies"),
-            (".agents/skills/orchestrate-agents", "src/agentflow/resources/skills/orchestrate-agents"),
-            ("templates/project", "src/agentflow/resources/templates/project"),
-        )
-        for source_relative, package_relative in mirrors:
-            with self.subTest(source=source_relative, package=package_relative):
-                source_root = REPO_ROOT / source_relative
-                package_root = REPO_ROOT / package_relative
-                source_files = {
-                    path.relative_to(source_root): path.read_bytes()
-                    for path in source_root.rglob("*") if path.is_file()
-                }
-                package_files = {
-                    path.relative_to(package_root): path.read_bytes()
-                    for path in package_root.rglob("*") if path.is_file()
-                }
-                self.assertEqual(source_files, package_files)
+        self.assertEqual(check_resources(REPO_ROOT), [])
+
+    def test_sync_is_deterministic_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "runtime/skills/example"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"---\nname: example\n---\n")
+            (source / "references/guide.md").parent.mkdir(parents=True)
+            (source / "references/guide.md").write_bytes(b"guide\n")
+            mirrors = (("runtime/skills", "exports/skills"),)
+
+            first_changes = sync_resources(root, mirrors=mirrors)
+            self.assertEqual(
+                first_changes,
+                ("exports/skills/example/SKILL.md", "exports/skills/example/references/guide.md"),
+            )
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
+            self.assertEqual(
+                (root / "exports/skills/example/references/guide.md").read_bytes(),
+                b"guide\n",
+            )
+
+    def test_check_reports_drift_without_rewriting_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "runtime/policies"
+            source.mkdir(parents=True)
+            (source / "models.json").write_bytes(b'{"canonical":true}\n')
+            mirrors = (("runtime/policies", "policies"),)
+            sync_resources(root, mirrors=mirrors)
+            (root / "policies/models.json").write_bytes(b'{"canonical":false}\n')
+            (root / "policies/obsolete.json").write_bytes(b"stale\n")
+            before = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+
+            errors = check_resources(root, mirrors=mirrors)
+
+            self.assertTrue(any("models.json: differs" in error for error in errors))
+            self.assertTrue(any("obsolete.json: extra export" in error for error in errors))
+            after = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+            sync_resources(root, mirrors=mirrors)
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
 
 
 class LoadPolicyTests(unittest.TestCase):

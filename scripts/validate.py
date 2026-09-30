@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agentflow import assets as assets_backend
 from agentflow import model_policy
 from agentflow import project_config
+from sync_resources import check_resources
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,14 +34,6 @@ PROVENANCE_MARKERS = (
 )
 
 
-def _tree_contents(root: Path) -> dict[Path, bytes]:
-    return {
-        path.relative_to(root): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
-
-
 def _looks_like_asset_lock(data: object) -> bool:
     return isinstance(data, dict) and "assets" in data and isinstance(data.get("assets"), list)
 
@@ -51,20 +44,7 @@ def _looks_like_model_policy(data: object) -> bool:
 
 def main() -> int:
     errors: list[str] = []
-    mirrored_resources = (
-        (ROOT / ".agents/skills", ROOT / "src/agentflow/resources/skills"),
-        (ROOT / ".codex/agents", ROOT / "src/agentflow/resources/agents/codex"),
-        (ROOT / ".claude/agents", ROOT / "src/agentflow/resources/agents/claude"),
-        (ROOT / ".github/agents", ROOT / "src/agentflow/resources/agents/copilot"),
-        (ROOT / "templates", ROOT / "src/agentflow/resources/templates"),
-        (ROOT / "policies", ROOT / "src/agentflow/resources/policies"),
-    )
-    for development_tree, packaged_tree in mirrored_resources:
-        if _tree_contents(development_tree) != _tree_contents(packaged_tree):
-            errors.append(
-                f"{development_tree.relative_to(ROOT)} differs from packaged mirror "
-                f"{packaged_tree.relative_to(ROOT)}"
-            )
+    errors.extend(check_resources(ROOT))
 
     packaged_skills = ROOT / "src/agentflow/resources/skills"
     for name in ADAPTED_SKILLS:
@@ -180,7 +160,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("Validated JSON, TOML, project configuration, and shared skills.")
+    print("Validated resource exports, JSON, TOML, project configuration, and shared skills.")
     return 0
 
 
