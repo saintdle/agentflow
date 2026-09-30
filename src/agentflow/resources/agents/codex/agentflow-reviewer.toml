@@ -1,6 +1,6 @@
 name = "agentflow-reviewer"
 description = "Reviews a bounded diff for correctness, security, regressions, and missing tests without editing it."
-model = "gpt-5.6-sol"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 developer_instructions = """

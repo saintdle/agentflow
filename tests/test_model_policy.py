@@ -19,6 +19,31 @@ def _base_document() -> dict:
     return json.loads(mp.DEFAULT_POLICY_PATH.read_text(encoding="utf-8"))
 
 
+class ResourceMirrorTests(unittest.TestCase):
+    def test_repository_resources_match_packaged_mirrors(self) -> None:
+        mirrors = (
+            (".codex/agents", "src/agentflow/resources/agents/codex"),
+            (".claude/agents", "src/agentflow/resources/agents/claude"),
+            (".github/agents", "src/agentflow/resources/agents/copilot"),
+            ("policies", "src/agentflow/resources/policies"),
+            (".agents/skills/orchestrate-agents", "src/agentflow/resources/skills/orchestrate-agents"),
+            ("templates/project", "src/agentflow/resources/templates/project"),
+        )
+        for source_relative, package_relative in mirrors:
+            with self.subTest(source=source_relative, package=package_relative):
+                source_root = REPO_ROOT / source_relative
+                package_root = REPO_ROOT / package_relative
+                source_files = {
+                    path.relative_to(source_root): path.read_bytes()
+                    for path in source_root.rglob("*") if path.is_file()
+                }
+                package_files = {
+                    path.relative_to(package_root): path.read_bytes()
+                    for path in package_root.rglob("*") if path.is_file()
+                }
+                self.assertEqual(source_files, package_files)
+
+
 class LoadPolicyTests(unittest.TestCase):
     def test_loads_shipped_policy_document(self) -> None:
         policy = mp.load_policy()
@@ -110,11 +135,20 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_codex_sol_controller_passes(self) -> None:
         self._assert_pass(provider="codex", role="controller", model="gpt-5.6-sol", effort="high")
 
+    def test_codex_gpt6_sol_controller_passes(self) -> None:
+        self._assert_pass(provider="codex", role="controller", model="gpt-6-sol", effort="high")
+
     def test_codex_sol_judgment_passes(self) -> None:
         self._assert_pass(provider="codex", role="judgment", model="gpt-5.6-sol", effort="xhigh")
 
     def test_codex_luna_coding_passes(self) -> None:
         self._assert_pass(provider="codex", role="coding", model="gpt-5.6-luna", effort="medium")
+
+    def test_codex_gpt6_luna_coding_worker_max_effort_passes(self) -> None:
+        self._assert_pass(provider="codex", role="coding", model="gpt-6-luna", effort="max")
+
+    def test_codex_gpt6_luna_exploration_does_not_inherit_coding_max_effort(self) -> None:
+        self._assert_fail(provider="codex", role="exploration", model="gpt-6-luna", effort="max")
 
     def test_codex_luna_medium_editing_passes(self) -> None:
         self._assert_pass(provider="codex", role="editing", model="gpt-5.6-luna", effort="medium")
@@ -124,6 +158,9 @@ class ValidateRouteMatrixTests(unittest.TestCase):
 
     def test_codex_luna_high_editing_fails(self) -> None:
         self._assert_fail(provider="codex", role="editing", model="gpt-5.6-luna", effort="high")
+
+    def test_codex_gpt6_luna_max_editing_fails(self) -> None:
+        self._assert_fail(provider="codex", role="editing", model="gpt-6-luna", effort="max")
 
     def test_claude_opus_4_8_controller_passes(self) -> None:
         self._assert_pass(provider="claude", role="controller", model="claude-opus-4-8", effort="high")
@@ -165,6 +202,11 @@ class ValidateRouteMatrixTests(unittest.TestCase):
 
     def test_codex_terra_fails(self) -> None:
         self._assert_fail(provider="codex", role="coding", model="gpt-5.6-terra", effort="medium")
+
+    def test_codex_terra_passes_only_with_explicit_selection(self) -> None:
+        self._assert_pass(
+            provider="codex", role="coding", model="gpt-5.6-terra", effort="medium", selective=True,
+        )
 
     def test_claude_haiku_fails(self) -> None:
         self._assert_fail(provider="claude", role="coding", model="haiku", effort="medium")
@@ -336,7 +378,7 @@ class MigrationPlanningTests(unittest.TestCase):
             action = actions[0]
             self.assertEqual(action.action, "propose_update")
             self.assertEqual(action.current_model, "gpt-5.6")
-            self.assertIn(action.proposed_model, self.policy.approved_models("codex"))
+            self.assertEqual(action.proposed_model, "gpt-6-sol")
 
     def test_skips_already_compliant_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -354,14 +396,14 @@ class MigrationPlanningTests(unittest.TestCase):
         by_path = {action.path: action for action in actions}
 
         # controller role -> the judgment/controller-tier model, not the coding tier.
-        self.assertEqual(by_path[".codex/agents/agentflow-controller.toml"].proposed_model, "gpt-5.6-sol")
+        self.assertEqual(by_path[".codex/agents/agentflow-controller.toml"].proposed_model, "gpt-6-sol")
         self.assertEqual(by_path[".claude/agents/agentflow-controller.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
             by_path[".github/agents/agentflow-controller.agent.md"].proposed_model, "claude-opus-4.8"
         )
 
         # exploration role -> the coding/execution-tier model.
-        self.assertEqual(by_path[".codex/agents/agentflow-explorer.toml"].proposed_model, "gpt-5.6-luna")
+        self.assertEqual(by_path[".codex/agents/agentflow-explorer.toml"].proposed_model, "gpt-6-luna")
         self.assertEqual(by_path[".claude/agents/agentflow-explorer.md"].proposed_model, "claude-sonnet-5")
 
         # review role -> the judgment/controller-tier model, same as controller.
@@ -369,7 +411,7 @@ class MigrationPlanningTests(unittest.TestCase):
 
         # pr-gatekeeper is judgment, not exploration: it migrates to the
         # judgment/controller-tier model (Sol / Opus), never the coding tier.
-        self.assertEqual(by_path[".codex/agents/agentflow-pr-gatekeeper.toml"].proposed_model, "gpt-5.6-sol")
+        self.assertEqual(by_path[".codex/agents/agentflow-pr-gatekeeper.toml"].proposed_model, "gpt-6-sol")
         self.assertEqual(by_path[".claude/agents/agentflow-pr-gatekeeper.md"].proposed_model, "claude-opus-4-8")
         self.assertEqual(
             by_path[".github/agents/agentflow-pr-gatekeeper.agent.md"].proposed_model, "claude-opus-4.8"
@@ -392,7 +434,20 @@ class MigrationPlanningTests(unittest.TestCase):
             actions = mp.plan_migration(root, self.policy)
             self.assertEqual(len(actions), 1)
             self.assertEqual(actions[0].action, "propose_update")
-            self.assertEqual(actions[0].proposed_model, "gpt-5.6-sol")
+            self.assertEqual(actions[0].proposed_model, "gpt-6-sol")
+
+    def test_coding_profile_migration_prefers_gpt6_luna_and_never_terra(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".codex" / "agents").mkdir(parents=True)
+            path = root / ".codex" / "agents" / "agentflow-worker.toml"
+            path.write_text(
+                'name = "agentflow-worker"\nmodel = "gpt-5.6-terra"\n', encoding="utf-8"
+            )
+            actions = mp.plan_migration(root, self.policy)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0].action, "propose_update")
+            self.assertEqual(actions[0].proposed_model, "gpt-6-luna")
 
     def test_pr_gatekeeper_migrates_to_judgment_tier_for_claude(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

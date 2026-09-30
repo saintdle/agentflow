@@ -13,6 +13,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Added exact GPT-6 Sol routes for Codex controller, judgment, and review work,
+  and GPT-6 Luna routes for coding, exploration, and editing. Bundled Codex
+  profiles now default to GPT-6 while GPT-5.6 Sol/Luna remain accepted for
+  existing project configurations.
 - Clarified public tagged-source installs and upgrades, the Herdr prerequisite
   for persistent external controller sessions, and GitHub Copilot Chat setup
   where IDE Agent mode and terminal access are available.

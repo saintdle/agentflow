@@ -6,10 +6,11 @@ values fail closed before lease/claim reservation.
 
 | Work | Provider/model | Effort |
 |---|---|---|
-| Goal shaping, architecture, difficult debugging | Codex `gpt-5.6-sol` | `high` or `xhigh` |
-| File discovery, bounded implementation, exploration | Codex `gpt-5.6-luna` | `medium` or `high` |
+| Goal shaping, architecture, difficult debugging | Codex `gpt-6-sol` | `high` or `xhigh` |
+| Bounded coding workers | Codex `gpt-6-luna` | `max` |
+| File discovery and exploration | Codex `gpt-6-luna` | `medium` or `high` |
 | Selective complex implementation or exploration, only when explicitly recorded | Codex `gpt-5.6-terra` | `medium` or `high` |
-| Conditional plain-language edit (default) | Codex `gpt-5.6-luna` | `medium` |
+| Conditional plain-language edit (default) | Codex `gpt-6-luna` | `medium` |
 | Conditional edit without OpenAI access | Claude `claude-sonnet-5` or Copilot `claude-sonnet-4.6` | `medium` |
 | Judgment, review, and queue integration (default when Claude or Opus is requested) | Claude `claude-opus-4-8` | `high` |
 | Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Claude `claude-opus-5` | `medium` unless the user states another level |
@@ -53,6 +54,8 @@ preflight.
 - Terra is not banned. It is a selective Codex execution route and requires an
   explicit per-launch selection recorded with the task; Luna remains the
   default Codex execution model.
+- GPT-5.6 Sol and Luna remain accepted exact routes for existing project
+  configurations. New bundled profiles use GPT-6 Sol and Luna.
 - Keep worker delegation disabled unless the approved graph records a deeper
   lane. The default maximum depth is one, with two attempts per task and a
   graph-derived total launch budget.
