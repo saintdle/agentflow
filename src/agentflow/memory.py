@@ -144,7 +144,19 @@ def find_first(
     instant = now or dt.datetime.now(dt.timezone.utc)
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=dt.timezone.utc)
-    candidates = index.find_candidates(query, limit=min(100, max_items * 4), min_authority=min_authority, scope=selected_scope, scope_id=scope_id)
+    # Candidate-status rows can never be recalled, so exclude them from the
+    # FTS result window. Otherwise even a small unapproved backlog can consume
+    # the max_items-based lookahead before an approved entry is considered.
+    # The second-stage fetch still rechecks approval evidence and all recall
+    # governance; the wider window leaves room for stale or duplicate results.
+    candidates = index.find_candidates(
+        query,
+        limit=100,
+        min_authority=min_authority,
+        scope=selected_scope,
+        scope_id=scope_id,
+        statuses=("approved",),
+    )
     items: list[RecallItem] = []
     rendered: list[str] = []
     seen_digests: set[str] = set()
