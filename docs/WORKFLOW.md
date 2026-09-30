@@ -22,6 +22,11 @@ until the current worker result is safely dispositioned, then stops before the
 next wave. Repeating the same named failed approach twice also creates a durable
 decision halt.
 
+The provider chat may have started from another open project or a global skill.
+Once the controller lease is acquired, Agentflow binds that provider session to
+the approved workflow workspace. Subsequent hooks resolve Beads and optional
+memory from the binding rather than the editor's incidental current directory.
+
 ```mermaid
 stateDiagram-v2
     state "Shape goal" as ShapeGoal
@@ -90,11 +95,25 @@ decision-prone sessions where observation or direct intervention is useful.
 dispatch. A live pane is an attention signal, never proof of correctness or
 completion.
 
+Generated native handoffs are direct-session contracts: they return in the
+provider session and never claim that controller-owned result files exist.
+Generated external handoffs are controller contracts and always require the
+leased controller's authenticated return channel.
+
 External launches consume provider allowance and therefore remain explicit
 unless an approved controller is operating within its recorded budget.
 Native Codex workers use a dedicated Luna profile with no inherited controller
 conversation (`fork_turns="none"`) or the smallest context slice that contains
 the task contract.
+
+External workers always return through the controller-minted authenticated
+channel. Do not launch their generated handoffs with `agentflow handoff launch`;
+resume the root controller. When outbound context must be restricted, persist
+`sterile: true` in `metadata.agentflow.launch`. The controller packages only
+declared context, acceptance data, and self-contained pinned skills, verifies
+the package inventory, and asks Herdr to use that package as the worker cwd.
+The current sterile lane is read-only and rejects `shell-write`; this is
+context minimization, not an OS sandbox.
 
 ## Durable Beads coordination
 

@@ -6,12 +6,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+### Added
 
+- Added protected provider-session bindings so controller hooks resolve the
+  approved workflow workspace instead of an incidental IDE cwd.
+- Added hash-inventoried sterile launch packages for external tasks that opt
+  into restricted outbound context.
 - Added exact GPT-6 Sol routes for Codex controller, judgment, and review work,
   and GPT-6 Luna routes for coding, exploration, and editing. Bundled Codex
   profiles now default to GPT-6 while GPT-5.6 Sol/Luna remain accepted for
   existing project configurations.
+
+### Changed
+
+- External handoffs now require the leased controller's authenticated Herdr
+  result channel; direct external launch fails before provider spawn.
+- Native direct handoffs no longer advertise controller-owned result files;
+  the conditional prose editor uses this bounded direct-session lane.
+- Authenticated results now require matching local lifecycle model evidence
+  for the bound provider session; this cooperative evidence is not
+  provider-signed proof. Claude launch also rejects hook suppression in known
+  project, user, and file-managed settings before spawn.
+
+### Fixed
+
+- Handoff preflight and sterile packaging now accept exact, provider-approved
+  external skill sources registered through project configuration while still
+  rejecting unregistered, retargeted, or package-escaping skill references.
+- Provider hooks remain fail-open when the protected workspace-binding
+  registry is unreadable or malformed.
+- Sterile packaging revalidates the exact approved skill pin before copying
+  and verifies the copied package bytes before launch.
+- Root preflight resolves relative output boundaries against the approved
+  execution root rather than the invoking shell's directory.
 
 ## [0.0.5] - 2026-09-15
 
