@@ -6909,6 +6909,48 @@ def _sterile_skill_root(stage: Path, provider: str, skill_name: str) -> Path:
     return stage / relative / skill_name
 
 
+def _sterile_session_hook(provider: str) -> tuple[Path, bytes] | None:
+    """Return the bundled project hook that captures a native session start.
+
+    Claude Code and Copilot discover project-local hooks from the worker cwd,
+    which is the sterile package for restricted launches.  Copy only the
+    bundled SessionStart/sessionStart handler: source-project hook files may
+    contain arbitrary commands and are never trusted as package inputs.  Codex
+    uses its user-level hook file, so it has no project-local file to stage.
+    """
+
+    resources = {
+        "claude": (
+            Path(".claude/settings.json"),
+            ("templates", "project", "claude-settings.json"),
+            "SessionStart",
+        ),
+        "copilot": (
+            Path(".github/hooks/agentflow.json"),
+            ("templates", "project", "copilot-hooks.json"),
+            "sessionStart",
+        ),
+    }
+    selected = resources.get(provider)
+    if selected is None:
+        return None
+    destination, resource_parts, event_name = selected
+    try:
+        template = json.loads(packaged_resources.item(*resource_parts).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"bundled {provider} session hook is unavailable") from exc
+    hooks = template.get("hooks") if isinstance(template, Mapping) else None
+    event_hooks = hooks.get(event_name) if isinstance(hooks, Mapping) else None
+    if not isinstance(event_hooks, list) or not event_hooks:
+        raise ValueError(f"bundled {provider} session hook is malformed")
+    # Retain Copilot's version field, but no unrelated project settings/hooks.
+    config: dict[str, Any] = {"hooks": {event_name: event_hooks}}
+    if provider == "copilot":
+        config["version"] = template.get("version", 1)
+    encoded = (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return destination, encoded
+
+
 def _validate_sterile_package(stage: Path) -> Path:
     stage = stage.expanduser().resolve(strict=True)
     manifest_path = stage / ".agentflow/sterile-manifest.json"
@@ -7055,6 +7097,13 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
             or expected_file_count != copied_file_count
         ):
             raise ValueError(f"sterile skill package changed while copying: {name}")
+
+    session_hook = _sterile_session_hook(str(manifest.get("provider") or ""))
+    if session_hook is not None:
+        hook_path, hook_contents = session_hook
+        hook_destination = stage / hook_path
+        hook_destination.parent.mkdir(parents=True, exist_ok=True)
+        hook_destination.write_bytes(hook_contents)
 
     output = stage / ".agentflow/tmp/handoffs" / source_handoff.name
     create_args = argparse.Namespace(

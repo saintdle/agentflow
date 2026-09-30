@@ -111,17 +111,19 @@ class WorkflowWorkspaceBindingTests(unittest.TestCase):
 
 class SterileLaunchPackageTests(unittest.TestCase):
     def _create_external_handoff(
-        self, root: Path, context: Path, *, required_skills: list[str] | None = None
+        self, root: Path, context: Path, *, required_skills: list[str] | None = None,
+        provider: str = "codex",
     ) -> Path:
         (root / "output").mkdir(exist_ok=True)
         output = root / ".agentflow/handoffs/task.md"
         args = argparse.Namespace(
-            to="codex", title="Bounded task", goal="Inspect only declared context",
+            to=provider, title="Bounded task", goal="Inspect only declared context",
             task_id="task-sterile", task_class="focused-review", role="reviewer",
             artifact_kind="internal", writer_model="", lane="external",
             tool_profile="shell-readonly", output_boundary=str(root / "output"),
             require_tool=[], require_skill=required_skills or [], allow_delegation=False, return_type="result",
-            max_ai_credits=None, acceptance_matrix="", isolation_profile="none",
+            max_ai_credits=30 if provider == "copilot" else None,
+            acceptance_matrix="", isolation_profile="none",
             require_asset=[], base="main@" + ("a" * 40), dependency=[], done_when=["Return evidence"],
             context=[str(context)], constraint=["Do not inspect other files"], check=[],
             budget=["10 minutes; one retry; stop on blocker"], issue="", branch="", out=str(output), cwd=str(root),
@@ -147,10 +149,69 @@ class SterileLaunchPackageTests(unittest.TestCase):
             self.assertEqual(cli._validate_sterile_package(stage), packaged)
             names = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()}
             self.assertFalse(any(name.endswith("AGENTS.md") for name in names))
+            self.assertFalse((stage / ".claude/settings.json").exists())
+            self.assertFalse((stage / ".github/hooks/agentflow.json").exists())
             packaged_context = next((stage / "context").iterdir())
             packaged_context.write_text("tampered\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 cli._validate_sterile_package(stage)
+
+    def test_package_contains_only_bundled_session_hook_for_claude_and_copilot(self) -> None:
+        cases = (
+            (
+                "claude", Path(".claude/settings.json"),
+                ("templates", "project", "claude-settings.json"), "SessionStart",
+            ),
+            (
+                "copilot", Path(".github/hooks/agentflow.json"),
+                ("templates", "project", "copilot-hooks.json"), "sessionStart",
+            ),
+        )
+        for provider, relative_hook, resource_parts, event_name in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                root = directory / "source"
+                root.mkdir()
+                context = root / "allowed.md"
+                context.write_text("bounded evidence\n", encoding="utf-8")
+                # Existing project hook instructions are untrusted and must
+                # not be carried into the separate provider cwd.
+                source_hook = root / relative_hook
+                source_hook.parent.mkdir(parents=True)
+                source_hook.write_text(
+                    json.dumps({"hooks": {event_name: [{"command": "run-untrusted-command"}]}}),
+                    encoding="utf-8",
+                )
+                handoff = self._create_external_handoff(
+                    root, context, provider=provider
+                )
+                stage = directory / "sterile"
+                with mock.patch.object(cli, "_provider_command", return_value="/fake/provider"):
+                    packaged = cli._package_handoff_sterile(handoff, stage)
+
+                bundled = json.loads(
+                    cli.packaged_resources.item(*resource_parts).read_text(encoding="utf-8")
+                )
+                expected = {"hooks": {event_name: bundled["hooks"][event_name]}}
+                if provider == "copilot":
+                    expected["version"] = bundled["version"]
+                hook_path = stage / relative_hook
+                self.assertEqual(json.loads(hook_path.read_text(encoding="utf-8")), expected)
+                self.assertNotIn("run-untrusted-command", hook_path.read_text(encoding="utf-8"))
+                self.assertEqual(cli._validate_sterile_package(stage), packaged)
+                inventory = json.loads(
+                    (stage / ".agentflow/sterile-manifest.json").read_text(encoding="utf-8")
+                )["files"]
+                inventory_by_path = {entry["path"]: entry["sha256"] for entry in inventory}
+                self.assertIn(relative_hook.as_posix(), inventory_by_path)
+                self.assertEqual(
+                    inventory_by_path[relative_hook.as_posix()],
+                    cli._file_sha256(hook_path),
+                )
+                self.assertEqual(
+                    set(json.loads(hook_path.read_text(encoding="utf-8"))["hooks"]),
+                    {event_name},
+                )
 
     def test_package_rejects_instruction_file_as_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

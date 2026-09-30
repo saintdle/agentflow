@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import argparse
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow import beads
+from agentflow import beads, cli
 from tests import _state_home  # noqa: F401  # external controller authority
 
 
@@ -242,6 +247,86 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=10, check=False)
             self.assertEqual(replay.returncode, 2, replay.stdout + replay.stderr)
             self.assertIn("controller-owned", replay.stdout)
+
+
+class SterileSessionHookLifecycleTests(unittest.TestCase):
+    """Exercise the packaged project hook and native event across a process boundary."""
+
+    def test_sterile_claude_and_copilot_hooks_attest_native_session_models(self) -> None:
+        cases = (
+            ("claude", Path(".claude/settings.json"), "SessionStart"),
+            ("copilot", Path(".github/hooks/agentflow.json"), "sessionStart"),
+        )
+        for provider, hook_path, event_name in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source"
+                source.mkdir()
+                context = source / "allowed.md"
+                context.write_text("bounded evidence\n", encoding="utf-8")
+                handoff = source / ".agentflow/handoffs/session-hook.md"
+                handoff_args = argparse.Namespace(
+                    to=provider, title="Session hook lifecycle", goal="Attest the provider route",
+                    task_id="task-session-hook", task_class="focused-review", role="reviewer",
+                    artifact_kind="internal", writer_model="", lane="external",
+                    tool_profile="shell-readonly", output_boundary=str(source / "output"),
+                    require_tool=[], require_skill=[], allow_delegation=False, return_type="result",
+                    max_ai_credits=30 if provider == "copilot" else None,
+                    acceptance_matrix="", isolation_profile="none",
+                    require_asset=[], base="main@" + ("a" * 40), dependency=[],
+                    done_when=["Return evidence"], context=[str(context)],
+                    constraint=["Do not inspect other files"], check=[],
+                    budget=["10 minutes; one retry; stop on blocker"], issue="", branch="",
+                    out=str(handoff), cwd=str(source), untrusted_task_data=False,
+                )
+                (source / "output").mkdir()
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.handoff_create(handoff_args), 0)
+                stage = directory / "sterile"
+                with mock.patch.object(cli, "_provider_command", return_value="/fake/provider"), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    packaged_handoff = cli._package_handoff_sterile(handoff, stage)
+                self.assertEqual(cli._validate_sterile_package(stage), packaged_handoff)
+
+                config = json.loads((stage / hook_path).read_text(encoding="utf-8"))
+                entry = config["hooks"][event_name][0]
+                command = entry["hooks"][0]["command"] if provider == "claude" else entry["bash"]
+                command_args = shlex.split(command)
+                self.assertEqual(command_args[0], "~/.local/bin/agentflow")
+                self.assertEqual(command_args[1:4], ["hook", "--provider", provider])
+                event_from_config = command_args[command_args.index("--event") + 1]
+                self.assertEqual(event_from_config, event_name)
+
+                state_home = directory / "state"
+                environment = dict(os.environ)
+                environment["AGENTFLOW_STATE_HOME"] = str(state_home)
+                environment["PYTHONPATH"] = (
+                    str(ROOT / "src") + os.pathsep + environment.get("PYTHONPATH", "")
+                )
+                native_session = f"{provider}-native-session"
+                event_payload = {
+                    "hook_event_name": event_from_config,
+                    "session_id": native_session,
+                    "cwd": str(stage),
+                    "model": "claude-sonnet-5",
+                }
+                # The bundled command is rooted at the normal local install
+                # path. Replace only that executable in this test so the same
+                # packaged hook arguments cross a real child-process boundary.
+                hook_argv = [sys.executable, "-m", "agentflow.cli", *command_args[1:]]
+                hook_result = subprocess.run(
+                    hook_argv, cwd=stage, env=environment,
+                    input=json.dumps(event_payload), capture_output=True,
+                    text=True, timeout=10, check=False,
+                )
+                self.assertEqual(hook_result.returncode, 0, hook_result.stdout + hook_result.stderr)
+                self.assertTrue((state_home / "events.jsonl").is_file())
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False):
+                    cli._require_attested_model(provider, native_session, "claude-sonnet-5")
+                    with self.assertRaisesRegex(ValueError, "provider model mismatch"):
+                        cli._require_attested_model(provider, native_session, "claude-sonnet-4.6")
+                    with self.assertRaisesRegex(ValueError, "no native model attestation"):
+                        cli._require_attested_model(provider, "missing-session", "claude-sonnet-5")
 
 
 if __name__ == "__main__":
