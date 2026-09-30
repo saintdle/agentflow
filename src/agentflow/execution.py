@@ -15,6 +15,7 @@ SCHEMA = "agentflow.execution-policy@1"
 EXECUTION_ROLES = frozenset({"coding", "editing", "exploration"})
 EXPENSIVE_MODELS = frozenset(
     {
+        "gpt-6-sol",
         "gpt-5.6-sol",
         "claude-opus-4-8",
         "claude-opus-4.8",

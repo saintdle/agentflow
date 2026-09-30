@@ -100,6 +100,18 @@ agentflow doctor
             with self.assertRaises(prose.ProseError):
                 prose.read_markdown(other)
 
+    def test_project_template_mirrors_keep_default_editor_on_gpt6_luna_medium(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        paths = (
+            repo_root / "templates/project/agentflow.json",
+            repo_root / "src/agentflow/resources/templates/project/agentflow.json",
+        )
+        configs = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+        self.assertEqual(configs[0], configs[1])
+        self.assertEqual(configs[0]["prose"]["editor"], {
+            "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
+        })
+
 
 class ProseCliTests(unittest.TestCase):
     def run_cli(self, arguments: list[str]) -> tuple[int, str, str]:
@@ -162,7 +174,7 @@ class ProseCliTests(unittest.TestCase):
             handoff = Path(result["handoff"])
             manifest = json.loads(handoff.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["prose"]["editor"], {
-                "provider": "codex", "model": "gpt-5.6-luna", "role": "editing",
+                "provider": "codex", "model": "gpt-6-luna", "role": "editing",
                 "effort": "medium", "policy": "models-v2",
             })
             self.assertEqual(manifest["prose"]["artifact_kind"], "reader-facing")
