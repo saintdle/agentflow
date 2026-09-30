@@ -99,10 +99,12 @@ def sync_resources(
     *,
     mirrors: Iterable[tuple[str, str]] = RESOURCE_MIRRORS,
 ) -> tuple[str, ...]:
-    """Export canonical resource trees, removing stale files in those exports.
+    """Export missing or changed files without removing extra export files.
 
-    All trees are read and checked for unsafe symlinks before the first write.
-    Re-running after a successful export makes no changes.
+    All trees are read and checked for unsafe symlinks and extra files before
+    the first write. Extra files may be user-owned, so their presence refuses
+    the entire sync rather than deleting them. Re-running after a successful
+    export makes no changes.
     """
 
     plans: list[tuple[Path, Path, dict[Path, bytes], dict[Path, bytes]]] = []
@@ -111,6 +113,12 @@ def sync_resources(
         export = _safe_tree_path(root, export_relative)
         canonical_files = _tree_contents(source, required=True)
         exported_files = _tree_contents(export, required=False)
+        extra_files = sorted(set(exported_files) - set(canonical_files))
+        if extra_files:
+            paths = ", ".join((Path(export_relative) / path).as_posix() for path in extra_files)
+            raise ResourceSyncError(
+                f"refusing to remove extra export file(s): {paths}; review them manually"
+            )
         plans.append((Path(source_relative), Path(export_relative), canonical_files, exported_files))
 
     changes: list[str] = []
@@ -123,21 +131,6 @@ def sync_resources(
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(payload)
             changes.append((export_relative / relative).as_posix())
-
-        for relative in sorted(set(exported_files) - set(canonical_files)):
-            (export / relative).unlink()
-            changes.append((export_relative / relative).as_posix())
-
-        if export.exists():
-            for directory in sorted(
-                (path for path in export.rglob("*") if path.is_dir()),
-                key=lambda path: len(path.parts),
-                reverse=True,
-            ):
-                try:
-                    directory.rmdir()
-                except OSError:
-                    pass
 
     return tuple(changes)
 
@@ -159,7 +152,11 @@ def main() -> int:
 
     try:
         if args.sync:
-            changed = sync_resources()
+            try:
+                changed = sync_resources()
+            except (OSError, ResourceSyncError) as exc:
+                print(f"Resource sync refused: {exc}")
+                return 1
             if changed:
                 print(f"Synchronized {len(changed)} exported resource file(s).")
                 for path in changed:
@@ -176,7 +173,10 @@ def main() -> int:
         print("Resource export validation failed:")
         for error in errors:
             print(f"- {error}")
-        print("Run python3 scripts/sync_resources.py --sync to regenerate exports.")
+        print(
+            "Review extra export files manually, then run "
+            "python3 scripts/sync_resources.py --sync to copy packaged resources."
+        )
         return 1
     print("Resource exports match packaged runtime resources.")
     return 0

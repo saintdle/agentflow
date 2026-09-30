@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from agentflow import model_policy as mp
-from sync_resources import check_resources, sync_resources
+from sync_resources import ResourceSyncError, check_resources, sync_resources
 
 
 def _base_document() -> dict:
@@ -54,7 +54,7 @@ class ResourceMirrorTests(unittest.TestCase):
             mirrors = (("runtime/policies", "policies"),)
             sync_resources(root, mirrors=mirrors)
             (root / "policies/models.json").write_bytes(b'{"canonical":false}\n')
-            (root / "policies/obsolete.json").write_bytes(b"stale\n")
+            (root / "policies/user-added.json").write_bytes(b"keep me\n")
             before = {
                 path.relative_to(root / "policies"): path.read_bytes()
                 for path in (root / "policies").rglob("*") if path.is_file()
@@ -63,13 +63,22 @@ class ResourceMirrorTests(unittest.TestCase):
             errors = check_resources(root, mirrors=mirrors)
 
             self.assertTrue(any("models.json: differs" in error for error in errors))
-            self.assertTrue(any("obsolete.json: extra export" in error for error in errors))
+            self.assertTrue(any("user-added.json: extra export" in error for error in errors))
             after = {
                 path.relative_to(root / "policies"): path.read_bytes()
                 for path in (root / "policies").rglob("*") if path.is_file()
             }
             self.assertEqual(after, before)
 
+            with self.assertRaisesRegex(ResourceSyncError, "user-added.json"):
+                sync_resources(root, mirrors=mirrors)
+            after_refusal = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+            self.assertEqual(after_refusal, before)
+
+            (root / "policies/user-added.json").unlink()
             sync_resources(root, mirrors=mirrors)
             self.assertEqual(check_resources(root, mirrors=mirrors), [])
             self.assertEqual(sync_resources(root, mirrors=mirrors), ())
