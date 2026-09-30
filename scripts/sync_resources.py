@@ -10,7 +10,10 @@ become an alternate runtime source of truth. Running this script without
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import stat
+import tempfile
 from typing import Iterable
 
 
@@ -27,6 +30,28 @@ RESOURCE_MIRRORS = (
 
 class ResourceSyncError(ValueError):
     """Raised when a resource tree cannot be safely read or exported."""
+
+
+def _atomic_write_bytes(destination: Path, payload: bytes, *, mode: int) -> None:
+    """Replace one export path without writing through its existing inode."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            os.fchmod(temporary_file.fileno(), mode)
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def _safe_tree_path(root: Path, relative: str) -> Path:
@@ -129,7 +154,9 @@ def sync_resources(
                 continue
             destination = export / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(payload)
+            source = root / source_relative / relative
+            mode = stat.S_IMODE(source.stat().st_mode)
+            _atomic_write_bytes(destination, payload, mode=mode)
             changes.append((export_relative / relative).as_posix())
 
     return tuple(changes)

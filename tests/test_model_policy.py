@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -44,6 +45,32 @@ class ResourceMirrorTests(unittest.TestCase):
                 (root / "exports/skills/example/references/guide.md").read_bytes(),
                 b"guide\n",
             )
+
+    def test_sync_does_not_mutate_outside_file_hardlinked_to_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            source = root / "runtime/policies"
+            source.mkdir(parents=True)
+            canonical = source / "models.json"
+            canonical.write_bytes(b'{"canonical":true}\n')
+            outside = Path(temp) / "outside.json"
+            outside.write_bytes(b'{"outside":true}\n')
+            export = root / "policies/models.json"
+            export.parent.mkdir(parents=True)
+            try:
+                os.link(outside, export)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"hard links are unavailable: {exc}")
+            self.assertTrue(os.path.samefile(outside, export))
+            mirrors = (("runtime/policies", "policies"),)
+
+            sync_resources(root, mirrors=mirrors)
+
+            self.assertEqual(outside.read_bytes(), b'{"outside":true}\n')
+            self.assertEqual(export.read_bytes(), canonical.read_bytes())
+            self.assertFalse(os.path.samefile(outside, export))
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
 
     def test_check_reports_drift_without_rewriting_exports(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
