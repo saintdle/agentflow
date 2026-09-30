@@ -12,6 +12,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   approved workflow workspace instead of an incidental IDE cwd.
 - Added hash-inventoried sterile launch packages for external tasks that opt
   into restricted outbound context.
+- Added exact GPT-6 Sol routes for Codex controller, judgment, and review work,
+  and GPT-6 Luna routes for coding, exploration, and editing. Bundled Codex
+  profiles now default to GPT-6 while GPT-5.6 Sol/Luna remain accepted for
+  existing project configurations.
 
 ### Changed
 
@@ -19,8 +23,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result channel; direct external launch fails before provider spawn.
 - Native direct handoffs no longer advertise controller-owned result files;
   the conditional prose editor uses this bounded direct-session lane.
-- Authenticated results now require native lifecycle evidence that the actual
-  provider model exactly matches the signed requested route.
+- Authenticated results now require matching local lifecycle model evidence
+  for the bound provider session; this cooperative evidence is not
+  provider-signed proof. Claude launch also rejects hook suppression in known
+  project, user, and file-managed settings before spawn.
 
 ### Fixed
 

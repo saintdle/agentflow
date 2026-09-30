@@ -31,7 +31,7 @@ An initialized project starts with a schema-versioned configuration like this:
   "prose": {
     "editor": {
       "provider": "codex",
-      "model": "gpt-5.6-luna",
+      "model": "gpt-6-luna",
       "effort": "medium"
     }
   },
@@ -116,7 +116,8 @@ writes.
 The initialized model policy is a reference safety policy, not an assertion that a
 model is available to every user. Teams can maintain a versioned policy for
 their approved providers, exact model identifiers, roles, and effort levels.
-The bundled `editing` role permits Codex `gpt-5.6-luna`, Claude Code
+The bundled `editing` role permits Codex `gpt-6-luna` (and retained
+`gpt-5.6-luna` compatibility), Claude Code
 `claude-sonnet-5`, or Copilot `claude-sonnet-4.6`, each at `medium`. The project
 chooses one exact route under `prose.editor`; Luna is the generated default.
 Unavailable, unapproved, or ambiguous model selection fails preflight.
@@ -138,7 +139,10 @@ Codex Terra is permitted, not banned. It is a selective execution route for
 coding or exploration at `medium` or `high`: the approved task must persist the
 exact `gpt-5.6-terra` route, set `selective_model=true`, and explain why Luna is
 not sufficient. An unmarked Terra launch fails closed. Generic, Auto, and Haiku
-routes remain disallowed.
+routes remain disallowed. New bundled Codex profiles use GPT-6 Sol for
+controller and judgment work and GPT-6 Luna for coding, exploration, and
+editing. GPT-5.6 Sol and Luna remain valid exact routes for projects that have
+not migrated their own model settings.
 
 ## Controller-only execution policy
 
