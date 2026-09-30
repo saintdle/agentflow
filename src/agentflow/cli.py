@@ -2579,9 +2579,10 @@ def herdr_launch(args: argparse.Namespace) -> int:
         _require_supported_launch_isolation(typed_handoff, transport="Herdr")
 
         root_preflight_report: dict[str, Any] = {}
+        claude_model_switch_version_verified = False
 
         def _revalidate_contract() -> None:
-            nonlocal typed_handoff, root_preflight_report
+            nonlocal typed_handoff, root_preflight_report, claude_model_switch_version_verified
             if typed_handoff is None:
                 raise ValueError("authenticated provider launch requires a confined typed handoff")
             # Re-read both files while the controller fence is held. The
@@ -2598,6 +2599,15 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 expected_preflight_sha256=typed_handoff.preflight_sha256,
             )
             _require_supported_launch_isolation(typed_handoff, transport="Herdr")
+            if provider == "claude":
+                # Model attestation for a persistent Claude session depends on
+                # both native lifecycle events. Recheck project settings at
+                # every contract fence so edits between validation and spawn
+                # cannot silently remove either controlled hook.
+                _require_claude_model_switch_hooks(execution_root)
+                if not claude_model_switch_version_verified:
+                    _require_claude_model_switch_version()
+                    claude_model_switch_version_verified = True
             manifest = typed_handoff.manifest
             machine_contract = manifest.get("machine_return_contract")
             acceptance_ids = tuple(
@@ -2778,6 +2788,26 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     provider_tail = provider_argv_backend.build_confined_argv(
                         provider, model, effort, typed_handoff, command=resolved_provider,
                     )
+                    if provider == "claude":
+                        # PostModelSwitch does not fire when Claude serves a
+                        # single turn through its fallback chain. Override any
+                        # configured chain with the exact primary model as the
+                        # only fallback. Claude may collapse this duplicate;
+                        # either outcome retries/fails on the same model, never
+                        # silently serving an unreported different model.
+                        try:
+                            primary_model = provider_tail[
+                                provider_tail.index("--model") + 1
+                            ]
+                        except (ValueError, IndexError) as exc:
+                            raise ValueError(
+                                "Claude Herdr argv is missing its exact primary model"
+                            ) from exc
+                        if primary_model != model:
+                            raise ValueError(
+                                "Claude Herdr argv primary model does not match the approved route"
+                            )
+                        provider_tail.extend(["--fallback-model", primary_model])
                     safe_env = [
                         f"AGENTFLOW_HANDOFF_PATH={typed_handoff.path}",
                         f"AGENTFLOW_RESULT_CONTRACT={return_channel['contract_path']}",
@@ -6935,6 +6965,146 @@ def _require_supported_launch_isolation(
         )
     if profile != "none":
         raise ValueError(f"unsupported handoff isolation profile: {profile!r}")
+
+
+def _require_claude_model_switch_hooks(provider_root: Path) -> None:
+    """Require the controlled native hooks without changing project settings."""
+
+    root = provider_root.expanduser().resolve()
+    settings_dir = root / ".claude"
+    settings_path = settings_dir / "settings.json"
+    if settings_dir.is_symlink() or settings_path.is_symlink() or not settings_path.is_file():
+        raise ValueError(
+            "Claude model-attested Herdr launch requires existing controlled SessionStart "
+            "and PostModelSwitch hooks in .claude/settings.json; add the bundled Agentflow "
+            "hook commands before launching. Existing project settings are not overwritten."
+        )
+    try:
+        resolved_settings = settings_path.resolve(strict=True)
+        resolved_settings.relative_to(root)
+        if settings_path.stat().st_size > 1024 * 1024:
+            raise ValueError("Claude project settings are too large to validate")
+        settings = json.loads(resolved_settings.read_text(encoding="utf-8"))
+        bundled = json.loads(
+            packaged_resources.item(
+                "templates", "project", "claude-settings.json"
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(
+            "Claude model-attested Herdr launch cannot validate .claude/settings.json; "
+            "repair the settings file and preserve its custom entries while adding the "
+            "bundled Agentflow SessionStart and PostModelSwitch hooks."
+        ) from exc
+
+    settings_hooks = settings.get("hooks") if isinstance(settings, Mapping) else None
+    bundled_hooks = bundled.get("hooks") if isinstance(bundled, Mapping) else None
+    if not isinstance(settings_hooks, Mapping) or not isinstance(bundled_hooks, Mapping):
+        raise ValueError("Claude model-attested Herdr launch cannot validate project hook settings")
+    if settings.get("disableAllHooks") is True:
+        raise ValueError(
+            "Claude model-attested Herdr launch cannot use .claude/settings.json with "
+            "disableAllHooks enabled; remove that setting while preserving the controlled "
+            "SessionStart and PostModelSwitch hooks."
+        )
+    if settings.get("allowManagedHooksOnly") is True:
+        raise ValueError(
+            "Claude model-attested Herdr launch cannot use .claude/settings.json with "
+            "allowManagedHooksOnly enabled because project hooks would not run; remove that "
+            "setting while preserving the controlled SessionStart and PostModelSwitch hooks."
+        )
+
+    for event_name in ("SessionStart", "PostModelSwitch"):
+        expected_entries = bundled_hooks.get(event_name)
+        expected_command = ""
+        if isinstance(expected_entries, list):
+            for expected_entry in expected_entries:
+                if not isinstance(expected_entry, Mapping):
+                    continue
+                expected_commands = expected_entry.get("hooks")
+                if not isinstance(expected_commands, list):
+                    continue
+                for expected_hook in expected_commands:
+                    if (
+                        isinstance(expected_hook, Mapping)
+                        and expected_hook.get("type") == "command"
+                        and isinstance(expected_hook.get("command"), str)
+                    ):
+                        expected_command = str(expected_hook["command"])
+                        break
+                if expected_command:
+                    break
+        if not expected_command:
+            raise ValueError(f"bundled Claude {event_name} hook is unavailable")
+
+        configured_entries = settings_hooks.get(event_name)
+        functional = False
+        if isinstance(configured_entries, list):
+            for entry in configured_entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                matcher = entry.get("matcher")
+                if event_name == "SessionStart" and matcher is not None:
+                    if not isinstance(matcher, str):
+                        continue
+                    sources = {source.strip().casefold() for source in matcher.split("|")}
+                    if not {"startup", "resume"}.issubset(sources):
+                        continue
+                elif event_name == "PostModelSwitch" and matcher:
+                    continue
+                configured_hooks = entry.get("hooks")
+                if not isinstance(configured_hooks, list):
+                    continue
+                if any(
+                    isinstance(hook_entry, Mapping)
+                    and hook_entry.get("type") == "command"
+                    and hook_entry.get("command") == expected_command
+                    for hook_entry in configured_hooks
+                ):
+                    functional = True
+                    break
+        if not functional:
+            raise ValueError(
+                f"Claude model-attested Herdr launch requires the controlled "
+                f"{event_name} hook in .claude/settings.json; add `{expected_command}` "
+                "while preserving existing project settings."
+            )
+
+
+def _require_claude_model_switch_version() -> None:
+    """Require Claude Code's native PostModelSwitch hook support."""
+
+    minimum = (2, 1, 251)
+    command = _provider_command("claude")
+    if not command:
+        raise ValueError(
+            "Claude Code 2.1.251 or newer is required for model-attested Herdr launches; "
+            "install or place `claude` on PATH and retry."
+        )
+    try:
+        result = subprocess.run(
+            [command, "--version"], capture_output=True, text=True,
+            timeout=8, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(
+            "could not verify Claude Code version; model-attested Herdr launches require "
+            "Claude Code 2.1.251 or newer"
+        ) from exc
+    version_text = f"{result.stdout or ''}\n{result.stderr or ''}"[:2048]
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)", version_text)
+    if result.returncode != 0 or not match:
+        raise ValueError(
+            "could not verify Claude Code version; model-attested Herdr launches require "
+            "Claude Code 2.1.251 or newer"
+        )
+    actual = tuple(int(part) for part in match.groups())
+    if actual < minimum:
+        found = ".".join(match.groups())
+        raise ValueError(
+            f"Claude Code {found} is too old for native PostModelSwitch attestation; "
+            "upgrade to 2.1.251 or newer before launching."
+        )
 
 
 _INSTRUCTION_FILENAMES = {"agents.md", "claude.md", "copilot-instructions.md"}

@@ -124,6 +124,13 @@ class ValidLaunch:
         subprocess.run(["git", "-C", r, "config", "user.email", "t@example.test"], capture_output=True, check=True)
         subprocess.run(["git", "-C", r, "config", "user.name", "Test"], capture_output=True, check=True)
         (self.root / "README.md").write_text("root\n", encoding="utf-8")
+        claude_settings = self.root / ".claude/settings.json"
+        claude_settings.parent.mkdir(parents=True, exist_ok=True)
+        claude_settings.write_bytes(
+            cli.packaged_resources.item(
+                "templates", "project", "claude-settings.json"
+            ).read_bytes()
+        )
         (self.root / "scripts").mkdir(exist_ok=True)
         (self.root / "scripts/validate.py").write_text("print('ok')\n", encoding="utf-8")
         (self.root / "tests").mkdir(exist_ok=True)
@@ -202,7 +209,8 @@ class ValidLaunch:
         return None
 
     def herdr_run(self, *, stdout: str | None = None, returncode: int = 0, stderr: str = "",
-                  capture: dict | None = None, on_spawn=None):
+                  capture: dict | None = None, on_spawn=None,
+                  claude_version: str = "2.1.281 (Claude Code)\n"):
         """A subprocess.run side_effect that intercepts ONLY the herdr spawn.
 
         Real git subprocesses (used by the handoff pipeline and preflight) pass
@@ -214,6 +222,14 @@ class ValidLaunch:
         body = stdout if stdout is not None else _agent_started_stdout(self.provider)
 
         def _run(argv, **kwargs):
+            if (
+                argv
+                and Path(str(argv[0])).name == "claude"
+                and list(argv[1:]) == ["--version"]
+            ):
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=claude_version, stderr=""
+                )
             if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
                 if capture is not None:
                     capture["argv"] = list(argv)
@@ -270,6 +286,11 @@ class AgentflowTests(unittest.TestCase):
             self.assertIn("--", argv)
             provider_tail = argv[argv.index("--") + 1:]
             self.assertEqual(provider_tail[:1], ["/usr/bin/claude"])
+            self.assertEqual(
+                provider_tail[provider_tail.index("--fallback-model") + 1],
+                fixture.model,
+            )
+            self.assertEqual(provider_tail.count("--fallback-model"), 1)
             self.assertIn("--cwd", argv)
             self.assertIn("--no-focus", argv)
             # The durable Agentflow session name lives in Agentflow state,
@@ -287,6 +308,226 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(contract["controller_id"], fixture.controller)
             self.assertEqual(contract["model"], fixture.model)
             self.assertEqual(contract["effort"], fixture.effort)
+
+    def test_nonsterile_launch_packages_and_tracks_claude_model_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
+                clear=False,
+            ):
+                fixture = ValidLaunch(Path(temporary).resolve())
+                session_id = "nonsterile-claude-session"
+                settings_path = fixture.root / ".claude/settings.json"
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                # A project fallback chain must not let Claude serve an
+                # unreported model for one turn (PostModelSwitch is not fired
+                # for that case). Herdr overrides it with the exact primary.
+                settings["fallbackModel"] = "claude-opus-4.8,claude-sonnet-4.6"
+                settings_path.write_text(
+                    json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+                )
+                hooks = settings.get("hooks", {})
+                template = json.loads(
+                    cli.packaged_resources.item(
+                        "templates", "project", "claude-settings.json"
+                    ).read_text(encoding="utf-8")
+                )
+                root_mirror = json.loads(
+                    (Path(__file__).resolve().parents[1]
+                     / "templates/project/claude-settings.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(root_mirror, template)
+                for event_name in ("SessionStart", "PostModelSwitch"):
+                    self.assertTrue(
+                        any(
+                            handler.get("type") == "command"
+                            and handler.get("command")
+                            == f"~/.local/bin/agentflow hook --provider claude --event {event_name}"
+                            for entry in hooks.get(event_name, [])
+                            for handler in entry.get("hooks", [])
+                        ),
+                        f"project settings lack the controlled {event_name} hook",
+                    )
+
+                captured: dict = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(
+                         cli.subprocess,
+                         "run",
+                         side_effect=fixture.herdr_run(
+                             stdout=_agent_started_stdout("claude", session_id=session_id),
+                             capture=captured,
+                         ),
+                     ):
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 0)
+                provider_tail = captured["argv"][captured["argv"].index("--") + 1:]
+                fallback_index = provider_tail.index("--fallback-model")
+                self.assertEqual(provider_tail[fallback_index + 1], fixture.model)
+                self.assertNotIn("claude-opus-4.8,claude-sonnet-4.6", provider_tail)
+                # Agentflow validates existing project settings but never
+                # overwrites the user's configured chain.
+                self.assertEqual(
+                    json.loads(settings_path.read_text(encoding="utf-8"))["fallbackModel"],
+                    "claude-opus-4.8,claude-sonnet-4.6",
+                )
+
+                switch_payload = {
+                    "hook_event_name": "PostModelSwitch",
+                    "session_id": session_id,
+                    "timestamp": "2026-09-30T09:01:00.000Z",
+                    "cwd": str(fixture.root),
+                    "source": "fallback",
+                    "from_model": fixture.model,
+                    "to_model": "claude-sonnet-4.6",
+                }
+                with mock.patch("sys.stdin", io.StringIO(json.dumps(switch_payload))), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        cli.hook(argparse.Namespace(provider="claude", event="PostModelSwitch")),
+                        0,
+                    )
+                with self.assertRaisesRegex(ValueError, "provider model mismatch"):
+                    cli._require_attested_model("claude", session_id, fixture.model)
+                cli._require_attested_model("claude", session_id, "claude-sonnet-4.6")
+
+    def test_nonsterile_launch_blocks_missing_claude_lifecycle_hook_before_spawn(self) -> None:
+        for missing_event in ("SessionStart", "PostModelSwitch"):
+            with self.subTest(event=missing_event), tempfile.TemporaryDirectory() as temporary:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
+                    clear=False,
+                ):
+                    fixture = ValidLaunch(Path(temporary).resolve())
+                    settings_path = fixture.root / ".claude/settings.json"
+                    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                    settings["hooks"].pop(missing_event, None)
+                    settings_path.write_text(
+                        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+                    )
+                    payloads: list[dict] = []
+                    captured: dict = {}
+                    with fixture.beads_patches(), \
+                         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                         mock.patch.object(
+                             cli.subprocess,
+                             "run",
+                             side_effect=fixture.herdr_run(capture=captured),
+                         ), \
+                         mock.patch.object(
+                             cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)
+                         ):
+                        self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                    self.assertNotIn("argv", captured)
+                    self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+                    self.assertEqual(len(payloads), 1)
+                    self.assertIn(missing_event, payloads[0]["error"])
+
+    def test_nonsterile_launch_requires_claude_post_model_switch_capability_before_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
+                clear=False,
+            ):
+                fixture = ValidLaunch(Path(temporary).resolve())
+                payloads: list[dict] = []
+                captured: dict = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(
+                         cli.subprocess,
+                         "run",
+                         side_effect=fixture.herdr_run(
+                             capture=captured, claude_version="2.1.250 (Claude Code)\n"
+                         ),
+                     ), \
+                     mock.patch.object(
+                         cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)
+                     ):
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                self.assertNotIn("argv", captured)
+                self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+                self.assertEqual(len(payloads), 1)
+                self.assertIn("2.1.251 or newer", payloads[0]["error"])
+
+    def test_nonsterile_launch_blocks_settings_that_disable_claude_hooks(self) -> None:
+        for disabling_setting in ("disableAllHooks", "allowManagedHooksOnly"):
+            with self.subTest(setting=disabling_setting), tempfile.TemporaryDirectory() as temporary:
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
+                    clear=False,
+                ):
+                    fixture = ValidLaunch(Path(temporary).resolve())
+                    settings_path = fixture.root / ".claude/settings.json"
+                    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                    settings[disabling_setting] = True
+                    settings_path.write_text(
+                        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+                    )
+                    payloads: list[dict] = []
+                    captured: dict = {}
+                    with fixture.beads_patches(), \
+                         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                         mock.patch.object(
+                             cli.subprocess,
+                             "run",
+                             side_effect=fixture.herdr_run(capture=captured),
+                         ), \
+                         mock.patch.object(
+                             cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)
+                         ):
+                        self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                    self.assertNotIn("argv", captured)
+                    self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+                    self.assertEqual(len(payloads), 1)
+                    self.assertIn(disabling_setting, payloads[0]["error"])
+
+    def test_nonsterile_launch_rechecks_claude_hooks_before_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
+                clear=False,
+            ):
+                fixture = ValidLaunch(Path(temporary).resolve())
+                settings_path = fixture.root / ".claude/settings.json"
+                payloads: list[dict] = []
+                captured: dict = {}
+
+                def remove_post_model_switch_after_initial_check(**_kwargs):
+                    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                    settings["hooks"].pop("PostModelSwitch", None)
+                    settings_path.write_text(
+                        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+                    )
+                    # Keep the already pinned root-preflight digest stable so
+                    # the next fenced contract check reaches hook validation.
+                    return {}, fixture.root_preflight_sha256
+
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(
+                         cli,
+                         "_run_actual_root_preflight",
+                         side_effect=remove_post_model_switch_after_initial_check,
+                     ), \
+                     mock.patch.object(
+                         cli.subprocess,
+                         "run",
+                         side_effect=fixture.herdr_run(capture=captured),
+                     ), \
+                     mock.patch.object(
+                         cli, "_json_or_status", side_effect=lambda value, **_: payloads.append(value)
+                     ):
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                self.assertNotIn("argv", captured)
+                self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+                self.assertEqual(len(payloads), 1)
+                self.assertIn("PostModelSwitch", payloads[0]["error"])
 
     def test_sterile_typed_launch_keeps_authority_in_root_and_spawns_in_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -356,6 +597,10 @@ class AgentflowTests(unittest.TestCase):
             real_run = subprocess.run
 
             def flaky_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
+                    )
                 if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
                     calls["n"] += 1
                     if calls["n"] == 1:
@@ -464,6 +709,10 @@ class AgentflowTests(unittest.TestCase):
             real_run = subprocess.run
 
             def slow_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
+                    )
                 if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
                     entered.set()
                     release.wait(timeout=5)
@@ -936,7 +1185,9 @@ class AgentflowTests(unittest.TestCase):
             "model": "test-model",
             "prompt": "Rework this private training lab",
         }
-        with tempfile.TemporaryDirectory() as state, mock.patch.dict(os.environ, {"XDG_STATE_HOME": state}), mock.patch(
+        with tempfile.TemporaryDirectory() as state, mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": state, "AGENTFLOW_STATE_HOME": ""}
+        ), mock.patch(
             "sys.stdin", io.StringIO(json.dumps(payload))
         ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             result = cli.hook(argparse.Namespace(provider="codex", event=""))
@@ -950,7 +1201,7 @@ class AgentflowTests(unittest.TestCase):
     def test_session_start_hook_is_generic(self) -> None:
         payload = {"hook_event_name": "SessionStart", "prompt": "Rework a training lab"}
         with tempfile.TemporaryDirectory() as state, mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": state}
+            os.environ, {"XDG_STATE_HOME": state, "AGENTFLOW_STATE_HOME": ""}
         ), mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), mock.patch(
             "sys.stdout", new_callable=io.StringIO
         ) as stdout, mock.patch.object(cli.beads_backend, "prime", return_value=""):
@@ -963,7 +1214,7 @@ class AgentflowTests(unittest.TestCase):
     def test_session_start_hook_injects_beads_only_when_active(self) -> None:
         payload = {"hook_event_name": "SessionStart", "cwd": "/tmp/project"}
         with tempfile.TemporaryDirectory() as state, mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": state}
+            os.environ, {"XDG_STATE_HOME": state, "AGENTFLOW_STATE_HOME": ""}
         ), mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), mock.patch(
             "sys.stdout", new_callable=io.StringIO
         ) as stdout, mock.patch.object(
@@ -979,7 +1230,7 @@ class AgentflowTests(unittest.TestCase):
     def test_copilot_session_hook_uses_additional_context_json(self) -> None:
         payload = {"hookEventName": "sessionStart", "cwd": "/tmp/project"}
         with tempfile.TemporaryDirectory() as state, mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": state}
+            os.environ, {"XDG_STATE_HOME": state, "AGENTFLOW_STATE_HOME": ""}
         ), mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), mock.patch(
             "sys.stdout", new_callable=io.StringIO
         ) as stdout, mock.patch.object(cli.beads_backend, "prime", return_value="bead context"):
@@ -1994,7 +2245,7 @@ class AgentflowTests(unittest.TestCase):
 
     def test_usage_and_review_records_capture_yield(self) -> None:
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
-            os.environ, {"XDG_STATE_HOME": temp}
+            os.environ, {"XDG_STATE_HOME": temp, "AGENTFLOW_STATE_HOME": ""}
         ):
             usage_args = argparse.Namespace(
                 provider="copilot",
