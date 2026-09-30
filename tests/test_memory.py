@@ -20,6 +20,48 @@ class MemoryRecallTests(unittest.TestCase):
             self.assertLessEqual(plan.character_count, 160)
             self.assertEqual(index.get("approved").injection_count, 1)  # type: ignore[union-attr]
 
+    def test_unapproved_matches_do_not_starve_approved_recall(self) -> None:
+        with KnowledgeIndex() as index:
+            for number in range(4):
+                index.add(KnowledgeDocument(
+                    f"candidate-{number}",
+                    "Runbook",
+                    "recover a stale worker",
+                    f"candidate-{number}.md",
+                    authority=90,
+                    scope="project",
+                    last_verified_at="2026-09-21T00:00:00+00:00",
+                ))
+            index.add(KnowledgeDocument(
+                "z-approved",
+                "Runbook",
+                "recover a stale worker",
+                "approved.md",
+                authority=90,
+                scope="project",
+                last_verified_at="2026-09-21T00:00:00+00:00",
+            ))
+            index.approve(
+                "z-approved",
+                approval_by="controller:root",
+                approval_ref="review-5",
+                approved_at="2026-09-21T00:00:00+00:00",
+            )
+
+            plan = find_first(
+                index,
+                "stale worker",
+                scope="project",
+                max_items=1,
+                max_age_days=7,
+                now=self.NOW,
+            )
+
+            self.assertEqual([item.document_id for item in plan.items], ["z-approved"])
+            self.assertEqual(index.get("z-approved").injection_count, 1)  # type: ignore[union-attr]
+            for number in range(4):
+                self.assertEqual(index.get(f"candidate-{number}").injection_count, 0)  # type: ignore[union-attr]
+
     def test_expiry_and_strict_budget(self) -> None:
         with MemoryStore() as store:
             store.candidate(KnowledgeDocument("expired", "Runbook", "recover a stale worker", "expired.md", authority=90, expires_at="2026-09-21T00:00:00+00:00", last_verified_at="2026-09-21T00:00:00+00:00"))
