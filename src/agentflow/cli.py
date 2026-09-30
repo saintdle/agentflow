@@ -35,6 +35,8 @@ from agentflow import execution as execution_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
+from agentflow import memory_runtime as memory_runtime_backend
+from agentflow import events as events_backend
 from agentflow import migration as migration_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
@@ -115,8 +117,7 @@ GITIGNORE_BLOCK = "\n".join(
 
 
 def _state_dir() -> Path:
-    root = os.environ.get("XDG_STATE_HOME")
-    return Path(root).expanduser() / "agentflow" if root else Path.home() / ".local/state/agentflow"
+    return memory_runtime_backend.state_home()
 
 
 def _now() -> str:
@@ -3544,7 +3545,11 @@ def _resource_tree_status(parts: tuple[str, ...], destination: Path) -> str:
 def _refresh_backup_path(destination: Path) -> Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     identity = hashlib.sha256(str(destination.absolute()).encode("utf-8")).hexdigest()[:12]
-    backup_root = _state_dir() / "backups" / stamp / identity
+    # Installation backups retain the historical XDG/home location so a
+    # process-scoped AGENTFLOW_STATE_HOME used by hooks cannot strand them.
+    legacy_home = os.environ.get("XDG_STATE_HOME")
+    backup_state = Path(legacy_home).expanduser() / "agentflow" if legacy_home else Path.home() / ".local/state/agentflow"
+    backup_root = backup_state / "backups" / stamp / identity
     backup_root.mkdir(parents=True, exist_ok=True)
     try:
         backup_root.chmod(0o700)
@@ -3941,6 +3946,12 @@ def doctor(args: argparse.Namespace) -> int:
                     missing_links += 1
         print(f"  {'skill sync':<16} {'ok' if not missing_links else 'stale':<7} {missing_links} missing/stale links")
         healthy = healthy and not missing_links
+        memory_settings = project_config_backend.memory_settings(config)
+        memory_health = memory_runtime_backend.health(root, memory_settings)
+        memory_status = str(memory_health.get("status") or "unknown")
+        print(f"  {'memory':<16} {'ok' if memory_status in {'disabled', 'ok', 'not-run'} else 'degraded':<7} {memory_status}")
+        if memory_status == "degraded":
+            healthy = False
     except (project_config_backend.ConfigError, model_policy_backend.ModelPolicyError, OSError) as exc:
         if config_path.exists() or config_path.is_symlink():
             print(f"  {'config':<16} {'invalid':<7} {exc}")
@@ -4692,6 +4703,44 @@ def search_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def memory_status(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    try:
+        config_path = project_config_backend.config_path(root)
+        config = (
+            project_config_backend.load(root)
+            if config_path.exists() or config_path.is_symlink()
+            else project_config_backend.default_data()
+        )
+        settings = project_config_backend.memory_settings(config)
+        value = memory_runtime_backend.health(root, settings)
+        value = {"enabled": bool(settings["enabled"]), "root": str(root), **value}
+    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
+        print(f"memory status: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory: {value.get('status', 'unknown')}")
+    return 0
+
+
+def memory_maintain(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    try:
+        config_path = project_config_backend.config_path(root)
+        config = (
+            project_config_backend.load(root)
+            if config_path.exists() or config_path.is_symlink()
+            else project_config_backend.default_data()
+        )
+        settings = project_config_backend.memory_settings(config)
+        runtime = memory_runtime_backend.MemoryRuntime(root, settings)
+        value = runtime.maintain(force=True)
+    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
+        print(f"memory maintain: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory maintenance: {value.get('status', 'unknown')}")
+    return 0
+
+
 def usage_yield(args: argparse.Namespace) -> int:
     try:
         value = _read_json_value(args.file) if args.file else _read_json_value(str(_state_dir() / "usage.jsonl"))
@@ -4934,31 +4983,49 @@ def hook(args: argparse.Namespace) -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
-    event = str(payload.get("hook_event_name") or payload.get("hookEventName") or args.event or "unknown")
-    session = str(payload.get("session_id") or payload.get("sessionId") or "")
-    record = {
-        "timestamp": _now(),
-        "provider": args.provider,
-        "event": event,
-        "session": hashlib.sha256(session.encode()).hexdigest()[:12] if session else "",
-        "model": str(payload.get("model") or ""),
-        "cwd": _safe_cwd(payload.get("cwd")),
-    }
-    _append_jsonl(_state_dir() / "events.jsonl", record)
+    event = str(
+        payload.get("hook_event_name") or payload.get("hookEventName")
+        or payload.get("event") or payload.get("type") or args.event or "unknown"
+    )
+    # The event spine is independent from optional recall.  It stores only a
+    # normalized metadata envelope and substitutes a synthetic session bucket
+    # when a provider omits its session identity.
+    try:
+        normalized = events_backend.normalize_event(
+            args.provider, payload, event=event,
+        )
+        spool = events_backend.EventSpool(_state_dir() / "events.jsonl")
+        if not events_backend.record_event_safely(spool, normalized):
+            events_backend.record_event_safely(spool, normalized)
+    except Exception:  # noqa: BLE001 - event capture must be fail-open
+        pass
+    raw_cwd = payload.get("cwd")
+    hook_cwd = (
+        Path(raw_cwd).expanduser().resolve()
+        if isinstance(raw_cwd, str) and raw_cwd
+        else Path.cwd().resolve()
+    )
+    try:
+        config_path = project_config_backend.config_path(_repository_root(hook_cwd))
+        config = (
+            project_config_backend.load(_repository_root(hook_cwd))
+            if config_path.exists() or config_path.is_symlink()
+            else project_config_backend.default_data()
+        )
+        runtime = memory_runtime_backend.MemoryRuntime(
+            _repository_root(hook_cwd), project_config_backend.memory_settings(config)
+        )
+        _, plan, _ = runtime.process(args.provider, payload, event)
+    except Exception:  # noqa: BLE001 - provider hooks must fail open
+        plan = None
 
-    if event.lower() not in {"sessionstart", "session_start"}:
+    if event.lower() not in {"sessionstart", "session_start"} and plan is None:
         return 0
     context = (
         "Keep handoffs terse; use measurable done conditions; delegate only bounded independent work; "
         "load project-owned domain skills when the task requires them. Use one approved Agentflow root "
         "per controller chat; related fixes stay under that root, while a materially different goal or "
         "a completed root starts in a fresh chat. Resume from durable state, not prior transcripts."
-    )
-    raw_cwd = payload.get("cwd")
-    hook_cwd = (
-        Path(raw_cwd).expanduser().resolve()
-        if isinstance(raw_cwd, str) and raw_cwd
-        else Path.cwd().resolve()
     )
     try:
         prime = beads_backend.prime(hook_cwd, maximum_characters=8_000)
@@ -4974,6 +5041,8 @@ def hook(args: argparse.Namespace) -> int:
             "copy/paste-ready next request. Use `agentflow beads explain <id>` when needed.\n\n"
             + prime
         )
+    if plan is not None and plan.text:
+        context += "\n\nApproved Agentflow memory (metadata-only; verify source references before relying on it):\n" + plan.text
     if args.provider == "claude":
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}))
     elif args.provider == "codex":
@@ -7442,6 +7511,17 @@ def build_parser() -> argparse.ArgumentParser:
     search_query_parser.add_argument("--source-kind", default="")
     search_query_parser.add_argument("--json", action="store_true")
     search_query_parser.set_defaults(func=search_query)
+
+    memory_parser = sub.add_parser("memory", help="Inspect or maintain optional governed local memory")
+    memory_sub = memory_parser.add_subparsers(dest="memory_command", required=True)
+    memory_status_parser = memory_sub.add_parser("status")
+    memory_status_parser.add_argument("--root", default=".")
+    memory_status_parser.add_argument("--json", action="store_true")
+    memory_status_parser.set_defaults(func=memory_status)
+    memory_maintain_parser = memory_sub.add_parser("maintain")
+    memory_maintain_parser.add_argument("--root", default=".")
+    memory_maintain_parser.add_argument("--json", action="store_true")
+    memory_maintain_parser.set_defaults(func=memory_maintain)
 
     doctor_parser = sub.add_parser("doctor", help="Inspect prerequisites and project configuration without revealing credentials")
     doctor_parser.add_argument("path", nargs="?", default=".")

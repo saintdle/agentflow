@@ -23,6 +23,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {"hooks": [{"type": "command", "command": "~/.local/bin/agentflow hook --provider claude --event PreToolUse", "timeout": 5}]}
+    ],
+    "PostToolUse": [
+      {"hooks": [{"type": "command", "command": "~/.local/bin/agentflow hook --provider claude --event PostToolUse", "timeout": 5}]}
+    ],
+    "PostToolUseFailure": [
+      {"hooks": [{"type": "command", "command": "~/.local/bin/agentflow hook --provider claude --event PostToolUseFailure", "timeout": 5}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "command", "command": "~/.local/bin/agentflow hook --provider claude --event PreCompact", "timeout": 5}]}
+    ],
     "Stop": [
       {
         "hooks": [

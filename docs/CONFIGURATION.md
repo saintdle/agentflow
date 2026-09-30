@@ -8,6 +8,9 @@ switches. Initialization places the shared project file at
 machine-local layer for absolute skill paths or a local model-policy override;
 local values override same-name shared values. Runtime state, credentials,
 claims, logs, temporary handoffs, and provider sessions must remain ignored.
+The optional `memory` section is disabled by default; schema-v1 files without
+it remain valid. See [governed memory](MEMORY.md) for the metadata-only hook,
+scope, budget, and retention contract.
 
 ## Principles
 
@@ -45,6 +48,23 @@ An initialized project starts with a schema-versioned configuration like this:
     "verification": false,
     "context_pressure_percent": 75,
     "max_children_per_parent": 12
+  },
+  "memory": {
+    "enabled": false,
+    "on_prompt": false,
+    "capture_failures": true,
+    "max_items": 5,
+    "max_chars": 2000,
+    "max_age_days": 30,
+    "scopes": ["project"],
+    "scope_id": "",
+    "max_events": 10000,
+    "max_event_bytes": 5242880,
+    "retention_days": 30,
+    "session_retention_days": 30,
+    "maintenance_interval_seconds": 300,
+    "session_ledger_limit": 256,
+    "startup_query": "agentflow"
   },
   "skills": [
     {

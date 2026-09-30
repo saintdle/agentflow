@@ -35,6 +35,34 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {"command": "~/.local/bin/agentflow hook --provider codex --event PreToolUse", "timeout": 5, "type": "command"}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {"command": "~/.local/bin/agentflow hook --provider codex --event PostToolUse", "timeout": 5, "type": "command"}
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {"command": "~/.local/bin/agentflow hook --provider codex --event PostToolUseFailure", "timeout": 5, "type": "command"}
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {"command": "~/.local/bin/agentflow hook --provider codex --event PreCompact", "timeout": 5, "type": "command"}
+        ]
+      }
     ]
   }
 }

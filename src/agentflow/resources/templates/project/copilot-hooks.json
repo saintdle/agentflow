@@ -15,6 +15,18 @@
         "timeoutSec": 5
       }
     ],
+    "preToolUse": [
+      {"type": "command", "bash": "~/.local/bin/agentflow hook --provider copilot --event preToolUse", "timeoutSec": 5}
+    ],
+    "postToolUse": [
+      {"type": "command", "bash": "~/.local/bin/agentflow hook --provider copilot --event postToolUse", "timeoutSec": 5}
+    ],
+    "postToolUseFailure": [
+      {"type": "command", "bash": "~/.local/bin/agentflow hook --provider copilot --event postToolUseFailure", "timeoutSec": 5}
+    ],
+    "preCompact": [
+      {"type": "command", "bash": "~/.local/bin/agentflow hook --provider copilot --event preCompact", "timeoutSec": 5}
+    ],
     "agentStop": [
       {
         "type": "command",
