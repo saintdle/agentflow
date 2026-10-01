@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added experimental, diagnostic-only Copilot SDK evidence groundwork for
+  validating per-call model events. It does not subscribe to or launch a live
+  SDK session. The workflow transport remains disabled because Python
+  pre-tool hooks do not expose exact tool-call/subagent identity; persistent
+  Herdr Copilot continues to fail closed.
 - Added typed root workspace contracts for authenticated external handoffs:
   Git workspaces pin branch@revision, while Gitless directories bind the exact
   canonical root path without a synthetic Git base.
