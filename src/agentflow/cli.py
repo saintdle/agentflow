@@ -9,8 +9,10 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import secrets
@@ -412,11 +414,16 @@ def _controller_credentials(
         or credentials.get("continuity_id", "") != lease.continuity_id
     ):
         authority_secret = secrets.token_urlsafe(48)
+    resume_secret = lease.resume_secret or credentials.get("resume_secret", "")
+    if not lease.verify_resume_proof(resume_secret):
+        raise controller_backend.ControllerError(
+            "protected controller resume credential is unavailable or does not match this lease"
+        )
     root = _root_arg(args)
     workflow_root = str(getattr(args, "workflow_root", "") or "")
     _write_resume_key(
         path,
-        lease.resume_secret,
+        resume_secret,
         authority_secret=authority_secret,
         continuity_id=lease.continuity_id,
         workspace_root=str(root),
@@ -441,7 +448,7 @@ def _controller_credentials(
     if legacy is not None and legacy != path and legacy.is_file():
         legacy.unlink()
     return path, {
-        "resume_secret": lease.resume_secret,
+        "resume_secret": resume_secret,
         "authority_secret": authority_secret,
         "continuity_id": lease.continuity_id,
         "workspace_root": str(root),
@@ -476,14 +483,38 @@ def _authority_secret(
     return credentials["authority_secret"]
 
 
+def _controller_supervisor_lock_path(root: Path, workflow_root: str) -> Path:
+    """Return a stable per-user lock path independent of credential storage.
+
+    The lock namespace is the canonical workspace plus the exact Beads root.
+    It intentionally ignores ``AGENTFLOW_STATE_HOME`` and custom resume-key
+    locations so changing credential storage cannot let another CLI process
+    fence an active supervisor.
+    """
+    canonical_root = str(Path(root).resolve())
+    exact_workflow_root = str(workflow_root)
+    if not canonical_root or not exact_workflow_root or exact_workflow_root.strip() != exact_workflow_root:
+        raise ValueError("controller supervisor lock requires an exact workspace and workflow root")
+    identity = json.dumps([canonical_root, exact_workflow_root], separators=(",", ":"))
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    stable_user_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return stable_user_home / ".local" / "state" / "agentflow" / "controller-locks" / f"{digest}.lock"
+
+
 def _controller_instance(args: argparse.Namespace) -> tuple[controller_backend.RootController, Path]:
     root = _root_arg(args)
     state_path, checkpoint_path = _controller_paths(args, root)
+    supervisor_lock_path = getattr(args, "_supervisor_lock_path", None)
+    if supervisor_lock_path is None:
+        supervisor_lock_path = _controller_supervisor_lock_path(
+            root, str(getattr(args, "workflow_root", "") or "")
+        )
     return controller_backend.RootController(
         str(root),
         getattr(args, "controller", "") or "agentflow-controller",
         state_path=state_path,
         checkpoint_path=checkpoint_path,
+        supervisor_lock_path=Path(supervisor_lock_path),
         stale_after=float(getattr(args, "stale_after", 300.0)),
     ), root
 
@@ -1348,7 +1379,7 @@ def _controller_step_parallel(
         )
         initial = controller._load_checkpoint()
         state = "draining"
-    draining = state == "draining"
+    draining = state == "draining" or initial.get("state") == "draining"
     drain_reason = str(initial.get("terminal_reason") or "") if draining else ""
 
     def note_failure(
@@ -1792,60 +1823,138 @@ def _controller_step(
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
+        raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
+        workflow_root = raw_workflow_root.strip()
+        if not workflow_root:
+            raise ValueError("--workflow-root is required before acquiring a controller lease")
+        if workflow_root != raw_workflow_root:
+            raise ValueError("--workflow-root must be the exact Beads root ID without surrounding whitespace")
+        if operation == "supervise" and bool(getattr(args, "takeover", False)):
+            raise ValueError("controller supervise never performs lease takeover")
+        if operation == "supervise" and str(getattr(args, "resume_token", "") or ""):
+            raise ValueError("controller supervise requires its protected credential file, not --resume-token")
         controller, root = _controller_instance(args)
-        key_path = _resume_key_path(args)
-        resume_proof = getattr(args, "resume_token", "") or ""
-        if not resume_proof and key_path is not None:
-            # AFREL-023: automatic protected reattach -- read the plaintext
-            # secret from the caller's own 0600 key file instead of
-            # requiring --resume-token to be supplied (and instead of ever
-            # scraping it out of state.json, which only ever stores a hash).
-            resume_proof = _read_resume_key(key_path)
-            legacy = _legacy_resume_key_path(args)
-            if not resume_proof and legacy is not None:
-                resume_proof = _read_resume_key(legacy)
-        lease = controller.acquire(
-            takeover=bool(getattr(args, "takeover", False)),
-            resume_proof=resume_proof,
-        )
-        _, credentials = _controller_credentials(args, lease, key_path=key_path)
-        # Internal-only: never serialized into a handoff, command argv, Herdr
-        # state, environment variable, checkpoint, or user-facing payload.
-        args._authority_secret = credentials["authority_secret"]
-        if not str(getattr(args, "workflow_root", "") or ""):
-            raise ValueError("--workflow-root is required before binding a controller session")
-        beads_backend.get_issue(root, str(args.workflow_root))
-        _bind_current_controller_sessions(root, str(args.workflow_root), lease)
 
-        # An authenticated resume is the acknowledgement for a required
-        # safe-boundary rotation.  Advance only the context generation; root,
-        # lease continuity, budgets, permissions, and workflow state survive.
-        rotation = controller.session_ledger().get("rotation")
-        if operation == "resume" and isinstance(rotation, Mapping) and rotation.get("required"):
-            controller.rotate_session_budget(lease=lease)
+        # Validate the exact Beads root before acquiring a lease or writing
+        # protected credentials.  The lock covers every long-running root
+        # owner (start/resume/supervise), so an authenticated resume cannot
+        # rotate the fencing token out from underneath a live supervisor.
+        with controller.supervisor_lock():
+            key_path = _resume_key_path(args)
+            beads_backend.get_issue(root, workflow_root)
+            if operation == "supervise":
+                credentials = _read_controller_credentials(key_path)
+                state = (
+                    json.loads(controller.state_path.read_text(encoding="utf-8"))
+                    if controller.state_path.exists() else {}
+                )
+                previous = controller._read_lease(state) if isinstance(state, Mapping) else None
+                if previous is None:
+                    lease = controller.acquire()
+                else:
+                    if not credentials.get("resume_secret"):
+                        raise controller_backend.LeaseConflict(
+                            "protected supervisor credential is missing; refusing to take over the existing lease"
+                        )
+                    if (
+                        credentials.get("workspace_root") != str(root.resolve())
+                        or credentials.get("workflow_root") != workflow_root
+                        or credentials.get("continuity_id") != previous.continuity_id
+                        or not credentials.get("authority_secret")
+                    ):
+                        raise controller_backend.LeaseConflict(
+                            "protected supervisor credential is incomplete or belongs to another workflow"
+                        )
+                    lease = controller.authorize(credentials["resume_secret"])
+            else:
+                resume_proof = getattr(args, "resume_token", "") or ""
+                if not resume_proof:
+                    # AFREL-023: protected automatic reattach -- the state
+                    # file only stores a hash, never the plaintext proof.
+                    resume_proof = _read_resume_key(key_path)
+                    legacy = _legacy_resume_key_path(args)
+                    if not resume_proof and legacy is not None:
+                        resume_proof = _read_resume_key(legacy)
+                lease = controller.acquire(
+                    takeover=bool(getattr(args, "takeover", False)),
+                    resume_proof=resume_proof,
+                )
+            _, credentials = _controller_credentials(args, lease, key_path=key_path)
+            # Internal-only: never serialized into a handoff, command argv,
+            # Herdr state, environment variable, checkpoint, or payload.
+            args._authority_secret = credentials["authority_secret"]
+            _bind_current_controller_sessions(root, workflow_root, lease)
 
-        # AFREL-020: one persistent lease-heartbeating loop drives the
-        # controller through claim -> preflight -> handoff -> launch ->
-        # identity wait -> result -> disposition -> next node all the way
-        # to a terminal state, automatically consuming Herdr results --
-        # no separate manual `herdr result` plus `resume` CLI action is
-        # needed between steps. --once exposes exactly one deterministic
-        # transition for diagnostics.
-        once = bool(getattr(args, "once", False))
-        poll_interval = float(getattr(args, "poll_interval", 5.0) or 5.0)
-        deadline_seconds = float(getattr(args, "deadline", 3600.0) or 3600.0)
-        started_at = time.monotonic()
-        while True:
-            payload, stop = _controller_step(args, controller, root, lease, operation=operation)
-            if stop or once:
-                break
-            if time.monotonic() - started_at >= deadline_seconds:
-                payload["stop_reason"] = payload.get("stop_reason") or "LOOP_DEADLINE_EXCEEDED"
-                break
-            time.sleep(poll_interval)
-            lease = controller.heartbeat(lease)
-        _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title=f"CONTROLLER {operation.upper()}")
-        return 0
+            # An authenticated resume acknowledges a required safe-boundary
+            # rotation.  A supervisor does not silently advance generations.
+            rotation = controller.session_ledger().get("rotation")
+            if operation == "resume" and isinstance(rotation, Mapping) and rotation.get("required"):
+                controller.rotate_session_budget(lease=lease)
+
+            once = bool(getattr(args, "once", False))
+            poll_interval = float(getattr(args, "poll_interval", 5.0))
+            deadline_seconds = float(getattr(args, "deadline", 3600.0))
+            if not math.isfinite(poll_interval) or poll_interval <= 0:
+                raise ValueError("--poll-interval must be a positive finite number")
+            if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+                raise ValueError("--deadline must be a non-negative finite number")
+            monotonic = getattr(args, "_monotonic", time.monotonic)
+            sleep = getattr(args, "_sleep", time.sleep)
+            started_at = monotonic()
+
+            def deadline_result() -> int:
+                result = controller.mark_incomplete("DEADLINE_EXCEEDED", lease=lease)
+                if result.terminal:
+                    state = result.state
+                    terminal_payload = {
+                        "operation": operation,
+                        "ok": True,
+                        "root": str(root),
+                        "controller": lease.controller,
+                        "lease": lease.to_dict(),
+                        "result": result.to_dict(),
+                        "stop_reason": "GOAL_COMPLETE" if state == "completed" else "USER_ACTION_REQUIRED",
+                        "workflow_root": workflow_root,
+                        "session_control": controller.session_ledger(),
+                    }
+                    _json_or_status(
+                        terminal_payload, as_json=bool(getattr(args, "json", False)),
+                        title=f"CONTROLLER {operation.upper()}",
+                    )
+                    return 0
+                payload = {
+                    "operation": operation,
+                    "ok": False,
+                    "status": "INCOMPLETE",
+                    "root": str(root),
+                    "controller": lease.controller,
+                    "lease": lease.to_dict(),
+                    "result": result.to_dict(),
+                    "stop_reason": "DEADLINE_EXCEEDED",
+                    "workflow_root": workflow_root,
+                    "session_control": controller.session_ledger(),
+                }
+                _json_or_status(
+                    payload, as_json=bool(getattr(args, "json", False)),
+                    title=f"CONTROLLER {operation.upper()} INCOMPLETE",
+                )
+                return 3
+
+            while True:
+                # --deadline 0 is an immediate durable incomplete result, not
+                # the default. Check before every step so an expired budget
+                # never launches another task after a poll/sleep boundary.
+                if monotonic() - started_at >= deadline_seconds:
+                    return deadline_result()
+                payload, stop = _controller_step(args, controller, root, lease, operation=operation)
+                if stop or once:
+                    break
+                if monotonic() - started_at >= deadline_seconds:
+                    return deadline_result()
+                sleep(poll_interval)
+                lease = controller.heartbeat(lease)
+            _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title=f"CONTROLLER {operation.upper()}")
+            return 0
     except (
         controller_backend.ControllerError, beads_backend.BeadsError,
         herdr_backend.HerdrError, session_control_backend.SessionControlError,
@@ -1862,6 +1971,11 @@ def controller_start(args: argparse.Namespace) -> int:
 
 def controller_resume(args: argparse.Namespace) -> int:
     return _controller_run(args, operation="resume")
+
+
+def controller_supervise(args: argparse.Namespace) -> int:
+    """Run or explicitly restart one protected, separate-terminal supervisor."""
+    return _controller_run(args, operation="supervise")
 
 
 def controller_status(args: argparse.Namespace) -> int:
@@ -8846,11 +8960,15 @@ def build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument(
             "--once", action="store_true",
             help="expose exactly one deterministic claim/dispatch/detect transition, for "
-                 "diagnostics; without it the controller loops (heartbeating the lease) until "
-                 "GOAL_COMPLETE, USER_ACTION_REQUIRED, or a per-task block",
+                 "diagnostics; otherwise the controller heartbeats while looping to "
+                 "GOAL_COMPLETE, TASK_BLOCKED, USER_ACTION_REQUIRED, ROTATION_REQUIRED, "
+                 "or a durable deadline result",
         )
         command_parser.add_argument("--poll-interval", type=float, default=5.0)
-        command_parser.add_argument("--deadline", type=float, default=3600.0)
+        command_parser.add_argument(
+            "--deadline", type=float, default=3600.0,
+            help="maximum loop seconds; zero is an immediate durable incomplete result",
+        )
         command_parser.add_argument(
             "--identity-deadline", type=float, default=300.0,
             help="seconds a task may stay identity_pending before a durable "
@@ -8868,6 +8986,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_controller_common(controller_resume_parser)
     controller_resume_parser.set_defaults(func=controller_resume)
+    controller_supervise_parser = controller_sub.add_parser(
+        "supervise",
+        help="Run one protected root supervisor in a separate terminal; explicitly rerun it after a crash",
+    )
+    add_controller_common(controller_supervise_parser)
+    controller_supervise_parser.set_defaults(func=controller_supervise)
     controller_status_parser = controller_sub.add_parser(
         "status", help="Inspect the root lease, phase, active work, and halt reason"
     )

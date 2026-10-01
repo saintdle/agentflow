@@ -2492,6 +2492,12 @@ def _controller_args(root: Path, **overrides: object) -> argparse.Namespace:
         root=str(root), controller="agentflow-controller", state_path="",
         checkpoint_path="", stale_after=300.0, takeover=False,
         workflow_root="wf-root", resume_token="", resume_key_file="", json=True, cwd=str(root),
+        # Keep test lock files in their temporary workspace. Production CLI
+        # users cannot configure this internal-only injection point.
+        _supervisor_lock_path=str(
+            root / ".agentflow/test-controller-locks"
+            / f"{cli._controller_namespace(str(overrides.get('workflow_root', 'wf-root')))}.lock"
+        ),
         # Tests exercise one deterministic transition at a time; the
         # autonomous loop itself (AFREL-020) is covered by its own
         # dedicated tests further down.
@@ -2522,6 +2528,24 @@ class ControllerResumeCredentialTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("controller --state-path is unsupported", payload["error"])
             self.assertFalse(custom.exists())
+
+    def test_supervisor_requires_exact_workflow_root_before_creating_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            args = _controller_args(root, workflow_root="")
+            with mock.patch.object(cli.beads_backend, "get_issue") as get_issue:
+                payload = _run_controller_json(cli.controller_supervise, args)
+            self.assertFalse(payload["ok"])
+            self.assertIn("--workflow-root is required", payload["error"])
+            get_issue.assert_not_called()
+            self.assertFalse(cli._controller_state_dir(root, "").exists())
+
+    def test_supervise_is_registered_as_a_controller_command(self) -> None:
+        args = cli.build_parser().parse_args([
+            "controller", "supervise", "--root", "/tmp/workspace",
+            "--workflow-root", "approved-root",
+        ])
+        self.assertIs(args.func, cli.controller_supervise)
 
     def test_resume_key_override_inside_worker_workspace_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2557,6 +2581,10 @@ class ControllerResumeCredentialTests(unittest.TestCase):
                     checkpoint_path="", stale_after=300.0, takeover=False,
                     workflow_root="wf-root", resume_token="", resume_key_file="",
                     json=True, once=True, poll_interval=0.01, deadline=5.0,
+                    _supervisor_lock_path=str(
+                        root / ".agentflow/test-controller-locks"
+                        / f"{cli._controller_namespace('wf-root')}.lock"
+                    ),
                 )
                 defaults.update(overrides)
                 return argparse.Namespace(**defaults)
@@ -3091,6 +3119,246 @@ class ControllerRunTests(unittest.TestCase):
             claim_ready.assert_called_once()
             self.assertFalse(payload["result"]["terminal"])
 
+    def test_deadline_zero_is_not_replaced_with_the_one_hour_default(self) -> None:
+        class FakeClock:
+            def __call__(self) -> float:
+                return 100.0
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            args = _controller_args(root, once=False, deadline=0.0, _monotonic=FakeClock())
+            payloads: list[dict] = []
+            issue = self._issue("wf-root")
+            step_payload = {"operation": "resume", "ok": True, "result": {"state": "advancing"}}
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), \
+                 mock.patch.object(cli, "_controller_step", return_value=(step_payload, False)), \
+                 mock.patch.object(cli.time, "sleep", side_effect=AssertionError("zero deadline was ignored")), \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                exit_code = cli.controller_resume(args)
+
+            self.assertEqual(exit_code, 3)
+            self.assertEqual(payloads[-1]["status"], "INCOMPLETE")
+            self.assertEqual(payloads[-1]["result"]["state"], "incomplete")
+
+    def test_supervisor_deadline_zero_is_durable_incomplete_with_nonzero_exit(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 41.0
+
+            def __call__(self) -> float:
+                return self.value
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            clock = FakeClock()
+            args = _controller_args(
+                root, once=False, deadline=0.0, _monotonic=clock,
+                _sleep=lambda _seconds: self.fail("zero deadline must not sleep"),
+            )
+            payloads: list[dict] = []
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                 mock.patch.object(cli, "_controller_step") as step, \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                exit_code = cli.controller_supervise(args)
+
+            self.assertEqual(exit_code, 3)
+            step.assert_not_called()
+            self.assertEqual(payloads[-1]["status"], "INCOMPLETE")
+            self.assertEqual(payloads[-1]["stop_reason"], "DEADLINE_EXCEEDED")
+            self.assertEqual(payloads[-1]["result"]["state"], "incomplete")
+            checkpoint_path = cli._controller_state_dir(root, args.workflow_root) / "checkpoint.json"
+            checkpoint = cli.checkpoint_backend.load_checkpoint(checkpoint_path)
+            self.assertEqual(checkpoint["status"], "incomplete")
+            self.assertEqual(checkpoint["terminal_reason"], "DEADLINE_EXCEEDED")
+
+    def test_supervisor_zero_deadline_preserves_terminal_checkpoints(self) -> None:
+        for state in ("completed", "blocked"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                root = base / "workspace"
+                root.mkdir()
+                args = _controller_args(root, once=False, deadline=0.0)
+                payloads: list[dict] = []
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    controller, _ = cli._controller_instance(args)
+                    lease = controller.acquire()
+                    cli._controller_credentials(args, lease)
+                    original = controller.halt(state, "original terminal evidence", lease=lease)
+
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
+                     mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                     mock.patch.object(cli, "_controller_step") as step, \
+                     mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                    exit_code = cli.controller_supervise(args)
+
+                self.assertEqual(exit_code, 0)
+                step.assert_not_called()
+                self.assertTrue(payloads[-1]["ok"])
+                self.assertTrue(payloads[-1]["result"]["terminal"])
+                self.assertEqual(payloads[-1]["result"]["state"], state)
+                self.assertEqual(payloads[-1]["result"]["checkpoint"], original.checkpoint)
+                final_checkpoint = cli.checkpoint_backend.load_checkpoint(controller.checkpoint_path)
+                self.assertEqual(final_checkpoint["status"], state)
+                self.assertTrue(final_checkpoint["terminal"])
+
+    def test_duplicate_supervisor_refuses_before_lease_reattach_or_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            args = _controller_args(root, once=False, deadline=10.0)
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}):
+                controller, _ = cli._controller_instance(args)
+                original_lease = controller.acquire()
+                cli._controller_credentials(args, original_lease)
+            payloads: list[dict] = []
+            with controller.supervisor_lock(), \
+                 mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                 mock.patch.object(cli, "_controller_step") as step, \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                exit_code = cli.controller_supervise(args)
+                resume_exit_code = cli.controller_resume(args)
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(resume_exit_code, 2)
+            self.assertIn("supervisor", payloads[-1]["error"])
+            step.assert_not_called()
+            self.assertEqual(controller._current_lease().token, original_lease.token)
+
+    def test_supervisor_lock_is_independent_of_state_home_and_resume_key_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            root = base / "workspace"
+            root.mkdir()
+            shared_key = base / "resume.key"
+            args_a = _controller_args(root, resume_key_file=str(shared_key))
+            args_b = _controller_args(root, resume_key_file=str(shared_key))
+            args_b._supervisor_lock_path = args_a._supervisor_lock_path
+
+            with mock.patch.dict(os.environ, {
+                "AGENTFLOW_STATE_HOME": str(base / "state-a"),
+                "HOME": str(base / "home-a"),
+            }):
+                production_path_a = cli._controller_supervisor_lock_path(root, "wf-root")
+                controller_a, _ = cli._controller_instance(args_a)
+                lease = controller_a.acquire()
+                cli._controller_credentials(args_a, lease)
+            with mock.patch.dict(os.environ, {
+                "AGENTFLOW_STATE_HOME": str(base / "state-b"),
+                "HOME": str(base / "home-b"),
+            }):
+                production_path_b = cli._controller_supervisor_lock_path(root, "wf-root")
+                controller_b, _ = cli._controller_instance(args_b)
+
+            self.assertEqual(production_path_a, production_path_b)
+            self.assertEqual(controller_a.supervisor_lock_path, controller_b.supervisor_lock_path)
+            payloads: list[dict] = []
+            with controller_a.supervisor_lock(), \
+                 mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-b")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                 mock.patch.object(cli, "_controller_step") as step, \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                self.assertEqual(cli.controller_resume(args_b), 2)
+
+            self.assertIn("supervisor", payloads[-1]["error"])
+            self.assertEqual(controller_a._current_lease().token, lease.token)
+            step.assert_not_called()
+
+    def test_supervisor_fails_closed_for_missing_wrong_or_spent_credential(self) -> None:
+        for failure_mode in ("missing", "wrong", "spent"):
+            with self.subTest(failure_mode=failure_mode), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                root = base / "workspace"
+                root.mkdir()
+                key_file = base / "resume.key"
+                args = _controller_args(root, resume_key_file=str(key_file), once=True)
+                root_issue = self._issue(args.workflow_root)
+                payloads: list[dict] = []
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
+                     mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[]), \
+                     mock.patch.object(cli.beads_backend, "claim_ready", return_value=None), \
+                     mock.patch.object(cli, "_json_or_status"):
+                    self.assertEqual(cli.controller_start(args), 0)
+                    old_credentials = cli._read_controller_credentials(key_file)
+                    if failure_mode == "spent":
+                        # A legitimate reattach spends the previous proof;
+                        # restoring it simulates a stale copied credential.
+                        self.assertEqual(cli.controller_resume(args), 0)
+                        cli._private_atomic_json(key_file, old_credentials)
+                    elif failure_mode == "wrong":
+                        wrong_credentials = dict(old_credentials)
+                        wrong_credentials["resume_secret"] = "not-the-current-proof"
+                        cli._private_atomic_json(key_file, wrong_credentials)
+                    else:
+                        key_file.unlink()
+
+                    payloads.clear()
+                    with mock.patch.object(cli.beads_backend, "claim_ready") as claim_ready, \
+                         mock.patch.object(cli, "_provider_command") as provider_command, \
+                         mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                        self.assertEqual(cli.controller_supervise(args), 2)
+
+                self.assertFalse(payloads[-1]["ok"])
+                self.assertTrue(
+                    "credential" in payloads[-1]["error"]
+                    or "proof" in payloads[-1]["error"]
+                )
+                claim_ready.assert_not_called()
+                provider_command.assert_not_called()
+
+    def test_supervisor_idle_polling_does_not_call_provider(self) -> None:
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+            def sleep(self, seconds: float) -> None:
+                self.value += seconds
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            root = base / "workspace"
+            root.mkdir()
+            clock = FakeClock()
+            args = _controller_args(
+                root, once=False, deadline=2.5, poll_interval=1.0,
+                _monotonic=clock, _sleep=clock.sleep,
+            )
+            root_issue = self._issue(args.workflow_root)
+            payloads: list[dict] = []
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready, \
+                 mock.patch.object(cli, "_provider_command") as provider_command, \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                exit_code = cli.controller_supervise(args)
+
+            self.assertEqual(exit_code, 3)
+            self.assertGreater(claim_ready.call_count, 1)
+            provider_command.assert_not_called()
+            self.assertEqual(payloads[-1]["stop_reason"], "DEADLINE_EXCEEDED")
+
+    def test_supervisor_stops_at_terminal_and_operator_safe_boundaries(self) -> None:
+        for reason in ("GOAL_COMPLETE", "TASK_BLOCKED", "USER_ACTION_REQUIRED", "ROTATION_REQUIRED"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                args = _controller_args(root, once=False, deadline=10.0)
+                payload = {"operation": "supervise", "ok": True, "stop_reason": reason}
+                payloads: list[dict] = []
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}), \
+                     mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                     mock.patch.object(cli, "_controller_step", return_value=(payload, True)) as step, \
+                     mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value)):
+                    self.assertEqual(cli.controller_supervise(args), 0)
+
+                step.assert_called_once()
+                self.assertEqual(payloads[-1]["stop_reason"], reason)
+
     def test_controller_loop_heartbeats_the_lease_between_iterations(self) -> None:
         """AFREL-020: the loop must be lease-heartbeating, not just
         re-polling with a stale lease that could go stale and get taken over."""
@@ -3140,6 +3408,67 @@ class ControllerRunTests(unittest.TestCase):
             record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))["sessions"]["task-1"]
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["return_channel"]["state"], "issued")
+
+    def test_supervisor_restart_keeps_lease_and_does_not_relaunch_live_herdr_task(self) -> None:
+        """A separate-terminal restart uses the protected proof to keep the
+        exact lease and reconciles the durable Herdr session instead of
+        launching a second provider process."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            key_file = base / "resume.key"
+            common_args = dict(
+                workflow_root=fixture.workflow_root,
+                resume_key_file=str(key_file),
+                once=True,
+                poll_interval=0.01,
+                deadline=5.0,
+            )
+            claims = {"n": 0}
+            spawned: list[list[str]] = []
+
+            def fake_claim_ready(_cwd, *, parent, labels, actor):
+                claims["n"] += 1
+                if claims["n"] == 1:
+                    fixture.task_issue["status"] = "in_progress"
+                    fixture.task_issue["assignee"] = actor
+                    return fixture.task_issue
+                return None
+
+            payloads: list[dict] = []
+
+            first_args = _controller_args(fixture.root, **common_args)
+            second_args = _controller_args(fixture.root, **common_args)
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", side_effect=fake_claim_ready), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command) as provider_command, \
+                 mock.patch.object(
+                     cli.subprocess, "run",
+                     side_effect=fixture.herdr_run(on_spawn=lambda argv: spawned.append(argv)),
+                 ), \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                self.assertEqual(cli.controller_supervise(first_args), 0)
+                first = payloads[-1]
+                self.assertEqual(first["result"]["state"], "running")
+                provider_calls_after_first = provider_command.call_count
+                self.assertEqual(cli.controller_supervise(second_args), 0)
+                second = payloads[-1]
+
+            self.assertEqual(first["lease"]["epoch"], second["lease"]["epoch"])
+            self.assertEqual(first["lease"]["token"], second["lease"]["token"])
+            self.assertEqual(first["lease"]["continuity_id"], second["lease"]["continuity_id"])
+            self.assertEqual(second["result"]["state"], "running")
+            self.assertEqual(provider_command.call_count, provider_calls_after_first)
+            self.assertEqual(len(spawned), 1)
+            self.assertEqual(claims["n"], 1)
+            record = json.loads(
+                (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+            )["sessions"]["task-1"]
+            self.assertEqual(record["status"], "launched")
 
     def test_controller_run_dispatches_gitless_directory_with_typed_workspace_contract(self) -> None:
         """A real controller preflight and Herdr launch work without .git or a fake base."""
@@ -4617,6 +4946,16 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                 self.assertEqual(comments[0][0], "task-1")
                 first_reason = first_payload["result"]["checkpoint"]["terminal_reason"]
 
+                # The deadline status must coexist with the draining state
+                # until live sibling results are reconciled, retaining the
+                # original failure evidence used to block future claims.
+                deadline_result = controller.mark_incomplete(lease=lease)
+                self.assertEqual(deadline_result.state, "incomplete")
+                deadline_checkpoint = controller._load_checkpoint()
+                self.assertEqual(deadline_checkpoint["status"], "incomplete")
+                self.assertEqual(deadline_checkpoint["state"], "draining")
+                self.assertEqual(deadline_checkpoint["terminal_reason"], first_reason)
+
                 # Simulate a crashed controller and a legitimate reattach;
                 # the durable drain barrier must survive without reopening
                 # task admission.
@@ -4626,7 +4965,9 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     checkpoint_path=state_path.with_name("checkpoint.json"),
                 )
                 lease = controller.acquire(resume_proof=resume_secret)
-                self.assertEqual(controller._load_checkpoint()["status"], "draining")
+                resumed_checkpoint = controller._load_checkpoint()
+                self.assertEqual(resumed_checkpoint["status"], "incomplete")
+                self.assertEqual(resumed_checkpoint["state"], "draining")
 
                 result_state["task-2"] = {
                     "outcome": "completed",

@@ -66,6 +66,38 @@ stateDiagram-v2
 the existing root after resolving the recorded cause; do not create a duplicate
 graph or treat a disconnected chat as a new workflow.
 
+## Separate-terminal supervision
+
+For work that should keep advancing after the initiating chat closes, run one
+supervisor in a separate terminal:
+
+```sh
+agentflow controller supervise --root . --workflow-root <root-id>
+```
+
+The command validates the exact Beads root before creating lease state, then
+holds a per-root OS lock in the protected user state directory and heartbeats
+the controller lease while it polls Beads and Herdr. Idle polls make no
+provider/model calls; a provider is launched only when a ready task passes the
+normal preflight. The first run creates the protected external credential used
+for an explicit process restart. If the supervisor exits or crashes, rerun the
+same command: after acquiring the lock and verifying the credential, it
+continues the existing lease without rotating its fencing token or relaunching
+durably recorded live tasks. Reusing the same epoch is safe because every
+current `start`, `resume`, and `supervise` runner takes that lock before lease
+authentication; only one can own the root at a time. Stop any runner from an
+older Agentflow release that predates this lock before starting supervision. A
+concurrent `start`, `resume`, or `supervise` for that root is refused while the
+lock is held. There is no automatic takeover; if the protected credential is
+missing or invalid, stop and recover it rather than replacing the lease.
+
+The supervisor stops at `GOAL_COMPLETE`, `TASK_BLOCKED`,
+`USER_ACTION_REQUIRED`, or `ROTATION_REQUIRED`. A loop deadline writes a
+resumable `incomplete` checkpoint with `DEADLINE_EXCEEDED` and exits with code
+3; it does not discard live task state. `--deadline 0` is an immediate deadline.
+After resolving the cause or extending the budget, explicitly rerun
+`controller supervise` to continue from the checkpoint.
+
 ## Default lifecycle
 
 1. Define an observable goal and approve its exit conditions.

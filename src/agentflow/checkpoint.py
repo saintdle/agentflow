@@ -224,7 +224,12 @@ def build_checkpoint(data: Any) -> dict[str, Any]:
         # unsafe to interpret that state as permission to launch again.
         status = "claimed_no_session"
     document["status"] = status
-    document["state"] = status or document["state"]
+    # A deadline can interrupt a parallel failure-drain.  Preserve the
+    # typed combination state=draining/status=incomplete: ``status`` exposes
+    # the resumable deadline to operators while ``state`` prevents resumed
+    # controllers from admitting new work before active siblings reconcile.
+    draining_incomplete = status == "incomplete" and document["state"] == "draining"
+    document["state"] = "draining" if draining_incomplete else status or document["state"]
     document["terminal"] = bool(terminal or status in TERMINAL_STATES)
 
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
