@@ -75,7 +75,7 @@ flowchart TB
 
     Lane --> Native["Native subagent"]
     Lane --> Package["Optional sterile package<br/>declared files and pinned skills only"]
-    Package --> Herdr["Herdr<br/>observable external session"]
+    Package --> Herdr["Herdr<br/>controller-managed external session"]
     Herdr --> Providers["Codex, Claude Code, or Copilot CLI"]
 
     Native --> Work["Bounded workspace<br/>Git worktree or Gitless directory"]
@@ -104,7 +104,8 @@ Optional tools:
 
 - [Herdr](https://github.com/ogulcancelik/herdr) for observable external sessions.
 - GitHub CLI (`gh`) for GitHub issue and pull-request workflows.
-- `tmux` as a portable fallback for external sessions.
+- `tmux` for manually managed terminal sessions; it is not a controller dispatch
+  fallback.
 
 Provider subscriptions, credentials, usage allowances, and terms are managed
 by their respective providers. Agentflow does not supply or authenticate them.

@@ -22,7 +22,10 @@
 - Default to at most three workers, one nesting level, and one writer for any Git branch/worktree or gitless output boundary.
 - Give each worker a return contract: concise result, evidence/file references, checks run, and blockers. Do not return raw logs.
 - Route queue work with scoped `af:stage:*`, `af:role:*`, and `af:cap:*` labels. Pull only below one approved root, preferring work assigned to the actor before shared unassigned work.
-- Use native subagents for bounded fire-and-forget work. Use an observable Herdr session only when cross-provider work, a long run, or likely human decisions justify it; tmux is the fallback.
+- Use native subagents for bounded fire-and-forget work. Use a controller-managed
+  Herdr session only when cross-provider work, a long run, or likely human
+  decisions justify it; tmux is for manually managed terminal sessions, not
+  controller dispatch.
 - A blocked external worker must stop with the decision needed, evidence tried, options, recommendation, and current branch/check state. The user may intervene directly, but the decision must be recorded in durable state.
 - Preflight every external handoff for readable context, explicit tool profile, required tools, required project domain skills, output boundary, exact base, budget, retry cap, and delegation mode before launch.
 - Launch external handoffs only through the leased root controller so every worker receives an authenticated result channel. For restricted outbound context, persist `sterile=true` on the task launch and keep declared context and skill packages self-contained.

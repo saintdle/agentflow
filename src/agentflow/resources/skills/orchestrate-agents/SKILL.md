@@ -21,7 +21,7 @@ Delegate when a task is independent and bounded, produces noisy output, benefits
 
 Use native subagents by default for bounded work that should run fire-and-forget. Their provider UI is sufficient when the worker is unlikely to need a user decision before returning evidence.
 
-Use an observable external session when work is long-running, crosses providers, needs a separate worktree, or is likely to stop for approval or judgment. Prefer Herdr when available and use tmux as the portable fallback. Treat the session tool as a cockpit only. Beads is authoritative when initialized; otherwise use the repository's issues and PRs. Handoff prompts are always transient.
+Use an observable external session when work is long-running, crosses providers, needs a separate worktree, or is likely to stop for approval or judgment. For controller-managed external work, use Herdr; Agentflow does not dispatch through tmux. Tmux is for manually managed terminal sessions only, not a controller fallback. Treat the session tool as a cockpit only. Beads is authoritative when initialized; otherwise use the repository's issues and PRs. Handoff prompts are always transient.
 
 Before dispatch, classify every writable artifact as `reader-facing` or
 `internal`. When Claude or Copilot Claude is the writer of reader-facing

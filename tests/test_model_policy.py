@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from agentflow import model_policy as mp
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from sync_resources import ResourceSyncError, check_resources, sync_resources
 
 
 def _base_document() -> dict:
@@ -21,27 +22,93 @@ def _base_document() -> dict:
 
 class ResourceMirrorTests(unittest.TestCase):
     def test_repository_resources_match_packaged_mirrors(self) -> None:
-        mirrors = (
-            (".codex/agents", "src/agentflow/resources/agents/codex"),
-            (".claude/agents", "src/agentflow/resources/agents/claude"),
-            (".github/agents", "src/agentflow/resources/agents/copilot"),
-            ("policies", "src/agentflow/resources/policies"),
-            (".agents/skills/orchestrate-agents", "src/agentflow/resources/skills/orchestrate-agents"),
-            ("templates/project", "src/agentflow/resources/templates/project"),
-        )
-        for source_relative, package_relative in mirrors:
-            with self.subTest(source=source_relative, package=package_relative):
-                source_root = REPO_ROOT / source_relative
-                package_root = REPO_ROOT / package_relative
-                source_files = {
-                    path.relative_to(source_root): path.read_bytes()
-                    for path in source_root.rglob("*") if path.is_file()
-                }
-                package_files = {
-                    path.relative_to(package_root): path.read_bytes()
-                    for path in package_root.rglob("*") if path.is_file()
-                }
-                self.assertEqual(source_files, package_files)
+        self.assertEqual(check_resources(REPO_ROOT), [])
+
+    def test_sync_is_deterministic_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "runtime/skills/example"
+            source.mkdir(parents=True)
+            (source / "SKILL.md").write_bytes(b"---\nname: example\n---\n")
+            (source / "references/guide.md").parent.mkdir(parents=True)
+            (source / "references/guide.md").write_bytes(b"guide\n")
+            mirrors = (("runtime/skills", "exports/skills"),)
+
+            first_changes = sync_resources(root, mirrors=mirrors)
+            self.assertEqual(
+                first_changes,
+                ("exports/skills/example/SKILL.md", "exports/skills/example/references/guide.md"),
+            )
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
+            self.assertEqual(
+                (root / "exports/skills/example/references/guide.md").read_bytes(),
+                b"guide\n",
+            )
+
+    def test_sync_does_not_mutate_outside_file_hardlinked_to_export(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            source = root / "runtime/policies"
+            source.mkdir(parents=True)
+            canonical = source / "models.json"
+            canonical.write_bytes(b'{"canonical":true}\n')
+            outside = Path(temp) / "outside.json"
+            outside.write_bytes(b'{"outside":true}\n')
+            export = root / "policies/models.json"
+            export.parent.mkdir(parents=True)
+            try:
+                os.link(outside, export)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"hard links are unavailable: {exc}")
+            self.assertTrue(os.path.samefile(outside, export))
+            mirrors = (("runtime/policies", "policies"),)
+
+            sync_resources(root, mirrors=mirrors)
+
+            self.assertEqual(outside.read_bytes(), b'{"outside":true}\n')
+            self.assertEqual(export.read_bytes(), canonical.read_bytes())
+            self.assertFalse(os.path.samefile(outside, export))
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
+
+    def test_check_reports_drift_without_rewriting_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "runtime/policies"
+            source.mkdir(parents=True)
+            (source / "models.json").write_bytes(b'{"canonical":true}\n')
+            mirrors = (("runtime/policies", "policies"),)
+            sync_resources(root, mirrors=mirrors)
+            (root / "policies/models.json").write_bytes(b'{"canonical":false}\n')
+            (root / "policies/user-added.json").write_bytes(b"keep me\n")
+            before = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+
+            errors = check_resources(root, mirrors=mirrors)
+
+            self.assertTrue(any("models.json: differs" in error for error in errors))
+            self.assertTrue(any("user-added.json: extra export" in error for error in errors))
+            after = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+            with self.assertRaisesRegex(ResourceSyncError, "user-added.json"):
+                sync_resources(root, mirrors=mirrors)
+            after_refusal = {
+                path.relative_to(root / "policies"): path.read_bytes()
+                for path in (root / "policies").rglob("*") if path.is_file()
+            }
+            self.assertEqual(after_refusal, before)
+
+            (root / "policies/user-added.json").unlink()
+            sync_resources(root, mirrors=mirrors)
+            self.assertEqual(check_resources(root, mirrors=mirrors), [])
+            self.assertEqual(sync_resources(root, mirrors=mirrors), ())
 
 
 class LoadPolicyTests(unittest.TestCase):
