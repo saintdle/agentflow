@@ -181,6 +181,33 @@ class ResumeResult:
         return self.to_dict()[key]
 
 
+def _active_tasks_from_checkpoint(document: Mapping[str, Any], root: str) -> list[dict[str, str]]:
+    """Read the bounded task collection, upgrading a live v1/v2 slot in memory.
+
+    Old checkpoints stored one task in the top-level pointer. A live pointer is
+    never discarded: on the next fenced write it is copied into ``active_tasks``
+    before another claim can be reserved.
+    """
+    rows = document.get("active_tasks")
+    if isinstance(rows, list) and rows:
+        return [dict(row) for row in rows if isinstance(row, Mapping)]
+    task_id = str(document.get("task") or "")
+    state = checkpoint.resume_state(dict(document))
+    if (
+        task_id and task_id != root
+        and state in {"claimed_no_session", "running", "launched", "identity_pending"}
+    ):
+        return [{
+            "task": task_id,
+            "phase": str(document.get("phase") or ""),
+            "actor": str(document.get("actor") or ""),
+            "claim_id": str(document.get("claim_id") or ""),
+            "session_id": str(document.get("session_id") or ""),
+            "state": state,
+        }]
+    return []
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -617,6 +644,105 @@ class RootController:
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
         with self.fence(lease):
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
+
+    def active_tasks(self) -> list[dict[str, str]]:
+        """Return current workers, preserving a legacy single-task checkpoint."""
+        return _active_tasks_from_checkpoint(self._load_checkpoint(), self.root)
+
+    def _checkpoint_active_tasks(
+        self, rows: list[dict[str, str]], current: Lease,
+    ) -> dict[str, Any]:
+        document = self._load_checkpoint()
+        document.update(
+            {
+                "task": self.root,
+                "phase": "controller",
+                "next_action": "await active task results" if rows else "select next ready task",
+                "root": self.root,
+                "controller": self.controller,
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "running" if rows else "advancing",
+                "status": "running" if rows else "advancing",
+                "terminal": False,
+                "active_tasks": rows,
+            }
+        )
+        return self._save_checkpoint(document, lease=current)
+
+    def migrate_active_tasks(
+        self, *, lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fenced migration of a live v1/v2 single slot into the v3 collection."""
+        current = self.assert_lease(lease)
+        document = self._load_checkpoint()
+        rows = _active_tasks_from_checkpoint(document, self.root)
+        already_current = isinstance(document.get("active_tasks"), list) and bool(document.get("active_tasks"))
+        legacy_live = bool(rows) and not already_current
+        if legacy_live:
+            return self._result(self._checkpoint_active_tasks(rows, current), resumed=True)
+        return self._result(document, resumed=True)
+
+    def reserve_active_task(
+        self, task: Mapping[str, Any], *, lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Durably reserve one exact task before any provider launch attempt."""
+        current = self.assert_lease(lease)
+        task_id = self._assert_task_root(task)
+        document = self._load_checkpoint()
+        rows = _active_tasks_from_checkpoint(document, self.root)
+        if any(item["task"] == task_id for item in rows):
+            raise ControllerError(f"task {task_id} is already present in the active task set")
+        if len(rows) >= checkpoint.MAX_ACTIVE_TASKS:
+            raise ControllerError("active task set reached its safe checkpoint limit")
+        row = {
+            "task": task_id,
+            "phase": str(task.get("phase") or "dispatch"),
+            "actor": str(task.get("actor") or task.get("assignee") or current.controller),
+            "claim_id": str(task.get("claim_id") or task.get("claim") or ""),
+            "session_id": "",
+            "state": "claimed_no_session",
+        }
+        rows.append(row)
+        return self._result(self._checkpoint_active_tasks(rows, current), resumed=False)
+
+    def bind_active_task(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        state: str = "running",
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Bind an already-reserved task to the session returned by Herdr."""
+        if state not in {"running", "launched", "identity_pending"}:
+            raise ControllerError(f"unsupported active task launch state {state!r}")
+        if state != "identity_pending" and not session_id:
+            raise ControllerError("a launched active task requires a provider session id")
+        current = self.assert_lease(lease)
+        document = self._load_checkpoint()
+        rows = _active_tasks_from_checkpoint(document, self.root)
+        matches = [item for item in rows if item["task"] == task_id]
+        if len(matches) != 1 or matches[0]["state"] != "claimed_no_session":
+            raise ControllerError(f"task {task_id} has no unique pending launch reservation")
+        matches[0]["session_id"] = session_id
+        matches[0]["state"] = state
+        return self._result(self._checkpoint_active_tasks(rows, current), dispatched=True)
+
+    def complete_active_task(
+        self, task_id: str, *, lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Remove one task only after its authenticated result is dispositioned."""
+        current = self.assert_lease(lease)
+        document = self._load_checkpoint()
+        rows = _active_tasks_from_checkpoint(document, self.root)
+        remaining = [item for item in rows if item["task"] != task_id]
+        if len(remaining) == len(rows):
+            raise ControllerError(f"task {task_id} is not present in the active task set")
+        return self._result(self._checkpoint_active_tasks(remaining, current), resumed=True)
 
     def _result(self, document: Mapping[str, Any], *, dispatched: bool = False, resumed: bool = False) -> ResumeResult:
         state = checkpoint.resume_state(dict(document))

@@ -833,6 +833,32 @@ def _run_actual_root_preflight(
     return payload, _preflight_payload_digest(payload)
 
 
+def _controller_execution_policy(
+    cwd: Path,
+    root: Path,
+    workflow_root: str,
+    *,
+    root_issue: Mapping[str, Any] | None = None,
+) -> execution_backend.ExecutionPolicy:
+    """Resolve the root's explicit execution budget; legacy roots stay serial."""
+    if project_config_backend.config_path(root).exists():
+        config = project_config_backend.load(root)
+        settings = project_config_backend.execution_settings(config)
+        configured_execution = config.get("execution")
+        if not isinstance(configured_execution, Mapping) or "max_parallel_workers" not in configured_execution:
+            settings["max_parallel_workers"] = 1
+    else:
+        # Do not silently enable parallel provider spend for an older/unconfigured
+        # workspace. A typed root policy or initialized project config opts in.
+        settings = dict(project_config_backend.execution_settings(project_config_backend.default_data()))
+        settings["max_parallel_workers"] = 1
+    issue = root_issue if root_issue is not None else beads_backend.get_issue(cwd, workflow_root)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    root_execution = agentflow.get("execution") if isinstance(agentflow, Mapping) else None
+    return execution_backend.policy_from_root_metadata(root_execution, fallback=settings)
+
+
 def _dispatch_via_herdr(
     args: argparse.Namespace, root: Path, cwd: Path, workflow_root: str, lease: controller_backend.Lease,
 ) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
@@ -859,17 +885,9 @@ def _dispatch_via_herdr(
             # ephemeral test and gitless roots).  Absence gets the safe
             # packaged defaults; an existing malformed config still fails
             # closed instead of being silently ignored.
-            if project_config_backend.config_path(root).exists():
-                config = project_config_backend.load(root)
-            else:
-                config = project_config_backend.default_data()
-            settings = project_config_backend.execution_settings(config)
             root_issue = beads_backend.get_issue(cwd, workflow_root)
-            root_metadata = root_issue.get("metadata")
-            root_agentflow = root_metadata.get("agentflow") if isinstance(root_metadata, Mapping) else None
-            root_execution = root_agentflow.get("execution") if isinstance(root_agentflow, Mapping) else None
-            launch_policy = execution_backend.policy_from_root_metadata(
-                root_execution, fallback=settings
+            launch_policy = _controller_execution_policy(
+                cwd, root, workflow_root, root_issue=root_issue
             )
             current_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
             session_values = [
@@ -991,7 +1009,7 @@ def _dispatch_via_herdr(
     return dispatch
 
 
-def _controller_step(
+def _controller_step_serial(
     args: argparse.Namespace,
     controller: controller_backend.RootController,
     root: Path,
@@ -1284,6 +1302,300 @@ def _controller_step(
             stop = False
 
     return _payload(result, stop_reason), stop
+
+
+def _controller_step_parallel(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    lease: controller_backend.Lease,
+    *,
+    operation: str,
+    policy: execution_backend.ExecutionPolicy,
+) -> tuple[dict[str, Any], bool]:
+    """Reconcile each live worker, then fill only the remaining policy slots."""
+    workflow_root = getattr(args, "workflow_root", "")
+    if not workflow_root:
+        raise ValueError("--workflow-root is required; controller traversal cannot use task metadata")
+    cwd = root
+    root_issue = beads_backend.get_issue(cwd, workflow_root)
+
+    def payload(result: controller_backend.ResumeResult, reason: str = "") -> dict[str, Any]:
+        return {
+            "operation": operation, "ok": True, "root": str(root),
+            "controller": lease.controller, "lease": lease.to_dict(),
+            "result": result.to_dict(), "stop_reason": reason,
+            "workflow_root": workflow_root,
+            "session_control": controller.session_ledger(),
+        }
+
+    initial = controller._load_checkpoint()
+    state = checkpoint_backend.resume_state(initial)
+    if state in controller_backend.TERMINAL_STATES:
+        result = controller.resume([], lease=lease)
+        reason = "GOAL_COMPLETE" if state == "completed" else "USER_ACTION_REQUIRED"
+        return payload(result, reason), True
+
+    # Migrate a v1/v2 single slot before examining or scheduling anything.
+    controller.migrate_active_tasks(lease=lease)
+    active = controller.active_tasks()
+    for entry in list(active):
+        task_id = entry["task"]
+        if entry["state"] == "claimed_no_session":
+            result = controller.halt(
+                "blocked",
+                f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but no session; "
+                "inspect the launch before retrying",
+                lease=lease,
+            )
+            return payload(result, "USER_ACTION_REQUIRED"), True
+
+        issue = beads_backend.get_issue(cwd, task_id)
+        terminal = str(issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+        session_record = _herdr_session_record(root, task_id) or {}
+        if terminal and not session_record:
+            result = controller.halt(
+                "blocked",
+                f"USER_ACTION_REQUIRED: task {task_id} is terminal in Beads but has no Herdr lifecycle record",
+                lease=lease,
+            )
+            return payload(result, "USER_ACTION_REQUIRED"), True
+        if entry["state"] == "identity_pending":
+            _resolve_pending_identity(root, task_id)
+            session_record = _herdr_session_record(root, task_id) or {}
+            if isinstance(session_record, dict) and session_record.get("status") == "identity_pending":
+                since_raw = str(session_record.get("identity_pending_since") or "")
+                deadline_seconds = float(getattr(args, "identity_deadline", 300.0) or 300.0)
+                expired = False
+                if since_raw:
+                    try:
+                        since = dt.datetime.fromisoformat(since_raw)
+                        expired = (dt.datetime.now(dt.timezone.utc) - since).total_seconds() >= deadline_seconds
+                    except ValueError:
+                        pass
+                if expired:
+                    result = controller.halt(
+                        "blocked",
+                        f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+                        f"{deadline_seconds:.0f}s; inspect the live pane before further action",
+                        lease=lease,
+                    )
+                    return payload(result, "USER_ACTION_REQUIRED"), True
+
+        ingestion = _ingest_submitted_result(
+            root, task_id, authority_secret=str(getattr(args, "_authority_secret", "") or "")
+        )
+        if ingestion.status == "rejected":
+            result = controller.halt(
+                "blocked", f"task {task_id} submitted result rejected: {ingestion.error}", lease=lease,
+            )
+            return payload(result, "TASK_BLOCKED"), True
+        task_result = _herdr_task_result(root, task_id)
+        if task_result is None:
+            continue
+        outcome = str(task_result.get("outcome") or "")
+        if outcome != "completed":
+            beads_backend.add_comment(
+                cwd, task_id, f"agentflow: Herdr result outcome={outcome or 'unknown'}"
+            )
+            result = controller.halt(
+                "blocked", f"task {task_id} Herdr result outcome={outcome or 'unknown'}", lease=lease,
+            )
+            return payload(result, "TASK_BLOCKED"), True
+        # Ingestion atomically changes the channel from issued to consumed;
+        # re-read the durable record rather than validating a stale snapshot.
+        session_record = _herdr_session_record(root, task_id) or {}
+        channel = session_record.get("return_channel") if isinstance(session_record, Mapping) else None
+        if not (
+            isinstance(channel, Mapping)
+            and channel.get("acceptance_ids")
+            and channel.get("state") == "consumed"
+        ):
+            result = controller.halt(
+                "blocked", f"task {task_id} has no authenticated acceptance disposition", lease=lease,
+            )
+            return payload(result, "TASK_BLOCKED"), True
+        try:
+            acceptance_results = _validate_acceptance_results(
+                task_result.get("acceptance_results"),
+                tuple(str(value) for value in channel.get("acceptance_ids", []) if str(value)),
+                {"actor": lease.controller, "approved_waivers": channel.get("approved_waivers", [])},
+                beads_cwd=cwd, task_id=task_id,
+            )
+        except ValueError as exc:
+            result = controller.halt(
+                "blocked", f"task {task_id} acceptance disposition rejected: {exc}", lease=lease,
+            )
+            return payload(result, "TASK_BLOCKED"), True
+        already_disposed = str(issue.get("status") or "").lower() in {
+            "closed", "done", "completed", "cancelled", "canceled",
+        }
+        if not already_disposed:
+            beads_backend.update_agentflow_metadata(
+                cwd, task_id,
+                {"disposition": {
+                    "outcome": outcome, "acceptance_results": acceptance_results,
+                    "session_id": str(task_result.get("session_id") or ""), "recorded_at": _now(),
+                }},
+            )
+            beads_backend.close_issue(
+                cwd, task_id, "agentflow: Herdr result completed with recorded evidence"
+            )
+        controller.record_session_event(
+            event="completed", task_class=_controller_session_task_class(issue), task=task_id,
+            phase=_controller_session_phase(issue),
+            evidence="authenticated Herdr result and acceptance disposition", lease=lease,
+        )
+        controller.complete_active_task(task_id, lease=lease)
+
+    active = controller.active_tasks()
+    rotation = controller.session_ledger().get("rotation")
+    rotation_required = isinstance(rotation, Mapping) and bool(rotation.get("required"))
+    if rotation_required:
+        if active:
+            # Let already-launched workers finish, but do not expand the wave
+            # beyond the safe rotation boundary.
+            return payload(controller.resume([], lease=lease)), False
+        packet, packet_path = _controller_rotation_packet(controller, root, workflow_root, lease)
+        result = controller.resume([], lease=lease)
+        response = payload(result, "ROTATION_REQUIRED")
+        response["rotation_packet"] = str(packet_path)
+        response["resume_prompt"] = session_control_backend.render_resume_prompt(packet)
+        return response, True
+
+    # Tasks returned as in_progress after a crash can be adopted only from a
+    # durable Herdr binding; a claimed_no_session marker above is never retried.
+    while len(active) < policy.max_parallel_workers:
+        descendants = beads_backend.root_descendants(cwd, workflow_root)
+        active_ids = {item["task"] for item in active}
+        orphaned = [
+            item for item in descendants
+            if str(item.get("status") or "").lower() == "in_progress"
+            and str(item.get("assignee") or "") == lease.controller
+            and str(item.get("id") or "") not in active_ids
+        ]
+        claimed = orphaned[0] if orphaned else beads_backend.claim_ready(
+            cwd, parent=workflow_root, labels=[], actor=lease.controller
+        )
+        if claimed is None:
+            break
+        task_id = str(claimed.get("id") or "")
+        if not task_id:
+            result = controller.halt("blocked", "Beads returned a claimed task without an ID", lease=lease)
+            return payload(result, "TASK_BLOCKED"), True
+        if orphaned:
+            existing_record = _herdr_session_record(root, task_id)
+            binding = existing_record.get("binding") if isinstance(existing_record, Mapping) else None
+            lifecycle_status = str(existing_record.get("status") or "") if isinstance(existing_record, Mapping) else ""
+            if isinstance(existing_record, Mapping) and lifecycle_status in {
+                "launching", "identity_pending", "launched", "running", "completed",
+            }:
+                adopted = dict(claimed)
+                adopted.update({"root": str(root), "actor": lease.controller})
+                controller.reserve_active_task(adopted, lease=lease)
+                session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
+                adopted_state = "running" if session_id else "identity_pending"
+                controller.bind_active_task(
+                    task_id, session_id=session_id, state=adopted_state, lease=lease,
+                )
+                active = controller.active_tasks()
+                continue
+            if isinstance(existing_record, Mapping):
+                result = controller.halt(
+                    "blocked",
+                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has a non-relaunchable Herdr "
+                    f"state {lifecycle_status or 'unknown'}; inspect lifecycle before retrying",
+                    lease=lease,
+                )
+                return payload(result, "USER_ACTION_REQUIRED"), True
+
+        metadata = claimed.get("metadata")
+        agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+        agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+        existing_claim_id = str(agentflow.get("claim_id") or "")
+        existing_claim_token = str(agentflow.get("claim_token") or "")
+        if existing_claim_token == f"{workflow_root}/{task_id}/{lease.controller}" or len(existing_claim_token) < 32:
+            existing_claim_token = ""
+        identity = beads_backend.ClaimIdentity(
+            workflow_root, task_id, lease.controller,
+            existing_claim_id or f"{workflow_root}/{task_id}/{lease.controller}",
+            existing_claim_token,
+        )
+        beads_backend.update_agentflow_metadata(
+            cwd, task_id,
+            {"root": workflow_root, "task": task_id, "actor": lease.controller,
+             "claim_id": identity.claim_id, "claim_token": identity.token},
+        )
+        _persist_claim_identity(cwd, beads_backend.ExactClaim(identity, claimed))
+        selected = dict(claimed)
+        selected.update({
+            "root": str(root), "claim_id": identity.claim_id,
+            "claim_token": identity.token, "actor": lease.controller,
+        })
+        # This atomic reservation precedes all handoff/preflight/provider work.
+        controller.reserve_active_task(selected, lease=lease)
+        dispatched = _dispatch_via_herdr(args, root, cwd, workflow_root, lease)(selected)
+        session_id = str(dispatched.get("session_id") or "")
+        dispatch_state = str(dispatched.get("state") or "")
+        if dispatch_state == "blocked" or (not session_id and dispatch_state != "identity_pending"):
+            result = controller.halt(
+                "blocked", f"task {task_id} failed preflight or provider launch", lease=lease,
+            )
+            return payload(result, "TASK_BLOCKED"), True
+        dispatch_state = dispatch_state if dispatch_state in {"running", "launched", "identity_pending"} else "running"
+        result = controller.bind_active_task(
+            task_id, session_id=session_id, state=dispatch_state, lease=lease,
+        )
+        controller.record_session_event(
+            event="dispatch", task_class=_controller_session_task_class(claimed), task=task_id,
+            phase=_controller_session_phase(claimed), lease=lease,
+        )
+        active = controller.active_tasks()
+
+    active = controller.active_tasks()
+    if active:
+        return payload(controller.resume([], lease=lease)), False
+
+    descendants = beads_backend.root_descendants(cwd, workflow_root)
+    nonterminal = [
+        item for item in descendants
+        if str(item.get("status") or "").lower()
+        not in {"closed", "done", "completed", "cancelled", "canceled"}
+    ]
+    if nonterminal:
+        titles = "; ".join(
+            f"{item.get('title') or item.get('id')} ({item.get('id')})" for item in nonterminal[:5]
+        )
+        result = controller.halt(
+            "blocked", f"USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: {titles}",
+            lease=lease,
+        )
+        return payload(result, "USER_ACTION_REQUIRED"), True
+    if _root_acceptance_passed(root_issue, beads_cwd=cwd):
+        result = controller.complete(reason="GOAL_COMPLETE", lease=lease)
+        return payload(result, "GOAL_COMPLETE"), True
+    return payload(controller.resume([], lease=lease)), False
+
+
+def _controller_step(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    lease: controller_backend.Lease,
+    *,
+    operation: str,
+) -> tuple[dict[str, Any], bool]:
+    workflow_root = getattr(args, "workflow_root", "")
+    cwd = root
+    root_issue = beads_backend.get_issue(cwd, workflow_root) if workflow_root else None
+    policy = _controller_execution_policy(cwd, root, workflow_root, root_issue=root_issue)
+    document = controller._load_checkpoint()
+    has_active_collection = bool(document.get("active_tasks"))
+    if policy.max_parallel_workers > 1 or has_active_collection:
+        return _controller_step_parallel(
+            args, controller, root, lease, operation=operation, policy=policy,
+        )
+    return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:

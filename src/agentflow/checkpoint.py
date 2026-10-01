@@ -13,8 +13,9 @@ class CheckpointError(RuntimeError):
 
 
 SCHEMA = "agentflow.checkpoint"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSIONS = frozenset({LEGACY_SCHEMA_VERSION, 2, SCHEMA_VERSION})
 
 # The schema is closed: only these keys are accepted. Rejecting unknown keys is
 # what keeps transcripts, prompts, and free-form context out of the checkpoint.
@@ -42,12 +43,15 @@ STATE_TEXT_FIELDS = (
 )
 REQUIRED_FIELDS = ("task", "phase", "next_action")
 LIST_FIELDS = ("changed_files",)
-ALL_FIELDS = TEXT_FIELDS + STATE_TEXT_FIELDS + LIST_FIELDS + ("epoch", "terminal")
+ALL_FIELDS = TEXT_FIELDS + STATE_TEXT_FIELDS + LIST_FIELDS + ("epoch", "terminal", "active_tasks")
 
 FIELD_MAX = 500
 SESSION_HASH_MAX = 128
 MAX_CHANGED_FILES = 50
 CHANGED_FILE_MAX = 240
+MAX_ACTIVE_TASKS = 8
+ACTIVE_TASK_FIELDS = frozenset({"task", "phase", "actor", "claim_id", "session_id", "state"})
+ACTIVE_TASK_STATES = frozenset({"claimed_no_session", "running", "launched", "identity_pending"})
 MAX_TOTAL_BYTES = 4096
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
 
@@ -137,13 +141,49 @@ def _check_changed_files(value: Any) -> list[str]:
     return files
 
 
+def _check_active_tasks(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CheckpointError("field 'active_tasks' must be a list")
+    if len(value) > MAX_ACTIVE_TASKS:
+        raise CheckpointError(
+            f"field 'active_tasks' exceeds {MAX_ACTIVE_TASKS} entries ({len(value)})"
+        )
+    tasks: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value, 1):
+        if not isinstance(raw, dict):
+            raise CheckpointError(f"active_tasks entry {index} must be an object")
+        unknown = sorted(set(raw) - ACTIVE_TASK_FIELDS)
+        if unknown:
+            raise CheckpointError(
+                f"active_tasks entry {index} has unknown field(s): {', '.join(unknown)}"
+            )
+        task = _check_text(f"active_tasks[{index}].task", raw.get("task"), required=True)
+        if task in seen:
+            raise CheckpointError(f"active_tasks contains duplicate task {task!r}")
+        seen.add(task)
+        state = _check_text(f"active_tasks[{index}].state", raw.get("state"), required=True)
+        if state not in ACTIVE_TASK_STATES:
+            raise CheckpointError(f"active_tasks entry {index} has unsupported state {state!r}")
+        item = {
+            field: _check_text(
+                f"active_tasks[{index}].{field}", raw.get(field),
+                required=field in {"task", "state"},
+            )
+            for field in ("task", "phase", "actor", "claim_id", "session_id", "state")
+        }
+        tasks.append(item)
+    return tasks
+
+
 def build_checkpoint(data: Any) -> dict[str, Any]:
     """Validate ``data`` and return a normalized, current-version document.
 
-    Version one checkpoints were deliberately small and remain readable.  The
-    v2 fields are optional so the command-line checkpoint format remains
-    backwards compatible while the controller can persist its lease and claim
-    identity in the same crash-safe document.
+    Version one and two checkpoints remain readable. The v3 ``active_tasks``
+    collection is bounded and optional so old single-task records can be
+    migrated without losing a live claim or provider session.
     """
 
     if not isinstance(data, dict):
@@ -160,7 +200,7 @@ def build_checkpoint(data: Any) -> dict[str, Any]:
     version = data.get("version", LEGACY_SCHEMA_VERSION)
     if isinstance(version, bool) or not isinstance(version, int):
         raise CheckpointError("checkpoint version must be an integer")
-    if version not in (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION):
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise CheckpointError(f"unsupported checkpoint version {version!r}")
 
     document: dict[str, Any] = {"schema": SCHEMA, "version": SCHEMA_VERSION}
@@ -169,6 +209,7 @@ def build_checkpoint(data: Any) -> dict[str, Any]:
     for field in STATE_TEXT_FIELDS:
         document[field] = _check_text(field, data.get(field), required=False)
     document["changed_files"] = _check_changed_files(data.get("changed_files"))
+    document["active_tasks"] = _check_active_tasks(data.get("active_tasks"))
 
     epoch = data.get("epoch", 0)
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
