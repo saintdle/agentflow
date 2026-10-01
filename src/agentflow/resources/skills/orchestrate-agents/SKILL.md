@@ -21,7 +21,7 @@ Delegate when a task is independent and bounded, produces noisy output, benefits
 
 Use native subagents by default for bounded work that should run fire-and-forget. Their provider UI is sufficient when the worker is unlikely to need a user decision before returning evidence.
 
-Use an observable external session when work is long-running, crosses providers, needs a separate worktree, or is likely to stop for approval or judgment. Prefer Herdr when available and use tmux as the portable fallback. Treat the session tool as a cockpit only. Beads is authoritative when initialized; otherwise use the repository's issues and PRs. Handoff prompts are always transient.
+Use an observable external session when work is long-running, crosses providers, needs a separate worktree, or is likely to stop for approval or judgment. For controller-managed external work, use Herdr; Agentflow does not dispatch through tmux. Tmux is for manually managed terminal sessions only, not a controller fallback. Treat the session tool as a cockpit only. Beads is authoritative when initialized; otherwise use the repository's issues and PRs. Handoff prompts are always transient.
 
 Before dispatch, classify every writable artifact as `reader-facing` or
 `internal`. When Claude or Copilot Claude is the writer of reader-facing
@@ -43,6 +43,16 @@ lane to chat, code, research notes, reviews, or internal handoffs.
 Agentflow routes skills; it does not own domain expertise. Treat the target repository's skills as authoritative for its domain. Inspect the worker's target directory and identify every skill required to complete or review the assignment. Do not rely on a global skill with similar scope when the repository supplies one.
 
 For external handoffs, add one `--require-skill <name>` per required domain skill. Preflight from the worker's actual `--cwd`; it must resolve a readable provider entrypoint and record its path and SHA-256 in the handoff sidecar. Stop before launch if a required skill is unavailable. For native workers, name the required skills explicitly in the assignment and verify that their target working directory exposes them.
+
+Every external worker must be launched by the leased root controller so it
+receives a minted authenticated result channel. Never use direct `agentflow
+handoff launch` for an external handoff. When the approved outbound file set
+must exclude repository instructions or unrelated source, persist
+`sterile=true` (or `outbound_context=restricted`) in the task's launch metadata.
+The controller then launches from a hash-inventoried package. Sterile skills
+must be self-contained; stop rather than widening a package for unresolved
+transitive references. The current sterile lane is read-only; never select it
+for `shell-write` work.
 
 ## Partition work
 
@@ -96,7 +106,9 @@ return: outcome, branch/commit, checks, risks, refs; no raw logs
 2. Run `agentflow handoff preflight <handoff>`. Add `--require-matrix` for substantial or environment-dependent work.
 3. Run preflight with `--cwd <worker-worktree>` when the handoff was created elsewhere. Confirm that every required skill resolves to the intended project/provider entrypoint.
 4. Do not launch until preflight passes. Treat it as a launcher capability check, not proof of the provider's later reasoning.
-5. If the task is direct review, keep delegation disabled.
+5. Resume the leased root controller to launch. It owns the authenticated
+   return channel and rejects missing or mismatched runtime model evidence.
+6. If the task is direct review, keep delegation disabled.
 
 Workers reply with one leading verb: `REPORTED`, `BLOCKED`, `ADVICE`, `REVIEW`, `FIXED`, or `APPROVE`. Require factual claims to include a file/line, commit, command result, URL, or `untested`.
 

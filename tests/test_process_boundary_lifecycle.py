@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import argparse
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow import beads
+from agentflow import beads, cli
 from tests import _state_home  # noqa: F401  # external controller authority
 
 
@@ -242,6 +247,148 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=10, check=False)
             self.assertEqual(replay.returncode, 2, replay.stdout + replay.stderr)
             self.assertIn("controller-owned", replay.stdout)
+
+
+class SterileSessionHookLifecycleTests(unittest.TestCase):
+    """Exercise the packaged project hook and native event across a process boundary."""
+
+    def test_sterile_native_hooks_preserve_provider_payloads_and_model_changes(self) -> None:
+        cases = (
+            ("claude", Path(".claude/settings.json"), {"SessionStart", "PostModelSwitch"}),
+            ("copilot", Path(".github/hooks/agentflow.json"), {"sessionStart"}),
+        )
+        for provider, hook_path, event_names in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source"
+                source.mkdir()
+                context = source / "allowed.md"
+                context.write_text("bounded evidence\n", encoding="utf-8")
+                handoff = source / ".agentflow/handoffs/session-hook.md"
+                handoff_args = argparse.Namespace(
+                    to=provider, title="Session hook lifecycle", goal="Attest the provider route",
+                    task_id="task-session-hook", task_class="focused-review", role="reviewer",
+                    artifact_kind="internal", writer_model="", lane="external",
+                    tool_profile="shell-readonly", output_boundary=str(source / "output"),
+                    require_tool=[], require_skill=[], allow_delegation=False, return_type="result",
+                    max_ai_credits=30 if provider == "copilot" else None,
+                    acceptance_matrix="", isolation_profile="none",
+                    require_asset=[], base="main@" + ("a" * 40), dependency=[],
+                    done_when=["Return evidence"], context=[str(context)],
+                    constraint=["Do not inspect other files"], check=[],
+                    budget=["10 minutes; one retry; stop on blocker"], issue="", branch="",
+                    out=str(handoff), cwd=str(source), untrusted_task_data=False,
+                )
+                (source / "output").mkdir()
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli.handoff_create(handoff_args), 0)
+                stage = directory / "sterile"
+                with mock.patch.object(cli, "_provider_command", return_value="/fake/provider"), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    packaged_handoff = cli._package_handoff_sterile(handoff, stage)
+                self.assertEqual(cli._validate_sterile_package(stage), packaged_handoff)
+
+                config = json.loads((stage / hook_path).read_text(encoding="utf-8"))
+                self.assertEqual(set(config["hooks"]), event_names)
+
+                state_home = directory / "state"
+                environment = dict(os.environ)
+                environment["AGENTFLOW_STATE_HOME"] = str(state_home)
+                environment["PYTHONPATH"] = (
+                    str(ROOT / "src") + os.pathsep + environment.get("PYTHONPATH", "")
+                )
+                native_session = f"{provider}-native-session"
+
+                def invoke_hook(event_name: str, event_payload: dict) -> None:
+                    entry = config["hooks"][event_name][0]
+                    command = entry["hooks"][0]["command"] if provider == "claude" else entry["bash"]
+                    command_args = shlex.split(command)
+                    self.assertEqual(command_args[0], "~/.local/bin/agentflow")
+                    self.assertEqual(command_args[1:4], ["hook", "--provider", provider])
+                    event_from_config = command_args[command_args.index("--event") + 1]
+                    self.assertEqual(event_from_config, event_name)
+                    # The bundled command is rooted at the normal local install
+                    # path. Replace only that executable so provider payloads
+                    # still cross a real child-process hook boundary.
+                    hook_argv = [sys.executable, "-m", "agentflow.cli", *command_args[1:]]
+                    hook_result = subprocess.run(
+                        hook_argv, cwd=stage, env=environment,
+                        input=json.dumps(event_payload), capture_output=True,
+                        text=True, timeout=10, check=False,
+                    )
+                    self.assertEqual(
+                        hook_result.returncode, 0, hook_result.stdout + hook_result.stderr
+                    )
+
+                if provider == "claude":
+                    invoke_hook("SessionStart", {
+                        "hook_event_name": "SessionStart",
+                        "session_id": native_session,
+                        "timestamp": "2026-09-30T09:00:00.000Z",
+                        "cwd": str(stage),
+                        "model": "claude-sonnet-5",
+                    })
+                    with mock.patch.dict(
+                        os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False
+                    ):
+                        cli._require_attested_model("claude", native_session, "claude-sonnet-5")
+                        invoke_hook("PostModelSwitch", {
+                            "hook_event_name": "PostModelSwitch",
+                            "session_id": native_session,
+                            "timestamp": "2026-09-30T09:01:00.000Z",
+                            "cwd": str(stage),
+                            "source": "fallback",
+                            "from_model": "claude-sonnet-5",
+                            "to_model": "claude-sonnet-4.6",
+                        })
+                        with self.assertRaisesRegex(ValueError, "provider model mismatch"):
+                            cli._require_attested_model(
+                                "claude", native_session, "claude-sonnet-5"
+                            )
+                        cli._require_attested_model(
+                            "claude", native_session, "claude-sonnet-4.6"
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "no usable local lifecycle model evidence"
+                        ):
+                            cli._require_attested_model(
+                                "claude", "missing-session", "claude-sonnet-5"
+                            )
+                else:
+                    # This is the documented Copilot `sessionStart` shape:
+                    # camelCase sessionId and a millisecond timestamp, with
+                    # no model field. It must still normalize as lifecycle
+                    # metadata without fabricating model attestation.
+                    invoke_hook("sessionStart", {
+                        "hookEventName": "sessionStart",
+                        "sessionId": native_session,
+                        "timestamp": 1724954400000,
+                        "cwd": str(stage),
+                        "source": "startup",
+                    })
+                    rows = cli.events_backend.EventSpool(
+                        state_home / "events.jsonl"
+                    ).read()
+                    matching = [
+                        row for row in rows
+                        if row.provider == "copilot"
+                        and row.session_id == cli.events_backend.session_scope(native_session)
+                    ]
+                    self.assertEqual(len(matching), 1)
+                    self.assertEqual(matching[0].event, "session.start")
+                    self.assertEqual(matching[0].timestamp, "2024-08-29T18:00:00.000Z")
+                    self.assertRegex(
+                        matching[0].metadata.get("source", ""), r"^source_[0-9a-f]{64}$"
+                    )
+                    self.assertNotIn("model", matching[0].metadata)
+                    with mock.patch.dict(
+                        os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False
+                    ), self.assertRaisesRegex(
+                        ValueError, "Copilot.*resolved-model evidence.*unsupported"
+                    ):
+                        cli._require_attested_model(
+                            "copilot", native_session, "claude-sonnet-5"
+                        )
 
 
 if __name__ == "__main__":

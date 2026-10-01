@@ -26,10 +26,12 @@ values fail closed before lease/claim reservation.
 | Work shape | Bounded, independent, fire-and-forget | Long-running, cross-provider, or decision-prone |
 | Intervention | Controller steers or stops it through the provider | User can attach directly when the worker reports `BLOCKED` |
 | Isolation | Provider-managed; use read-only work or disjoint ownership | Use a dedicated worktree and authenticated confinement |
-| UI | Provider agent view | Herdr when available; tmux as fallback |
+| UI | Provider agent view | Herdr for controller-managed sessions; tmux for manual sessions only |
 
-Choose the native lane for routine work. Use Herdr when direct intervention,
-cross-provider identity, or a durable pane binding has concrete value.
+Choose the native lane for routine work. For controller-managed external work,
+Herdr is the supported transport; tmux is limited to manually managed terminal
+sessions and is not an Agentflow dispatch fallback. Use Herdr when direct
+intervention, cross-provider identity, or a durable pane binding has concrete value.
 
 ## External task classes
 
