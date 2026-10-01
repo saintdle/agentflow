@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added typed root workspace contracts for authenticated external handoffs:
+  Git workspaces pin branch@revision, while Gitless directories bind the exact
+  canonical root path without a synthetic Git base.
 - Added a bounded pull-request CI smoke against real Beads 1.1.0 while keeping
   the broader integration run on its scheduled and manual triggers.
 - Added protected provider-session bindings so controller hooks resolve the
