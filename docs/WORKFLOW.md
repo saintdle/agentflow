@@ -129,7 +129,10 @@ ready or assigned does not prove that a worker session is live.
 
 Gitless projects can use Beads and Agentflow runtime state without inventing
 branches, commits, pull requests, or merge gates. Serialize overlapping file
-writes in that mode.
+writes in that mode. External handoffs use a typed workspace contract: Git
+roots pin an exact `branch@SHA`, while non-Git directories carry no Git base
+and bind to their canonical absolute directory path. Preflight fails closed if
+the selected workspace type or exact root differs from the handoff.
 
 Compare Beads claims and dispositions with Herdr sessions whenever status is
 unclear:

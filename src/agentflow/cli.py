@@ -688,6 +688,80 @@ def _preflight_payload_digest(payload: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+_WORKSPACE_CONTRACT_SCHEMA = "agentflow.workspace@1"
+
+
+def _workspace_contract_errors(
+    manifest: Mapping[str, Any], *, observed_root: Path, allow_sterile: bool = False,
+    allow_sterile_candidate: bool = False,
+) -> list[str]:
+    """Validate the durable typed workspace binding in a handoff manifest.
+
+    A normal launch must match the actual Git repository or directory. A
+    sterile launch is the sole exception: its isolated execution root is not
+    the source workspace, so the manifest must bind the source root while its
+    sterile-package pointer stays at the exact package-manifest location.
+    """
+    errors: list[str] = []
+    contract = manifest.get("workspace_contract")
+    if not isinstance(contract, Mapping) or contract.get("schema") != _WORKSPACE_CONTRACT_SCHEMA:
+        return ["typed workspace contract is missing or unsupported"]
+    kind = str(contract.get("kind") or "")
+    workspace_root_value = str(contract.get("root") or "")
+    if kind not in {"git", "directory"}:
+        errors.append("workspace contract kind must be 'git' or 'directory'")
+        return errors
+    workspace_root = Path(workspace_root_value).expanduser()
+    if (
+        not workspace_root_value
+        or not workspace_root.is_absolute()
+        or str(workspace_root.resolve()) != workspace_root_value
+    ):
+        errors.append("workspace contract root must be a canonical absolute path")
+        return errors
+    if manifest.get("workspace_kind") != kind:
+        errors.append("workspace kind does not match the typed workspace contract")
+    if kind == "git":
+        base = manifest.get("base")
+        if not isinstance(base, str) or not base:
+            errors.append("Git workspace contract requires a non-empty base")
+        if not isinstance(base, str) or "@" not in base or not all(base.split("@", 1)):
+            errors.append("Git workspace contract requires an exact branch@revision base")
+        if contract.get("base") != base:
+            errors.append("Git base does not match the typed workspace contract")
+    else:
+        if manifest.get("base", "") not in ("", None):
+            errors.append("directory workspace must not carry a Git base")
+        if contract.get("base") is not None:
+            errors.append("directory workspace contract must not contain a Git base")
+        if manifest.get("branch", "") not in ("", None):
+            errors.append("directory workspace must not carry a Git branch")
+
+    sterile_marker = str(manifest.get("sterile_package") or "")
+    is_sterile = bool(sterile_marker)
+    if is_sterile:
+        expected_marker = (observed_root.resolve() / ".agentflow/sterile-manifest.json").resolve()
+        if not allow_sterile or Path(sterile_marker).expanduser().resolve() != expected_marker:
+            errors.append("sterile workspace marker is not bound to this execution root")
+        elif not allow_sterile_candidate and not expected_marker.is_file():
+            errors.append("sterile package manifest is missing")
+        if workspace_root == observed_root.resolve():
+            errors.append("sterile workspace binding must name the source, not package, root")
+    else:
+        actual_kind = "git" if _is_git_repository(observed_root) else "directory"
+        actual_root = _repository_root(observed_root).resolve() if actual_kind == "git" else observed_root.resolve()
+        if actual_kind != kind:
+            errors.append("workspace kind does not match the target workspace")
+        if workspace_root != actual_root:
+            errors.append("workspace root does not match the exact target workspace")
+        if kind == "git" and isinstance(manifest.get("base"), str) and manifest.get("base"):
+            if not _git_base_matches(observed_root, str(manifest["base"])):
+                errors.append("Git base does not resolve to the approved revision in the target workspace")
+    if not workspace_root.is_dir():
+        errors.append("workspace contract root is not an existing directory")
+    return errors
+
+
 def _run_actual_root_preflight(
     *,
     root: Path,
@@ -707,6 +781,17 @@ def _run_actual_root_preflight(
 ) -> tuple[dict[str, Any], str]:
     """Run the public root preflight against the materialized launch inputs."""
     manifest = handoff.manifest
+    workspace_contract = manifest.get("workspace_contract")
+    if not isinstance(workspace_contract, Mapping) or workspace_contract.get("schema") != _WORKSPACE_CONTRACT_SCHEMA:
+        raise ValueError("actual root-wide preflight requires a typed workspace contract")
+    workspace_kind = str(workspace_contract.get("kind") or "")
+    workspace_root = str(workspace_contract.get("root") or "")
+    workspace_errors = _workspace_contract_errors(
+        manifest, observed_root=execution_root or root,
+        allow_sterile=execution_root is not None and execution_root.resolve() != root.resolve(),
+    )
+    if workspace_errors:
+        raise ValueError("invalid handoff workspace contract: " + "; ".join(workspace_errors))
     machine_contract = manifest.get("machine_return_contract")
     acceptance_ids = tuple(
         str(value) for value in (
@@ -725,10 +810,9 @@ def _run_actual_root_preflight(
     if not boundary.is_absolute():
         boundary = (execution_root or root) / boundary
     base = str(manifest.get("base") or "")
-    if not base and not _is_git_repository(root):
-        base = "workspace"
     namespace = argparse.Namespace(
-        root=str(execution_root or root), authority_root=str(root), base=base, context=list(context_values),
+        root=str(execution_root or root), authority_root=str(root), base=base,
+        workspace_kind=workspace_kind, workspace_root=workspace_root, context=list(context_values),
         boundary=str(boundary), matrix=list(acceptance_ids),
         tool=list(required_tools), provider=provider, role=role, model=model, effort=effort,
         policy_version="", workflow_root=workflow_root, task=task_id, actor=actor,
@@ -1591,10 +1675,17 @@ def preflight_root(args: argparse.Namespace) -> int:
         snapshot = preflight_backend.take_snapshot(root, tools=tools)
         model = getattr(args, "model", "") or " "
         session_id = getattr(args, "session_id", "") or " "
+        workspace_kind = getattr(args, "workspace_kind", "") or (
+            "git" if _is_git_repository(authority_root) else "directory"
+        )
+        workspace_root = getattr(args, "workspace_root", "") or str(
+            _repository_root(authority_root).resolve()
+            if workspace_kind == "git" else authority_root
+        )
         policy_args = argparse.Namespace(root=str(authority_root), policy=getattr(args, "policy", ""))
         policy = model_policy_backend.load_policy(_resolve_model_policy(policy_args, authority_root))
         spec = preflight_backend.LaunchSpec(
-            base=getattr(args, "base", "") or " ",
+            base=getattr(args, "base", ""),
             context=tuple(getattr(args, "context", []) or []),
             boundary=getattr(args, "boundary", "") or str(root),
             matrix=tuple(getattr(args, "matrix", []) or []),
@@ -1615,11 +1706,42 @@ def preflight_root(args: argparse.Namespace) -> int:
             authenticated_confinement=bool(getattr(args, "authenticated_confinement", False)),
             selective_model=bool(getattr(args, "selective_model", False)),
             strict=True,
+            workspace_kind=workspace_kind,
+            workspace_root=workspace_root,
         )
         report = preflight_backend.check_launch(spec, snapshot, policy=policy)
         findings = list(report.findings)
+        if spec.handoff:
+            handoff_manifest, handoff_errors = _handoff_manifest(Path(spec.handoff).expanduser())
+            if handoff_errors or not isinstance(handoff_manifest, Mapping):
+                findings.append(_preflight_finding(
+                    "workspace-contract-unavailable", "workspace",
+                    handoff_errors[0] if handoff_errors else "handoff manifest is unavailable",
+                    "Read and validate the typed workspace identity from the exact handoff manifest.",
+                ))
+            else:
+                for error in _workspace_contract_errors(
+                    handoff_manifest, observed_root=root,
+                    allow_sterile=root.resolve() != authority_root.resolve(),
+                ):
+                    findings.append(_preflight_finding(
+                        "workspace-contract-invalid", "workspace", error,
+                        "Regenerate the handoff from the exact approved workspace and preflight it again.",
+                    ))
+                contract = handoff_manifest.get("workspace_contract")
+                if isinstance(contract, Mapping) and (
+                    contract.get("kind") != spec.workspace_kind
+                    or contract.get("root") != spec.workspace_root
+                    or handoff_manifest.get("base", "") != spec.base
+                ):
+                    findings.append(_preflight_finding(
+                        "workspace-contract-mismatch", "workspace",
+                        "root preflight specification differs from the authenticated handoff workspace contract",
+                        "Use the workspace kind, exact root, and base from the handoff manifest.",
+                    ))
         for field, value in (
             ("base", spec.base), ("boundary", spec.boundary), ("handoff", spec.handoff),
+            ("workspace_root", spec.workspace_root),
             ("workflow_root", getattr(args, "workflow_root", "")),
             ("task", getattr(args, "task", "")), ("actor", getattr(args, "actor", "")),
         ):
@@ -1653,10 +1775,40 @@ def preflight_root(args: argparse.Namespace) -> int:
                     "beads-snapshot-unavailable", "beads", str(exc),
                     "Read and validate the complete Beads descendant snapshot before launch.",
                 ))
-        if not spec.base.strip():
-            findings.append(_preflight_finding("base-missing", "git", "git base is required", "Provide the approved branch@revision base."))
-        elif not _git_base_matches(authority_root, spec.base):
-            findings.append(_preflight_finding("base-invalid", "git", f"git base {spec.base!r} is not present in the root", "Use the exact approved branch@revision base."))
+        authority_kind = "git" if _is_git_repository(authority_root) else "directory"
+        expected_workspace_root = (
+            _repository_root(authority_root).resolve()
+            if authority_kind == "git" else authority_root
+        )
+        if spec.workspace_kind != authority_kind:
+            findings.append(_preflight_finding(
+                "workspace-kind-mismatch", "workspace",
+                f"declared workspace kind {spec.workspace_kind!r} does not match target {authority_kind!r}",
+                "Use the exact typed kind of the approved target workspace.",
+            ))
+        if Path(spec.workspace_root).expanduser().resolve() != expected_workspace_root:
+            findings.append(_preflight_finding(
+                "workspace-root-mismatch", "workspace",
+                f"declared workspace root {spec.workspace_root!r} does not match target {str(expected_workspace_root)!r}",
+                "Bind the launch to the exact canonical target workspace root.",
+            ))
+        if spec.workspace_kind == "git":
+            if "@" not in spec.base or not all(spec.base.split("@", 1)):
+                findings.append(_preflight_finding(
+                    "base-missing", "git", "exact Git branch@revision base is required",
+                    "Provide the approved branch@SHA base.",
+                ))
+            elif not _git_base_matches(authority_root, spec.base):
+                findings.append(_preflight_finding(
+                    "base-invalid", "git", f"git base {spec.base!r} is not present at the approved revision in the root",
+                    "Use the exact approved branch@SHA base.",
+                ))
+        elif spec.base:
+            findings.append(_preflight_finding(
+                "directory-base-present", "workspace",
+                "directory workspace cannot carry a Git base",
+                "Remove the Git base and bind the exact directory workspace root.",
+            ))
         if spec.strict and task_id and spec.lease_id and spec.claim_id:
             try:
                 _verify_launch_authority(
@@ -1677,6 +1829,9 @@ def preflight_root(args: argparse.Namespace) -> int:
         payload["effort"] = spec.effort
         payload["workflow_root"] = workflow_root
         payload["task"] = task_id
+        payload["workspace_kind"] = spec.workspace_kind
+        payload["workspace_root"] = spec.workspace_root
+        payload["base"] = spec.base
         payload["descendants"] = [str(item.get("id") or "") for item in descendants]
         payload["ok"] = not payload["launch_blocked"]
         if getattr(args, "json", False):
@@ -5817,6 +5972,7 @@ def prose_prepare(args: argparse.Namespace) -> int:
 def handoff_create(args: argparse.Namespace) -> int:
     task_cwd = _task_cwd(args)
     workspace_kind = "git" if _is_git_repository(task_cwd) else "directory"
+    workspace_root = _repository_root(task_cwd).resolve() if workspace_kind == "git" else task_cwd
     requested_output = Path(args.out).expanduser() if args.out else None
     if requested_output is not None and not requested_output.is_absolute():
         requested_output = task_cwd / requested_output
@@ -5859,6 +6015,20 @@ def handoff_create(args: argparse.Namespace) -> int:
 
     lane = getattr(args, "lane", "native")
     base = getattr(args, "base", "")
+    branch = getattr(args, "branch", "")
+    if workspace_kind == "git":
+        current_branch, current_base = _git_identity(task_cwd)
+        branch = branch or current_branch
+        base = base or current_base
+        if not base:
+            print("Cannot bind a Git handoff to an exact branch@revision.", file=sys.stderr)
+            return 2
+    else:
+        if base not in ("", None):
+            print("A directory workspace cannot be assigned a Git base.", file=sys.stderr)
+            return 2
+        base = ""
+        branch = ""
     dependencies = getattr(args, "dependency", [])
     budgets = getattr(args, "budget", [])
     task_id = getattr(args, "task_id", "") or args.issue or output.stem
@@ -5996,8 +6166,8 @@ Writer model: {writer_model or 'resolved at launch'}
 Delegation: {'allowed' if allow_delegation else 'disabled'}
 Tool profile: {tool_profile}
 Issue: {args.issue or 'none'}
-Branch/worktree: {args.branch or 'current'}
-Base: {base or ('not applicable (non-Git directory)' if workspace_kind == 'directory' else 'current HEAD; resolve before concurrent writes')}
+Branch/worktree: {branch or 'current'}
+Base: {base or ('not applicable (directory workspace bound by exact path)' if workspace_kind == 'directory' else 'current HEAD; resolve before concurrent writes')}
 
 {authority_boundary}## Goal
 
@@ -6091,7 +6261,7 @@ Do not wait while consuming allowance. In an external session, the user may atta
         "handoff": str(output.resolve()),
         "acceptance_matrix": str(acceptance_path) if acceptance_path else "",
         "base": base,
-        "branch": args.branch,
+        "branch": branch,
         "issue": args.issue,
         "goal": args.goal,
         "done_when": args.done_when,
@@ -6109,6 +6279,12 @@ Do not wait while consuming allowance. In an external session, the user may atta
         "state_backend": "file",
         "untrusted_task_data": untrusted_task_data,
         "workspace_kind": workspace_kind,
+        "workspace_contract": {
+            "schema": _WORKSPACE_CONTRACT_SCHEMA,
+            "kind": workspace_kind,
+            "root": str(workspace_root),
+            "base": base if workspace_kind == "git" else None,
+        },
     }
     if machine_return_contract is not None:
         manifest["machine_return_contract"] = machine_return_contract
@@ -6159,6 +6335,9 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
     stored = agentflow if isinstance(agentflow, dict) else {}
     provider = args.to
     branch, exact_base = _git_identity(task_cwd)
+    workspace_kind = "git" if _is_git_repository(task_cwd) else "directory"
+    if workspace_kind == "directory":
+        branch, exact_base = "", ""
     acceptance = stored.get("acceptance")
     requested_output = Path(args.out).expanduser() if args.out else None
     if requested_output is not None and not requested_output.is_absolute():
@@ -6194,7 +6373,14 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
     role = args.role or str(stored.get("role") or "writer")
     tool_profile = args.tool_profile or str(stored.get("tool_profile") or "provider-default")
     return_type = args.return_type or str(stored.get("return_type") or "result")
-    base = args.base or str(stored.get("base") or exact_base)
+    # A base persisted by a formerly Git-backed project must not turn a
+    # directory workspace into a fake branch. Only an explicit CLI override
+    # is forwarded so handoff_create can reject it; stale stored Git identity
+    # is ignored when the exact target has no repository.
+    base = (
+        args.base or str(stored.get("base") or exact_base)
+        if workspace_kind == "git" else args.base
+    )
 
     create_args = argparse.Namespace(
         to=provider,
@@ -6257,6 +6443,7 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
             "output_boundary",
             "return_type",
             "base",
+            "workspace_contract",
             "branch",
             "context",
             "constraints",
@@ -6306,6 +6493,10 @@ def handoff_preflight(args: argparse.Namespace) -> int:
         if args.cwd
         else Path(str(manifest.get("cwd") or Path.cwd())).expanduser().resolve()
     )
+    errors.extend(_workspace_contract_errors(
+        manifest, observed_root=root, allow_sterile=True,
+        allow_sterile_candidate=bool(getattr(args, "_allow_incomplete_sterile", False)),
+    ))
     bead_id = str(manifest.get("bead_id") or "")
     beads_cwd = Path(str(manifest.get("beads_cwd") or root)).expanduser().resolve()
     if bead_id:
@@ -6458,6 +6649,7 @@ def handoff_preflight(args: argparse.Namespace) -> int:
             "root": str(root),
             "provider": provider,
             "lane": lane,
+            "workspace_contract": manifest.get("workspace_contract"),
             "checks": list(checks),
             "context_files": context_files,
             "context_bytes": context_bytes,
@@ -7503,11 +7695,14 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         allow_delegation=bool(manifest.get("delegation_allowed")),
         return_type=str(manifest.get("return_type") or "result"),
         max_ai_credits=manifest.get("max_ai_credits"), acceptance_matrix=copied_acceptance,
-        isolation_profile="none", require_asset=[], base=str(manifest.get("base") or ""),
+        # The package is a fresh directory, not the source workspace. Create
+        # it with a directory-local temporary identity, then restore the
+        # typed source-workspace contract below before final preflight.
+        isolation_profile="none", require_asset=[], base="",
         dependency=list(manifest.get("dependencies") or []), done_when=list(manifest.get("done_when") or []),
         context=copied_context, constraint=list(manifest.get("constraints") or []),
         check=list(manifest.get("checks") or []), budget=list(manifest.get("budget") or []),
-        issue=str(manifest.get("issue") or ""), branch=str(manifest.get("branch") or ""),
+        issue=str(manifest.get("issue") or ""), branch="",
         out=str(output), cwd=str(stage), untrusted_task_data=bool(manifest.get("untrusted_task_data")),
     )
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -7517,10 +7712,36 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
             raise ValueError("sterile handoff failed preflight")
     sidecar = output.with_suffix(".json")
     sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    source_workspace = manifest.get("workspace_contract")
+    if not isinstance(source_workspace, Mapping):
+        raise ValueError("source handoff has no typed workspace contract")
+    sidecar_data["workspace_contract"] = dict(source_workspace)
+    sidecar_data["workspace_kind"] = str(source_workspace.get("kind") or "")
+    sidecar_data["base"] = str(manifest.get("base") or "")
+    sidecar_data["branch"] = str(manifest.get("branch") or "")
     sidecar_data["sterile_package"] = str(stage / ".agentflow/sterile-manifest.json")
     _write_json(sidecar, sidecar_data)
+    source_kind = str(source_workspace.get("kind") or "")
+    source_base = str(manifest.get("base") or "")
+    source_branch = str(manifest.get("branch") or "")
+    handoff_text = output.read_text(encoding="utf-8")
+    handoff_lines = handoff_text.splitlines()
+    handoff_lines = [
+        f"Branch/worktree: {source_branch or 'current'}"
+        if line.startswith("Branch/worktree:") else
+        f"Base: {source_base or ('not applicable (directory workspace bound by exact path)' if source_kind == 'directory' else 'missing exact Git base')}"
+        if line.startswith("Base:") else line
+        for line in handoff_lines
+    ]
+    output.write_text("\n".join(handoff_lines) + "\n", encoding="utf-8")
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-        if handoff_preflight(argparse.Namespace(file=str(output), cwd=str(stage), require_matrix=bool(copied_acceptance))) != 0:
+        # The sterile marker is written after the final sidecar is sealed so
+        # it can inventory the completed files without a recursive hash. The
+        # package validator immediately below verifies the finished marker.
+        if handoff_preflight(argparse.Namespace(
+            file=str(output), cwd=str(stage),
+            require_matrix=bool(copied_acceptance), _allow_incomplete_sterile=True,
+        )) != 0:
             raise ValueError("sterile handoff failed final preflight")
 
     inventory = []
@@ -8187,6 +8408,8 @@ def build_parser() -> argparse.ArgumentParser:
     root_preflight_parser = preflight_sub.add_parser("root")
     root_preflight_parser.add_argument("--root", default=".")
     root_preflight_parser.add_argument("--base", default="")
+    root_preflight_parser.add_argument("--workspace-kind", choices=("git", "directory"), default="")
+    root_preflight_parser.add_argument("--workspace-root", default="")
     root_preflight_parser.add_argument("--context", action="append", default=[])
     root_preflight_parser.add_argument("--boundary", default="")
     root_preflight_parser.add_argument("--matrix", action="append", default=[])

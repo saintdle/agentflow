@@ -40,7 +40,7 @@ class FirstWorkflowDocumentationTests(unittest.TestCase):
                 bead=issue["id"], to="codex", cwd=str(root), task_class="implementation",
                 role="", lane="", tool_profile="", output_boundary="",
                 require_tool=[], require_skill=[], allow_delegation=False, return_type="result",
-                max_ai_credits=None, base="main@abc123", branch="agent/first-workflow-1",
+                max_ai_credits=None, base="", branch="",
                 context=[], constraint=[], check=[], budget=[], out=str(handoff),
             )
             with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), mock.patch.object(

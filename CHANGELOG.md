@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added typed root workspace contracts for authenticated external handoffs:
+  Git workspaces pin branch@revision, while Gitless directories bind the exact
+  canonical root path without a synthetic Git base.
 - Added protected provider-session bindings so controller hooks resolve the
   approved workflow workspace instead of an incidental IDE cwd.
 - Added hash-inventoried sterile launch packages for external tasks that opt
