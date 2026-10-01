@@ -4318,5 +4318,28 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
             self.assertEqual(result, 0)
 
 
+class CopilotSdkAdapterCliTests(unittest.TestCase):
+    def test_status_is_local_only_and_transport_remains_disabled(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(
+            cli.copilot_sdk_backend,
+            "sdk_availability",
+            return_value=cli.copilot_sdk_backend.CopilotSdkAvailability(
+                True, "available", "1.0.11"
+            ),
+        ), contextlib.redirect_stdout(output):
+            code = cli.main(["adapter", "copilot-sdk", "--json"])
+        self.assertEqual(code, 0)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["sdk_available"])
+        self.assertEqual(result["adapter_mode"], "diagnostic-only")
+        self.assertFalse(result["workflow_transport_enabled"])
+        self.assertFalse(result["live_session_started"])
+        self.assertFalse(result["event_stream_observed"])
+        self.assertFalse(result["provider_calls_made"])
+        self.assertTrue(result["first_call_model_mismatch_detected_after_inference"])
+        self.assertFalse(result["same_uid_events_are_provider_signed"])
+
+
 if __name__ == "__main__":
     unittest.main()

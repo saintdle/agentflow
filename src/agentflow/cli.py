@@ -31,6 +31,7 @@ from agentflow import beads as beads_backend
 from agentflow import checkpoint as checkpoint_backend
 from agentflow import controller as controller_backend
 from agentflow import context_budget as context_budget_backend
+from agentflow import copilot_sdk as copilot_sdk_backend
 from agentflow import execution as execution_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
@@ -5145,6 +5146,42 @@ def adapter_evaluate(args: argparse.Namespace) -> int:
     return 0 if result.passed else 2
 
 
+def adapter_copilot_sdk(args: argparse.Namespace) -> int:
+    availability = copilot_sdk_backend.sdk_availability()
+    result = {
+        "adapter": "github-copilot-sdk",
+        "adapter_mode": "diagnostic-only",
+        "sdk_available": availability.available,
+        "sdk_version": availability.sdk_version or None,
+        "sdk_reason": availability.reason,
+        "workflow_transport_enabled": False,
+        "live_session_started": False,
+        "event_stream_observed": False,
+        "provider_calls_made": False,
+        "first_call_model_mismatch_detected_after_inference": True,
+        "model_evidence_source": "assistant.usage.model per observed API call",
+        "same_uid_events_are_provider_signed": False,
+        "blocked_by": (
+            "Python SDK pre-tool hooks do not expose exact tool-call or sub-agent identity; "
+            "Agentflow cannot safely bind model evidence to tool execution yet."
+        ),
+        "next_step": "Keep persistent Herdr Copilot launches fail-closed; SDK evidence is diagnostic groundwork, not an executable worker route.",
+    }
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("Copilot SDK model-evidence groundwork")
+        print(f"  SDK available:          {'yes' if availability.available else 'no'}")
+        if availability.sdk_version:
+            print(f"  SDK version:            {availability.sdk_version}")
+        print("  workflow transport:     disabled (no provider call was made)")
+        print(f"  SDK status:             {availability.reason}")
+        print(f"  blocked by:             {result['blocked_by']}")
+        print("  first-call cost:        model mismatch is observable only after inference")
+        print(f"  same-UID signed proof:  no")
+    return 0
+
+
 def hook(args: argparse.Namespace) -> int:
     try:
         payload = json.load(sys.stdin)
@@ -8665,6 +8702,11 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_evaluate_parser.add_argument("--manifest", required=True, help="JSON adapter manifest")
     adapter_evaluate_parser.add_argument("--results", required=True, help="JSON benchmark results")
     adapter_evaluate_parser.set_defaults(func=adapter_evaluate)
+    adapter_copilot_sdk_parser = adapter_sub.add_parser(
+        "copilot-sdk", help="Report Copilot SDK model-evidence adapter readiness without launching a provider"
+    )
+    adapter_copilot_sdk_parser.add_argument("--json", action="store_true")
+    adapter_copilot_sdk_parser.set_defaults(func=adapter_copilot_sdk)
 
     hook_parser = sub.add_parser("hook", help=argparse.SUPPRESS)
     hook_parser.add_argument("--provider", choices=PROVIDERS, required=True)

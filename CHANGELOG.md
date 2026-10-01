@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added experimental, diagnostic-only Copilot SDK evidence groundwork for
+  validating per-call model events. It does not subscribe to or launch a live
+  SDK session. The workflow transport remains disabled because Python
+  pre-tool hooks do not expose exact tool-call/subagent identity; persistent
+  Herdr Copilot continues to fail closed.
 - Added protected provider-session bindings so controller hooks resolve the
   approved workflow workspace instead of an incidental IDE cwd.
 - Added hash-inventoried sterile launch packages for external tasks that opt

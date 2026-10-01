@@ -274,6 +274,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 - [Bring your own skills](docs/SKILLS.md)
 - [Workflow guide](docs/WORKFLOW.md)
 - [Security model](docs/SECURITY.md)
+- [Copilot SDK model-evidence groundwork](docs/COPILOT_SDK.md)
 - [Authorship and third-party provenance](docs/PROVENANCE.md)
 - [Security reporting](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)

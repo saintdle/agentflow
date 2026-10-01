@@ -23,6 +23,12 @@ before Agentflow:
 Herdr, GitHub CLI, and `tmux` are optional. Agentflow reports missing optional
 integrations without reading their credential stores.
 
+The experimental Copilot SDK evidence groundwork is optional and requires
+Python 3.11 or later. From an Agentflow source checkout, install its optional
+dependency with `python3.11 -m pip install '.[copilot-sdk]'`. It is
+diagnostic-only: no SDK session is launched and Copilot controller launches
+remain disabled. See [Copilot SDK evidence groundwork](COPILOT_SDK.md).
+
 ## Install an isolated CLI
 
 Install a tagged release with `uv`:

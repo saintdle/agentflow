@@ -29,6 +29,7 @@ Issues = "https://github.com/saintdle/agentflow/issues"
 
 [project.optional-dependencies]
 dev = ["PyYAML>=6.0"]
+copilot-sdk = ["github-copilot-sdk>=1.0,<2.0; python_version >= '3.11'"]
 
 [project.scripts]
 agentflow = "agentflow.cli:main"
