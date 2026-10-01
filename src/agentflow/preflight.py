@@ -84,10 +84,14 @@ class LaunchSpec:
     authenticated_confinement: bool = False
     selective_model: bool = False
     strict: bool = False
+    workspace_kind: str = "git"
+    workspace_root: str = ""
 
     def __post_init__(self) -> None:
-        if not self.base:
-            raise PreflightError("base must not be empty")
+        if self.workspace_kind not in {"git", "directory"}:
+            raise PreflightError("workspace_kind must be 'git' or 'directory'")
+        if self.workspace_kind == "git" and not self.base.strip():
+            raise PreflightError("git workspaces require a non-empty base")
         if not self.boundary:
             raise PreflightError("boundary must not be empty")
         if not self.model:
@@ -182,12 +186,40 @@ def _filesystem_findings(spec: LaunchSpec, snapshot: RootSnapshot) -> list[Prefl
     findings: list[PreflightFinding] = []
     root = Path(snapshot.root)
 
-    # base
-    if not spec.base.strip():
+    # Typed workspace identity. Git workspaces bind to an exact ref/revision;
+    # directory workspaces bind to their canonical absolute path and carry no
+    # invented branch/base sentinel.
+    if spec.workspace_kind not in {"git", "directory"}:
+        findings.append(PreflightFinding(
+            "workspace-kind-invalid", BLOCKER, "workspace",
+            f"unsupported workspace kind {spec.workspace_kind!r}",
+            "Use the typed 'git' or 'directory' workspace contract.",
+        ))
+    if not spec.workspace_root.strip():
+        findings.append(PreflightFinding(
+            "workspace-root-missing", BLOCKER, "workspace",
+            "workspace contract has no exact root path",
+            "Bind the launch to the canonical absolute Git or directory root.",
+        ))
+    else:
+        workspace_root = Path(spec.workspace_root).expanduser()
+        if not workspace_root.is_absolute() or str(workspace_root.resolve()) != spec.workspace_root:
+            findings.append(PreflightFinding(
+                "workspace-root-invalid", BLOCKER, "workspace",
+                f"workspace root {spec.workspace_root!r} is not a canonical absolute path",
+                "Use the resolved absolute root stored in the durable workspace contract.",
+            ))
+    if spec.workspace_kind == "git" and not spec.base.strip():
         findings.append(PreflightFinding(
             "base-empty", BLOCKER, "base",
-            "base ref is empty",
-            "Provide a non-empty git ref or commit SHA.",
+            "Git workspace base ref is empty",
+            "Provide the approved branch@revision base.",
+        ))
+    elif spec.workspace_kind == "directory" and spec.base:
+        findings.append(PreflightFinding(
+            "directory-base-present", BLOCKER, "base",
+            "directory workspace unexpectedly carries a Git base",
+            "Remove the Git base and bind the exact directory root instead.",
         ))
 
     # boundary
