@@ -13,7 +13,9 @@ indexes are unrelated projects and must not be installed.
 
 1. Confirm the platform is supported, Python is 3.10 or later, `git` and
    Beads 1.1 or later are available, and at least one intended provider CLI is
-   installed. Report optional tools separately; do not treat them as required.
+   installed. Herdr is required for persistent external worker sessions managed
+   by the Agentflow controller, but not for planning-only or native-subagent
+   workflows. Report other optional tools separately.
 2. Inspect the latest reviewed GitHub release and its changelog. Install an
    explicit Agentflow tag into an isolated `uv tool`, `pipx`, or virtual
    environment. Never install an unqualified similarly named package.
@@ -58,8 +60,9 @@ configuration.
 
 ## Copy/paste request for the user
 
-Send this from a ChatGPT/Codex or Claude coding-agent chat that has terminal
-access:
+Send this from a ChatGPT/Codex or Claude coding-agent chat, or from GitHub
+Copilot Chat in a supported IDE Agent mode, when the session has access to the
+target workspace and terminal:
 
 ```text
 Install and configure Agentflow from https://github.com/saintdle/agentflow for

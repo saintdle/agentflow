@@ -8,17 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added a bounded pull-request CI smoke against real Beads 1.1.0 while keeping
+  the broader integration run on its scheduled and manual triggers.
 - Added protected provider-session bindings so controller hooks resolve the
   approved workflow workspace instead of an incidental IDE cwd.
 - Added hash-inventoried sterile launch packages for external tasks that opt
   into restricted outbound context.
+
+### Changed
+
 - Added exact GPT-6 Sol routes for Codex controller, judgment, and review work,
   and GPT-6 Luna routes for coding, exploration, and editing. Bundled Codex
   profiles now default to GPT-6 while GPT-5.6 Sol/Luna remain accepted for
   existing project configurations.
-
-### Changed
-
+- Clarified public tagged-source installs and upgrades, the Herdr prerequisite
+  for persistent external controller sessions, and GitHub Copilot Chat setup
+  where IDE Agent mode and terminal access are available.
 - External handoffs now require the leased controller's authenticated Herdr
   result channel; direct external launch fails before provider spawn.
 - Native direct handoffs no longer advertise controller-owned result files;
