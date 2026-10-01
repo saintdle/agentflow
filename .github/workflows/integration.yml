@@ -19,7 +19,8 @@ jobs:
     timeout-minutes: 25
     env:
       AGENTFLOW_INTEGRATION: "1"
-      CGO_ENABLED: "0"
+      CGO_ENABLED: "1"
+      GOFLAGS: "-tags=gms_pure_go"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
