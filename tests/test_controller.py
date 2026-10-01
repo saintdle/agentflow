@@ -5,14 +5,16 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow import beads, checkpoint
+from agentflow import beads, checkpoint, controller as controller_module
 from agentflow.controller import (
     TERMINAL_STATES,
+    ControllerError,
     DuplicateController,
     FencedLease,
     Lease,
@@ -327,6 +329,140 @@ class ControllerTests(unittest.TestCase):
             second = controller.resume([{"task": "task-2", "root": "root"}], lease=lease)
             self.assertEqual(second.state, "claimed_no_session")
             self.assertEqual(second.task, "task-2")
+
+    def test_v2_live_checkpoint_is_preserved_in_the_v3_active_task_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = controller.acquire()
+            cp.write_text(json.dumps({
+                "schema": checkpoint.SCHEMA, "version": 2,
+                "task": "legacy-task", "phase": "dispatch", "next_action": "await session",
+                "root": "root", "controller": "one", "actor": "one", "claim_id": "claim-legacy",
+                "session_id": "session-legacy", "lease_token": lease.token,
+                "state": "running", "status": "running", "epoch": lease.epoch,
+            }), encoding="utf-8")
+
+            migrated = controller.migrate_active_tasks(lease=lease)
+
+            self.assertEqual(migrated.checkpoint["task"], "root")
+            self.assertEqual(migrated.checkpoint["version"], checkpoint.SCHEMA_VERSION)
+            self.assertEqual(migrated.checkpoint["active_tasks"], [{
+                "task": "legacy-task", "phase": "dispatch", "actor": "one",
+                "claim_id": "claim-legacy", "session_id": "session-legacy", "state": "running",
+            }])
+
+    def test_v1_live_checkpoint_is_preserved_in_the_v3_active_task_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = controller.acquire()
+            cp.write_text(json.dumps({
+                "schema": checkpoint.SCHEMA, "version": 1,
+                "task": "legacy-task-v1", "phase": "dispatch", "next_action": "await session",
+                "root": "root", "controller": "one", "actor": "one", "claim_id": "claim-v1",
+                "session_id": "session-v1", "lease_token": lease.token,
+                "state": "running", "status": "running", "epoch": lease.epoch,
+            }), encoding="utf-8")
+
+            migrated = controller.migrate_active_tasks(lease=lease)
+
+            self.assertEqual(migrated.checkpoint["task"], "root")
+            self.assertEqual(migrated.checkpoint["version"], checkpoint.SCHEMA_VERSION)
+            self.assertEqual(migrated.checkpoint["active_tasks"], [{
+                "task": "legacy-task-v1", "phase": "dispatch", "actor": "one",
+                "claim_id": "claim-v1", "session_id": "session-v1", "state": "running",
+            }])
+
+    def test_concurrent_active_task_reservations_do_not_lose_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = controller.acquire()
+            read_barrier = threading.Barrier(2)
+            original = controller_module._active_tasks_from_checkpoint
+            original_assert = controller._assert_task_root
+
+            def synchronized_read(document, root):
+                rows = original(document, root)
+                # Hold the read window open. Without a single lock around the
+                # read/check/write, both callers deterministically read the
+                # same old task set before either replaces it.
+                time.sleep(0.05)
+                return rows
+
+            def synchronized_task_check(task):
+                task_id = original_assert(task)
+                read_barrier.wait(timeout=3)
+                return task_id
+
+            failures: list[BaseException] = []
+
+            def reserve(task_id: str) -> None:
+                try:
+                    controller.reserve_active_task(
+                        {"task": task_id, "root": "root", "actor": "one", "claim_id": f"claim-{task_id}"},
+                        lease=lease,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with mock.patch.object(
+                controller_module, "_active_tasks_from_checkpoint", side_effect=synchronized_read,
+            ), mock.patch.object(controller, "_assert_task_root", side_effect=synchronized_task_check):
+                threads = [threading.Thread(target=reserve, args=(task_id,)) for task_id in ("task-a", "task-b")]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads), "reservation threads did not finish")
+            self.assertEqual(failures, [])
+            self.assertEqual({row["task"] for row in controller.active_tasks()}, {"task-a", "task-b"})
+
+    def test_prelaunch_reservation_is_not_duplicated_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            first = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = first.acquire()
+            first.reserve_active_task(
+                {"task": "task-1", "root": "root", "actor": "one", "claim_id": "claim-1"},
+                lease=lease,
+            )
+
+            resumed = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            next_lease = resumed.acquire(resume_proof=lease.resume_secret)
+            rows = resumed.active_tasks()
+            self.assertEqual(rows[0]["state"], "claimed_no_session")
+            with self.assertRaises(ControllerError):
+                resumed.reserve_active_task(
+                    {"task": "task-1", "root": "root", "actor": "one", "claim_id": "claim-1"},
+                    lease=next_lease,
+                )
+            self.assertEqual([item["task"] for item in resumed.active_tasks()], ["task-1"])
+
+    def test_active_task_checkpoint_rejects_secret_fields_and_duplicate_ids(self) -> None:
+        base = {"task": "root", "phase": "controller", "next_action": "await workers"}
+        with self.assertRaises(checkpoint.CheckpointError):
+            checkpoint.build_checkpoint({
+                **base,
+                "active_tasks": [{
+                    "task": "task-1", "state": "running", "session_id": "s1",
+                    "claim_token": "must-not-be-persisted",
+                }],
+            })
+        with self.assertRaises(checkpoint.CheckpointError):
+            checkpoint.build_checkpoint({
+                **base,
+                "active_tasks": [
+                    {"task": "task-1", "state": "running"},
+                    {"task": "task-1", "state": "launched"},
+                ],
+            })
 
     def test_fence_blocks_concurrent_takeover_for_its_entire_duration(self) -> None:
         """AFREL-027/AFREL-009: fence() holds the controller lock across an

@@ -77,6 +77,10 @@ class ExecutionAdmissionTests(unittest.TestCase):
         self.assertEqual(loaded.max_parallel_workers, 1)
         self.assertEqual(loaded.max_attempts_per_task, 1)
 
+    def test_parallel_worker_limit_cannot_exceed_checkpoint_capacity(self) -> None:
+        with self.assertRaisesRegex(execution.ExecutionPolicyError, "maximum supported parallel worker count"):
+            execution.ExecutionPolicy(max_parallel_workers=9)
+
 
 class ContextAuditTests(unittest.TestCase):
     def test_audit_uses_only_sanitized_metadata(self) -> None:

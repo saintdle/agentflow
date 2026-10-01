@@ -3626,7 +3626,7 @@ class ControllerRunTests(unittest.TestCase):
             with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
                  mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
                  mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
-                 mock.patch.object(cli.beads_backend, "claim_ready") as claim_ready, \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready, \
                  mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run()):
@@ -4468,6 +4468,554 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
                     argparse.Namespace(file=str(output), cwd=str(root), require_matrix=False)
                 )
             self.assertEqual(result, 0)
+
+
+class ControllerParallelDispatchTests(unittest.TestCase):
+    """The root scheduler admits a bounded launch wave before polling results."""
+
+    def test_invalid_acceptance_result_is_tracked_until_herdr_is_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            task = dict(fixture.task_issue)
+            task["status"] = "in_progress"
+            task_id = str(task["id"])
+            acceptance_ids = cli._bound_acceptance_ids(task, task_id)
+            herdr_status = {task_id: "running"}
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": task_id, "root": str(fixture.root), "actor": fixture.controller,
+                "claim_id": "claim-task-1",
+            }, lease=lease)
+            controller.bind_active_task(task_id, session_id="session-task-1", lease=lease)
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+            claim_ready = mock.Mock()
+
+            def session_record(_root, _task_id):
+                return {
+                    "status": herdr_status[task_id],
+                    "return_channel": {
+                        "state": "consumed", "acceptance_ids": list(acceptance_ids),
+                        "approved_waivers": [],
+                    },
+                }
+
+            invalid_result = {
+                "outcome": "completed",
+                "acceptance_results": [{
+                    "acceptance_id": acceptance_ids[0], "status": "failed",
+                    "evidence": "validation did not pass", "source": "provider",
+                }],
+            }
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else task), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task]), \
+                 mock.patch.object(cli, "_herdr_session_record", side_effect=session_record), \
+                 mock.patch.object(cli, "_ingest_submitted_result",
+                                   return_value=cli._SubmissionIngestion("consumed")), \
+                 mock.patch.object(cli, "_herdr_task_result", return_value=invalid_result), \
+                 mock.patch.object(cli.beads_backend, "add_comment"), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", claim_ready):
+                first_payload, first_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+                self.assertFalse(first_stop)
+                self.assertEqual(first_payload["result"]["state"], "draining")
+                self.assertEqual([row["task"] for row in controller.active_tasks()], [task_id])
+                self.assertEqual(controller.active_tasks()[0]["state"], "running")
+
+                herdr_status[task_id] = "completed"
+                final_payload, final_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+
+            self.assertTrue(final_stop)
+            self.assertEqual(final_payload["stop_reason"], "TASK_BLOCKED")
+            self.assertEqual(final_payload["result"]["state"], "blocked")
+            self.assertTrue(final_payload["result"]["terminal"])
+            self.assertIn("acceptance disposition rejected", final_payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(final_payload["result"]["checkpoint"]["active_tasks"], [])
+            claim_ready.assert_not_called()
+
+    def test_failed_parallel_task_drains_sibling_before_terminalizing_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            first = dict(fixture.task_issue)
+            second = json.loads(json.dumps(fixture.task_issue))
+            second.update(id="task-2", title="Second bounded task")
+            second["metadata"]["agentflow"].update(
+                task="task-2", claim_id="claim-2",
+                claim_token="opaque-claim-token-task-two-0123456789abcdef",
+            )
+            second["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
+            tasks = {"task-1": first, "task-2": second}
+            for task in tasks.values():
+                task["status"] = "in_progress"
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            for task_id in tasks:
+                controller.reserve_active_task({
+                    "task": task_id, "root": str(fixture.root), "actor": fixture.controller,
+                    "claim_id": f"claim-{task_id}",
+                }, lease=lease)
+                controller.bind_active_task(
+                    task_id, session_id=f"session-{task_id}", lease=lease,
+                )
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+            first_ids = cli._bound_acceptance_ids(first, "task-1")
+            second_ids = cli._bound_acceptance_ids(second, "task-2")
+            failure_reason = {"task-1": "provider exited non-zero"}
+            result_state = {"task-2": None}
+            comments: list[tuple[str, str]] = []
+            closed: list[str] = []
+            claim_ready = mock.Mock()
+
+            def session_record(_root, task_id):
+                ids = first_ids if task_id == "task-1" else second_ids
+                status = "failed" if task_id == "task-1" else "completed" if result_state[task_id] else "launched"
+                return {"status": status, "return_channel": {
+                    "state": "consumed", "acceptance_ids": list(ids), "approved_waivers": [],
+                }}
+
+            def task_result(_root, task_id):
+                if task_id == "task-1":
+                    return {"outcome": "failed", "error": failure_reason[task_id]}
+                return result_state[task_id]
+
+            def close_issue(_cwd, task_id, _reason):
+                tasks[task_id]["status"] = "closed"
+                closed.append(task_id)
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else tasks[issue_id]), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=list(tasks.values())), \
+                 mock.patch.object(cli, "_herdr_session_record", side_effect=session_record), \
+                 mock.patch.object(cli, "_ingest_submitted_result", return_value=cli._SubmissionIngestion("consumed")), \
+                 mock.patch.object(cli, "_herdr_task_result", side_effect=task_result), \
+                 mock.patch.object(cli.beads_backend, "add_comment", side_effect=lambda _cwd, task_id, text:
+                                   comments.append((task_id, text))), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "close_issue", side_effect=close_issue), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", claim_ready):
+                first_payload, first_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+                self.assertFalse(first_stop)
+                self.assertEqual(first_payload["result"]["state"], "draining")
+                self.assertEqual([item["task"] for item in controller.active_tasks()], ["task-2"])
+                self.assertEqual(comments[0][0], "task-1")
+                first_reason = first_payload["result"]["checkpoint"]["terminal_reason"]
+
+                # Simulate a crashed controller and a legitimate reattach;
+                # the durable drain barrier must survive without reopening
+                # task admission.
+                resume_secret = lease.resume_secret
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller, state_path=state_path,
+                    checkpoint_path=state_path.with_name("checkpoint.json"),
+                )
+                lease = controller.acquire(resume_proof=resume_secret)
+                self.assertEqual(controller._load_checkpoint()["status"], "draining")
+
+                result_state["task-2"] = {
+                    "outcome": "completed",
+                    "acceptance_results": [{
+                        "acceptance_id": acceptance_id, "status": "passed",
+                        "evidence": "verified sibling result", "source": "provider",
+                    } for acceptance_id in second_ids],
+                }
+                final_payload, final_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+
+            self.assertTrue(final_stop)
+            self.assertEqual(final_payload["stop_reason"], "TASK_BLOCKED")
+            self.assertEqual(final_payload["result"]["state"], "blocked")
+            self.assertTrue(final_payload["result"]["terminal"])
+            self.assertIn("task-1", final_payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertIn("failed", final_payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(final_payload["result"]["checkpoint"]["terminal_reason"], first_reason)
+            self.assertEqual(final_payload["result"]["checkpoint"]["active_tasks"], [])
+            self.assertEqual(closed, ["task-2"])
+            claim_ready.assert_not_called()
+
+    def test_orphaned_launching_record_does_not_become_stuck_identity_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            orphan = dict(fixture.task_issue)
+            orphan.update(status="in_progress", assignee=fixture.controller)
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+            payloads: list[dict] = []
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else orphan), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[orphan]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready, \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_persist_claim_identity"), \
+                 mock.patch.object(cli, "_herdr_session_record", return_value={
+                     "status": "launching", "binding": None, "pane_id": "",
+                 }), \
+                 mock.patch.object(cli, "_resolve_pending_identity") as resolve_identity:
+                payload, stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+                payloads.append(payload)
+
+            self.assertTrue(stop)
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertEqual(payload["result"]["state"], "draining")
+            self.assertIn("launching", payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual([item["state"] for item in controller.active_tasks()], ["claimed_no_session"])
+            claim_ready.assert_not_called()
+            resolve_identity.assert_not_called()
+
+    def test_legacy_terminal_root_with_live_sibling_reopens_only_to_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            sibling = json.loads(json.dumps(fixture.task_issue))
+            sibling.update(id="task-2", status="in_progress")
+            sibling["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": "task-2", "root": str(fixture.root), "actor": fixture.controller,
+                "claim_id": "claim-task-2",
+            }, lease=lease)
+            controller.bind_active_task("task-2", session_id="session-task-2", lease=lease)
+            previous = controller._load_checkpoint()
+            previous.update({
+                "state": "blocked", "status": "blocked", "terminal": True,
+                "terminal_reason": "task-1 failed before sibling task-2 completed",
+            })
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, previous)
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else sibling), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[sibling]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready, \
+                 mock.patch.object(cli, "_herdr_session_record", return_value={
+                     "status": "launched", "return_channel": {"state": "issued"},
+                 }), \
+                 mock.patch.object(cli, "_ingest_submitted_result", return_value=cli._SubmissionIngestion("pending")), \
+                 mock.patch.object(cli, "_herdr_task_result", return_value=None):
+                payload, stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+
+            self.assertFalse(stop)
+            self.assertEqual(payload["result"]["state"], "draining")
+            self.assertEqual(payload["stop_reason"], "DRAINING_AFTER_TASK_FAILURE")
+            self.assertEqual(payload["result"]["checkpoint"]["terminal_reason"],
+                             "task-1 failed before sibling task-2 completed")
+            self.assertEqual([item["task"] for item in controller.active_tasks()], ["task-2"])
+            claim_ready.assert_not_called()
+
+    def test_checkpoint_capacity_is_enforced_before_beads_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                "schema": cli.execution_backend.SCHEMA, "controller_only": True,
+                "max_parallel_workers": 9, "max_delegation_depth": 1,
+                "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                "max_expensive_execution_children": 0,
+            }
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            args = argparse.Namespace(workflow_root=fixture.workflow_root)
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=fixture.root_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready:
+                with self.assertRaisesRegex(cli.execution_backend.ExecutionPolicyError,
+                                            "maximum supported parallel worker count"):
+                    cli._controller_step(args, controller, fixture.root, lease, operation="resume")
+            claim_ready.assert_not_called()
+
+    def test_two_ready_tasks_launch_before_either_result_is_polled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            first = dict(fixture.task_issue)
+            second = json.loads(json.dumps(fixture.task_issue))
+            second.update(id="task-2", title="Second bounded task")
+            second["metadata"]["agentflow"].update(
+                task="task-2", claim_id="claim-2",
+                claim_token="opaque-claim-token-task-two-0123456789abcdef",
+            )
+            second["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
+            first["status"] = second["status"] = "open"
+            tasks = {"task-1": first, "task-2": second}
+            fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                "schema": "agentflow.execution-policy@1", "controller_only": True,
+                "max_parallel_workers": 2, "max_delegation_depth": 1,
+                "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                "max_expensive_execution_children": 0,
+            }
+            ready = iter((first, second, None))
+            events: list[str] = []
+            payloads: list[dict] = []
+            args = _controller_args(
+                fixture.root, workflow_root=fixture.workflow_root, once=True
+            )
+
+            def fake_dispatch(_args, _root, _cwd, _workflow_root, _lease):
+                def dispatch(selected):
+                    task_id = str(selected.get("task") or selected.get("id"))
+                    events.append(f"launch:{task_id}")
+                    return {"state": "running", "session_id": f"session-{task_id}"}
+                return dispatch
+
+            def get_issue(_cwd, issue_id):
+                return fixture.root_issue if issue_id == fixture.workflow_root else tasks[issue_id]
+
+            def fake_claim_ready(*_args, **_kwargs):
+                issue = next(ready)
+                if issue is not None:
+                    issue["status"] = "in_progress"
+                return issue
+
+            def task_result(*_args, **_kwargs):
+                events.append("poll-result")
+                return None
+
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "agentflow-state")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[first, second]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", side_effect=fake_claim_ready), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_persist_claim_identity"), \
+                 mock.patch.object(cli, "_dispatch_via_herdr", side_effect=fake_dispatch), \
+                 mock.patch.object(cli, "_herdr_task_result", side_effect=task_result), \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                self.assertEqual(cli.controller_resume(args), 0, payloads)
+
+            self.assertEqual(events, ["launch:task-1", "launch:task-2"])
+            checkpoint = cli.checkpoint_backend.load_checkpoint(
+                cli._controller_state_dir(fixture.root, fixture.workflow_root) / "checkpoint.json"
+            )
+            self.assertEqual(
+                [item["task"] for item in checkpoint["active_tasks"]],
+                ["task-1", "task-2"],
+            )
+
+    def test_crash_after_reservation_halts_without_duplicate_provider_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                "schema": "agentflow.execution-policy@1", "controller_only": True,
+                "max_parallel_workers": 2, "max_delegation_depth": 1,
+                "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                "max_expensive_execution_children": 0,
+            }
+            task = dict(fixture.task_issue)
+            task["status"] = "in_progress"
+            task["assignee"] = fixture.controller
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root, once=True)
+            payloads: list[dict] = []
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")}):
+                state_path = cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json"
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller, state_path=state_path,
+                    checkpoint_path=state_path.with_name("checkpoint.json"),
+                )
+                lease = controller.acquire()
+                cli._controller_credentials(args, lease)
+                controller.reserve_active_task({
+                    "task": "task-1", "root": str(fixture.root),
+                    "actor": fixture.controller, "claim_id": "claim-1",
+                }, lease=lease)
+                self.assertEqual(controller.active_tasks()[0]["state"], "claimed_no_session")
+                self.assertEqual(
+                    cli._controller_execution_policy(
+                        fixture.root, fixture.root, fixture.workflow_root,
+                        root_issue=fixture.root_issue,
+                    ).max_parallel_workers,
+                    2,
+                )
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task]), \
+                     mock.patch.object(cli.beads_backend, "claim_ready") as claim_ready, \
+                     mock.patch.object(cli, "_dispatch_via_herdr") as dispatch_builder, \
+                     mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value)):
+                    self.assertEqual(cli.controller_resume(args), 0, payloads)
+            claim_ready.assert_not_called()
+            dispatch_builder.assert_not_called()
+            final = payloads[-1]
+            self.assertEqual(final["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertEqual(final["result"]["checkpoint"]["active_tasks"][0]["state"], "claimed_no_session")
+
+    def test_two_authenticated_results_are_dispositioned_out_of_launch_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            first = dict(fixture.task_issue)
+            second = json.loads(json.dumps(fixture.task_issue))
+            second.update(id="task-2", title="Second bounded task")
+            second["metadata"]["agentflow"].update(
+                task="task-2", claim_id="claim-2",
+                claim_token="opaque-claim-token-task-two-0123456789abcdef",
+            )
+            second["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
+            tasks = {"task-1": first, "task-2": second}
+            fixture.root_issue["metadata"]["agentflow"].update({
+                "execution": {
+                    "schema": "agentflow.execution-policy@1", "controller_only": True,
+                    "max_parallel_workers": 2, "max_delegation_depth": 1,
+                    "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                    "max_expensive_execution_children": 0,
+                },
+                "acceptance": {
+                    "version": 1, "task_id": fixture.workflow_root,
+                    "rows": [{"id": "ROOT", "outcome": "complete", "owner": "eng",
+                              "lane": "static", "planned_evidence": "both tasks close",
+                              "status": "passed", "actual_evidence": "both tasks closed"}],
+                },
+            })
+            ready = iter((first, second, None))
+            spawned: list[str] = []
+            closed: list[str] = []
+            task2_closed = threading.Event()
+            provider_done = threading.Event()
+            threads: list[threading.Thread] = []
+
+            def get_issue(_cwd, issue_id):
+                return fixture.root_issue if issue_id == fixture.workflow_root else tasks[issue_id]
+
+            def root_descendants(_cwd, _root_id):
+                return [first, second]
+
+            def claim_ready(*_args, **_kwargs):
+                issue = next(ready, None)
+                if issue is not None:
+                    issue["status"] = "in_progress"
+                    issue["assignee"] = fixture.controller
+                return issue
+
+            def close_issue(_cwd, task_id, _reason):
+                tasks[task_id]["status"] = "closed"
+                closed.append(task_id)
+                if task_id == "task-2":
+                    task2_closed.set()
+
+            def submit_result(task_id: str) -> None:
+                state_path = fixture.root / ".agentflow/herdr/sessions.json"
+                deadline = time.monotonic() + 6
+                record = None
+                while time.monotonic() < deadline:
+                    try:
+                        record = json.loads(state_path.read_text(encoding="utf-8"))["sessions"].get(task_id)
+                        if isinstance(record, dict) and record.get("status") == "launched":
+                            channel = record.get("return_channel") or {}
+                            if channel.get("state") == "issued":
+                                break
+                    except (OSError, json.JSONDecodeError, KeyError):
+                        pass
+                    time.sleep(0.01)
+                assert isinstance(record, dict), f"no Herdr launch record for {task_id}"
+                channel = record["return_channel"]
+                contract_path = Path(channel["contract_path"])
+                contract = json.loads(contract_path.read_text(encoding="utf-8"))
+                result_path = Path(channel["result_path"])
+                result_path.write_text(json.dumps({
+                    "outcome": "completed",
+                    "acceptance_results": [{
+                        "acceptance_id": acceptance_id, "status": "passed",
+                        "evidence": f"verified result for {task_id}", "source": "provider",
+                    } for acceptance_id in contract["acceptance_ids"]],
+                }), encoding="utf-8")
+                self.assertEqual(cli.herdr_submit(argparse.Namespace(
+                    root=str(fixture.root), contract=str(contract_path),
+                    file=str(result_path), json=True,
+                )), 0)
+
+            def result_order_worker() -> None:
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline and len(spawned) < 2:
+                    time.sleep(0.005)
+                assert len(spawned) == 2, "controller did not launch the two-task wave"
+                submit_result("task-2")
+                assert task2_closed.wait(timeout=6), "second task was not dispositioned first"
+                submit_result("task-1")
+                provider_done.set()
+
+            real_subprocess_run = subprocess.run
+
+            def fake_herdr_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="2.1.281 (Claude Code)\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and "start" in argv:
+                    task_id = str(argv[3])
+                    session_id = f"session-{task_id}"
+                    spawned.append(task_id)
+                    cli.events_backend.record_event_safely(
+                        cli.events_backend.EventSpool(cli._state_dir() / "events.jsonl"),
+                        cli.events_backend.normalize_event(
+                            "claude", {"event": "session.start", "session_id": session_id,
+                                       "model": fixture.model},
+                            event_id=f"parallel-model-{task_id}",
+                        ),
+                    )
+                    if len(spawned) == 2:
+                        thread = threading.Thread(target=result_order_worker, daemon=True)
+                        thread.start()
+                        threads.append(thread)
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=_agent_started_stdout("claude", session_id=session_id), stderr=""
+                    )
+                return real_subprocess_run(argv, **kwargs)
+
+            args = _controller_args(
+                fixture.root, workflow_root=fixture.workflow_root, once=False,
+                poll_interval=0.01, deadline=12.0,
+            )
+            payloads: list[dict] = []
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", side_effect=root_descendants), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", side_effect=claim_ready), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "close_issue", side_effect=close_issue), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fake_herdr_run), \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value)):
+                self.assertEqual(cli.controller_resume(args), 0, payloads)
+                for thread in threads:
+                    thread.join(timeout=6)
+
+            self.assertTrue(provider_done.is_set(), payloads)
+            self.assertEqual(spawned, ["task-1", "task-2"])
+            self.assertEqual(closed, ["task-2", "task-1"])
+            final = [item for item in payloads if item.get("operation") == "resume"][-1]
+            self.assertEqual(final["stop_reason"], "GOAL_COMPLETE")
+            self.assertEqual(final["result"]["state"], "completed")
 
 
 if __name__ == "__main__":
