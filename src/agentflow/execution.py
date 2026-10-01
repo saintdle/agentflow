@@ -10,6 +10,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Iterable, Mapping
 
+from agentflow import checkpoint
+
 
 SCHEMA = "agentflow.execution-policy@1"
 EXECUTION_ROLES = frozenset({"coding", "editing", "exploration"})
@@ -60,6 +62,11 @@ class ExecutionPolicy:
             minimum = 0 if field in {"max_delegation_depth", "max_expensive_execution_children"} else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                 raise ExecutionPolicyError(f"{field} must be an integer of at least {minimum}")
+            if field == "max_parallel_workers" and value > checkpoint.MAX_ACTIVE_TASKS:
+                raise ExecutionPolicyError(
+                    "max_parallel_workers exceeds the maximum supported parallel worker count "
+                    f"({checkpoint.MAX_ACTIVE_TASKS})"
+                )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "ExecutionPolicy":

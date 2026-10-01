@@ -1332,9 +1332,40 @@ def _controller_step_parallel(
     initial = controller._load_checkpoint()
     state = checkpoint_backend.resume_state(initial)
     if state in controller_backend.TERMINAL_STATES:
-        result = controller.resume([], lease=lease)
-        reason = "GOAL_COMPLETE" if state == "completed" else "USER_ACTION_REQUIRED"
-        return payload(result, reason), True
+        legacy_active = controller.active_tasks()
+        if not legacy_active:
+            result = controller.resume([], lease=lease)
+            reason = "GOAL_COMPLETE" if state == "completed" else "USER_ACTION_REQUIRED"
+            return payload(result, reason), True
+        # A prior parallel-controller release could terminalize the root on
+        # one worker's failure while sibling sessions were still running.
+        # Reopen only that inconsistent terminal-with-active state as a
+        # durable drain; it will never admit another claim.
+        controller.begin_draining(
+            str(initial.get("terminal_reason") or
+                f"previously terminal root state {state} had active workers to reconcile"),
+            lease=lease,
+        )
+        initial = controller._load_checkpoint()
+        state = "draining"
+    draining = state == "draining"
+    drain_reason = str(initial.get("terminal_reason") or "") if draining else ""
+
+    def note_failure(
+        task_id: str,
+        reason: str,
+        *,
+        provider_terminal: bool = False,
+    ) -> controller_backend.ResumeResult:
+        nonlocal draining, drain_reason
+        result = controller.begin_draining(
+            reason,
+            failed_task=task_id if provider_terminal else "",
+            lease=lease,
+        )
+        draining = True
+        drain_reason = str((result.checkpoint or {}).get("terminal_reason") or reason)
+        return result
 
     # Migrate a v1/v2 single slot before examining or scheduling anything.
     controller.migrate_active_tasks(lease=lease)
@@ -1342,25 +1373,78 @@ def _controller_step_parallel(
     for entry in list(active):
         task_id = entry["task"]
         if entry["state"] == "claimed_no_session":
-            result = controller.halt(
-                "blocked",
-                f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but no session; "
-                "inspect the launch before retrying",
-                lease=lease,
-            )
-            return payload(result, "USER_ACTION_REQUIRED"), True
+            session_record = _herdr_session_record(root, task_id) or {}
+            lifecycle_status = str(session_record.get("status") or "") if isinstance(session_record, Mapping) else ""
+            binding = session_record.get("binding") if isinstance(session_record, Mapping) else None
+            session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
+            terminal_provider_states = {"completed", "failed", "blocked", "cancelled", "canceled"}
+            if not session_record:
+                # Keep the durable pre-launch reservation for operator review.
+                # Even if no provider process was started, silently clearing a
+                # claimed task would make a later retry indistinguishable from
+                # a fresh claim and weaken crash recovery's no-duplicate rule.
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but no Herdr lifecycle record; "
+                    "inspect the launch before retrying",
+                )
+                continue
+            if lifecycle_status in terminal_provider_states:
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} has terminal Herdr state {lifecycle_status} "
+                    "but no provider session binding",
+                    provider_terminal=True,
+                )
+                continue
+            if lifecycle_status == "identity_pending" and str(session_record.get("pane_id") or ""):
+                controller.bind_active_task(
+                    task_id, session_id="", state="identity_pending", lease=lease,
+                )
+                entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
+            elif lifecycle_status in {"launched", "running", "completed"} and session_id:
+                controller.bind_active_task(
+                    task_id, session_id=session_id, state="running", lease=lease,
+                )
+                entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
+            else:
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but Herdr state "
+                    f"{lifecycle_status or 'unknown'} has no committed provider identity; inspect the live pane",
+                )
+                continue
 
         issue = beads_backend.get_issue(cwd, task_id)
         terminal = str(issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
         session_record = _herdr_session_record(root, task_id) or {}
         if terminal and not session_record:
-            result = controller.halt(
-                "blocked",
+            note_failure(
+                task_id,
                 f"USER_ACTION_REQUIRED: task {task_id} is terminal in Beads but has no Herdr lifecycle record",
-                lease=lease,
             )
-            return payload(result, "USER_ACTION_REQUIRED"), True
+            continue
         if entry["state"] == "identity_pending":
+            if isinstance(session_record, Mapping) and session_record.get("status") == "launching":
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} remains identity-pending in the checkpoint but "
+                    "Herdr has no committed pane/session identity; inspect the launch before further action",
+                )
+                continue
+            if (
+                isinstance(session_record, Mapping)
+                and session_record.get("status") == "identity_pending"
+                and (
+                    not str(session_record.get("pane_id") or "")
+                    or not str(session_record.get("identity_pending_since") or "")
+                )
+            ):
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} has incomplete identity-pending lifecycle metadata",
+                )
+                continue
             _resolve_pending_identity(root, task_id)
             session_record = _herdr_session_record(root, task_id) or {}
             if isinstance(session_record, dict) and session_record.get("status") == "identity_pending":
@@ -1374,34 +1458,57 @@ def _controller_step_parallel(
                     except ValueError:
                         pass
                 if expired:
-                    result = controller.halt(
-                        "blocked",
+                    note_failure(
+                        task_id,
                         f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
                         f"{deadline_seconds:.0f}s; inspect the live pane before further action",
-                        lease=lease,
                     )
-                    return payload(result, "USER_ACTION_REQUIRED"), True
+                    continue
 
         ingestion = _ingest_submitted_result(
             root, task_id, authority_secret=str(getattr(args, "_authority_secret", "") or "")
         )
         if ingestion.status == "rejected":
-            result = controller.halt(
-                "blocked", f"task {task_id} submitted result rejected: {ingestion.error}", lease=lease,
+            reason = f"task {task_id} submitted result rejected: {ingestion.error}"
+            beads_backend.add_comment(cwd, task_id, f"agentflow: {reason}")
+            note_failure(
+                task_id, reason,
+                provider_terminal=str(session_record.get("status") or "") in {
+                    "completed", "failed", "blocked", "cancelled", "canceled",
+                },
             )
-            return payload(result, "TASK_BLOCKED"), True
+            continue
         task_result = _herdr_task_result(root, task_id)
         if task_result is None:
+            if str(session_record.get("status") or "") in {
+                "completed", "failed", "blocked", "cancelled", "canceled",
+            }:
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: task {task_id} has terminal Herdr state "
+                    f"{session_record.get('status')} but no authenticated result",
+                    provider_terminal=True,
+                )
             continue
         outcome = str(task_result.get("outcome") or "")
         if outcome != "completed":
             beads_backend.add_comment(
                 cwd, task_id, f"agentflow: Herdr result outcome={outcome or 'unknown'}"
             )
-            result = controller.halt(
-                "blocked", f"task {task_id} Herdr result outcome={outcome or 'unknown'}", lease=lease,
+            terminal_record = _herdr_session_record(root, task_id) or {}
+            terminal_channel = terminal_record.get("return_channel") if isinstance(terminal_record, Mapping) else None
+            provider_terminal = (
+                isinstance(terminal_channel, Mapping)
+                and terminal_channel.get("state") == "consumed"
+                and str(terminal_record.get("status") or "") in {
+                    "completed", "failed", "blocked", "cancelled", "canceled",
+                }
             )
-            return payload(result, "TASK_BLOCKED"), True
+            note_failure(
+                task_id, f"task {task_id} Herdr result outcome={outcome or 'unknown'}",
+                provider_terminal=provider_terminal,
+            )
+            continue
         # Ingestion atomically changes the channel from issued to consumed;
         # re-read the durable record rather than validating a stale snapshot.
         session_record = _herdr_session_record(root, task_id) or {}
@@ -1411,10 +1518,19 @@ def _controller_step_parallel(
             and channel.get("acceptance_ids")
             and channel.get("state") == "consumed"
         ):
-            result = controller.halt(
-                "blocked", f"task {task_id} has no authenticated acceptance disposition", lease=lease,
+            reason = f"task {task_id} has no authenticated acceptance disposition"
+            beads_backend.add_comment(cwd, task_id, f"agentflow: {reason}")
+            note_failure(
+                task_id, reason,
+                provider_terminal=(
+                    isinstance(channel, Mapping)
+                    and channel.get("state") == "consumed"
+                    and str(session_record.get("status") or "") in {
+                        "completed", "failed", "blocked", "cancelled", "canceled",
+                    }
+                ),
             )
-            return payload(result, "TASK_BLOCKED"), True
+            continue
         try:
             acceptance_results = _validate_acceptance_results(
                 task_result.get("acceptance_results"),
@@ -1423,10 +1539,13 @@ def _controller_step_parallel(
                 beads_cwd=cwd, task_id=task_id,
             )
         except ValueError as exc:
-            result = controller.halt(
-                "blocked", f"task {task_id} acceptance disposition rejected: {exc}", lease=lease,
+            reason = f"task {task_id} acceptance disposition rejected: {exc}"
+            beads_backend.add_comment(cwd, task_id, f"agentflow: {reason}")
+            note_failure(
+                task_id, reason,
+                provider_terminal=True,
             )
-            return payload(result, "TASK_BLOCKED"), True
+            continue
         already_disposed = str(issue.get("status") or "").lower() in {
             "closed", "done", "completed", "cancelled", "canceled",
         }
@@ -1449,6 +1568,13 @@ def _controller_step_parallel(
         controller.complete_active_task(task_id, lease=lease)
 
     active = controller.active_tasks()
+    if draining and not active:
+        result = controller.halt(
+            "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
+            lease=lease,
+        )
+        stop_reason = "USER_ACTION_REQUIRED" if "USER_ACTION_REQUIRED:" in drain_reason else "TASK_BLOCKED"
+        return payload(result, stop_reason), True
     rotation = controller.session_ledger().get("rotation")
     rotation_required = isinstance(rotation, Mapping) and bool(rotation.get("required"))
     if rotation_required:
@@ -1465,7 +1591,7 @@ def _controller_step_parallel(
 
     # Tasks returned as in_progress after a crash can be adopted only from a
     # durable Herdr binding; a claimed_no_session marker above is never retried.
-    while len(active) < policy.max_parallel_workers:
+    while not draining and len(active) < policy.max_parallel_workers:
         descendants = beads_backend.root_descendants(cwd, workflow_root)
         active_ids = {item["task"] for item in active}
         orphaned = [
@@ -1481,19 +1607,48 @@ def _controller_step_parallel(
             break
         task_id = str(claimed.get("id") or "")
         if not task_id:
-            result = controller.halt("blocked", "Beads returned a claimed task without an ID", lease=lease)
-            return payload(result, "TASK_BLOCKED"), True
+            note_failure("", "Beads returned a claimed task without an ID")
+            break
         if orphaned:
             existing_record = _herdr_session_record(root, task_id)
             binding = existing_record.get("binding") if isinstance(existing_record, Mapping) else None
             lifecycle_status = str(existing_record.get("status") or "") if isinstance(existing_record, Mapping) else ""
-            if isinstance(existing_record, Mapping) and lifecycle_status in {
-                "launching", "identity_pending", "launched", "running", "completed",
-            }:
+            if isinstance(existing_record, Mapping) and lifecycle_status == "launching":
                 adopted = dict(claimed)
                 adopted.update({"root": str(root), "actor": lease.controller})
                 controller.reserve_active_task(adopted, lease=lease)
+                note_failure(
+                    task_id,
+                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has an incomplete Herdr launching "
+                    "record without a committed binding; inspect the pane before further action",
+                )
+                break
+            if isinstance(existing_record, Mapping) and lifecycle_status in {
+                "identity_pending", "launched", "running", "completed",
+            }:
                 session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
+                if lifecycle_status == "identity_pending" and not str(existing_record.get("pane_id") or ""):
+                    adopted = dict(claimed)
+                    adopted.update({"root": str(root), "actor": lease.controller})
+                    controller.reserve_active_task(adopted, lease=lease)
+                    note_failure(
+                        task_id,
+                        f"USER_ACTION_REQUIRED: orphaned task {task_id} is identity-pending without a pane ID",
+                    )
+                    break
+                if lifecycle_status != "identity_pending" and not session_id:
+                    adopted = dict(claimed)
+                    adopted.update({"root": str(root), "actor": lease.controller})
+                    controller.reserve_active_task(adopted, lease=lease)
+                    note_failure(
+                        task_id,
+                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has Herdr state "
+                        f"{lifecycle_status} without a committed provider session binding",
+                    )
+                    break
+                adopted = dict(claimed)
+                adopted.update({"root": str(root), "actor": lease.controller})
+                controller.reserve_active_task(adopted, lease=lease)
                 adopted_state = "running" if session_id else "identity_pending"
                 controller.bind_active_task(
                     task_id, session_id=session_id, state=adopted_state, lease=lease,
@@ -1501,13 +1656,23 @@ def _controller_step_parallel(
                 active = controller.active_tasks()
                 continue
             if isinstance(existing_record, Mapping):
-                result = controller.halt(
-                    "blocked",
+                if lifecycle_status in {"failed", "blocked", "cancelled", "canceled"}:
+                    note_failure(
+                        task_id,
+                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has terminal Herdr state "
+                        f"{lifecycle_status} without an authenticated result",
+                        provider_terminal=True,
+                    )
+                    break
+                adopted = dict(claimed)
+                adopted.update({"root": str(root), "actor": lease.controller})
+                controller.reserve_active_task(adopted, lease=lease)
+                note_failure(
+                    task_id,
                     f"USER_ACTION_REQUIRED: orphaned task {task_id} has a non-relaunchable Herdr "
                     f"state {lifecycle_status or 'unknown'}; inspect lifecycle before retrying",
-                    lease=lease,
                 )
-                return payload(result, "USER_ACTION_REQUIRED"), True
+                break
 
         metadata = claimed.get("metadata")
         agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
@@ -1538,10 +1703,16 @@ def _controller_step_parallel(
         session_id = str(dispatched.get("session_id") or "")
         dispatch_state = str(dispatched.get("state") or "")
         if dispatch_state == "blocked" or (not session_id and dispatch_state != "identity_pending"):
-            result = controller.halt(
-                "blocked", f"task {task_id} failed preflight or provider launch", lease=lease,
+            launch_record = _herdr_session_record(root, task_id) or {}
+            launch_status = str(launch_record.get("status") or "") if isinstance(launch_record, Mapping) else ""
+            note_failure(
+                task_id, f"task {task_id} failed preflight or provider launch",
+                provider_terminal=(
+                    not launch_record
+                    or launch_status in {"failed", "blocked", "cancelled", "canceled"}
+                ),
             )
-            return payload(result, "TASK_BLOCKED"), True
+            break
         dispatch_state = dispatch_state if dispatch_state in {"running", "launched", "identity_pending"} else "running"
         result = controller.bind_active_task(
             task_id, session_id=session_id, state=dispatch_state, lease=lease,
@@ -1554,7 +1725,25 @@ def _controller_step_parallel(
 
     active = controller.active_tasks()
     if active:
-        return payload(controller.resume([], lease=lease)), False
+        result = controller.resume([], lease=lease)
+        if draining and "USER_ACTION_REQUIRED:" in drain_reason and all(
+            item["state"] in {"claimed_no_session", "identity_pending"} for item in active
+        ):
+            # No provider result can be polled for these unresolved identities.
+            # Keep them durable and fail closed, but stop the autonomous loop
+            # once all trackable sibling sessions have drained.
+            return payload(result, "USER_ACTION_REQUIRED"), True
+        return payload(
+            result,
+            "DRAINING_AFTER_TASK_FAILURE" if draining else "",
+        ), False
+    if draining:
+        result = controller.halt(
+            "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
+            lease=lease,
+        )
+        stop_reason = "USER_ACTION_REQUIRED" if "USER_ACTION_REQUIRED:" in drain_reason else "TASK_BLOCKED"
+        return payload(result, stop_reason), True
 
     descendants = beads_backend.root_descendants(cwd, workflow_root)
     nonterminal = [
