@@ -53,11 +53,11 @@ def sdk_availability(
             "The model-evidence adapter requires a supported github-copilot-sdk 1.x release.",
             distribution_version,
         )
-        return CopilotSdkAvailability(
-            True,
-            "Copilot SDK 1.x is available; this does not enable a workflow transport.",
-            distribution_version,
-        )
+    return CopilotSdkAvailability(
+        True,
+        "Copilot SDK 1.x is available; this does not enable a workflow transport.",
+        distribution_version,
+    )
 
 
 def _get(value: Any, *names: str, default: Any = None) -> Any:
