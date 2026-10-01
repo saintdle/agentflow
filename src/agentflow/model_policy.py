@@ -1,11 +1,12 @@
 """Versioned exact provider/model/role/effort policy, audit, and migration planning.
 
-The policy is a closed, versioned document (see ``policies/models-v2.json``)
-listing the only approved (provider, model, role, effort) routes. Anything not
-an exact match fails closed.  A selective route such as Codex Terra also needs
-an explicit per-launch selection; merely naming the model is insufficient.
-This module never writes to disk; the audit and migration-planning primitives
-are read-only.
+The policy is a closed, versioned document shipped at
+``agentflow/resources/policies/models-v2.json`` and listing the only approved
+(provider, model, role, effort) routes. Repository-level policy files are
+exports of that packaged runtime resource. Anything not an exact match fails
+closed. A selective route such as Codex Terra also needs an explicit
+per-launch selection; merely naming the model is insufficient. This module
+never writes to disk; the audit and migration-planning primitives are read-only.
 """
 
 from __future__ import annotations

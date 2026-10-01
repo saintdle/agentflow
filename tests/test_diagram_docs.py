@@ -34,6 +34,23 @@ class DocumentationDiagramTests(unittest.TestCase):
         self.assertIn('subgraph Scoped["Task-scoped worker boundary"]', security)
         self.assertIn('Inbox -->|"validate and consume"| Controller', security)
 
+    def test_controller_managed_external_sessions_use_herdr_not_tmux(self) -> None:
+        readme = " ".join(self._read("README.md").split())
+        workflow = " ".join(self._read("docs/WORKFLOW.md").split())
+        security = " ".join(self._read("docs/SECURITY.md").split())
+
+        self.assertIn('Herdr<br/>controller-managed external session', readme)
+        self.assertIn("`tmux` for manually managed terminal sessions", readme)
+        self.assertIn("Use Herdr for controller-managed", workflow)
+        self.assertIn(
+            "tmux` is available for manually managed terminal handoffs only", workflow
+        )
+        self.assertIn('Launcher["Herdr<br/>controller-managed external launch"]', security)
+        self.assertIn("`tmux` is only for manually managed terminal sessions", security)
+        self.assertNotIn("Herdr or tmux", readme)
+        self.assertNotIn("Herdr or `tmux`", workflow)
+        self.assertNotIn("Herdr, tmux, or native agent runtime", security)
+
     def test_mermaid_fences_are_balanced(self) -> None:
         for relative in ("README.md", "docs/WORKFLOW.md", "docs/SECURITY.md"):
             document = self._read(relative)

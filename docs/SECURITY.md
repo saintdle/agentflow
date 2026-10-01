@@ -43,7 +43,7 @@ flowchart TB
     end
 
     subgraph External["External trust domains"]
-        Launcher["Herdr, tmux, or native agent runtime"]
+        Launcher["Herdr<br/>controller-managed external launch"]
         Provider["Codex, Claude Code, or Copilot service"]
         Git["Git and GitHub"]
         Launcher --> Provider
@@ -60,6 +60,8 @@ flowchart TB
 Controller credentials and raw provider transcripts do not cross into the
 task-scoped worker boundary. The return channel carries a bounded result that
 the controller authenticates and validates before changing durable task state.
+Controller-managed external launches use Herdr. `tmux` is only for manually
+managed terminal sessions and is not a controller launch path.
 
 The controller also binds its native provider-session identity to the approved
 workflow workspace in protected user state. Hooks validate that binding against
