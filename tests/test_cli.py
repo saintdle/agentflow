@@ -3171,12 +3171,36 @@ class ControllerRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             fixture = ValidLaunch(Path(temp).resolve())
             manifest = dict(fixture.handoff.manifest)
-            manifest["base"] = "main@deadbeef"
+            branch, current_base = cli._git_identity(fixture.root)
+            current_revision = current_base.partition("@")[2]
+            manifest["base"] = f"{branch}@{current_revision[:1]}"
             workspace = dict(manifest["workspace_contract"])
-            workspace["base"] = "main@deadbeef"
+            workspace["base"] = manifest["base"]
             manifest["workspace_contract"] = workspace
             errors = cli._workspace_contract_errors(manifest, observed_root=fixture.root)
             self.assertTrue(any("approved revision" in error for error in errors), errors)
+
+    def test_git_base_requires_matching_12_to_40_hex_revision_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            branch, _ = cli._git_identity(fixture.root)
+            resolved = subprocess.run(
+                ["git", "-C", str(fixture.root), "rev-parse", "--verify", "HEAD^{commit}"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+            for length in (12, 20, 40):
+                with self.subTest(length=length):
+                    self.assertTrue(
+                        cli._git_base_matches(fixture.root, f"{branch}@{resolved[:length]}")
+                    )
+
+            wrong_revision = ("0" if resolved[0] != "0" else "1") + resolved[1:]
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{wrong_revision}"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved[:11]}"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved[:11]}g"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved}0"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved}g"))
 
     def test_directory_workspace_contract_rejects_changed_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as other:

@@ -1649,20 +1649,25 @@ def _git_base_matches(root: Path, base: str) -> bool:
     if not _is_git_repository(root):
         return False
     reference, separator, expected_revision = base.partition("@")
-    if not reference.strip():
+    if (
+        not reference.strip()
+        or not separator
+        or not re.fullmatch(r"[0-9a-fA-F]{12,40}", expected_revision)
+    ):
         return False
     try:
         resolved = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--verify", reference],
+            ["git", "-C", str(root), "rev-parse", "--verify", f"{reference}^{{commit}}"],
             capture_output=True, text=True, timeout=8, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
     if resolved.returncode != 0:
         return False
-    if not separator or not expected_revision:
-        return True
-    return resolved.stdout.strip().startswith(expected_revision) or expected_revision.startswith(resolved.stdout.strip()[:12])
+    resolved_revision = resolved.stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved_revision):
+        return False
+    return resolved_revision.lower().startswith(expected_revision.lower())
 
 
 def preflight_root(args: argparse.Namespace) -> int:
