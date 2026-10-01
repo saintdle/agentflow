@@ -16,6 +16,9 @@ import threading
 from typing import Any, Mapping
 
 
+_MISSING = object()
+
+
 class CopilotSdkEvidenceError(ValueError):
     """Raised when Copilot SDK model evidence is unavailable or ambiguous."""
 
@@ -125,7 +128,7 @@ class CopilotSdkModelEvidenceGate:
         with self._lock:
             event_type = _get(event, "type", default="")
             event_id = _get(event, "id", default="")
-            parent_id = _get(event, "parent_id", "parentId")
+            parent_id = _get(event, "parent_id", "parentId", default=_MISSING)
             if not isinstance(event_type, str) or not event_type:
                 self._block("SDK event type is missing")
                 return
@@ -137,7 +140,7 @@ class CopilotSdkModelEvidenceGate:
                 self._block("SDK event identity was replayed")
                 return
             chain_valid = event_identity_valid
-            if self._last_event_id is None and parent_id not in (None, ""):
+            if self._last_event_id is None and parent_id is not None:
                 self._block("SDK event chain is discontinuous or ambiguous")
                 chain_valid = False
             elif self._last_event_id is not None and parent_id != self._last_event_id:
@@ -157,7 +160,17 @@ class CopilotSdkModelEvidenceGate:
             if event_type in ("assistant.message", "assistant_message"):
                 if self._pending_message is not None:
                     self._block("a second assistant message arrived before the prior call's usage event")
-                if any(message_id != event_id for message_id in self._pending_delta_message_ids):
+                final_message_id = _get(data, "message_id", "messageId")
+                if (
+                    not isinstance(final_message_id, str)
+                    or not final_message_id.strip()
+                    or final_message_id != event_id
+                ):
+                    self._block("SDK message identity is missing or disagrees with its event envelope")
+                if any(
+                    message_id != final_message_id or message_id != event_id
+                    for message_id in self._pending_delta_message_ids
+                ):
                     self._block("SDK message identity mismatch: delta does not match its finalized message")
                 self._pending_delta_message_ids.clear()
                 tool_requests = _get(data, "tool_requests", "toolRequests", default=())
@@ -171,16 +184,15 @@ class CopilotSdkModelEvidenceGate:
                 if agent_id is None and isinstance(content, str) and content:
                     self._root_responses.append(content)
             elif event_type in ("assistant.message_delta", "assistant_message_delta"):
-                delta_message_id = _get(data, "message_id", "messageId")
-                if delta_message_id is not None:
-                    if not isinstance(delta_message_id, str) or not delta_message_id.strip():
-                        self._block("SDK message delta identity is malformed")
-                    elif self._pending_message is None:
-                        # Deltas can precede the finalized assistant.message;
-                        # defer their identity check until that event arrives.
-                        self._pending_delta_message_ids.add(delta_message_id)
-                    elif delta_message_id != self._pending_message[0]:
-                        self._block("SDK message identity mismatch: delta does not match its pending message")
+                delta_message_id = _get(data, "message_id", "messageId", default=_MISSING)
+                if not isinstance(delta_message_id, str) or not delta_message_id.strip():
+                    self._block("SDK message identity is missing or malformed in a delta")
+                elif self._pending_message is None:
+                    # Deltas can precede the finalized assistant.message;
+                    # defer their identity check until that event arrives.
+                    self._pending_delta_message_ids.add(delta_message_id)
+                elif delta_message_id != self._pending_message[0]:
+                    self._block("SDK message identity mismatch: delta does not match its pending message")
                 if agent_id is None:
                     delta = _get(data, "delta_content", "deltaContent", default="")
                     if isinstance(delta, str):
