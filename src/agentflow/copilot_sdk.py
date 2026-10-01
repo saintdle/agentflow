@@ -99,6 +99,7 @@ class CopilotSdkModelEvidenceGate:
         self._last_event_id: str | None = None
         self._seen_event_ids: set[str] = set()
         self._pending_message: tuple[str, str | None, tuple[Any, ...], bool] | None = None
+        self._pending_delta_message_ids: set[str] = set()
         self._calls: list[ModelCallEvidence] = []
         self._blocked_reason = ""
         self._response_chunks: list[str] = []
@@ -136,7 +137,10 @@ class CopilotSdkModelEvidenceGate:
                 self._block("SDK event identity was replayed")
                 return
             chain_valid = event_identity_valid
-            if self._last_event_id is not None and parent_id != self._last_event_id:
+            if self._last_event_id is None and parent_id not in (None, ""):
+                self._block("SDK event chain is discontinuous or ambiguous")
+                chain_valid = False
+            elif self._last_event_id is not None and parent_id != self._last_event_id:
                 self._block("SDK event chain is discontinuous or ambiguous")
                 chain_valid = False
             if event_identity_valid:
@@ -153,6 +157,9 @@ class CopilotSdkModelEvidenceGate:
             if event_type in ("assistant.message", "assistant_message"):
                 if self._pending_message is not None:
                     self._block("a second assistant message arrived before the prior call's usage event")
+                if any(message_id != event_id for message_id in self._pending_delta_message_ids):
+                    self._block("SDK message identity mismatch: delta does not match its finalized message")
+                self._pending_delta_message_ids.clear()
                 tool_requests = _get(data, "tool_requests", "toolRequests", default=())
                 if tool_requests is None:
                     tool_requests = ()
@@ -164,6 +171,16 @@ class CopilotSdkModelEvidenceGate:
                 if agent_id is None and isinstance(content, str) and content:
                     self._root_responses.append(content)
             elif event_type in ("assistant.message_delta", "assistant_message_delta"):
+                delta_message_id = _get(data, "message_id", "messageId")
+                if delta_message_id is not None:
+                    if not isinstance(delta_message_id, str) or not delta_message_id.strip():
+                        self._block("SDK message delta identity is malformed")
+                    elif self._pending_message is None:
+                        # Deltas can precede the finalized assistant.message;
+                        # defer their identity check until that event arrives.
+                        self._pending_delta_message_ids.add(delta_message_id)
+                    elif delta_message_id != self._pending_message[0]:
+                        self._block("SDK message identity mismatch: delta does not match its pending message")
                 if agent_id is None:
                     delta = _get(data, "delta_content", "deltaContent", default="")
                     if isinstance(delta, str):
@@ -216,6 +233,8 @@ class CopilotSdkModelEvidenceGate:
             elif event_type in ("session.idle", "session_idle"):
                 if self._pending_message is not None:
                     self._block("SDK session became idle before its model usage event finalized")
+                if self._pending_delta_message_ids:
+                    self._block("SDK session became idle before a message delta identity could be matched")
                 self._session_idle = True
 
     def on_pre_tool_use(self, input_data: Any, invocation: Any) -> dict[str, str]:

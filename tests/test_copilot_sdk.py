@@ -81,6 +81,54 @@ class CopilotSdkModelEvidenceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(CopilotSdkEvidenceError, "mismatch"):
             gate.validated_response()
 
+    def test_message_delta_identity_must_match_the_usage_bound_message(self):
+        mismatched = self.gate()
+        mismatched.on_event(event(
+            "assistant.message_delta", "delta-1", None,
+            {"messageId": "unrelated-message", "delta_content": "UNVERIFIED"},
+        ))
+        mismatched.on_event(event(
+            "assistant.message", "message-1", "delta-1",
+            {"content": "", "tool_requests": []},
+        ))
+        mismatched.on_event(event(
+            "assistant.usage", "usage-1", "message-1",
+            {"model": "claude-sonnet-4.6"},
+        ))
+        mismatched.on_event(event("session.idle", "idle-1", "usage-1", {}))
+        with self.assertRaisesRegex(CopilotSdkEvidenceError, "message identity"):
+            mismatched.validated_response()
+
+        matching = self.gate()
+        matching.on_event(event(
+            "assistant.message_delta", "delta-1", None,
+            {"messageId": "message-1", "delta_content": "verified"},
+        ))
+        matching.on_event(event(
+            "assistant.message", "message-1", "delta-1",
+            {"content": "", "tool_requests": []},
+        ))
+        matching.on_event(event(
+            "assistant.usage", "usage-1", "message-1",
+            {"model": "claude-sonnet-4.6"},
+        ))
+        matching.on_event(event("session.idle", "idle-1", "usage-1", {}))
+        self.assertEqual(matching.validated_response(), "verified")
+
+    def test_first_event_must_not_claim_an_unobserved_parent(self):
+        gate = self.gate()
+        gate.on_event(event(
+            "assistant.message", "message-1", "missing-parent",
+            {"content": "UNVERIFIED", "tool_requests": []},
+        ))
+        gate.on_event(event(
+            "assistant.usage", "usage-1", "message-1",
+            {"model": "claude-sonnet-4.6"},
+        ))
+        gate.on_event(event("session.idle", "idle-1", "usage-1", {}))
+        with self.assertRaisesRegex(CopilotSdkEvidenceError, "discontinuous"):
+            gate.validated_response()
+
     def test_missing_usage_or_discontinuous_event_chain_fails_closed(self):
         missing = self.gate()
         missing.on_event(event("assistant.message", "message-1", None, {"content": "hidden", "tool_requests": []}))
