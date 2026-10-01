@@ -1543,7 +1543,9 @@ def _controller_step_parallel(
             beads_backend.add_comment(cwd, task_id, f"agentflow: {reason}")
             note_failure(
                 task_id, reason,
-                provider_terminal=True,
+                provider_terminal=str(session_record.get("status") or "") in {
+                    "completed", "failed", "blocked", "cancelled", "canceled",
+                },
             )
             continue
         already_disposed = str(issue.get("status") or "").lower() in {

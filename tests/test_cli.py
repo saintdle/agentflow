@@ -4465,6 +4465,76 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
 class ControllerParallelDispatchTests(unittest.TestCase):
     """The root scheduler admits a bounded launch wave before polling results."""
 
+    def test_invalid_acceptance_result_is_tracked_until_herdr_is_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            task = dict(fixture.task_issue)
+            task["status"] = "in_progress"
+            task_id = str(task["id"])
+            acceptance_ids = cli._bound_acceptance_ids(task, task_id)
+            herdr_status = {task_id: "running"}
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": task_id, "root": str(fixture.root), "actor": fixture.controller,
+                "claim_id": "claim-task-1",
+            }, lease=lease)
+            controller.bind_active_task(task_id, session_id="session-task-1", lease=lease)
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+            claim_ready = mock.Mock()
+
+            def session_record(_root, _task_id):
+                return {
+                    "status": herdr_status[task_id],
+                    "return_channel": {
+                        "state": "consumed", "acceptance_ids": list(acceptance_ids),
+                        "approved_waivers": [],
+                    },
+                }
+
+            invalid_result = {
+                "outcome": "completed",
+                "acceptance_results": [{
+                    "acceptance_id": acceptance_ids[0], "status": "failed",
+                    "evidence": "validation did not pass", "source": "provider",
+                }],
+            }
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else task), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task]), \
+                 mock.patch.object(cli, "_herdr_session_record", side_effect=session_record), \
+                 mock.patch.object(cli, "_ingest_submitted_result",
+                                   return_value=cli._SubmissionIngestion("consumed")), \
+                 mock.patch.object(cli, "_herdr_task_result", return_value=invalid_result), \
+                 mock.patch.object(cli.beads_backend, "add_comment"), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", claim_ready):
+                first_payload, first_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+                self.assertFalse(first_stop)
+                self.assertEqual(first_payload["result"]["state"], "draining")
+                self.assertEqual([row["task"] for row in controller.active_tasks()], [task_id])
+                self.assertEqual(controller.active_tasks()[0]["state"], "running")
+
+                herdr_status[task_id] = "completed"
+                final_payload, final_stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+
+            self.assertTrue(final_stop)
+            self.assertEqual(final_payload["stop_reason"], "TASK_BLOCKED")
+            self.assertEqual(final_payload["result"]["state"], "blocked")
+            self.assertTrue(final_payload["result"]["terminal"])
+            self.assertIn("acceptance disposition rejected", final_payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(final_payload["result"]["checkpoint"]["active_tasks"], [])
+            claim_ready.assert_not_called()
+
     def test_failed_parallel_task_drains_sibling_before_terminalizing_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
