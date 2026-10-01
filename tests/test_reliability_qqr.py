@@ -124,7 +124,7 @@ class SterileLaunchPackageTests(unittest.TestCase):
             require_tool=[], require_skill=required_skills or [], allow_delegation=False, return_type="result",
             max_ai_credits=30 if provider == "copilot" else None,
             acceptance_matrix="", isolation_profile="none",
-            require_asset=[], base="main@" + ("a" * 40), dependency=[], done_when=["Return evidence"],
+            require_asset=[], base="", dependency=[], done_when=["Return evidence"],
             context=[str(context)], constraint=["Do not inspect other files"], check=[],
             budget=["10 minutes; one retry; stop on blocker"], issue="", branch="", out=str(output), cwd=str(root),
             untrusted_task_data=False,

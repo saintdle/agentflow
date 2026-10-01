@@ -5,8 +5,9 @@ the `agentflow` command and the `agentflow` Python import package. Do not instal
 the unrelated `agentflow` or `agentflow-cli` distributions from a package
 index.
 
-To have a ChatGPT/Codex or Claude coding agent perform these steps, send it the
-copy/paste request in the repository's
+To have a ChatGPT/Codex or Claude coding agent—or GitHub Copilot Chat in an IDE
+with Agent mode and terminal access—perform these steps, send it the copy/paste
+request in the repository's
 [agent-led setup contract](../AGENT_SETUP.md). That contract adds preservation,
 legacy-migration, redaction, verification, and halt requirements around the
 commands below.
@@ -20,8 +21,12 @@ before Agentflow:
 2. Beads 1.1 or later, with `bd` available on `PATH`.
 3. One or more coding-agent CLIs you intend to use.
 
-Herdr, GitHub CLI, and `tmux` are optional. Agentflow reports missing optional
-integrations without reading their credential stores.
+The [Herdr runtime](https://github.com/herdrdev/herdr) is required for
+persistent external worker sessions launched by an Agentflow controller, but
+is optional for planning, local Beads tracking, and native-subagent workflows.
+GitHub CLI and `tmux` are optional; `tmux` is for manually managed terminal
+sessions, not a controller-managed persistent worker transport. Agentflow
+reports missing optional integrations without reading their credential stores.
 
 The experimental Copilot SDK evidence groundwork is optional and requires
 Python 3.11 or later. From an Agentflow source checkout, install its optional
@@ -51,8 +56,9 @@ cd agentflow
 pipx install .
 ```
 
-The repository requires authentication while it remains private. A release
-wheel built by GitHub Actions can be installed without a source checkout:
+The source repository is public, so direct GitHub installs do not require an
+authenticated checkout. A release wheel built by GitHub Actions can also be
+installed without a source checkout:
 
 ```sh
 pipx install ./saintdle_agentflow-0.0.5-py3-none-any.whl
@@ -101,11 +107,15 @@ managed by Agentflow. Existing custom files are preserved for manual merging.
 
 ## Upgrade
 
-Upgrade to an explicit tag, then rerun health checks:
+Choose an explicit tag from the [GitHub releases](https://github.com/saintdle/agentflow/releases)
+page, then reinstall from that tag. The commands below show the current `v0.0.5`
+tag; replace it with the exact reviewed release you intend to install. Plain
+`uv tool upgrade saintdle-agentflow` or `pipx upgrade saintdle-agentflow` does
+not specify a new tag; use the install command with the selected tag to advance.
 
 ```sh
-uv tool upgrade saintdle-agentflow
-# or: pipx upgrade saintdle-agentflow
+uv tool install --reinstall "git+https://github.com/saintdle/agentflow.git@v0.0.5"
+# or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.5"
 agentflow --version
 agentflow install --dry-run
 # After reviewing stale bundled assets and private-state backup behavior:

@@ -42,6 +42,47 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertIn("CHAT_WORKFLOWS.md", tutorial)
         self.assertIn("AGENT_SETUP.md", installation)
 
+    def test_pull_request_ci_runs_bounded_real_pinned_beads_smoke(self) -> None:
+        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        integration = (REPOSITORY / ".github/workflows/integration.yml").read_text(encoding="utf-8")
+        smoke = (REPOSITORY / "scripts/ci/integration_beads.sh").read_text(encoding="utf-8")
+
+        self.assertRegex(ci, r"(?m)^  pull_request:\s*$")
+        self.assertIn("beads-smoke:", ci)
+        self.assertIn("if: github.event_name == 'pull_request'", ci)
+        self.assertIn("timeout-minutes: 20", ci)
+        self.assertIn('AGENTFLOW_INTEGRATION: "1"', ci)
+        self.assertIn('CGO_ENABLED: "1"', ci)
+        self.assertIn('GOFLAGS: "-tags=gms_pure_go"', ci)
+        self.assertIn('go-version: "1.26.2"', ci)
+        self.assertIn("go install github.com/steveyegge/beads/cmd/bd@v1.1.0", ci)
+        self.assertIn("scripts/ci/integration_beads.sh", ci)
+        self.assertIn('schedule:', integration)
+        self.assertIn('workflow_dispatch:', integration)
+        self.assertNotRegex(integration, r"(?m)^  pull_request:")
+        self.assertIn('CGO_ENABLED: "1"', integration)
+        self.assertIn('GOFLAGS: "-tags=gms_pure_go"', integration)
+        self.assertIn('go install github.com/steveyegge/beads/cmd/bd@v1.1.0', integration)
+        self.assertIn('Expected Beads 1.1.0', smoke)
+
+    def test_setup_docs_explain_public_tagged_install_herdr_and_copilot(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        installation = (REPOSITORY / "docs/INSTALLATION.md").read_text(encoding="utf-8")
+        setup = (REPOSITORY / "AGENT_SETUP.md").read_text(encoding="utf-8")
+        chat = (REPOSITORY / "docs/CHAT_WORKFLOWS.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("Until the repository is public", readme)
+        self.assertNotIn("while it remains private", installation)
+        for required in (
+            "uv tool install --reinstall",
+            "pipx install --force",
+            "@v0.0.5",
+            "Herdr is required",
+            "Agent mode",
+            "terminal access",
+        ):
+            self.assertIn(required, installation + setup + chat + readme)
+
 
 if __name__ == "__main__":
     unittest.main()

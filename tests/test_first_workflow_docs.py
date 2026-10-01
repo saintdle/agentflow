@@ -16,6 +16,14 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 class FirstWorkflowDocumentationTests(unittest.TestCase):
+    def test_tutorial_names_herdr_as_required_for_persistent_external_dispatch(self) -> None:
+        tutorial = (REPOSITORY / "docs/FIRST_WORKFLOW.md").read_text(encoding="utf-8")
+        compact_tutorial = re.sub(r"\s+", " ", tutorial)
+
+        self.assertIn("persistent, controller-managed", tutorial)
+        self.assertIn("Herdr is required for this path", tutorial)
+        self.assertIn("`tmux` is not a transport for this controller workflow", compact_tutorial)
+
     def test_documented_task_materializes_and_preflights_after_fresh_init(self) -> None:
         tutorial = (REPOSITORY / "docs/FIRST_WORKFLOW.md").read_text(encoding="utf-8")
         match = re.search(r"--metadata '([^']+)'", tutorial)
@@ -40,7 +48,7 @@ class FirstWorkflowDocumentationTests(unittest.TestCase):
                 bead=issue["id"], to="codex", cwd=str(root), task_class="implementation",
                 role="", lane="", tool_profile="", output_boundary="",
                 require_tool=[], require_skill=[], allow_delegation=False, return_type="result",
-                max_ai_credits=None, base="main@abc123", branch="agent/first-workflow-1",
+                max_ai_credits=None, base="", branch="",
                 context=[], constraint=[], check=[], budget=[], out=str(handoff),
             )
             with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), mock.patch.object(

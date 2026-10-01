@@ -32,6 +32,8 @@ def _minimal_spec(**kwargs) -> LaunchSpec:
         handoff="handoff-1",
         herdr_session="herdr-1",
         herdr_protocol="agentflow.herdr@1",
+        workspace_kind="git",
+        workspace_root="/repo",
     )
     defaults.update(kwargs)
     return LaunchSpec(**defaults)
@@ -47,6 +49,8 @@ def _fs_spec(**kwargs) -> LaunchSpec:
         tools=(),
         model="claude-sonnet-4.6",
         session_id="sess-001",
+        workspace_kind="git",
+        workspace_root="/repo",
     )
     defaults.update(kwargs)
     return LaunchSpec(**defaults)
@@ -187,6 +191,41 @@ class PreflightAggregateTests(unittest.TestCase):
     def test_empty_base_is_blocker(self) -> None:
         with self.assertRaises(PreflightError):
             _minimal_spec(base="")
+
+    def test_directory_workspace_passes_with_exact_root_and_no_git_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            snap = _minimal_snapshot(str(root))
+            spec = _minimal_spec(
+                base="", workspace_kind="directory", workspace_root=str(root),
+                boundary=str(root),
+            )
+            report = check_launch(spec, snap)
+            self.assertFalse(report.launch_blocked, report.findings)
+            self.assertFalse(any(f.id == "base-empty" for f in report.findings))
+
+    def test_directory_workspace_rejects_fake_git_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            spec = _minimal_spec(
+                base="workspace", workspace_kind="directory",
+                workspace_root=str(root), boundary=str(root),
+            )
+            report = check_launch(spec, _minimal_snapshot(str(root)))
+            self.assertTrue(report.launch_blocked)
+            self.assertIn("directory-base-present", {f.id for f in report.findings})
+
+    def test_directory_workspace_requires_canonical_absolute_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            snap = _minimal_snapshot(str(root))
+            spec = _minimal_spec(
+                base="", workspace_kind="directory",
+                workspace_root="relative/path", boundary=str(root),
+            )
+            report = check_launch(spec, snap)
+            self.assertTrue(report.launch_blocked)
+            self.assertIn("workspace-root-invalid", {f.id for f in report.findings})
 
     def test_boundary_outside_root_is_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

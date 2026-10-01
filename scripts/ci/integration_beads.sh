@@ -8,7 +8,12 @@ fi
 
 command -v bd >/dev/null
 command -v agentflow >/dev/null
-bd --version
+beads_version="$(bd --version)"
+printf '%s\n' "${beads_version}"
+if [[ "${beads_version}" != *"1.1.0"* ]]; then
+  echo "Expected Beads 1.1.0 for this integration smoke." >&2
+  exit 1
+fi
 agentflow --version
 
 integration_root="$(mktemp -d)"

@@ -70,7 +70,8 @@ class ValidLaunch:
     def __init__(self, root: Path, *, provider: str = "claude", model: str = "claude-sonnet-5",
                  effort: str = "medium", role: str = "coding",
                  controller: str = "agentflow-controller", seed_lease: bool = True,
-                 claim_token: str = "opaque-claim-token-0123456789abcdef0123456789ab") -> None:
+                 claim_token: str = "opaque-claim-token-0123456789abcdef0123456789ab",
+                 gitless: bool = False) -> None:
         self.root = root
         self.provider = provider
         self.model = model
@@ -80,6 +81,7 @@ class ValidLaunch:
         self.workflow_root = "wf-root"
         self.task_id = "task-1"
         self.actor = controller
+        self.gitless = gitless
         self.claim_token = claim_token
         self.session_name = "agentflow-task-1"
         self.acceptance = {
@@ -120,9 +122,10 @@ class ValidLaunch:
 
     def _init_git(self) -> None:
         r = str(self.root)
-        subprocess.run(["git", "init", "-b", "main", r], capture_output=True, check=True)
-        subprocess.run(["git", "-C", r, "config", "user.email", "t@example.test"], capture_output=True, check=True)
-        subprocess.run(["git", "-C", r, "config", "user.name", "Test"], capture_output=True, check=True)
+        if not self.gitless:
+            subprocess.run(["git", "init", "-b", "main", r], capture_output=True, check=True)
+            subprocess.run(["git", "-C", r, "config", "user.email", "t@example.test"], capture_output=True, check=True)
+            subprocess.run(["git", "-C", r, "config", "user.name", "Test"], capture_output=True, check=True)
         (self.root / "README.md").write_text("root\n", encoding="utf-8")
         claude_settings = self.root / ".claude/settings.json"
         claude_settings.parent.mkdir(parents=True, exist_ok=True)
@@ -135,8 +138,9 @@ class ValidLaunch:
         (self.root / "scripts/validate.py").write_text("print('ok')\n", encoding="utf-8")
         (self.root / "tests").mkdir(exist_ok=True)
         (self.root / "tests/test_smoke.py").write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
-        subprocess.run(["git", "-C", r, "add", "-A"], capture_output=True, check=True)
-        subprocess.run(["git", "-C", r, "commit", "-m", "init"], capture_output=True, check=True)
+        if not self.gitless:
+            subprocess.run(["git", "-C", r, "add", "-A"], capture_output=True, check=True)
+            subprocess.run(["git", "-C", r, "commit", "-m", "init"], capture_output=True, check=True)
 
     def _seed_lease(self):
         state_path = cli._controller_state_dir(self.root, self.workflow_root) / "state.json"
@@ -1393,7 +1397,7 @@ class AgentflowTests(unittest.TestCase):
                 return_type="review",
                 max_ai_credits=None,
                 acceptance_matrix=str(matrix),
-                base="main@abc123",
+                base="",
                 dependency=[],
                 done_when=["Review returns a verdict"],
                 context=[str(context)],
@@ -1401,8 +1405,9 @@ class AgentflowTests(unittest.TestCase):
                 check=["test -s source.md"],
                 budget=["20 minutes; one retry; stop on blocker"],
                 issue="#1",
-                branch="agent/review",
+                branch="",
                 out=str(output),
+                cwd=str(root),
             )
             self.assertEqual(cli.handoff_create(handoff_args), 0)
             with mock.patch.object(cli, "_provider_command", return_value="/usr/bin/true"):
@@ -1434,7 +1439,7 @@ class AgentflowTests(unittest.TestCase):
                 return_type="result",
                 max_ai_credits=None,
                 acceptance_matrix="",
-                base="main@abc123",
+                base="",
                 dependency=[],
                 done_when=["Evidence returned"],
                 context=[str(context)],
@@ -1444,6 +1449,7 @@ class AgentflowTests(unittest.TestCase):
                 issue="",
                 branch="",
                 out=str(output),
+                cwd=str(root),
             )
             self.assertEqual(cli.handoff_create(args), 0)
             with mock.patch.object(cli, "_provider_command", return_value="/usr/bin/true"):
@@ -1794,7 +1800,7 @@ class AgentflowTests(unittest.TestCase):
                 return_type="result",
                 max_ai_credits=None,
                 acceptance_matrix="",
-                base="main@abc123",
+                base="",
                 dependency=[],
                 done_when=["Evidence returned"],
                 context=[str(context)],
@@ -1804,6 +1810,7 @@ class AgentflowTests(unittest.TestCase):
                 issue="",
                 branch="",
                 out=str(output),
+                cwd=str(root),
             )
             self.assertEqual(cli.handoff_create(args), 0)
             with mock.patch.object(cli, "_provider_command", return_value="/usr/bin/true"), mock.patch.object(
@@ -1877,6 +1884,18 @@ class AgentflowTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
+            cli.subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
+                capture_output=True, text=True, check=True,
+            )
+            cli.subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Agentflow Test"],
+                capture_output=True, text=True, check=True,
+            )
+            cli.subprocess.run(
+                ["git", "-C", str(root), "commit", "--allow-empty", "-m", "base"],
+                capture_output=True, text=True, check=True,
+            )
             output = root / ".agentflow/tmp/handoffs/work-1-codex.md"
             issue = {
                 "id": "work-1",
@@ -1905,8 +1924,8 @@ class AgentflowTests(unittest.TestCase):
                 allow_delegation=False,
                 return_type="result",
                 max_ai_credits=None,
-                base="main@abc123",
-                branch="agent/work-1",
+                base="",
+                branch="",
                 context=[],
                 constraint=[],
                 check=[],
@@ -1928,6 +1947,44 @@ class AgentflowTests(unittest.TestCase):
             self.assertIn("untrusted task data", prompt)
             self.assertIn("Bounded bead (work-1)", prompt)
             update.assert_called_once()
+
+    def test_handoff_from_bead_ignores_stale_git_identity_in_gitless_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            issue = {
+                "id": "work-dir-1",
+                "title": "Bounded directory task",
+                "description": "Produce the observable result.",
+                "acceptance_criteria": "Focused test passes",
+                "status": "open",
+                "metadata": {
+                    "agentflow": {
+                        "base": "old-branch@deadbeef",
+                        "branch": "old-branch",
+                        "checks": ["python3 -m unittest"],
+                    }
+                },
+            }
+            output = root / ".agentflow/tmp/handoffs/work-dir-1-codex.md"
+            args = argparse.Namespace(
+                bead="work-dir-1", to="codex", cwd=str(root),
+                task_class="implementation", role="writer", lane="native",
+                tool_profile="provider-default", output_boundary=str(root),
+                require_tool=[], require_skill=[], allow_delegation=False,
+                return_type="result", max_ai_credits=None, base="", branch="",
+                context=[], constraint=[], check=[], budget=[], out=str(output),
+            )
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"):
+                self.assertEqual(cli.handoff_from_bead(args), 0)
+
+            self.assertFalse((root / ".git").exists())
+            manifest = json.loads(output.with_suffix(".json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["workspace_kind"], "directory")
+            self.assertEqual(manifest["workspace_contract"]["root"], str(root))
+            self.assertEqual(manifest["workspace_contract"]["base"], None)
+            self.assertEqual(manifest["base"], "")
+            self.assertEqual(manifest["branch"], "")
 
     def test_beads_explain_translates_blocked_ids(self) -> None:
         issue = {
@@ -3076,6 +3133,93 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["return_channel"]["state"], "issued")
 
+    def test_controller_run_dispatches_gitless_directory_with_typed_workspace_contract(self) -> None:
+        """A real controller preflight and Herdr launch work without .git or a fake base."""
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False, gitless=True)
+            self.assertFalse(cli._is_git_repository(fixture.root))
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            capture: dict = {}
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertTrue(payload["ok"], payload)
+            self.assertEqual(payload["result"]["state"], "running")
+            self.assertEqual(capture["argv"][:4], ["/usr/bin/herdr", "agent", "start", "task-1"])
+            manifest_path = fixture.root / ".agentflow/tmp/handoffs/task-1-claude.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["workspace_kind"], "directory")
+            self.assertEqual(
+                manifest["workspace_contract"],
+                {
+                    "schema": "agentflow.workspace@1",
+                    "kind": "directory",
+                    "root": str(fixture.root),
+                    "base": None,
+                },
+            )
+            self.assertEqual(manifest["base"], "")
+            self.assertEqual(manifest["branch"], "")
+
+    def test_git_workspace_contract_rejects_wrong_exact_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            manifest = dict(fixture.handoff.manifest)
+            branch, current_base = cli._git_identity(fixture.root)
+            current_revision = current_base.partition("@")[2]
+            manifest["base"] = f"{branch}@{current_revision[:1]}"
+            workspace = dict(manifest["workspace_contract"])
+            workspace["base"] = manifest["base"]
+            manifest["workspace_contract"] = workspace
+            errors = cli._workspace_contract_errors(manifest, observed_root=fixture.root)
+            self.assertTrue(any("approved revision" in error for error in errors), errors)
+
+    def test_git_base_requires_matching_12_to_40_hex_revision_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            branch, _ = cli._git_identity(fixture.root)
+            resolved = subprocess.run(
+                ["git", "-C", str(fixture.root), "rev-parse", "--verify", "HEAD^{commit}"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+            for length in (12, 20, 40):
+                with self.subTest(length=length):
+                    self.assertTrue(
+                        cli._git_base_matches(fixture.root, f"{branch}@{resolved[:length]}")
+                    )
+
+            wrong_revision = ("0" if resolved[0] != "0" else "1") + resolved[1:]
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{wrong_revision}"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved[:11]}"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved[:11]}g"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved}0"))
+            self.assertFalse(cli._git_base_matches(fixture.root, f"{branch}@{resolved}g"))
+
+    def test_directory_workspace_contract_rejects_changed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as other:
+            root = Path(temp).resolve()
+            manifest = {
+                "workspace_kind": "directory",
+                "workspace_contract": {
+                    "schema": "agentflow.workspace@1",
+                    "kind": "directory",
+                    "root": str(Path(other).resolve()),
+                    "base": None,
+                },
+                "base": "",
+                "branch": "",
+                "lane": "external",
+            }
+            errors = cli._workspace_contract_errors(manifest, observed_root=root)
+            self.assertIn("workspace root does not match the exact target workspace", errors)
+
     def test_controller_run_blocks_spawn_when_root_preflight_fails(self) -> None:
         """AFREL-019: dispatch must call the mandatory root preflight and an
         invalid result must prevent the spawn -- reproduced by making
@@ -4213,7 +4357,7 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
             return_type="result",
             max_ai_credits=None,
             acceptance_matrix="",
-            base="main@abc123",
+            base="",
             dependency=[],
             done_when=["Do the thing"],
             context=[str(context)],
