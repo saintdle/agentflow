@@ -2838,10 +2838,12 @@ class ControllerRunTests(unittest.TestCase):
 
             threads: list = []
             report_done = threading.Event()
+            first_state_observed = threading.Event()
 
             def on_spawn(argv):
                 _spawn_provider_report(fixture, argv, report_delay=0.0,
-                                       report_done=report_done, threads=threads)
+                                       report_done=report_done, threads=threads,
+                                       report_gate=first_state_observed.is_set)
 
             claim_calls = {"n": 0}
 
@@ -2876,9 +2878,15 @@ class ControllerRunTests(unittest.TestCase):
                  mock.patch.object(cli, "_json_or_status", side_effect=lambda pl, **k: payloads1.append(pl)):
                 self.assertEqual(cli.controller_resume(args1), 0)
                 first = [pl for pl in payloads1 if pl.get("operation") == "resume"][-1]
-                self.assertEqual(first["result"]["state"], "running")
-                for thread in threads:
-                    thread.join(timeout=5)
+                try:
+                    self.assertEqual(first["result"]["state"], "running")
+                finally:
+                    # Keep the provider from submitting until invocation 1's
+                    # returned state has been checked; then wait for its real
+                    # inbox submission before simulating the crash/restart.
+                    first_state_observed.set()
+                    for thread in threads:
+                        thread.join(timeout=5)
             self.assertTrue(report_done.is_set(), "provider never finalized its result inbox")
             record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))["sessions"]["task-1"]
             self.assertEqual(record["return_channel"]["state"], "issued")
