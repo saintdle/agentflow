@@ -88,10 +88,12 @@ explicitly selected exact route with a persisted rationale.
 
 ## Execution lanes
 
-Use native subagents for bounded, fire-and-forget work. Use Herdr or `tmux` for
-long-running, cross-provider, worktree-owned, or decision-prone sessions where
-observation or direct intervention is useful. A live pane is an attention
-signal, never proof of correctness or completion.
+Use native subagents for bounded, fire-and-forget work. Use Herdr for
+controller-managed, long-running, cross-provider, worktree-owned, or
+decision-prone sessions where observation or direct intervention is useful.
+`tmux` is available for manually managed terminal handoffs only, not controller
+dispatch. A live pane is an attention signal, never proof of correctness or
+completion.
 
 Generated native handoffs are direct-session contracts: they return in the
 provider session and never claim that controller-owned result files exist.

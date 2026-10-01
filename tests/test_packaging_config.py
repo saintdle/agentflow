@@ -21,6 +21,10 @@ from agentflow import preflight
 class PackagingConfigTests(unittest.TestCase):
     def test_version_and_resources_are_distribution_owned(self) -> None:
         self.assertEqual(__version__, "0.0.5")
+        self.assertEqual(
+            model_policy.DEFAULT_POLICY_PATH,
+            resources.item("policies", "models-v2.json"),
+        )
         self.assertTrue(resources.item("templates", "project", "agentflow.json").is_file())
         self.assertTrue(resources.item("policies", "models-v1.json").is_file())
         self.assertTrue(resources.item("policies", "models-v2.json").is_file())
