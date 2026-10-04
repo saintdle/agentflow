@@ -6,8 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-10-04
+
 ### Added
 
+- Added bounded parallel root dispatch with an admission-phase gate that keeps
+  deadline-draining controllers from claiming fresh work after a crash.
 - Added a protected separate-terminal `controller supervise` runner with a
   per-root process lock and authenticated same-lease restart across chat or
   process boundaries.
@@ -20,6 +24,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   approved workflow workspace instead of an incidental IDE cwd.
 - Added hash-inventoried sterile launch packages for external tasks that opt
   into restricted outbound context.
+- Added deterministic generation checks for bundled model and skill resources.
 
 ### Changed
 
@@ -38,6 +43,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for the bound provider session; this cooperative evidence is not
   provider-signed proof. Claude launch also rejects hook suppression in known
   project, user, and file-managed settings before spawn.
+- Persistent Herdr Copilot launches remain fail-closed when actual-model
+  evidence is unavailable; native direct Copilot use remains available.
 
 ### Fixed
 
@@ -53,6 +60,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and verifies the copied package bytes before launch.
 - Root preflight resolves relative output boundaries against the approved
   execution root rather than the invoking shell's directory.
+- Approved memory recall no longer starves behind draft candidates.
 
 ## [0.0.5] - 2026-09-15
 
@@ -179,7 +187,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/saintdle/agentflow/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/saintdle/agentflow/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/saintdle/agentflow/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/saintdle/agentflow/compare/v0.0.2...v0.0.3
