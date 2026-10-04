@@ -1083,11 +1083,27 @@ def _controller_step_serial(
     # Beads after a repeated-approach/user-action halt merely because another
     # descendant is ready.
     initial_document = controller._load_checkpoint()
+    initial_phase = checkpoint_backend.admission_phase(initial_document)
     initial_state = checkpoint_backend.resume_state(initial_document)
-    if initial_state in controller_backend.TERMINAL_STATES:
+    if initial_phase == "terminal":
         result = controller.resume([], lease=lease)
         reason = "GOAL_COMPLETE" if initial_state == "completed" else "USER_ACTION_REQUIRED"
         return _payload(result, reason), True
+    if initial_phase == "draining":
+        drain_reason = str(initial_document.get("terminal_reason") or "")
+        if controller.active_tasks():
+            # The router normally sends durable drains through the parallel
+            # reconciliation path. Keep direct serial callers closed too.
+            return _payload(
+                controller.resume([], lease=lease), "DRAINING_AFTER_TASK_FAILURE"
+            ), False
+        result = controller.halt(
+            "blocked",
+            drain_reason or "USER_ACTION_REQUIRED: a worker failed while draining",
+            lease=lease,
+        )
+        stop_reason = "USER_ACTION_REQUIRED" if "USER_ACTION_REQUIRED:" in drain_reason else "TASK_BLOCKED"
+        return _payload(result, stop_reason), True
 
     # Step 1: if a task is already in flight, check its REAL Herdr
     # result instead of blindly trusting the stale checkpoint
@@ -1361,8 +1377,9 @@ def _controller_step_parallel(
         }
 
     initial = controller._load_checkpoint()
+    phase = checkpoint_backend.admission_phase(initial)
     state = checkpoint_backend.resume_state(initial)
-    if state in controller_backend.TERMINAL_STATES:
+    if phase == "terminal":
         legacy_active = controller.active_tasks()
         if not legacy_active:
             result = controller.resume([], lease=lease)
@@ -1379,7 +1396,8 @@ def _controller_step_parallel(
         )
         initial = controller._load_checkpoint()
         state = "draining"
-    draining = state == "draining" or initial.get("state") == "draining"
+        phase = checkpoint_backend.admission_phase(initial)
+    draining = phase == "draining"
     drain_reason = str(initial.get("terminal_reason") or "") if draining else ""
 
     def note_failure(
@@ -1813,7 +1831,8 @@ def _controller_step(
     policy = _controller_execution_policy(cwd, root, workflow_root, root_issue=root_issue)
     document = controller._load_checkpoint()
     has_active_collection = bool(document.get("active_tasks"))
-    if policy.max_parallel_workers > 1 or has_active_collection:
+    phase = checkpoint_backend.admission_phase(document)
+    if phase == "draining" or policy.max_parallel_workers > 1 or has_active_collection:
         return _controller_step_parallel(
             args, controller, root, lease, operation=operation, policy=policy,
         )

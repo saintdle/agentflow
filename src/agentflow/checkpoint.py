@@ -305,11 +305,27 @@ def load_checkpoint(path: Path, *, migrate: bool = True) -> dict[str, Any]:
     return document
 
 
+def admission_phase(document: dict[str, Any]) -> str:
+    """Classify whether a validated checkpoint admits new work.
+
+    A deadline may make a draining checkpoint visibly incomplete while its
+    state remains draining.  Admission follows that durable drain intent,
+    not the resumable status presented to operators.
+    """
+
+    current = build_checkpoint(document)
+    if current["terminal"] or current["status"] in TERMINAL_STATES:
+        return "terminal"
+    if current["state"] == "draining" or current["status"] == "draining":
+        return "draining"
+    return "open"
+
+
 def resume_state(document: dict[str, Any]) -> str:
     """Return the safe controller action for a validated checkpoint."""
 
     current = build_checkpoint(document)
-    if current["terminal"]:
+    if admission_phase(current) == "terminal":
         return current["status"] or "terminal"
     if current["status"] in {"claimed", "claimed_no_session"} and not current["session_id"]:
         return "claimed_no_session"

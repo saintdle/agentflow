@@ -4802,6 +4802,66 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
 class ControllerParallelDispatchTests(unittest.TestCase):
     """The root scheduler admits a bounded launch wave before polling results."""
 
+    def test_authenticated_resume_finalizes_empty_drain_without_claiming_ready_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            key_file = base / "resume.key"
+            fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                "schema": "agentflow.execution-policy@1", "controller_only": True,
+                "max_parallel_workers": 1, "max_delegation_depth": 1,
+                "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                "max_expensive_execution_children": 0,
+            }
+            args = _controller_args(
+                fixture.root, workflow_root=fixture.workflow_root,
+                resume_key_file=str(key_file),
+            )
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                controller, _ = cli._controller_instance(args)
+                lease = controller.acquire()
+                cli._controller_credentials(args, lease)
+                controller.reserve_active_task({
+                    "task": "failed-task", "root": str(fixture.root),
+                    "actor": fixture.controller, "claim_id": "claim-failed",
+                }, lease=lease)
+                controller.bind_active_task(
+                    "failed-task", session_id="session-failed", lease=lease,
+                )
+                controller.begin_draining(
+                    "USER_ACTION_REQUIRED: failed-task exited non-zero",
+                    failed_task="failed-task", lease=lease,
+                )
+                cutpoint = controller.mark_incomplete(lease=lease)
+                self.assertEqual(cutpoint.checkpoint["state"], "draining")
+                self.assertEqual(cutpoint.checkpoint["status"], "incomplete")
+                self.assertEqual(cutpoint.checkpoint["active_tasks"], [])
+
+                claims: list[str] = []
+
+                def claim_ready(_cwd, *, parent, labels, actor):
+                    claims.append(actor)
+                    fixture.task_issue["status"] = "in_progress"
+                    return fixture.task_issue
+
+                payload = None
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                     mock.patch.object(cli.beads_backend, "claim_ready", side_effect=claim_ready), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_dispatch_via_herdr") as dispatch_builder, \
+                     mock.patch.object(cli, "_provider_command") as provider_command:
+                    payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertTrue(payload["ok"], payload)
+            self.assertEqual(payload["result"]["state"], "blocked")
+            self.assertTrue(payload["result"]["terminal"])
+            self.assertEqual(payload["result"]["checkpoint"]["active_tasks"], [])
+            self.assertIn("failed-task exited non-zero", payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(claims, [])
+            dispatch_builder.assert_not_called()
+            provider_command.assert_not_called()
+
     def test_invalid_acceptance_result_is_tracked_until_herdr_is_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)

@@ -697,7 +697,7 @@ class RootController:
         rows: list[dict[str, str]],
         current: Lease,
     ) -> dict[str, Any]:
-        draining = document.get("state") == "draining" or document.get("status") == "draining"
+        draining = checkpoint.admission_phase(document) == "draining"
         next_action = (
             "drain active task results" if draining and rows
             else "finalize blocked root after draining" if draining
@@ -859,8 +859,14 @@ class RootController:
 
         current_lease = self.assert_lease(lease)
         document = self._load_checkpoint()
+        phase = checkpoint.admission_phase(document)
         state = checkpoint.resume_state(document)
-        if state in TERMINAL_STATES:
+        if phase == "terminal":
+            return self._result(document, resumed=True)
+        if phase == "draining":
+            # A resumable deadline status can coexist with a durable drain.
+            # Reconciliation may continue elsewhere, but this admission API
+            # must never turn it into permission to select a fresh candidate.
             return self._result(document, resumed=True)
         if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
             return self._result(document, resumed=True)
@@ -965,15 +971,13 @@ class RootController:
         with self.fence(lease) as current:
             document = self._load_checkpoint()
             rows = _active_tasks_from_checkpoint(document, self.root)
-            previous_state = checkpoint.resume_state(document)
-            if previous_state in TERMINAL_STATES and not rows:
+            phase = checkpoint.admission_phase(document)
+            if phase == "terminal" and not rows:
                 # An immediate deadline must not reopen a completed/blocked
                 # checkpoint and make future resumes schedule work again.
                 return self._result(document, resumed=True)
-            was_draining = (
-                document.get("state") == "draining"
-                or document.get("status") == "draining"
-                or previous_state in TERMINAL_STATES
+            was_draining = phase == "draining" or (
+                phase == "terminal" and bool(rows)
             )
             if rows:
                 # Convert the legacy single-task pointer to the durable active

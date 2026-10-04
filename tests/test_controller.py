@@ -121,6 +121,36 @@ class ControllerTests(unittest.TestCase):
                 "claim_id": "claim-1", "session_id": "session-1", "state": "running",
             }])
 
+    def test_draining_deadline_checkpoint_rejects_new_resume_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            checkpoint_path = Path(tmp) / "checkpoint.json"
+            controller = RootController(
+                "root", "one", state_path=state, checkpoint_path=checkpoint_path
+            )
+            lease = controller.acquire()
+            draining = controller.begin_draining("task-1 failed", lease=lease)
+            incomplete = controller.mark_incomplete(lease=lease)
+            self.assertEqual(incomplete.state, "incomplete")
+            self.assertEqual(incomplete.checkpoint["state"], "draining")
+            self.assertEqual(incomplete.checkpoint["status"], "incomplete")
+            self.assertEqual(
+                incomplete.checkpoint["terminal_reason"],
+                draining.checkpoint["terminal_reason"],
+            )
+
+            dispatch = mock.Mock(return_value={"session_id": "unexpected"})
+            result = controller.resume(
+                [{"task": "ready-child", "root": "root", "ready": True}],
+                dispatch=dispatch,
+                lease=lease,
+            )
+
+            self.assertEqual(result.state, "incomplete")
+            self.assertEqual(result.checkpoint["active_tasks"], [])
+            self.assertEqual(checkpoint.admission_phase(result.checkpoint), "draining")
+            dispatch.assert_not_called()
+
     def test_deadline_does_not_reopen_terminal_checkpoint(self) -> None:
         for state in ("completed", "blocked"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
