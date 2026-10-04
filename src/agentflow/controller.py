@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -38,6 +39,10 @@ class LeaseConflict(ControllerError):
 
 class DuplicateController(LeaseConflict):
     """A second live controller attempted to acquire the same root."""
+
+
+class DuplicateSupervisor(ControllerError):
+    """A supervisor process already owns this root's OS lock."""
 
 
 class StaleLease(LeaseConflict):
@@ -269,6 +274,7 @@ class RootController:
         *,
         state_path: Path | None = None,
         checkpoint_path: Path | None = None,
+        supervisor_lock_path: Path | None = None,
         stale_after: float = 300.0,
         clock: Callable[[], float] = time.time,
         owner_id: str | None = None,
@@ -290,6 +296,11 @@ class RootController:
         self.state_path = Path(state_path)
         self.checkpoint_path = Path(checkpoint_path or self.state_path.with_suffix(".checkpoint.json"))
         self.lock_path = self.state_path.with_name(f".{self.state_path.name}.lock")
+        self.supervisor_lock_path = (
+            Path(supervisor_lock_path)
+            if supervisor_lock_path
+            else self.state_path.with_name(f".{self.state_path.name}.supervisor.lock")
+        )
         self._lease: Lease | None = None
 
     def _locked(self):
@@ -297,6 +308,35 @@ class RootController:
         handle = self.lock_path.open("a+", encoding="utf-8")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         return handle
+
+    @contextmanager
+    def supervisor_lock(self):
+        """Hold the one process-level supervisor lock for this root.
+
+        The file is deliberately separate from the lease transaction lock:
+        short status/credential operations remain available while one
+        supervised controller polls.  The kernel releases this lock if its
+        process exits, so restart requires an explicit command and protected
+        lease credential rather than a time-based takeover.
+        """
+        self.supervisor_lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        handle = self.supervisor_lock_path.open("a+", encoding="utf-8")
+        try:
+            os.fchmod(handle.fileno(), 0o600)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise DuplicateSupervisor(
+                        f"a supervisor is already running for root {self.root}"
+                    ) from exc
+                raise
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
     def _read_lease(self, state: Mapping[str, Any]) -> Lease | None:
         value = state.get("lease")
@@ -430,14 +470,16 @@ class RootController:
         return current
 
     def authorize(self, resume_proof: str) -> Lease:
-        """Authenticate an operator command without reattaching or fencing.
+        """Authenticate a sideband command or a lock-protected restart.
 
         Progress recording and rotation-packet generation are side-band
         controller operations.  They may share the current controller lease
         when the caller proves possession of its private resume secret; unlike
         ``acquire(resume_proof=...)`` this does not rotate epoch, token, owner,
         secret, or continuity identity and therefore does not interrupt a live
-        autonomous controller heartbeat.
+        autonomous controller heartbeat.  A supervised process restart also
+        uses this path, but only after acquiring ``supervisor_lock()``; every
+        current root runner takes that same lock before lease authentication.
         """
 
         if not resume_proof:
@@ -655,7 +697,7 @@ class RootController:
         rows: list[dict[str, str]],
         current: Lease,
     ) -> dict[str, Any]:
-        draining = document.get("status") == "draining"
+        draining = checkpoint.admission_phase(document) == "draining"
         next_action = (
             "drain active task results" if draining and rows
             else "finalize blocked root after draining" if draining
@@ -817,8 +859,14 @@ class RootController:
 
         current_lease = self.assert_lease(lease)
         document = self._load_checkpoint()
+        phase = checkpoint.admission_phase(document)
         state = checkpoint.resume_state(document)
-        if state in TERMINAL_STATES:
+        if phase == "terminal":
+            return self._result(document, resumed=True)
+        if phase == "draining":
+            # A resumable deadline status can coexist with a durable drain.
+            # Reconciliation may continue elsewhere, but this admission API
+            # must never turn it into permission to select a fresh candidate.
             return self._result(document, resumed=True)
         if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
             return self._result(document, resumed=True)
@@ -912,6 +960,62 @@ class RootController:
 
     def complete(self, *, reason: str = "", lease: Lease | str | None = None) -> ResumeResult:
         return self.halt("completed", reason, lease=lease)
+
+    def mark_incomplete(
+        self,
+        reason: str = "DEADLINE_EXCEEDED",
+        *,
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Persist a resumable deadline result without discarding live work."""
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            phase = checkpoint.admission_phase(document)
+            if phase == "terminal" and not rows:
+                # An immediate deadline must not reopen a completed/blocked
+                # checkpoint and make future resumes schedule work again.
+                return self._result(document, resumed=True)
+            was_draining = phase == "draining" or (
+                phase == "terminal" and bool(rows)
+            )
+            if rows:
+                # Convert the legacy single-task pointer to the durable active
+                # collection before replacing its visible status.  On the
+                # next resume this routes through the same Herdr reconciliation
+                # path and cannot authorize a second launch.
+                document.update({
+                    "task": self.root,
+                    "phase": "controller",
+                    "next_action": "resume controller and reconcile active tasks",
+                    "root": self.root,
+                    "controller": self.controller,
+                    "actor": "",
+                    "claim_id": "",
+                    "session_id": "",
+                    "epoch": current.epoch,
+                    "lease_token": current.token,
+                    "active_tasks": rows,
+                })
+            if was_draining:
+                # Keep the original failure evidence as the reason for the
+                # drain. The separate status carries the deadline outcome.
+                document.update({
+                    "state": "draining",
+                    "status": "incomplete",
+                    "terminal": False,
+                    "next_action": "deadline exceeded; resume controller and drain active tasks",
+                })
+            else:
+                document.update({
+                    "state": "incomplete",
+                    "status": "incomplete",
+                    "terminal": False,
+                    "terminal_reason": reason or "DEADLINE_EXCEEDED",
+                    "next_action": "resume controller",
+                })
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
+            return self._result(saved, resumed=True)
 
     def advance(self, *, lease: Lease | str | None = None) -> ResumeResult:
         """Clear the current in-flight task pointer; a non-terminal transition.
@@ -1030,6 +1134,7 @@ __all__ = [
     "Controller",
     "ControllerError",
     "DuplicateController",
+    "DuplicateSupervisor",
     "FencedLease",
     "Lease",
     "LeaseConflict",

@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added a protected separate-terminal `controller supervise` runner with a
+  per-root process lock and authenticated same-lease restart across chat or
+  process boundaries.
 - Added typed root workspace contracts for authenticated external handoffs:
   Git workspaces pin branch@revision, while Gitless directories bind the exact
   canonical root path without a synthetic Git base.
@@ -38,6 +41,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Controller deadlines now persist a resumable `incomplete` checkpoint and
+  return a nonzero exit instead of reporting success; `--deadline 0` is an
+  immediate deadline rather than the one-hour default.
 - Handoff preflight and sterile packaging now accept exact, provider-approved
   external skill sources registered through project configuration while still
   rejecting unregistered, retargeted, or package-escaping skill references.

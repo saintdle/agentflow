@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from agentflow.controller import (
     TERMINAL_STATES,
     ControllerError,
     DuplicateController,
+    DuplicateSupervisor,
     FencedLease,
     Lease,
     RootController,
@@ -33,6 +35,141 @@ class Clock:
 
 
 class ControllerTests(unittest.TestCase):
+    def test_supervisor_lock_is_exclusive_per_root_and_released_on_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            first = RootController("root", "one", state_path=state)
+            second = RootController("root", "one", state_path=state)
+            other_root = RootController(
+                "other-root", "one", state_path=Path(tmp) / "other.json"
+            )
+
+            with first.supervisor_lock():
+                with self.assertRaises(DuplicateSupervisor):
+                    with second.supervisor_lock():
+                        pass
+                # Independent workflow roots have independent supervisors.
+                with other_root.supervisor_lock():
+                    pass
+
+            # A process restart may acquire the lock once the prior owner exits.
+            with second.supervisor_lock():
+                pass
+
+    def test_supervisor_lock_is_exclusive_across_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            source_root = Path(__file__).resolve().parents[1] / "src"
+            script = "\n".join((
+                "import sys",
+                "from pathlib import Path",
+                "sys.path.insert(0, sys.argv[1])",
+                "from agentflow.controller import RootController",
+                "controller = RootController('root', 'one', state_path=Path(sys.argv[2]))",
+                "with controller.supervisor_lock():",
+                "    print('ready', flush=True)",
+                "    sys.stdin.readline()",
+            ))
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(source_root), str(state)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                contender = RootController("root", "one", state_path=state)
+                with self.assertRaises(DuplicateSupervisor):
+                    with contender.supervisor_lock():
+                        pass
+            finally:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.write("stop\n")
+                        process.stdin.flush()
+                    except BrokenPipeError:
+                        pass
+                    process.stdin.close()
+                process.wait(timeout=5)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    def test_deadline_incomplete_preserves_live_task_for_safe_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            checkpoint_path = Path(tmp) / "checkpoint.json"
+            controller = RootController(
+                "root", "one", state_path=state, checkpoint_path=checkpoint_path
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task(
+                {"task": "task-1", "root": "root", "actor": "one", "claim_id": "claim-1"},
+                lease=lease,
+            )
+            controller.bind_active_task("task-1", session_id="session-1", lease=lease)
+
+            incomplete = controller.mark_incomplete("DEADLINE_EXCEEDED", lease=lease)
+
+            self.assertEqual(incomplete.state, "incomplete")
+            self.assertFalse(incomplete.terminal)
+            self.assertEqual(incomplete.checkpoint["terminal_reason"], "DEADLINE_EXCEEDED")
+            self.assertEqual(incomplete.checkpoint["active_tasks"], [{
+                "task": "task-1", "phase": "dispatch", "actor": "one",
+                "claim_id": "claim-1", "session_id": "session-1", "state": "running",
+            }])
+
+    def test_draining_deadline_checkpoint_rejects_new_resume_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            checkpoint_path = Path(tmp) / "checkpoint.json"
+            controller = RootController(
+                "root", "one", state_path=state, checkpoint_path=checkpoint_path
+            )
+            lease = controller.acquire()
+            draining = controller.begin_draining("task-1 failed", lease=lease)
+            incomplete = controller.mark_incomplete(lease=lease)
+            self.assertEqual(incomplete.state, "incomplete")
+            self.assertEqual(incomplete.checkpoint["state"], "draining")
+            self.assertEqual(incomplete.checkpoint["status"], "incomplete")
+            self.assertEqual(
+                incomplete.checkpoint["terminal_reason"],
+                draining.checkpoint["terminal_reason"],
+            )
+
+            dispatch = mock.Mock(return_value={"session_id": "unexpected"})
+            result = controller.resume(
+                [{"task": "ready-child", "root": "root", "ready": True}],
+                dispatch=dispatch,
+                lease=lease,
+            )
+
+            self.assertEqual(result.state, "incomplete")
+            self.assertEqual(result.checkpoint["active_tasks"], [])
+            self.assertEqual(checkpoint.admission_phase(result.checkpoint), "draining")
+            dispatch.assert_not_called()
+
+    def test_deadline_does_not_reopen_terminal_checkpoint(self) -> None:
+        for state in ("completed", "blocked"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                state_path = Path(tmp) / "controller.json"
+                checkpoint_path = Path(tmp) / "checkpoint.json"
+                controller = RootController(
+                    "root", "one", state_path=state_path, checkpoint_path=checkpoint_path
+                )
+                lease = controller.acquire()
+                terminal = controller.halt(state, "original terminal evidence", lease=lease)
+
+                after_deadline = controller.mark_incomplete(lease=lease)
+
+                self.assertTrue(after_deadline.terminal)
+                self.assertEqual(after_deadline.state, state)
+                self.assertEqual(after_deadline.checkpoint, terminal.checkpoint)
+                self.assertEqual(checkpoint.load_checkpoint(checkpoint_path)["terminal_reason"],
+                                 "original terminal evidence")
+
     def test_duplicate_controllers_and_epoch_safe_takeover(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             clock = Clock()
