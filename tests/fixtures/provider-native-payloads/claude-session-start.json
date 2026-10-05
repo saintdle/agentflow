@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "SessionStart",
+  "session_id": "synthetic-claude-session",
+  "timestamp": "2026-10-05T09:00:00.000Z",
+  "cwd": "/tmp/agentflow-provider-fixture",
+  "model": "claude-sonnet-5"
+}

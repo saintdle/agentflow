@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "PostModelSwitch",
+  "session_id": "synthetic-claude-session",
+  "timestamp": "2026-10-05T09:01:00.000Z",
+  "cwd": "/tmp/agentflow-provider-fixture",
+  "source": "fallback",
+  "from_model": "claude-sonnet-5",
+  "to_model": "claude-sonnet-4.6"
+}

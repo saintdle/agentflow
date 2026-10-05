@@ -1,0 +1,7 @@
+{
+  "hookEventName": "sessionStart",
+  "sessionId": "synthetic-copilot-session",
+  "timestamp": 1724954400000,
+  "cwd": "/tmp/agentflow-provider-fixture",
+  "source": "startup"
+}

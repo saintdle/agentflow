@@ -32,6 +32,7 @@ from agentflow import audit as audit_backend
 from agentflow import beads as beads_backend
 from agentflow import checkpoint as checkpoint_backend
 from agentflow import controller as controller_backend
+from agentflow import config_commands as config_commands_backend
 from agentflow import context_budget as context_budget_backend
 from agentflow import execution as execution_backend
 from agentflow import guidance as guidance_backend
@@ -43,7 +44,9 @@ from agentflow import migration as migration_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
+from agentflow import installation as installation_backend
 from agentflow import isolation as isolation_backend
+from agentflow import launch_recovery as launch_recovery_backend
 from agentflow import readiness as readiness_backend
 from agentflow import reconciliation as reconciliation_backend
 from agentflow import search as search_backend
@@ -1130,7 +1133,19 @@ def _controller_step_serial(
                 lease=lease,
             )
             return _payload(result, "USER_ACTION_REQUIRED"), True
-        if in_flight_state == "identity_pending":
+        recovery = launch_recovery_backend.reduce_incomplete_launch(
+            in_flight_state, in_flight_record, task_id=in_flight_task,
+        )
+        if recovery.action == "require_operator":
+            result = controller.halt("blocked", recovery.reason, lease=lease)
+            response = _payload(result, "USER_ACTION_REQUIRED")
+            response["action_required"] = _launch_action_required(
+                in_flight_task, in_flight_record, recovery,
+            )
+            return response, True
+        if in_flight_state == "identity_pending" or recovery.action in {
+            "poll_identity", "reattach_identity_pending",
+        }:
             # AFREL-025: poll the live pane for its now-available
             # provider session identity instead of relaunching.
             _resolve_pending_identity(root, in_flight_task)
@@ -1309,16 +1324,65 @@ def _controller_step_serial(
             "root": str(root), "claim_id": identity.claim_id,
             "claim_token": identity.token, "actor": lease.controller,
         })
+        if orphaned:
+            existing_record = _herdr_session_record(root, task_id)
+            if isinstance(existing_record, Mapping):
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", existing_record, task_id=task_id,
+                )
+                if recovery.action == "require_operator":
+                    # Reconstruct the exact durable claim pointer, then halt
+                    # with the shared recovery decision. Never run preflight
+                    # or dispatch over an existing incomplete Herdr record.
+                    controller.resume([selected], lease=lease)
+                    result = controller.halt("blocked", recovery.reason, lease=lease)
+                    response = _payload(result, "USER_ACTION_REQUIRED")
+                    response["action_required"] = _launch_action_required(
+                        task_id, existing_record, recovery,
+                    )
+                    return response, True
+                if recovery.action in {"reattach_identity_pending", "reattach_running"}:
+                    dispatch_state = (
+                        "identity_pending"
+                        if recovery.action == "reattach_identity_pending" else "running"
+                    )
+                    result = controller.resume(
+                        [selected],
+                        dispatch=lambda _selected: {
+                            "state": dispatch_state,
+                            "session_id": recovery.session_id,
+                        },
+                        lease=lease,
+                    )
+                    if result.dispatched:
+                        controller.record_session_event(
+                            event="dispatch", task_class=_controller_session_task_class(claimed),
+                            task=task_id, phase=_controller_session_phase(claimed), lease=lease,
+                        )
+                    return _payload(result, ""), False
         result = controller.resume(
             [selected], dispatch=_dispatch_via_herdr(args, root, cwd, workflow_root, lease), lease=lease,
         )
+        action_required: dict[str, str] | None = None
         if result.dispatched:
             controller.record_session_event(
                 event="dispatch", task_class=_controller_session_task_class(claimed),
                 task=task_id, phase=_controller_session_phase(claimed), lease=lease,
             )
         if result.state == "blocked":
-            stop_reason = "TASK_BLOCKED"
+            launch_record = _herdr_session_record(root, task_id)
+            if isinstance(launch_record, Mapping) and launch_record.get("status") == "launching":
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", launch_record, task_id=task_id,
+                )
+            else:
+                recovery = launch_recovery_backend.LaunchRecoveryDecision(action="continue")
+            if recovery.action == "require_operator":
+                result = controller.halt("blocked", recovery.reason, lease=lease)
+                stop_reason = "USER_ACTION_REQUIRED"
+                action_required = _launch_action_required(task_id, launch_record, recovery)
+            else:
+                stop_reason = "TASK_BLOCKED"
         # AFREL-020: a fresh dispatch that is now running/identity_pending
         # is progress, not a stop condition -- the loop keeps polling it.
         stop = bool(stop_reason)
@@ -1340,7 +1404,7 @@ def _controller_step_serial(
             )
             result = controller.halt(
                 "blocked",
-                f"USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: {titles}",
+                f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
                 lease=lease,
             )
             stop_reason = "USER_ACTION_REQUIRED"
@@ -1357,7 +1421,10 @@ def _controller_step_serial(
             result = controller.resume([], lease=lease)
             stop = False
 
-    return _payload(result, stop_reason), stop
+    response = _payload(result, stop_reason)
+    if claimed is not None and action_required:
+        response["action_required"] = action_required
+    return response, stop
 
 
 def _controller_step_parallel(
@@ -1429,54 +1496,39 @@ def _controller_step_parallel(
     controller.migrate_active_tasks(lease=lease)
     active = controller.active_tasks()
     attention_required: dict[str, str] | None = None
+    launch_attention_required: dict[str, str] | None = None
     for entry in list(active):
         task_id = entry["task"]
+        session_record = _herdr_session_record(root, task_id) or {}
+        recovery = launch_recovery_backend.reduce_incomplete_launch(
+            entry["state"], session_record, task_id=task_id,
+        )
+        if recovery.action == "require_operator":
+            note_failure(
+                task_id, recovery.reason,
+                provider_terminal=recovery.provider_terminal,
+            )
+            launch_attention_required = _launch_action_required(
+                task_id, session_record, recovery,
+            )
+            continue
         if entry["state"] == "claimed_no_session":
-            session_record = _herdr_session_record(root, task_id) or {}
-            lifecycle_status = str(session_record.get("status") or "") if isinstance(session_record, Mapping) else ""
-            binding = session_record.get("binding") if isinstance(session_record, Mapping) else None
-            session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
-            terminal_provider_states = {"completed", "failed", "blocked", "cancelled", "canceled"}
-            if not session_record:
-                # Keep the durable pre-launch reservation for operator review.
-                # Even if no provider process was started, silently clearing a
-                # claimed task would make a later retry indistinguishable from
-                # a fresh claim and weaken crash recovery's no-duplicate rule.
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but no Herdr lifecycle record; "
-                    "inspect the launch before retrying",
-                )
-                continue
-            if lifecycle_status in terminal_provider_states:
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has terminal Herdr state {lifecycle_status} "
-                    "but no provider session binding",
-                    provider_terminal=True,
-                )
-                continue
-            if lifecycle_status == "identity_pending" and str(session_record.get("pane_id") or ""):
+            if recovery.action == "reattach_identity_pending":
                 controller.bind_active_task(
                     task_id, session_id="", state="identity_pending", lease=lease,
                 )
                 entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
-            elif lifecycle_status in {"launched", "running", "completed"} and session_id:
+            elif recovery.action == "reattach_running":
                 controller.bind_active_task(
-                    task_id, session_id=session_id, state="running", lease=lease,
+                    task_id, session_id=recovery.session_id, state="running", lease=lease,
                 )
                 entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
             else:
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but Herdr state "
-                    f"{lifecycle_status or 'unknown'} has no committed provider identity; inspect the live pane",
-                )
+                note_failure(task_id, f"USER_ACTION_REQUIRED: task {task_id} has no safe launch recovery action")
                 continue
 
         issue = beads_backend.get_issue(cwd, task_id)
         terminal = str(issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
-        session_record = _herdr_session_record(root, task_id) or {}
         if terminal and not session_record:
             note_failure(
                 task_id,
@@ -1484,26 +1536,6 @@ def _controller_step_parallel(
             )
             continue
         if entry["state"] == "identity_pending":
-            if isinstance(session_record, Mapping) and session_record.get("status") == "launching":
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} remains identity-pending in the checkpoint but "
-                    "Herdr has no committed pane/session identity; inspect the launch before further action",
-                )
-                continue
-            if (
-                isinstance(session_record, Mapping)
-                and session_record.get("status") == "identity_pending"
-                and (
-                    not str(session_record.get("pane_id") or "")
-                    or not str(session_record.get("identity_pending_since") or "")
-                )
-            ):
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has incomplete identity-pending lifecycle metadata",
-                )
-                continue
             _resolve_pending_identity(root, task_id)
             session_record = _herdr_session_record(root, task_id) or {}
             if isinstance(session_record, dict) and session_record.get("status") == "identity_pending":
@@ -1676,66 +1708,46 @@ def _controller_step_parallel(
             break
         if orphaned:
             existing_record = _herdr_session_record(root, task_id)
-            binding = existing_record.get("binding") if isinstance(existing_record, Mapping) else None
-            lifecycle_status = str(existing_record.get("status") or "") if isinstance(existing_record, Mapping) else ""
-            if isinstance(existing_record, Mapping) and lifecycle_status == "launching":
-                adopted = dict(claimed)
-                adopted.update({"root": str(root), "actor": lease.controller})
-                controller.reserve_active_task(adopted, lease=lease)
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has an incomplete Herdr launching "
-                    "record without a committed binding; inspect the pane before further action",
-                )
-                break
-            if isinstance(existing_record, Mapping) and lifecycle_status in {
-                "identity_pending", "launched", "running", "completed",
-            }:
-                session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
-                if lifecycle_status == "identity_pending" and not str(existing_record.get("pane_id") or ""):
-                    adopted = dict(claimed)
-                    adopted.update({"root": str(root), "actor": lease.controller})
-                    controller.reserve_active_task(adopted, lease=lease)
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} is identity-pending without a pane ID",
-                    )
-                    break
-                if lifecycle_status != "identity_pending" and not session_id:
-                    adopted = dict(claimed)
-                    adopted.update({"root": str(root), "actor": lease.controller})
-                    controller.reserve_active_task(adopted, lease=lease)
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has Herdr state "
-                        f"{lifecycle_status} without a committed provider session binding",
-                    )
-                    break
-                adopted = dict(claimed)
-                adopted.update({"root": str(root), "actor": lease.controller})
-                controller.reserve_active_task(adopted, lease=lease)
-                adopted_state = "running" if session_id else "identity_pending"
-                controller.bind_active_task(
-                    task_id, session_id=session_id, state=adopted_state, lease=lease,
-                )
-                active = controller.active_tasks()
-                continue
             if isinstance(existing_record, Mapping):
-                if lifecycle_status in {"failed", "blocked", "cancelled", "canceled"}:
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has terminal Herdr state "
-                        f"{lifecycle_status} without an authenticated result",
-                        provider_terminal=True,
-                    )
-                    break
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", existing_record, task_id=task_id,
+                )
                 adopted = dict(claimed)
                 adopted.update({"root": str(root), "actor": lease.controller})
                 controller.reserve_active_task(adopted, lease=lease)
+                if recovery.action == "require_operator":
+                    note_failure(
+                        task_id, recovery.reason,
+                        provider_terminal=recovery.provider_terminal,
+                    )
+                    launch_attention_required = _launch_action_required(
+                        task_id, existing_record, recovery,
+                    )
+                    break
+                if recovery.action in {"reattach_identity_pending", "reattach_running"}:
+                    session_id = recovery.session_id
+                    adopted_state = (
+                        "identity_pending"
+                        if recovery.action == "reattach_identity_pending" else "running"
+                    )
+                    controller.bind_active_task(
+                        task_id, session_id=session_id, state=adopted_state, lease=lease,
+                    )
+                    active = controller.active_tasks()
+                    continue
+                # A lifecycle record exists but has no recognized committed
+                # recovery transition. Preserve the reservation and fail closed.
                 note_failure(
                     task_id,
-                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has a non-relaunchable Herdr "
-                    f"state {lifecycle_status or 'unknown'}; inspect lifecycle before retrying",
+                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has an unrecognized Herdr "
+                    "recovery state; inspect lifecycle before retrying",
+                )
+                launch_attention_required = _launch_action_required(
+                    task_id, existing_record,
+                    launch_recovery_backend.LaunchRecoveryDecision(
+                        action="require_operator",
+                        reason=f"USER_ACTION_REQUIRED: orphaned task {task_id} has an unrecognized Herdr recovery state",
+                    ),
                 )
                 break
 
@@ -1770,13 +1782,28 @@ def _controller_step_parallel(
         if dispatch_state == "blocked" or (not session_id and dispatch_state != "identity_pending"):
             launch_record = _herdr_session_record(root, task_id) or {}
             launch_status = str(launch_record.get("status") or "") if isinstance(launch_record, Mapping) else ""
-            note_failure(
-                task_id, f"task {task_id} failed preflight or provider launch",
-                provider_terminal=(
-                    not launch_record
-                    or launch_status in {"failed", "blocked", "cancelled", "canceled"}
-                ),
-            )
+            if launch_status == "launching":
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", launch_record, task_id=task_id,
+                )
+            else:
+                recovery = launch_recovery_backend.LaunchRecoveryDecision(action="continue")
+            if recovery.action == "require_operator":
+                note_failure(
+                    task_id, recovery.reason,
+                    provider_terminal=recovery.provider_terminal,
+                )
+                launch_attention_required = _launch_action_required(
+                    task_id, launch_record, recovery,
+                )
+            else:
+                note_failure(
+                    task_id, f"task {task_id} failed preflight or provider launch",
+                    provider_terminal=(
+                        not launch_record
+                        or launch_status in {"failed", "blocked", "cancelled", "canceled"}
+                    ),
+                )
             break
         dispatch_state = dispatch_state if dispatch_state in {"running", "launched", "identity_pending"} else "running"
         result = controller.bind_active_task(
@@ -1801,11 +1828,17 @@ def _controller_step_parallel(
             # No provider result can be polled for these unresolved identities.
             # Keep them durable and fail closed, but stop the autonomous loop
             # once all trackable sibling sessions have drained.
-            return payload(result, "USER_ACTION_REQUIRED"), True
-        return payload(
+            response = payload(result, "USER_ACTION_REQUIRED")
+            if launch_attention_required:
+                response["action_required"] = launch_attention_required
+            return response, True
+        response = payload(
             result,
             "DRAINING_AFTER_TASK_FAILURE" if draining else "",
-        ), False
+        )
+        if launch_attention_required:
+            response["action_required"] = launch_attention_required
+        return response, False
     if draining:
         result = controller.halt(
             "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
@@ -1825,7 +1858,7 @@ def _controller_step_parallel(
             f"{item.get('title') or item.get('id')} ({item.get('id')})" for item in nonterminal[:5]
         )
         result = controller.halt(
-            "blocked", f"USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: {titles}",
+            "blocked", f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
             lease=lease,
         )
         return payload(result, "USER_ACTION_REQUIRED"), True
@@ -1857,6 +1890,105 @@ def _controller_step(
     return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
+def _verify_no_ready_ack_candidate(
+    root: Path, workflow_root: str,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+) -> str:
+    """Read-only proof that this same root has ready work and nothing live."""
+    document = controller._load_checkpoint()
+    reason = str(document.get("terminal_reason") or "")
+    if not (
+        reason.startswith("USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: ")
+        or reason.startswith("USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: ")
+    ):
+        raise controller_backend.ControllerError("checkpoint is not a recognized no-ready-work halt")
+    if controller.active_tasks():
+        raise controller_backend.ControllerError("cannot acknowledge while controller workers remain active")
+    ledger = controller.session_ledger()
+    if ledger.get("blocked"):
+        raise controller_backend.ControllerError("cannot acknowledge a repeated-approach blocked controller")
+    current_root = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(current_root.get("id") or "") != workflow_root
+        or str(current_root.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise controller_backend.ControllerError("workflow root is missing, mismatched, or terminal")
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    for descendant in descendants:
+        task_id = str(descendant.get("id") or "")
+        if str(descendant.get("status") or "").lower() == "in_progress":
+            raise controller_backend.ControllerError(
+                "cannot acknowledge while a descendant remains claimed in progress"
+            )
+        record = _herdr_session_record(root, task_id) if task_id else None
+        if record is None:
+            continue
+        if not isinstance(record, Mapping):
+            raise controller_backend.ControllerError("Herdr session state is malformed")
+        status = str(record.get("status") or "").lower()
+        channel = record.get("return_channel")
+        result = record.get("result")
+        binding = record.get("binding")
+        safely_completed = (
+            status == "completed"
+            and isinstance(channel, Mapping) and channel.get("state") == "consumed"
+            and isinstance(result, Mapping) and result.get("outcome") == "completed"
+            and isinstance(binding, Mapping)
+            and str(binding.get("root") or "") == str(root.resolve())
+            and str(binding.get("task_id") or "") == task_id
+            and str(result.get("workflow_root") or "") == workflow_root
+            and str(result.get("workspace_root") or "") == str(root.resolve())
+            and str(result.get("task_id") or "") == task_id
+            and str(result.get("session_id") or "") == str(binding.get("session_id") or "")
+            and str(result.get("launch_id") or "") == str(binding.get("launch_id") or "")
+        )
+        if not safely_completed:
+            raise controller_backend.ControllerError(
+                "cannot acknowledge while a descendant has an unconsumed, failed, "
+                "ambiguous, or unknown Herdr lifecycle"
+            )
+    eligible = {
+        str(item.get("id") or "")
+        for item in descendants
+        if str(item.get("status") or "").lower() not in reconciliation_backend.TERMINAL
+    }
+    if not eligible:
+        raise controller_backend.ControllerError(
+            "no eligible nonterminal descendant remains under this workflow root"
+        )
+    common = ["ready", "--parent", workflow_root, "--limit", "1", "--sort", "priority"]
+
+    def ready_rows(value: Any, operation: str) -> list[Any]:
+        if isinstance(value, Mapping):
+            if isinstance(value.get("issues"), list):
+                return value["issues"]
+            return [value] if value.get("id") else []
+        if isinstance(value, list):
+            return value
+        raise beads_backend.BeadsError(f"{operation} returned an unexpected JSON shape")
+
+    assigned = beads_backend._json_output(
+        beads_backend.run(root, *common, "--assignee", lease.controller, "--json"),
+        "bd ready --assignee",
+    )
+    rows = ready_rows(assigned, "bd ready --assignee")
+    if not rows:
+        shared = beads_backend._json_output(
+            beads_backend.run(root, *common, "--unassigned", "--json"),
+            "bd ready --unassigned",
+        )
+        rows = ready_rows(shared, "bd ready --unassigned")
+    if len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise controller_backend.ControllerError("no single ready descendant can be verified for this workflow root")
+    task_id = str(rows[0].get("id") or "")
+    if not task_id or task_id not in eligible:
+        raise controller_backend.ControllerError(
+            "the ready candidate is not a current descendant of this workflow root"
+        )
+    return task_id
+
+
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
@@ -1871,6 +2003,11 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         if operation == "supervise" and str(getattr(args, "resume_token", "") or ""):
             raise ValueError("controller supervise requires its protected credential file, not --resume-token")
         controller, root = _controller_instance(args)
+        acknowledge_no_ready = operation == "resume" and bool(
+            getattr(args, "acknowledge_no_ready_halt", False)
+        )
+        if acknowledge_no_ready and bool(getattr(args, "takeover", False)):
+            raise ValueError("--acknowledge-no-ready-halt requires authenticated reattach, not takeover")
 
         # Validate the exact Beads root before acquiring a lease or writing
         # protected credentials.  The lock covers every long-running root
@@ -1912,6 +2049,30 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     legacy = _legacy_resume_key_path(args)
                     if not resume_proof and legacy is not None:
                         resume_proof = _read_resume_key(legacy)
+                if acknowledge_no_ready:
+                    state = (
+                        json.loads(controller.state_path.read_text(encoding="utf-8"))
+                        if controller.state_path.exists() else {}
+                    )
+                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
+                    credentials = _read_controller_credentials(key_path)
+                    legacy = _legacy_resume_key_path(args)
+                    if not credentials and legacy is not None:
+                        credentials = _read_controller_credentials(legacy)
+                    if (
+                        previous is None
+                        or previous.root != str(root)
+                        or previous.controller != controller.controller
+                        or not previous.verify_resume_proof(resume_proof)
+                        or credentials.get("workspace_root") != str(root.resolve())
+                        or credentials.get("workflow_root") != workflow_root
+                        or credentials.get("continuity_id") != previous.continuity_id
+                        or not credentials.get("authority_secret")
+                    ):
+                        raise controller_backend.LeaseConflict(
+                            "--acknowledge-no-ready-halt requires the protected credential "
+                            "for this workflow incarnation"
+                        )
                 lease = controller.acquire(
                     takeover=bool(getattr(args, "takeover", False)),
                     resume_proof=resume_proof,
@@ -1920,6 +2081,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             # Internal-only: never serialized into a handoff, command argv,
             # Herdr state, environment variable, checkpoint, or payload.
             args._authority_secret = credentials["authority_secret"]
+            if acknowledge_no_ready:
+                ready_task = _verify_no_ready_ack_candidate(root, workflow_root, controller, lease)
+                controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
             _bind_current_controller_sessions(root, workflow_root, lease)
 
             # An authenticated resume acknowledges a required safe-boundary
@@ -3375,14 +3539,46 @@ def _pending_startup_attention(
     active_rows = checkpoint.get("active_tasks")
     task_ids = [str(item.get("task") or "") for item in active_rows
                 if isinstance(item, Mapping)] if isinstance(active_rows, list) else []
-    task_ids.append(str(checkpoint.get("in_flight_task") or ""))
+    for field in ("in_flight_task", "task"):
+        task_id = str(checkpoint.get(field) or "")
+        if task_id and task_id != str(checkpoint.get("root") or ""):
+            task_ids.append(task_id)
     for task_id in task_ids:
         record = sessions.get(task_id)
-        if isinstance(record, Mapping) and record.get("status") == "identity_pending":
+        if isinstance(record, Mapping):
             attention = record.get("startup_attention")
             if isinstance(attention, Mapping):
                 return {str(key): str(value) for key, value in attention.items()}
+            if record.get("status") == "launching":
+                decision = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", record, task_id=task_id,
+                )
+                return _launch_action_required(task_id, record, decision)
     return None
+
+
+def _launch_action_required(
+    task_id: str,
+    record: Mapping[str, Any] | None,
+    decision: launch_recovery_backend.LaunchRecoveryDecision,
+) -> dict[str, str]:
+    """Project a pure recovery decision into concise operator guidance."""
+    if isinstance(record, Mapping):
+        attention = record.get("startup_attention")
+        if isinstance(attention, Mapping):
+            return {str(key): str(value) for key, value in attention.items()}
+    observed = record.get("launch_observation") if isinstance(record, Mapping) else None
+    pane_id = str(observed.get("pane_id") or "") if isinstance(observed, Mapping) else ""
+    ambiguous = (
+        isinstance(record, Mapping)
+        and str(record.get("launch_outcome") or "").lower() == "ambiguous"
+    )
+    return {
+        "code": "herdr_start_ambiguous" if ambiguous else "incomplete_herdr_launch",
+        "task_id": task_id,
+        "pane_id": pane_id,
+        "message": decision.reason.removeprefix("USER_ACTION_REQUIRED: "),
+    }
 
 
 def _herdr_server_running(herdr: str) -> bool:
@@ -3579,6 +3775,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
         agent_name = getattr(args, "agent_name", "") or task_id
         launch_id = str(uuid.uuid4())
         attempt = 1
+        launch_timeout: subprocess.TimeoutExpired | None = None
         return_channel: dict[str, Any] | None = None
 
         def _mark_failed(code: str) -> None:
@@ -3590,6 +3787,64 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     record.setdefault("attempts", []).append(
                         {"attempt": attempt, "status": "failed", "error": record["error"]}
                     )
+
+        def _mark_ambiguous_start(exc: subprocess.TimeoutExpired) -> None:
+            """Keep a timed-out spawn reservation live and record only observed identity."""
+            output = getattr(exc, "stdout", None)
+            if output is None:
+                output = getattr(exc, "output", None)
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            observation: dict[str, str] = {}
+            if isinstance(output, str) and output:
+                try:
+                    binding = _actual_herdr_binding(
+                        output, root=root, task_id=task_id,
+                        claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                        provider=provider, launch_id=launch_id,
+                    )
+                except IdentityPending as pending:
+                    observation["pane_id"] = pending.pane_id
+                except (herdr_backend.HerdrError, ValueError):
+                    pass
+                else:
+                    observation.update({
+                        "pane_id": binding.pane_id,
+                        "session_id": binding.session_id,
+                    })
+            pane_id = observation.get("pane_id", "")
+            message = (
+                "Herdr agent start timed out; inspect the Herdr pane/session and verify whether "
+                "provider work started before any retry. Do not relaunch while the outcome is uncertain."
+            )
+            attention = {
+                "code": "herdr_start_ambiguous",
+                "task_id": task_id,
+                "launch_id": launch_id,
+                "pane_id": pane_id,
+                "message": message,
+            }
+            with _herdr_transaction(state_path) as state:
+                record = state.get("sessions", {}).get(task_id)
+                if not isinstance(record, dict) or record.get("status") != "launching":
+                    raise ValueError("Herdr launch reservation was replaced after start timeout")
+                record["launch_outcome"] = "ambiguous"
+                record["launch_timeout"] = {
+                    "timeout_seconds": exc.timeout,
+                    "observed_at": _now(),
+                }
+                if observation:
+                    # This is diagnostic evidence only, not a committed
+                    # binding and never authority to ingest a provider result.
+                    record["launch_observation"] = {
+                        "state": "uncommitted", **observation,
+                    }
+                record["startup_attention"] = attention
+                record.setdefault("attempts", []).append({
+                    "attempt": attempt,
+                    "status": "ambiguous",
+                    "reason": "herdr_start_timeout",
+                })
 
         # AFREL-027/AFREL-016: lock order is always controller-then-Herdr.
         # Holding the controller's own lock (fence()) across each
@@ -3752,10 +4007,33 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         *sum((["--env", value] for value in safe_env), []),
                         "--", *provider_tail,
                     ]
-                    launched = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+                    try:
+                        launched = subprocess.run(
+                            argv, capture_output=True, text=True, timeout=30, check=False,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        # The timeout bounds our wait; it does not prove that
+                        # Herdr failed to create a pane. Persist ambiguity while
+                        # the controller fence is still held, and never mark the
+                        # reserved attempt failed or authorize an automatic retry.
+                        _mark_ambiguous_start(exc)
+                        launch_timeout = exc
+                        launched = None
             except (ValueError, controller_backend.FencedLease) as exc:
                 _mark_failed("authority_superseded")
                 raise ValueError(f"launch authority revalidation failed before spawn: {exc}") from exc
+            if launch_timeout is not None:
+                payload = {
+                    "operation": "launch", "ok": False, "retryable": False,
+                    "state_path": str(state_path), "root": str(root),
+                    "task_id": task_id, "status": "ambiguous",
+                    "error": {"code": "herdr_start_timeout"},
+                }
+                _json_or_status(
+                    payload, as_json=bool(getattr(args, "json", False)),
+                    title="HERDR LAUNCH OUTCOME AMBIGUOUS",
+                )
+                return 2
             error_code = "herdr_exit" if launched.returncode else ""
 
         if launched is None or launched.returncode:
@@ -4700,6 +4978,56 @@ def _copy_resource_tree(
     return "refreshed" if existed else "installed"
 
 
+MANAGED_INSTALL_SCHEMA = installation_backend.MANAGED_INSTALL_SCHEMA
+
+
+def _managed_install_manifest_path() -> Path:
+    return installation_backend.managed_install_manifest_path()
+
+
+def _managed_destination_key(destination: Path) -> str:
+    return installation_backend.managed_destination_key(destination)
+
+
+def _load_managed_install_manifest(path: Path | None = None) -> dict[str, Any]:
+    return installation_backend.load_managed_install_manifest(path)
+
+
+def _save_managed_install_manifest(manifest: Mapping[str, Any], path: Path | None = None) -> None:
+    installation_backend.save_managed_install_manifest(manifest, path)
+
+
+def _install_managed_resource(
+    parts: tuple[str, ...], destination: Path, manifest: dict[str, Any], *,
+    is_tree: bool, dry_run: bool, refresh: bool,
+) -> str:
+    return installation_backend.install_resource(
+        parts, destination, manifest, is_tree=is_tree, dry_run=dry_run, refresh=refresh
+    )
+
+
+def _managed_hook_inventory(document: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    return installation_backend._managed_hook_inventory(document)
+
+
+def _merge_agentflow_hook_config(
+    existing: Mapping[str, Any], packaged: Mapping[str, Any], *,
+    previously_owned: Mapping[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    return installation_backend.merge_agentflow_hook_config(
+        existing, packaged, previously_owned=previously_owned
+    )
+
+
+def _install_merged_codex_hooks(
+    destination: Path, parts: tuple[str, ...], manifest: dict[str, Any], *,
+    dry_run: bool, refresh: bool,
+) -> str:
+    return installation_backend.install_codex_hooks(
+        destination, parts, manifest, dry_run=dry_run, refresh=refresh
+    )
+
+
 def _install_beads_formula(
     workspace_data: dict[str, Any], *, refresh: bool = False
 ) -> tuple[str, Path]:
@@ -5092,14 +5420,7 @@ def _link(source: Path, destination: Path, force: bool, dry_run: bool) -> str:
 
 
 def config_show(args: argparse.Namespace) -> int:
-    root = Path(args.path).expanduser().resolve()
-    try:
-        data = project_config_backend.load(root)
-    except (project_config_backend.ConfigError, OSError) as exc:
-        print(f"Invalid Agentflow configuration: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(data, indent=2, sort_keys=True))
-    return 0
+    return config_commands_backend.config_show(args, project_config=project_config_backend)
 
 
 def skills_list(args: argparse.Namespace) -> int:
@@ -5287,6 +5608,12 @@ def skills_remove(args: argparse.Namespace) -> int:
 
 def install(args: argparse.Namespace) -> int:
     """Install bundled workflow skills, profiles, hooks, then configured skills."""
+    try:
+        manifest = _load_managed_install_manifest()
+    except ValueError as exc:
+        print(f"Cannot trust managed install ownership: {exc}", file=sys.stderr)
+        return 2
+    original_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     mappings: list[tuple[tuple[str, ...], Path, bool]] = []
     skill_homes = (
         Path.home() / ".agents/skills",
@@ -5307,47 +5634,29 @@ def install(args: argparse.Namespace) -> int:
 
     failed = False
     for parts, destination, is_tree in mappings:
-        if is_tree:
-            result = _copy_resource_tree(
-                parts, destination, dry_run=args.dry_run,
-                refresh=bool(getattr(args, "refresh_bundled", False)),
-            )
-        elif args.dry_run:
-            status = _resource_status(parts, destination)
-            if status == "missing":
-                result = "would-install"
-            elif status == "installed":
-                result = "unchanged"
-            elif getattr(args, "refresh_bundled", False) and destination.is_file() and not destination.is_symlink():
-                result = "would-refresh"
-            else:
-                result = "preserved"
-        else:
-            result = _copy_resource(
-                parts, destination,
-                refresh=bool(getattr(args, "refresh_bundled", False)),
-            )
+        result = _install_managed_resource(
+            parts, destination, manifest, is_tree=is_tree,
+            dry_run=args.dry_run,
+            refresh=bool(getattr(args, "refresh_bundled", False)),
+        )
         print(f"{result:<17} {_safe_cwd(str(destination))}")
         failed = failed or result in {"stale", "preserved", "refused", "unreadable"}
 
     hook = Path.home() / ".codex/hooks.json"
     hook_parts = ("templates", "user", "codex-hooks.json")
-    if args.dry_run:
-        hook_status = _resource_status(hook_parts, hook)
-        if hook_status == "missing":
-            hook_result = "would-install"
-        elif hook_status == "installed":
-            hook_result = "unchanged"
-        elif getattr(args, "refresh_bundled", False) and hook.is_file() and not hook.is_symlink():
-            hook_result = "would-refresh"
-        else:
-            hook_result = "preserved"
-    else:
-        hook_result = _copy_resource(
-            hook_parts, hook, refresh=bool(getattr(args, "refresh_bundled", False))
-        )
+    hook_result = _install_merged_codex_hooks(
+        hook, hook_parts, manifest, dry_run=args.dry_run,
+        refresh=bool(getattr(args, "refresh_bundled", False)),
+    )
     print(f"{hook_result:<17} {_safe_cwd(str(hook))}")
     failed = failed or hook_result in {"stale", "preserved", "refused", "unreadable"}
+
+    if not args.dry_run and json.dumps(manifest, sort_keys=True, separators=(",", ":")) != original_manifest:
+        try:
+            _save_managed_install_manifest(manifest)
+        except OSError as exc:
+            print(f"Cannot save managed install ownership: {exc}", file=sys.stderr)
+            failed = True
 
     root = Path(args.path).expanduser().resolve()
     if project_config_backend.config_path(root).is_file():
@@ -5355,8 +5664,10 @@ def install(args: argparse.Namespace) -> int:
         failed = failed or sync_result != 0
     if failed:
         print(
-            "Stale or conflicting bundled files were preserved. Review them, then use "
-            "--refresh-bundled; --force applies only to custom skill links.",
+            "Stale or unowned bundled files were preserved. Review conflicts manually; "
+            "--refresh-bundled updates only assets matching their ownership records, "
+            "and --force applies "
+            "only to custom skill links.",
             file=sys.stderr,
         )
         return 2
@@ -5794,41 +6105,36 @@ def search_query(args: argparse.Namespace) -> int:
 
 
 def memory_status(args: argparse.Namespace) -> int:
-    root = Path(args.root).expanduser().resolve()
-    try:
-        config_path = project_config_backend.config_path(root)
-        config = (
-            project_config_backend.load(root)
-            if config_path.exists() or config_path.is_symlink()
-            else project_config_backend.default_data()
-        )
-        settings = project_config_backend.memory_settings(config)
-        value = memory_runtime_backend.health(root, settings)
-        value = {"enabled": bool(settings["enabled"]), "root": str(root), **value}
-    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
-        print(f"memory status: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory: {value.get('status', 'unknown')}")
-    return 0
+    return config_commands_backend.memory_status(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
 
 
 def memory_maintain(args: argparse.Namespace) -> int:
-    root = Path(args.root).expanduser().resolve()
-    try:
-        config_path = project_config_backend.config_path(root)
-        config = (
-            project_config_backend.load(root)
-            if config_path.exists() or config_path.is_symlink()
-            else project_config_backend.default_data()
-        )
-        settings = project_config_backend.memory_settings(config)
-        runtime = memory_runtime_backend.MemoryRuntime(root, settings)
-        value = runtime.maintain(force=True)
-    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
-        print(f"memory maintain: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory maintenance: {value.get('status', 'unknown')}")
-    return 0
+    return config_commands_backend.memory_maintain(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
+
+
+def memory_toggle(args: argparse.Namespace) -> int:
+    return config_commands_backend.memory_toggle(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
+
+
+def config_hooks_merge(args: argparse.Namespace) -> int:
+    return config_commands_backend.hooks_merge(
+        args,
+        project_config=project_config_backend,
+        installation=installation_backend,
+        memory_runtime=memory_runtime_backend,
+    )
 
 
 def usage_yield(args: argparse.Namespace) -> int:
@@ -9147,6 +9453,10 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="Reattach to a resumable root and continue its durable workflow"
     )
     add_controller_common(controller_resume_parser)
+    controller_resume_parser.add_argument(
+        "--acknowledge-no-ready-halt", action="store_true",
+        help="explicitly acknowledge a recognized no-ready-work halt after a fresh safe-boundary check",
+    )
     controller_resume_parser.set_defaults(func=controller_resume)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",
@@ -9425,17 +9735,6 @@ def build_parser() -> argparse.ArgumentParser:
     search_query_parser.add_argument("--json", action="store_true")
     search_query_parser.set_defaults(func=search_query)
 
-    memory_parser = sub.add_parser("memory", help="Inspect or maintain optional governed local memory")
-    memory_sub = memory_parser.add_subparsers(dest="memory_command", required=True)
-    memory_status_parser = memory_sub.add_parser("status")
-    memory_status_parser.add_argument("--root", default=".")
-    memory_status_parser.add_argument("--json", action="store_true")
-    memory_status_parser.set_defaults(func=memory_status)
-    memory_maintain_parser = memory_sub.add_parser("maintain")
-    memory_maintain_parser.add_argument("--root", default=".")
-    memory_maintain_parser.add_argument("--json", action="store_true")
-    memory_maintain_parser.set_defaults(func=memory_maintain)
-
     doctor_parser = sub.add_parser("doctor", help="Inspect prerequisites and project configuration without revealing credentials")
     doctor_parser.add_argument("path", nargs="?", default=".")
     doctor_parser.set_defaults(func=doctor)
@@ -9446,7 +9745,10 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--dry-run", action="store_true")
     install_parser.add_argument(
         "--refresh-bundled", action="store_true",
-        help="Refresh reviewed stale bundled assets; skill trees are backed up beside their destination",
+        help=(
+            "Refresh only assets matching ownership records; keep private backups "
+            "and preserve user edits"
+        ),
     )
     install_parser.set_defaults(func=install)
 
@@ -9472,11 +9774,15 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_legacy_parser.add_argument("--json", action="store_true")
     migrate_legacy_parser.set_defaults(func=migrate_legacy)
 
-    config_parser = sub.add_parser("config", help="Inspect schema-versioned project configuration")
-    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
-    config_show_parser = config_sub.add_parser("show", help="Validate and print the active configuration")
-    config_show_parser.add_argument("path", nargs="?", default=".")
-    config_show_parser.set_defaults(func=config_show)
+    config_commands_backend.register_parser(
+        sub,
+        providers=PROVIDERS,
+        config_show_handler=config_show,
+        memory_status_handler=memory_status,
+        memory_maintain_handler=memory_maintain,
+        memory_toggle_handler=memory_toggle,
+        hooks_merge_handler=config_hooks_merge,
+    )
 
     skills_parser = sub.add_parser("skills", help="Manage project-registered local skills")
     skills_sub = skills_parser.add_subparsers(dest="skills_command", required=True)

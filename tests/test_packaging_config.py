@@ -47,7 +47,7 @@ class PackagingConfigTests(unittest.TestCase):
             self.assertIn("agentflow-controller.toml", rendered)
             self.assertIn("shape-goal", rendered)
 
-    def test_bundled_install_is_idempotent_and_refresh_is_explicit_with_backup(self) -> None:
+    def test_bundled_install_is_idempotent_and_preserves_unowned_edits(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temp,
             tempfile.TemporaryDirectory() as explicit_state,
@@ -68,13 +68,12 @@ class PackagingConfigTests(unittest.TestCase):
             profile = Path(temp) / ".codex/agents/agentflow-controller.toml"
             profile.write_text("stale\n", encoding="utf-8")
             args.refresh_bundled = True
-            self.assertEqual(cli.install(args), 0)
-            self.assertNotEqual(profile.read_text(encoding="utf-8"), "stale\n")
+            self.assertEqual(cli.install(args), 2)
+            self.assertEqual(profile.read_text(encoding="utf-8"), "stale\n")
             backups = list((Path(xdg_state) / "agentflow/backups").rglob(
                 "agentflow-controller.toml"
             ))
-            self.assertEqual(len(backups), 1)
-            self.assertEqual(backups[0].read_text(encoding="utf-8"), "stale\n")
+            self.assertEqual(backups, [])
 
     def test_adapted_skills_install_with_self_contained_attribution(self) -> None:
         adapted = ("code-review", "diagnosing-bugs", "to-tickets", "wayfinder")

@@ -17,6 +17,17 @@ Security vulnerabilities must be reported through the private process in
    details, personal paths, or internal-only material in code, fixtures, logs,
    commits, or screenshots.
 
+Public pull requests, comments, and commit messages must stand on their own for
+readers who cannot access contributors' local tools or coordination state.
+Describe the goal and user impact, and link relevant published issues,
+commits, tests, or CI results. Summarize an approved internal contract in
+self-contained public language; link only published specifications or issues.
+Do not expose private Beads IDs, statuses or dependency graphs, actor/session
+IDs, local paths, transcripts, or private model-spend details. Generic Beads
+product documentation and clearly illustrative placeholder examples are fine;
+there is no requirement to publish private records. Keep detailed coordination
+reports in private controller chat rather than public PRs.
+
 ## Development setup
 
 Use Python 3.10 or later and an isolated virtual environment:
@@ -53,7 +64,9 @@ still pass link, formatting, and privacy checks where available.
 ## Pull requests
 
 - Use a descriptive title and explain the user-visible outcome.
-- Link the issue or approved goal when one exists.
+- Link the public issue or published specification when one exists; otherwise
+  provide a self-contained public summary of the approved goal. Do not link a
+  private Beads record.
 - State the exact checks run and any checks that were not run.
 - Call out compatibility, configuration migration, and security effects.
 - Update `CHANGELOG.md` under `Unreleased` for user-visible changes.

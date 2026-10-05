@@ -1,26 +1,13 @@
-## Outcome
+## Summary
 
-<!-- Describe the user-visible result and link the issue or approved goal. -->
+<!-- Explain the goal and user-visible impact for a reader without access to local tools or coordination state. Link only public issues/specifications. -->
 
-## Changes
+## Validation
 
-<!-- Summarize the bounded implementation. -->
+<!-- List relevant tests and public CI links; say what was not run. Include tests for behavior changes. -->
 
-## Evidence
+## Compatibility
 
-<!-- List exact commands and results. Mark anything not run. -->
+<!-- Note relevant security, platform, provider, or configuration compatibility effects; mention Unreleased documentation, configuration preservation or explicit migration/rollback, and third-party licence/attribution where relevant. -->
 
-- [ ] `python3 scripts/validate.py`
-- [ ] `python3 -m unittest discover -s tests -p 'test_*.py'`
-- [ ] Package build and clean-install check, when packaging changed
-- [ ] `git diff --check`
-
-## Risk and compatibility
-
-<!-- Describe security, platform, provider, configuration, migration, and rollback effects. -->
-
-- [ ] Tests cover behavior changes.
-- [ ] User-visible changes are documented under `CHANGELOG.md` → `Unreleased`.
-- [ ] Existing user configuration is preserved or an explicit migration is documented.
-- [ ] No credentials, private paths, transcripts, customer data, or account details are included.
-- [ ] Third-party material has licence and attribution records.
+<!-- Keep public context self-contained. Do not include private Beads IDs/statuses/graphs, actor or session IDs, local paths, transcripts, or private model-spend details. Generic Beads product documentation and placeholder examples are fine; private records need not be published. -->

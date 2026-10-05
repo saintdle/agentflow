@@ -3,16 +3,23 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
+import importlib
+from importlib import resources as importlib_resources
 import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -2875,6 +2882,203 @@ class ControllerRunTests(unittest.TestCase):
         issue.update(overrides)
         return issue
 
+    def test_acknowledge_no_ready_halt_is_same_root_authenticated_and_shared_by_schedulers(self) -> None:
+        """The explicit acknowledgement reopens only a proven safe no-ready boundary."""
+        for workers in (1, 2):
+            with self.subTest(max_parallel_workers=workers), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                fixture = ValidLaunch(base / "workspace", seed_lease=False)
+                key_file = base / "resume.key"
+                ready = dict(fixture.task_issue, id="task-10", title="Newly ready child", status="open")
+                ready["metadata"] = {"agentflow": {}}
+                prior = self._issue("task-9", status="closed", parent=fixture.workflow_root)
+                if workers > 1:
+                    fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                        "schema": "agentflow.execution-policy@1", "controller_only": True,
+                        "max_parallel_workers": 2, "max_delegation_depth": 1,
+                        "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                        "max_expensive_execution_children": 0,
+                    }
+                args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root,
+                    resume_key_file=str(key_file),
+                )
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    controller, _ = cli._controller_instance(args)
+                    lease = controller.acquire()
+                    cli._controller_credentials(args, lease)
+                    checkpoint = controller._load_checkpoint()
+                    checkpoint["completed_evidence"] = "prior authenticated result preserved"
+                    checkpoint["changed_files"] = ["src/previous.py"]
+                    controller._save_checkpoint(checkpoint, lease=lease)
+                    controller.halt(
+                        "blocked",
+                        "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: old (.12)",
+                        lease=lease,
+                    )
+                    cli._private_atomic_json(
+                        fixture.root / ".agentflow/herdr/sessions.json",
+                        {"schema": "agentflow.herdr", "version": 1, "sessions": {
+                            "task-9": {
+                                "status": "completed",
+                                "binding": {
+                                    "root": str(fixture.root), "task_id": "task-9",
+                                    "provider": "claude", "session_id": "session-old",
+                                    "launch_id": "launch-old", "claim_id": "claim-old", "lease_id": "lease-old",
+                                },
+                                "return_channel": {
+                                    "state": "consumed", "consumed_at": "then",
+                                    "result_sha256": "d" * 64,
+                                },
+                                "result": {
+                                    "acceptance_results": [], "actor": fixture.controller,
+                                    "claim_token_sha256": "e" * 64, "evidence": "done",
+                                    "launch_id": "launch-old", "lease_id": "lease-old",
+                                    "outcome": "completed", "provider": "claude",
+                                    "session_id": "session-old", "task_id": "task-9",
+                                    "workflow_root": fixture.workflow_root,
+                                    "workspace_root": str(fixture.root),
+                                },
+                            },
+                        }},
+                    )
+
+                    args.acknowledge_no_ready_halt = True
+                    args.workflow_root = "wf-other"
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue", return_value=fixture.root_issue,
+                    ):
+                        wrong_root = _run_controller_json(cli.controller_resume, args)
+                    self.assertFalse(wrong_root["ok"])
+                    self.assertEqual(controller._load_checkpoint()["state"], "blocked")
+                    args.workflow_root = fixture.workflow_root
+                    args.resume_token = "not-the-protected-reattach-proof"
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue",
+                        side_effect=lambda _cwd, _id: fixture.root_issue,
+                    ):
+                        unauthorized = _run_controller_json(cli.controller_resume, args)
+                    self.assertFalse(unauthorized["ok"])
+                    self.assertEqual(controller._load_checkpoint()["state"], "blocked")
+                    args.resume_token = ""
+                    args.acknowledge_no_ready_halt = False
+
+                    get_issue = lambda _cwd, issue_id: (
+                        fixture.root_issue if issue_id == fixture.workflow_root else ready
+                    )
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                         mock.patch.object(cli.beads_backend, "claim_ready") as claim:
+                        stale = _run_controller_json(cli.controller_resume, args)
+                    self.assertEqual(stale["result"]["state"], "blocked")
+                    self.assertTrue(stale["result"]["terminal"])
+                    claim.assert_not_called()
+
+                    args.acknowledge_no_ready_halt = True
+                    def read_ready(_cwd, *argv):
+                        rows = [] if "--assignee" in argv else [{"id": "task-10"}]
+                        return subprocess.CompletedProcess(["bd"], 0, json.dumps(rows), "")
+
+                    ready["status"] = "open"
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=[prior, ready]), \
+                         mock.patch.object(cli.beads_backend, "run", side_effect=read_ready), \
+                         mock.patch.object(cli.beads_backend, "claim_ready", side_effect=[ready, None]) as claim, \
+                         mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                         mock.patch.object(cli, "_persist_claim_identity"), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                         mock.patch.object(cli, "_dispatch_via_herdr", return_value=lambda _task: {
+                             "state": "running", "session_id": "session-new",
+                         }):
+                        resumed = _run_controller_json(cli.controller_resume, args)
+                    self.assertTrue(resumed["ok"], resumed)
+                    self.assertFalse(resumed["result"]["terminal"])
+                    self.assertEqual(resumed["result"]["state"], "running")
+                    self.assertIn("task-10", resumed["result"]["checkpoint"]["last_check"])
+                    self.assertIn(
+                        "nonterminal descendant(s) remain",
+                        resumed["result"]["checkpoint"]["terminal_reason"],
+                    )
+                    self.assertEqual(
+                        resumed["result"]["checkpoint"]["completed_evidence"],
+                        "prior authenticated result preserved",
+                    )
+                    self.assertEqual(resumed["result"]["checkpoint"]["changed_files"], ["src/previous.py"])
+                    self.assertEqual(claim.call_count, workers)
+
+    def test_acknowledgement_rejects_unknown_or_completed_terminal_reason(self) -> None:
+        for state in ("blocked", "completed", "failed"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(state, "USER_ACTION_REQUIRED: a worker may still be live", lease=lease)
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    controller.acknowledge_no_ready_halt(fixture.workflow_root, "task-1", lease=lease)
+
+    def test_acknowledgement_fails_closed_on_unresolved_or_unknown_herdr_lifecycle(self) -> None:
+        for status in ("launching", "identity_pending", "failed", "unknown", "completed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(
+                    "blocked",
+                    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    lease=lease,
+                )
+                cli._private_atomic_json(
+                    fixture.root / ".agentflow/herdr/sessions.json",
+                    {"schema": "agentflow.herdr", "version": 1,
+                     "sessions": {"task-1": {"status": status}}},
+                )
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value=fixture.root_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]):
+                    with self.assertRaises(cli.controller_backend.ControllerError):
+                        cli._verify_no_ready_ack_candidate(
+                            fixture.root, fixture.workflow_root, controller, lease,
+                        )
+
+    def test_acknowledgement_requires_unblocked_ledger_and_a_current_ready_descendant(self) -> None:
+        for mode in ("blocked-ledger", "no-ready", "foreign-ready"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(
+                    "blocked",
+                    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    lease=lease,
+                )
+                if mode == "no-ready":
+                    ready_rows = []
+                elif mode == "foreign-ready":
+                    ready_rows = [{"id": "outside-root"}]
+                else:
+                    ready_rows = []
+
+                def run_ready(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else ready_rows
+                    return subprocess.CompletedProcess(["bd"], 0, json.dumps(rows), "")
+
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value=fixture.root_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready), \
+                     mock.patch.object(
+                         controller, "session_ledger",
+                         return_value={"blocked": mode == "blocked-ledger"},
+                     ):
+                    with self.assertRaises(cli.controller_backend.ControllerError):
+                        cli._verify_no_ready_ack_candidate(
+                            fixture.root, fixture.workflow_root, controller, lease,
+                        )
+
     def _consumed_session_record(self, root: Path, task_id: str, *, session_id: str = "sess-1",
                                  launch_id: str = "launch-1", acceptance_id: str = "R1",
                                  acceptance_ids: object = None, acceptance_results: object = None,
@@ -4002,6 +4206,51 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(payload["result"]["task"], "task-1")
             self.assertEqual(payload["result"]["state"], "running")
 
+    def test_claimed_checkpoint_reattaches_committed_result_through_authority_checks(self) -> None:
+        """A committed Herdr identity can safely repair a claim-only
+        checkpoint; result consumption and disposition still use the existing
+        authenticated path, and no replacement provider is launched."""
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.root_issue["metadata"]["agentflow"]["acceptance"] = {
+                "version": 1, "task_id": fixture.workflow_root,
+                "rows": [{
+                    "id": "R1", "outcome": "root complete", "owner": "eng",
+                    "lane": "static", "planned_evidence": "task closes",
+                    "status": "passed", "actual_evidence": "task result authenticated",
+                }],
+            }
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            self._seed_in_flight_checkpoint(
+                args, task_id="task-1", session_id="", state="claimed_no_session",
+            )
+            cli._private_atomic_json(
+                fixture.root / ".agentflow/herdr/sessions.json",
+                self._consumed_session_record(fixture.root, "task-1", session_id="sess-1"),
+            )
+            fixture.task_issue["status"] = "in_progress"
+            closed: list[str] = []
+
+            def get_issue(_cwd, issue_id):
+                return fixture.root_issue if issue_id == fixture.workflow_root else fixture.task_issue
+
+            def close_issue(_cwd, task_id, _reason):
+                fixture.task_issue["status"] = "closed"
+                closed.append(task_id)
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "close_issue", side_effect=close_issue), \
+                 mock.patch.object(cli, "_dispatch_via_herdr") as dispatch_builder:
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertEqual(payload["stop_reason"], "GOAL_COMPLETE")
+            self.assertEqual(payload["result"]["state"], "completed")
+            self.assertEqual(closed, ["task-1"])
+            dispatch_builder.assert_not_called()
+
     def test_controller_run_advances_after_matching_result_then_claims_next(self) -> None:
         """After a matching authenticated completed result for the in-flight
         task, the controller closes it exactly once, advances, and claims +
@@ -4610,6 +4859,472 @@ class GenuineLifecycleTests(unittest.TestCase):
                         result, ("R1",), contract,
                         beads_cwd=root, task_id="task-1",
                     )
+
+
+class ManagedInstallCliTests(unittest.TestCase):
+    def test_codex_hook_merge_retains_user_data_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / ".codex/hooks.json"
+            destination.parent.mkdir(parents=True)
+            packaged = json.loads(
+                cli.packaged_resources.text("templates", "user", "codex-hooks.json")
+            )
+            session_handler = packaged["hooks"]["SessionStart"][0]["hooks"][0]
+            herdr_handler = {"type": "command", "command": "herdr event handler"}
+            custom_agentflow_handler = {
+                **session_handler,
+                "timeout": 19,
+                "command": session_handler["command"] + " --customized",
+            }
+            existing = {
+                "description": "user-owned description",
+                "metadata": {"retained": True},
+                "hooks": {
+                    "SessionStart": [{
+                        "matcher": "user-start-matcher",
+                        "label": "keep this wrapper",
+                        "hooks": [session_handler, herdr_handler, custom_agentflow_handler],
+                    }],
+                    "HerdrEvent": [{
+                        "matcher": "herdr-only",
+                        "hooks": [herdr_handler],
+                    }],
+                },
+            }
+            destination.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("templates", "user", "codex-hooks.json")
+
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "xdg")}):
+                result = cli._install_merged_codex_hooks(
+                    destination, parts, manifest, dry_run=False, refresh=True
+                )
+                self.assertEqual(result, "updated")
+                merged = json.loads(destination.read_text(encoding="utf-8"))
+                session = merged["hooks"]["SessionStart"][0]
+                self.assertEqual(session["matcher"], "user-start-matcher")
+                self.assertEqual(session["label"], "keep this wrapper")
+                self.assertIn(herdr_handler, session["hooks"])
+                self.assertIn(custom_agentflow_handler, session["hooks"])
+                self.assertEqual(merged["description"], "user-owned description")
+                self.assertEqual(merged["metadata"], {"retained": True})
+                self.assertEqual(merged["hooks"]["HerdrEvent"][0]["matcher"], "herdr-only")
+                self.assertEqual(
+                    sum(item == session_handler for item in session["hooks"]), 1
+                )
+                for event, handlers in cli._managed_hook_inventory(packaged).items():
+                    installed = [
+                        item
+                        for group in merged["hooks"][event]
+                        for item in group.get("hooks", [])
+                    ]
+                    for handler in handlers:
+                        self.assertEqual(installed.count(handler), 1, event)
+
+                first_bytes = destination.read_bytes()
+                backup_root = root / "xdg/agentflow/backups"
+                backups_before = sorted(backup_root.rglob("hooks.json"))
+                self.assertEqual(len(backups_before), 1)
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=False, refresh=True
+                    ),
+                    "unchanged",
+                )
+                self.assertEqual(destination.read_bytes(), first_bytes)
+                self.assertEqual(sorted(backup_root.rglob("hooks.json")), backups_before)
+
+    def test_hook_merge_replaces_only_proven_handler_and_preserves_matcher(self) -> None:
+        packaged = json.loads(
+            cli.packaged_resources.text("templates", "user", "codex-hooks.json")
+        )
+        prior = cli._managed_hook_inventory(packaged)
+        old = packaged["hooks"]["SessionStart"][0]["hooks"][0]
+        updated_package = json.loads(json.dumps(packaged))
+        new = updated_package["hooks"]["SessionStart"][0]["hooks"][0]
+        new["timeout"] = old["timeout"] + 7
+        custom = {"command": "keep unrelated command", "type": "command"}
+        existing = {
+            "topLevel": "keep",
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "user-customized-matcher",
+                    "metadata": {"keep": 1},
+                    "hooks": [old, custom],
+                }]
+            },
+        }
+        merged, _ = cli._merge_agentflow_hook_config(
+            existing, updated_package, previously_owned=prior
+        )
+        group = merged["hooks"]["SessionStart"][0]
+        self.assertEqual(group["matcher"], "user-customized-matcher")
+        self.assertEqual(group["metadata"], {"keep": 1})
+        self.assertIn(custom, group["hooks"])
+        self.assertIn(new, group["hooks"])
+        self.assertNotIn(old, group["hooks"])
+        self.assertEqual(merged["topLevel"], "keep")
+
+    def test_shared_merge_api_handles_claude_settings_shape(self) -> None:
+        packaged = json.loads(
+            cli.packaged_resources.text("templates", "project", "claude-settings.json")
+        )
+        existing = {
+            "model": "user-model",
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "user-session-filter",
+                    "customMetadata": "preserve",
+                    "hooks": [{"type": "command", "command": "custom session hook"}],
+                }],
+                "UserEvent": [{"hooks": [{"type": "command", "command": "user hook"}]}],
+            },
+        }
+        merged, handlers = cli._merge_agentflow_hook_config(existing, packaged)
+        session_rules = merged["hooks"]["SessionStart"]
+        self.assertEqual(session_rules[0]["matcher"], "user-session-filter")
+        self.assertEqual(session_rules[0]["customMetadata"], "preserve")
+        self.assertEqual(session_rules[0]["hooks"][0]["command"], "custom session hook")
+        self.assertIn("PostModelSwitch", merged["hooks"])
+        self.assertIn("PostModelSwitch", handlers)
+        self.assertEqual(merged["hooks"]["UserEvent"][0]["hooks"][0]["command"], "user hook")
+        self.assertEqual(merged["model"], "user-model")
+
+    def test_legacy_exact_package_match_establishes_ownership_but_edits_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill = cli.packaged_resources.names("skills")[0]
+            source = cli.packaged_resources.item("skills", skill)
+            exact_destination = root / "exact" / skill
+            exact_destination.parent.mkdir(parents=True)
+            shutil.copytree(source, exact_destination)
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("skills", skill)
+            self.assertEqual(
+                cli._install_managed_resource(
+                    parts, exact_destination, manifest, is_tree=True,
+                    dry_run=False, refresh=True,
+                ),
+                "unchanged",
+            )
+            self.assertIn(cli._managed_destination_key(exact_destination), manifest["resources"])
+
+            modified_destination = root / "modified" / skill
+            modified_destination.parent.mkdir(parents=True)
+            shutil.copytree(source, modified_destination)
+            skill_md = modified_destination / "SKILL.md"
+            skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8")
+            before = skill_md.read_bytes()
+            untracked_manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            self.assertEqual(
+                cli._install_managed_resource(
+                    parts, modified_destination, untracked_manifest, is_tree=True,
+                    dry_run=False, refresh=True,
+                ),
+                "preserved",
+            )
+            self.assertEqual(skill_md.read_bytes(), before)
+            self.assertEqual(untracked_manifest["resources"], {})
+
+    def test_recorded_assets_refresh_once_and_dry_run_never_mutates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "package" / "profile.md"
+            source.parent.mkdir()
+            source.write_text("new packaged profile\n", encoding="utf-8")
+            destination = root / "home" / ".codex/agents/profile.md"
+            destination.parent.mkdir(parents=True)
+            old_bytes = b"previous bundled profile\n"
+            destination.write_bytes(old_bytes)
+            parts = ("synthetic", "profile.md")
+            manifest = {
+                "schema": cli.MANAGED_INSTALL_SCHEMA,
+                "resources": {
+                    cli._managed_destination_key(destination): {
+                        "resource": list(parts), "kind": "file",
+                        "sha256": hashlib.sha256(old_bytes).hexdigest(),
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}), \
+                    mock.patch.object(cli.packaged_resources, "item", return_value=source):
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=True, refresh=True,
+                    ),
+                    "would-refresh",
+                )
+                self.assertEqual(destination.read_bytes(), old_bytes)
+                self.assertEqual(
+                    manifest["resources"][cli._managed_destination_key(destination)]["sha256"],
+                    hashlib.sha256(old_bytes).hexdigest(),
+                )
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=False, refresh=True,
+                    ),
+                    "updated",
+                )
+                self.assertEqual(destination.read_text(encoding="utf-8"), "new packaged profile\n")
+                backups = list((root / "state/agentflow/backups").rglob("profile.md"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), old_bytes)
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=False, refresh=True,
+                    ),
+                    "unchanged",
+                )
+                self.assertEqual(len(list((root / "state/agentflow/backups").rglob("profile.md"))), 1)
+
+    def test_recorded_skill_tree_can_refresh_but_backup_remains_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "package/skill"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text("new bundled skill\n", encoding="utf-8")
+            destination = root / "home/.agents/skills/example-skill"
+            destination.mkdir(parents=True)
+            old_skill = destination / "SKILL.md"
+            old_skill.write_text("previous bundled skill\n", encoding="utf-8")
+            old_skill.chmod(0o755)
+            executable_digest = cli.installation_backend._tree_digest(destination)
+            old_skill.chmod(0o600)
+            self.assertEqual(
+                cli.installation_backend._tree_digest(destination), executable_digest
+            )
+            parts = ("synthetic", "example-skill")
+            manifest = {
+                "schema": cli.MANAGED_INSTALL_SCHEMA,
+                "resources": {
+                    cli._managed_destination_key(destination): {
+                        "resource": list(parts), "kind": "tree",
+                        "sha256": cli.installation_backend._tree_digest(destination),
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}), \
+                    mock.patch.object(cli.packaged_resources, "item", return_value=package):
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=True,
+                        dry_run=False, refresh=True,
+                    ),
+                    "refreshed",
+                )
+                self.assertEqual((destination / "SKILL.md").read_text(encoding="utf-8"), "new bundled skill\n")
+                backups = list((root / "state/agentflow/backups").rglob("example-skill"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual((backups[0] / "SKILL.md").read_text(encoding="utf-8"), "previous bundled skill\n")
+
+    def test_owned_tree_refresh_refuses_file_directory_and_dangling_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = ("synthetic", "example-skill")
+            old_contents = {
+                "SKILL.md": b"old bundled skill\n",
+                "nested/data.txt": b"old nested data\n",
+            }
+            new_contents = {
+                "SKILL.md": b"new bundled skill\n",
+                "nested/data.txt": b"new nested data\n",
+            }
+
+            for link_kind in ("file", "directory", "dangling"):
+                with self.subTest(link_kind=link_kind):
+                    case_root = root / link_kind
+                    package_v1 = case_root / "package-v1/skill"
+                    package_v2 = case_root / "package-v2/skill"
+                    for package, contents in (
+                        (package_v1, old_contents), (package_v2, new_contents)
+                    ):
+                        (package / "nested").mkdir(parents=True)
+                        (package / "SKILL.md").write_bytes(contents["SKILL.md"])
+                        (package / "nested/data.txt").write_bytes(contents["nested/data.txt"])
+
+                    destination = case_root / "home/skill"
+                    manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+                    with mock.patch.object(
+                        cli.packaged_resources, "item", return_value=package_v1
+                    ):
+                        self.assertEqual(
+                            cli._install_managed_resource(
+                                parts, destination, manifest, is_tree=True,
+                                dry_run=False, refresh=True,
+                            ),
+                            "installed",
+                        )
+
+                    link_target_root = case_root / "external"
+                    (link_target_root / "nested").mkdir(parents=True)
+                    (link_target_root / "SKILL.md").write_bytes(old_contents["SKILL.md"])
+                    (link_target_root / "nested/data.txt").write_bytes(
+                        old_contents["nested/data.txt"]
+                    )
+                    if link_kind == "file":
+                        linked_path = destination / "SKILL.md"
+                        linked_path.unlink()
+                        linked_path.symlink_to(link_target_root / "SKILL.md")
+                    elif link_kind == "directory":
+                        linked_path = destination / "nested"
+                        shutil.rmtree(linked_path)
+                        linked_path.symlink_to(link_target_root / "nested", target_is_directory=True)
+                    else:
+                        linked_path = destination / "SKILL.md"
+                        linked_path.unlink()
+                        linked_path.symlink_to(case_root / "missing-target")
+                    original_link_target = os.readlink(linked_path)
+
+                    owned_record = dict(
+                        manifest["resources"][cli._managed_destination_key(destination)]
+                    )
+                    with mock.patch.dict(
+                        os.environ, {"XDG_STATE_HOME": str(case_root / "state")}
+                    ), mock.patch.object(
+                        cli.packaged_resources, "item", return_value=package_v2
+                    ):
+                        for dry_run in (True, False):
+                            with self.subTest(dry_run=dry_run):
+                                self.assertEqual(
+                                    cli._install_managed_resource(
+                                        parts, destination, manifest, is_tree=True,
+                                        dry_run=dry_run, refresh=True,
+                                    ),
+                                    "refused",
+                                )
+                                self.assertTrue(linked_path.is_symlink())
+                                self.assertEqual(
+                                    os.readlink(linked_path),
+                                    original_link_target,
+                                )
+                                self.assertEqual(
+                                    manifest["resources"][cli._managed_destination_key(destination)],
+                                    owned_record,
+                                )
+                        self.assertFalse((case_root / "state/agentflow/backups").exists())
+
+    def test_tree_digest_supports_zip_importlib_traversables_without_symlink_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package_name = f"agentflow_zip_resources_{os.getpid()}_{time.time_ns()}"
+            archive = root / "resources.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr(f"{package_name}/__init__.py", "")
+                bundle.writestr(f"{package_name}/tree/nested/data.txt", "packaged data\n")
+
+            sys.path.insert(0, str(archive))
+            try:
+                package = importlib.import_module(package_name)
+                traversable = importlib_resources.files(package).joinpath("tree")
+                self.assertFalse(hasattr(traversable.joinpath("nested"), "lstat"))
+                self.assertEqual(
+                    cli.installation_backend._tree_contents(traversable),
+                    {"nested/data.txt": b"packaged data\n"},
+                )
+            finally:
+                sys.path.remove(str(archive))
+                sys.modules.pop(package_name, None)
+
+    def test_invalid_codex_json_is_refused_and_dry_run_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / ".codex/hooks.json"
+            destination.parent.mkdir(parents=True)
+            invalid = b'{"hooks": [}\n'
+            destination.write_bytes(invalid)
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("templates", "user", "codex-hooks.json")
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}):
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=False, refresh=True
+                    ),
+                    "refused",
+                )
+                self.assertEqual(destination.read_bytes(), invalid)
+                self.assertEqual(manifest["resources"], {})
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+                destination.write_text(json.dumps({"hooks": {"UserEvent": []}, "keep": 1}), encoding="utf-8")
+                before = destination.read_bytes()
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=True, refresh=True
+                    ),
+                    "would-refresh",
+                )
+                self.assertEqual(destination.read_bytes(), before)
+                self.assertEqual(manifest["resources"], {})
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+    def test_install_writes_private_manifest_and_refreshes_mixed_codex_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            hook = home / ".codex/hooks.json"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(json.dumps({
+                "customTopLevel": "retained",
+                "hooks": {"UserEvent": [{"hooks": [{"command": "user handler"}]}]},
+            }), encoding="utf-8")
+            args = argparse.Namespace(
+                path=str(workspace), force=False, dry_run=True, refresh_bundled=True,
+            )
+            with mock.patch.object(Path, "home", return_value=home), \
+                    mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "xdg")}), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                original_hook = hook.read_bytes()
+                self.assertEqual(cli.install(args), 0)
+                self.assertEqual(hook.read_bytes(), original_hook)
+                self.assertFalse((home / ".agents/skills").exists())
+                self.assertFalse((root / "xdg/agentflow/install/managed-assets.json").exists())
+
+                args.dry_run = False
+                self.assertEqual(cli.install(args), 0)
+                manifest_path = root / "xdg/agentflow/install/managed-assets.json"
+                self.assertTrue(manifest_path.is_file())
+                self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o600)
+                first_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertGreater(len(first_manifest["resources"]), 1)
+                merged = json.loads(hook.read_text(encoding="utf-8"))
+                self.assertEqual(merged["customTopLevel"], "retained")
+                self.assertEqual(merged["hooks"]["UserEvent"][0]["hooks"][0]["command"], "user handler")
+                self.assertIn("SessionStart", merged["hooks"])
+                self.assertEqual(cli.install(args), 0)
+                self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), first_manifest)
+
+
+class ControllerDocumentationTests(unittest.TestCase):
+    def test_documented_no_ready_recovery_example_parses_without_execution(self) -> None:
+        document = (Path(__file__).resolve().parents[1] / "docs/CONTROLLER.md").read_text(
+            encoding="utf-8"
+        )
+        shell_blocks = re.findall(r"```(?:sh|shell)\s*\n(.*?)\n```", document, re.DOTALL)
+        command = next(
+            line.strip()
+            for block in shell_blocks
+            for line in block.splitlines()
+            if line.strip().startswith("agentflow controller resume ")
+        )
+        args = cli.build_parser().parse_args(shlex.split(command)[1:])
+
+        self.assertIs(args.func, cli.controller_resume)
+        self.assertEqual(args.root, "/path/to/workspace")
+        self.assertEqual(args.workflow_root, "ROOT")
+        self.assertEqual(args.controller, "agentflow-controller")
+        self.assertTrue(args.acknowledge_no_ready_halt)
+        self.assertFalse(args.takeover)
+        self.assertEqual(args.resume_token, "")
+        self.assertEqual(args.resume_key_file, "")
 
 
 class IsolationCliTests(unittest.TestCase):
@@ -5502,6 +6217,235 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             final = [item for item in payloads if item.get("operation") == "resume"][-1]
             self.assertEqual(final["stop_reason"], "GOAL_COMPLETE")
             self.assertEqual(final["result"]["state"], "completed")
+
+
+class LaunchRecoveryLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _is_herdr_start(argv) -> bool:
+        return bool(
+            argv and Path(str(argv[0])).name == "herdr"
+            and "agent" in argv and "start" in argv
+        )
+
+    def _timeout_after_pane_created(self, fixture: ValidLaunch, spawned: list[list[str]]):
+        herdr_run = fixture.herdr_run(on_spawn=lambda argv: spawned.append(argv))
+
+        def timeout_run(argv, **kwargs):
+            if self._is_herdr_start(argv):
+                # The fake Herdr has created a pane and emitted its structured
+                # identity, but the CLI process times out before returning.
+                started = herdr_run(argv, **kwargs)
+                raise subprocess.TimeoutExpired(
+                    argv, kwargs.get("timeout", 30), output=started.stdout,
+                    stderr="Herdr client stopped responding after pane creation",
+                )
+            return herdr_run(argv, **kwargs)
+
+        return timeout_run
+
+    def _execution_policy_for_parallel(self, fixture: ValidLaunch) -> None:
+        fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+            "schema": "agentflow.execution-policy@1", "controller_only": True,
+            "max_parallel_workers": 2, "max_delegation_depth": 1,
+            "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+            "max_expensive_execution_children": 0,
+        }
+
+    def test_timeout_after_pane_creation_is_durable_ambiguous_in_both_schedulers(self) -> None:
+        for scheduler in ("serial", "parallel"):
+            with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                if scheduler == "parallel":
+                    self._execution_policy_for_parallel(fixture)
+                args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+                spawned: list[list[str]] = []
+                payloads: list[dict] = []
+                claim_ready = mock.Mock(return_value=fixture.task_issue)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                ), mock.patch.object(
+                    cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
+                ), mock.patch.object(
+                    cli.beads_backend, "root_descendants", return_value=[fixture.task_issue],
+                ), mock.patch.object(
+                    cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None,
+                ), mock.patch.object(
+                    cli.beads_backend, "claim_ready", claim_ready,
+                ), mock.patch.object(
+                    cli.beads_backend, "update_agentflow_metadata",
+                ), mock.patch.object(
+                    cli, "_provider_command", side_effect=fixture.provider_command,
+                ), mock.patch.object(
+                    cli.subprocess, "run", side_effect=self._timeout_after_pane_created(fixture, spawned),
+                ), mock.patch.object(
+                    cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value),
+                ):
+                    self.assertEqual(cli.controller_resume(args), 0)
+                    first = payloads[-1]
+                    self.assertEqual(first["stop_reason"], "USER_ACTION_REQUIRED")
+                    self.assertIn("ambiguous", first["result"]["checkpoint"]["terminal_reason"])
+                    self.assertEqual(first["action_required"]["pane_id"], "pane-1")
+
+                    state_path = fixture.root / ".agentflow/herdr/sessions.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    record = state["sessions"]["task-1"]
+                    self.assertEqual(record["status"], "launching")
+                    self.assertEqual(record["launch_outcome"], "ambiguous")
+                    self.assertNotIn("error", record)
+                    self.assertIsNone(record["binding"])
+                    self.assertEqual(record["return_channel"]["state"], "issued")
+                    self.assertEqual(record["launch_observation"], {
+                        "state": "uncommitted", "pane_id": "pane-1", "session_id": "sess-1",
+                    })
+                    self.assertEqual(record["attempts"][-1]["status"], "ambiguous")
+                    self.assertEqual(len(spawned), 1)
+
+                    # A subsequent resume observes the same durable decision;
+                    # it neither spends another launch attempt nor re-claims.
+                    self.assertEqual(cli.controller_resume(args), 0)
+                    self.assertEqual(payloads[-1]["stop_reason"], "USER_ACTION_REQUIRED")
+                    self.assertEqual(len(spawned), 1)
+                    self.assertEqual(claim_ready.call_count, 1)
+
+                    status_args = _controller_args(
+                        fixture.root, workflow_root=fixture.workflow_root,
+                    )
+                    self.assertEqual(cli.controller_status(status_args), 0)
+                    status = payloads[-1]
+                    self.assertEqual(status["action_required"]["code"], "herdr_start_ambiguous")
+                    self.assertEqual(status["action_required"]["pane_id"], "pane-1")
+
+    def test_serial_orphaned_launching_record_is_reconciled_before_any_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.task_issue.update(status="in_progress", assignee=fixture.controller)
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            launch_record = {
+                "root": str(fixture.root), "task_id": "task-1", "claim_id": "claim-1",
+                "launch_id": "interrupted-launch", "status": "launching",
+                "launch_outcome": "ambiguous", "binding": None,
+                "launch_observation": {"state": "uncommitted", "pane_id": "pane-1"},
+            }
+            cli._private_atomic_json(
+                fixture.root / ".agentflow/herdr/sessions.json",
+                {"schema": "agentflow.herdr", "version": 1,
+                 "sessions": {"task-1": launch_record}},
+            )
+            payloads: list[dict] = []
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+            ), mock.patch.object(
+                cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
+            ), mock.patch.object(
+                cli.beads_backend, "root_descendants", return_value=[fixture.task_issue],
+            ), mock.patch.object(
+                cli.beads_backend, "claim_ready",
+            ) as claim_ready, mock.patch.object(
+                cli.beads_backend, "update_agentflow_metadata",
+            ), mock.patch.object(
+                cli, "_dispatch_via_herdr",
+            ) as dispatch_builder, mock.patch.object(
+                cli, "_json_or_status",
+                side_effect=lambda value, **_kwargs: payloads.append(value),
+            ):
+                self.assertEqual(cli.controller_resume(args), 0, payloads)
+
+            payload = payloads[-1]
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertIn("ambiguous", payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(payload["result"]["checkpoint"]["task"], "task-1")
+            self.assertEqual(payload["result"]["checkpoint"]["claim_id"], "claim-1")
+            self.assertEqual(payload["action_required"]["pane_id"], "pane-1")
+            claim_ready.assert_not_called()
+            dispatch_builder.assert_not_called()
+
+    def test_interrupted_launching_reservation_recovers_without_dispatch_in_both_modes(self) -> None:
+        for scheduler in ("serial", "parallel"):
+            with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                if scheduler == "parallel":
+                    self._execution_policy_for_parallel(fixture)
+                args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+                task = dict(fixture.task_issue, status="in_progress", assignee=fixture.controller)
+                selected = {
+                    "task": "task-1", "root": str(fixture.root),
+                    "actor": fixture.controller, "claim_id": "claim-1",
+                }
+                payloads: list[dict] = []
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                ):
+                    controller, _root = cli._controller_instance(args)
+                    lease = controller.acquire()
+                    args.resume_token = lease.resume_secret
+                    if scheduler == "parallel":
+                        controller.reserve_active_task(selected, lease=lease)
+                    else:
+                        controller.resume([selected], lease=lease)
+                    launch_record = {
+                        "root": str(fixture.root), "task_id": "task-1",
+                        "claim_id": "claim-1", "lease_id": lease.token,
+                        "launch_id": "launch-preserved", "provider": "claude",
+                        "status": "launching",
+                        "binding": None,
+                        "return_channel": {"state": "issued", "launch_id": "launch-preserved"},
+                    }
+                    cli._private_atomic_json(
+                        fixture.root / ".agentflow/herdr/sessions.json",
+                        {"schema": "agentflow.herdr", "version": 1,
+                         "sessions": {"task-1": launch_record}},
+                    )
+
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue",
+                        side_effect=lambda _cwd, issue_id: (
+                            fixture.root_issue if issue_id == fixture.workflow_root else task
+                        ),
+                    ), mock.patch.object(
+                        cli.beads_backend, "root_descendants", return_value=[task],
+                    ), mock.patch.object(
+                        cli.beads_backend, "claim_ready",
+                    ) as claim_ready, mock.patch.object(
+                        cli, "_dispatch_via_herdr",
+                    ) as dispatch_builder, mock.patch.object(
+                        cli, "_json_or_status",
+                        side_effect=lambda value, **_kwargs: payloads.append(value),
+                    ):
+                        self.assertEqual(cli.controller_resume(args), 0, payloads)
+                        first = payloads[-1]
+                        self.assertEqual(first["stop_reason"], "USER_ACTION_REQUIRED")
+                        self.assertIn(
+                            "incomplete Herdr launching reservation",
+                            first["result"]["checkpoint"]["terminal_reason"],
+                        )
+                        # The authenticated resume rotated its proof; a fresh
+                        # process reads the updated protected credential file.
+                        args.resume_token = ""
+                        self.assertEqual(cli.controller_resume(args), 0, payloads)
+                        self.assertEqual(payloads[-1]["stop_reason"], "USER_ACTION_REQUIRED")
+
+                    claim_ready.assert_not_called()
+                    dispatch_builder.assert_not_called()
+                    recovered_state = json.loads(
+                        (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+                    )["sessions"]["task-1"]
+                    self.assertEqual(recovered_state["launch_id"], "launch-preserved")
+                    self.assertEqual(recovered_state["claim_id"], "claim-1")
+                    self.assertEqual(recovered_state["status"], "launching")
+                    checkpoint = first["result"]["checkpoint"]
+                    if scheduler == "parallel":
+                        self.assertEqual(checkpoint["active_tasks"][0]["task"], "task-1")
+                        self.assertEqual(checkpoint["active_tasks"][0]["claim_id"], "claim-1")
+                        self.assertEqual(checkpoint["active_tasks"][0]["state"], "claimed_no_session")
+                    else:
+                        self.assertEqual(checkpoint["task"], "task-1")
+                        self.assertEqual(checkpoint["claim_id"], "claim-1")
 
 
 if __name__ == "__main__":

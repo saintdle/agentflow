@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -13,9 +15,21 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any, Iterable
 
 from agentflow import beads as beads_backend
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX systems
+    msvcrt = None  # type: ignore[assignment]
 
 
 PROVIDERS = ("copilot", "codex", "claude")
@@ -23,6 +37,8 @@ ARCHIVE_ENV = "AGENTFLOW_HISTORY_ARCHIVE"
 DEFAULT_ARCHIVE = Path("~/Library/Application Support/Agentflow/history").expanduser()
 MANIFEST_NAME = "manifest.json"
 ARTIFACT_CONFIG_NAME = "artifacts.json"
+TRANSACTION_NAME = ".history-pending-update.json"
+LOCK_NAME = ".history.lock"
 PLIST_LABEL = "com.agentflow.history-sync"
 MAX_SUMMARY_BYTES = 16_384
 SUMMARY_FIELDS = {
@@ -81,6 +97,112 @@ UUID_RE = re.compile(
 
 class HistoryError(RuntimeError):
     """A safe, user-facing history archive error."""
+
+
+_ARCHIVE_LOCKS: dict[str, threading.RLock] = {}
+_ARCHIVE_LOCKS_GUARD = threading.Lock()
+_ARCHIVE_LOCK_STATE = threading.local()
+
+
+def _thread_lock_for_archive(key: str) -> threading.RLock:
+    with _ARCHIVE_LOCKS_GUARD:
+        lock = _ARCHIVE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ARCHIVE_LOCKS[key] = lock
+        return lock
+
+
+def _lock_file_descriptor(path: Path) -> int:
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise HistoryError(f"Cannot open history archive lock: {exc}") from exc
+    try:
+        value = os.fstat(descriptor)
+        try:
+            path_value = path.lstat()
+        except OSError as exc:
+            raise HistoryError("History archive lock changed while opening") from exc
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or stat.S_ISLNK(path_value.st_mode)
+            or (value.st_dev, value.st_ino) != (path_value.st_dev, path_value.st_ino)
+            or value.st_uid != os.getuid()
+        ):
+            raise HistoryError("History archive lock is not a private regular file")
+        os.fchmod(descriptor, 0o600)
+        if fcntl is None and msvcrt is not None and value.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _acquire_archive_file_lock(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return
+    if msvcrt is None:  # pragma: no cover - unsupported Python platform
+        raise HistoryError("Process locks are unavailable on this platform")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:  # LK_LOCK has a bounded retry count on Windows; retry indefinitely.
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            time.sleep(0.05)
+
+
+def _release_archive_file_lock(descriptor: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover - Windows fallback
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+
+@contextlib.contextmanager
+def _archive_lock(archive: Path) -> Iterable[None]:
+    """Serialize archive transactions across threads and independent processes."""
+    target = Path(archive).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = str(target)
+    thread_lock = _thread_lock_for_archive(key)
+    thread_lock.acquire()
+    held = getattr(_ARCHIVE_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _ARCHIVE_LOCK_STATE.held = held
+    active = held.get(key)
+    try:
+        if active is None:
+            descriptor = _lock_file_descriptor(target / LOCK_NAME)
+            try:
+                _acquire_archive_file_lock(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            held[key] = [descriptor, 1]
+        else:
+            active[1] += 1
+        try:
+            yield
+        finally:
+            active = held[key]
+            active[1] -= 1
+            if active[1] == 0:
+                del held[key]
+                try:
+                    _release_archive_file_lock(active[0])
+                finally:
+                    os.close(active[0])
+    finally:
+        thread_lock.release()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1162,6 +1284,13 @@ def _empty_manifest() -> dict[str, Any]:
 
 
 def load_manifest(archive: Path) -> dict[str, Any]:
+    if not archive.is_dir():
+        return _empty_manifest()
+    with _archive_lock(archive):
+        return _load_manifest_unlocked(archive)
+
+
+def _load_manifest_unlocked(archive: Path) -> dict[str, Any]:
     path = archive / MANIFEST_NAME
     if not path.is_file():
         return _empty_manifest()
@@ -1182,6 +1311,13 @@ def _empty_artifact_config() -> dict[str, Any]:
 
 
 def load_artifact_config(archive: Path) -> dict[str, Any]:
+    if not archive.is_dir():
+        return _empty_artifact_config()
+    with _archive_lock(archive):
+        return _load_artifact_config_unlocked(archive)
+
+
+def _load_artifact_config_unlocked(archive: Path) -> dict[str, Any]:
     path = archive / ARTIFACT_CONFIG_NAME
     if not path.is_file():
         return _empty_artifact_config()
@@ -1199,11 +1335,47 @@ def load_artifact_config(archive: Path) -> dict[str, Any]:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
     data = json.dumps(value, indent=2, sort_keys=True) + "\n"
-    temporary.write_text(data, encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    temporary.replace(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EACCES}:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def register_artifact(
@@ -1237,16 +1409,18 @@ def register_artifact(
     item = {"name": name, "bead_id": stable_artifact_id(name), "path": str(source),
             "title": title, "kind": kind, "description": description,
             "include": list(includes), "watch": list(watches), "source_type": "directory" if stat.S_ISDIR(source_stat.st_mode) else "file"}
-    ensure_archive(target)
-    config = load_artifact_config(target)
-    existing = config["artifacts"].get(name)
-    if existing == item:
-        return {"artifact": name, "id": item["bead_id"], "status": "unchanged"}
-    if existing is not None and not replace:
-        raise HistoryError("Artifact registration conflicts; use --replace to update it")
-    config["artifacts"][name] = item
-    _atomic_json(target / ARTIFACT_CONFIG_NAME, config)
-    return {"artifact": name, "id": item["bead_id"], "status": "replaced" if existing else "registered"}
+    with _archive_lock(target):
+        ensure_archive(target)
+        _recover_pending_archive_update(target)
+        config = load_artifact_config(target)
+        existing = config["artifacts"].get(name)
+        if existing == item:
+            return {"artifact": name, "id": item["bead_id"], "status": "unchanged"}
+        if existing is not None and not replace:
+            raise HistoryError("Artifact registration conflicts; use --replace to update it")
+        config["artifacts"][name] = item
+        _atomic_json(target / ARTIFACT_CONFIG_NAME, config)
+        return {"artifact": name, "id": item["bead_id"], "status": "replaced" if existing else "registered"}
 
 
 def list_artifacts(archive: Path | None = None) -> list[dict[str, Any]]:
@@ -1259,13 +1433,15 @@ def unregister_artifact(name: str, *, archive: Path | None = None) -> dict[str, 
     """Remove an active registration; sync will reconcile its indexed row."""
     target = archive or archive_path()
     name = _safe_artifact_name(name)
-    ensure_archive(target)
-    config = load_artifact_config(target)
-    if name not in config["artifacts"]:
-        return {"artifact": name, "id": stable_artifact_id(name), "status": "unchanged"}
-    del config["artifacts"][name]
-    _atomic_json(target / ARTIFACT_CONFIG_NAME, config)
-    return {"artifact": name, "id": stable_artifact_id(name), "status": "unregistered"}
+    with _archive_lock(target):
+        ensure_archive(target)
+        _recover_pending_archive_update(target)
+        config = load_artifact_config(target)
+        if name not in config["artifacts"]:
+            return {"artifact": name, "id": stable_artifact_id(name), "status": "unchanged"}
+        del config["artifacts"][name]
+        _atomic_json(target / ARTIFACT_CONFIG_NAME, config)
+        return {"artifact": name, "id": stable_artifact_id(name), "status": "unregistered"}
 
 
 def _artifact_lstat(path: Path) -> os.stat_result:
@@ -1634,6 +1810,11 @@ def _verify_history_beads_workspace(archive: Path) -> bool:
 
 
 def ensure_archive(archive: Path) -> str:
+    with _archive_lock(archive):
+        return _ensure_archive_locked(archive)
+
+
+def _ensure_archive_locked(archive: Path) -> str:
     archive.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(archive, 0o700)
     mode = stat.S_IMODE(archive.stat().st_mode)
@@ -1752,6 +1933,152 @@ def _import_rows(archive: Path, values: Iterable[dict[str, Any]]) -> dict[str, A
         return {"output": result.stdout.strip()}
 
 
+def _pending_archive_update(archive: Path) -> dict[str, Any] | None:
+    path = archive / TRANSACTION_NAME
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise HistoryError("Pending history update is not a private regular file")
+    try:
+        transaction = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HistoryError(f"Pending history update is unreadable: {exc}") from exc
+    if (
+        not isinstance(transaction, dict)
+        or set(transaction) != {"schema_version", "manifest", "rows"}
+        or transaction.get("schema_version") != 1
+    ):
+        raise HistoryError("Pending history update has an unsupported schema")
+    manifest = transaction.get("manifest")
+    rows = transaction.get("rows")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != 1
+        or not isinstance(manifest.get("sessions"), dict)
+        or ("artifacts" in manifest and not isinstance(manifest["artifacts"], dict))
+        or not isinstance(rows, list)
+    ):
+        raise HistoryError("Pending history update has invalid archive data")
+    sessions = manifest["sessions"]
+    artifacts = manifest.get("artifacts", {})
+    imported_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("bead_id"), str):
+            raise HistoryError("Pending history update contains an invalid Beads row")
+        bead_id = row["bead_id"]
+        if bead_id in imported_ids:
+            raise HistoryError("Pending history update contains duplicate Beads rows")
+        imported_ids.add(bead_id)
+        is_artifact = "artifact_name" in row
+        expected = (artifacts if is_artifact else sessions).get(bead_id)
+        if not isinstance(expected, dict) or expected != row:
+            raise HistoryError("Pending history update does not match its manifest")
+        try:
+            _bead_row(row)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HistoryError("Pending history update contains an invalid Beads row") from exc
+    return {"manifest": manifest, "rows": rows}
+
+
+def _clear_pending_archive_update(archive: Path) -> None:
+    path = archive / TRANSACTION_NAME
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise HistoryError("Refusing to remove a non-regular pending history update")
+    path.unlink()
+    _fsync_directory(archive)
+
+
+def _recover_pending_archive_update(archive: Path) -> None:
+    """Replay a prepared import before any new archive transaction can proceed.
+
+    Beads history rows use deterministic session/artifact IDs, so replaying an
+    import whose outcome was ambiguous is an upsert, not a duplicate creation.
+    The journal remains until both the import and manifest replacement finish.
+    """
+    pending = _pending_archive_update(archive)
+    if pending is None:
+        return
+    _import_rows(archive, pending["rows"])
+    manifest = pending["manifest"]
+    _preserve_newer_summaries(manifest, _load_manifest_unlocked(archive))
+    _atomic_json(archive / MANIFEST_NAME, manifest)
+    _clear_pending_archive_update(archive)
+
+
+def _commit_archive_update(
+    archive: Path,
+    manifest: dict[str, Any],
+    import_values: Iterable[dict[str, Any]],
+) -> None:
+    rows = list(import_values)
+    if rows:
+        _atomic_json(
+            archive / TRANSACTION_NAME,
+            {"schema_version": 1, "manifest": manifest, "rows": rows},
+        )
+        # If import fails or the process exits here, the prepared transaction is
+        # deliberately retained and replayed on the next mutating archive call.
+    _import_rows(archive, rows)
+    # The archive lock serializes independent writers. This final merge also
+    # protects a summary completed reentrantly by a same-thread integration
+    # callback while the outer import was in flight.
+    _preserve_newer_summaries(manifest, _load_manifest_unlocked(archive))
+    _atomic_json(archive / MANIFEST_NAME, manifest)
+    if rows:
+        _clear_pending_archive_update(archive)
+
+
+def _preserve_newer_summaries(
+    manifest: dict[str, Any], latest: dict[str, Any]
+) -> None:
+    sessions = manifest.get("sessions")
+    latest_sessions = latest.get("sessions")
+    if not isinstance(sessions, dict) or not isinstance(latest_sessions, dict):
+        return
+    for session_id, current in list(sessions.items()):
+        newer = latest_sessions.get(session_id)
+        if not isinstance(current, dict) or not isinstance(newer, dict):
+            continue
+        summary = newer.get("summary")
+        fingerprint = current.get("fingerprint")
+        if (
+            not isinstance(summary, dict)
+            or not fingerprint
+            or newer.get("summary_source_fingerprint") != fingerprint
+        ):
+            continue
+        try:
+            current_updated = dt.datetime.fromisoformat(
+                str(current.get("bead_updated_at") or "").replace("Z", "+00:00")
+            )
+            newer_updated = dt.datetime.fromisoformat(
+                str(newer.get("bead_updated_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            current_updated = newer_updated = None
+        if current_updated is not None and current_updated.tzinfo is None:
+            current_updated = current_updated.replace(tzinfo=dt.timezone.utc)
+        if newer_updated is not None and newer_updated.tzinfo is None:
+            newer_updated = newer_updated.replace(tzinfo=dt.timezone.utc)
+        if current_updated is not None and newer_updated is not None and newer_updated <= current_updated:
+            continue
+        if current_updated is not None and newer_updated is None:
+            continue
+        preserved = dict(current)
+        preserved["summary"] = summary
+        preserved["summary_source_fingerprint"] = fingerprint
+        preserved["disposition"] = "summarized"
+        if isinstance(newer.get("bead_updated_at"), str):
+            preserved["bead_updated_at"] = newer["bead_updated_at"]
+        sessions[session_id] = preserved
+
+
 def sync(
     *,
     archive: Path | None = None,
@@ -1761,12 +2088,41 @@ def sync(
     home: Path | None = None,
 ) -> dict[str, Any]:
     target = archive or archive_path()
+    selected_providers = tuple(dict.fromkeys(providers))
+    # Session discovery only reads provider files and has no archive side
+    # effects. Keep it outside the transaction lock; all decisions based on the
+    # archive's current manifest/configuration happen after acquiring the lock.
+    records = discover(selected_providers, roots=roots, home=home)
+    if dry_run:
+        if target.is_dir():
+            with _archive_lock(target):
+                return _sync_archive_locked(
+                    target, records, selected_providers, home=home, dry_run=True
+                )
+        return _sync_archive_locked(
+            target, records, selected_providers, home=home, dry_run=True
+        )
+    with _archive_lock(target):
+        if _pending_archive_update(target) is not None:
+            ensure_archive(target)
+            _recover_pending_archive_update(target)
+        return _sync_archive_locked(
+            target, records, selected_providers, home=home, dry_run=False
+        )
+
+
+def _sync_archive_locked(
+    target: Path,
+    records: list[SessionRecord],
+    selected_providers: tuple[str, ...],
+    *,
+    home: Path | None,
+    dry_run: bool,
+) -> dict[str, Any]:
     manifest = load_manifest(target)
     old_sessions = manifest["sessions"]
     artifact_config = load_artifact_config(target)
     old_artifacts = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
-    selected_providers = tuple(dict.fromkeys(providers))
-    records = discover(selected_providers, roots=roots, home=home)
     selected = set(selected_providers)
     seen: set[str] = set()
     new_values: list[dict[str, Any]] = []
@@ -1871,11 +2227,10 @@ def sync(
     merged = dict(old_sessions)
     for value in new_values:
         merged[str(value["bead_id"])] = value
-    _import_rows(target, import_values)
     manifest["sessions"] = merged
     manifest["artifacts"] = artifact_values
     manifest["last_sync_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    _atomic_json(target / MANIFEST_NAME, manifest)
+    _commit_archive_update(target, manifest, import_values)
     return report
 
 
@@ -2037,35 +2392,44 @@ def apply_summary(
 ) -> dict[str, Any]:
     validated = _validate_summary(summary)
     target = archive or archive_path()
-    manifest = load_manifest(target)
-    session_id = validated["session_id"]
-    value = manifest["sessions"].get(session_id)
-    if not isinstance(value, dict):
-        raise HistoryError(f"Unknown history session: {session_id}")
-    if value.get("disposition") not in {"pending_summary", "summarized"}:
-        raise HistoryError(
-            f"Session disposition {value.get('disposition') or 'unknown'} cannot accept a summary"
-        )
-    expected = str(value.get("fingerprint") or "")
-    if validated["source_fingerprint"] != expected:
-        raise HistoryError("Summary source fingerprint does not match the indexed session")
-    current = _current_fingerprint(value, home)
-    if current != expected:
-        raise HistoryError("Session source changed after indexing; run history sync first")
-    durable = {
-        key: validated.get(key, "" if key in {"goal", "outcome"} else [])
-        for key in SUMMARY_FIELDS
-    }
-    value = dict(value)
-    value["summary"] = durable
-    value["summary_source_fingerprint"] = expected
-    value["disposition"] = "summarized"
-    value["bead_updated_at"] = _next_bead_updated_at(value)
-    manifest["sessions"][session_id] = value
-    ensure_archive(target)
-    _import_rows(target, [value])
-    _atomic_json(target / MANIFEST_NAME, manifest)
-    return {"session_id": session_id, "disposition": "summarized"}
+    with _archive_lock(target):
+        if _pending_archive_update(target) is not None:
+            ensure_archive(target)
+            _recover_pending_archive_update(target)
+        manifest = load_manifest(target)
+        session_id = validated["session_id"]
+        value = manifest["sessions"].get(session_id)
+        if not isinstance(value, dict):
+            raise HistoryError(f"Unknown history session: {session_id}")
+        if value.get("disposition") not in {"pending_summary", "summarized"}:
+            raise HistoryError(
+                f"Session disposition {value.get('disposition') or 'unknown'} cannot accept a summary"
+            )
+        expected = str(value.get("fingerprint") or "")
+        if validated["source_fingerprint"] != expected:
+            raise HistoryError("Summary source fingerprint does not match the indexed session")
+        current = _current_fingerprint(value, home)
+        if current != expected:
+            raise HistoryError("Session source changed after indexing; run history sync first")
+        ensure_archive(target)
+        durable = {
+            key: validated.get(key, "" if key in {"goal", "outcome"} else [])
+            for key in SUMMARY_FIELDS
+        }
+        if (
+            value.get("disposition") == "summarized"
+            and value.get("summary") == durable
+            and value.get("summary_source_fingerprint") == expected
+        ):
+            return {"session_id": session_id, "disposition": "summarized"}
+        value = dict(value)
+        value["summary"] = durable
+        value["summary_source_fingerprint"] = expected
+        value["disposition"] = "summarized"
+        value["bead_updated_at"] = _next_bead_updated_at(value)
+        manifest["sessions"][session_id] = value
+        _commit_archive_update(target, manifest, [value])
+        return {"session_id": session_id, "disposition": "summarized"}
 
 
 def _render_summary(summary: dict[str, Any]) -> str:

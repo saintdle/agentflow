@@ -79,6 +79,23 @@ and consumes a matching result.
 Do not copy controller state into a repository, shared worktree, provider
 prompt, or support report.
 
+## Local memory approval and recall
+
+Knowledge-base approvals using `human:` or `controller:` identifiers are local
+same-user governance metadata. They record why an entry was admitted to recall;
+they do not authenticate the named person or controller, provide a signature,
+or create an operating-system isolation boundary. A same-user process that can
+modify the local memory database or state can change entries and fabricate
+approval metadata. Do not treat this mechanism as protection from a malicious
+process running as the same user.
+
+Recalled memory is rendered as quoted JSON reference data with a fixed prompt
+guardrail: it cannot override current system, user, or project instructions,
+and approval grants no command authority. This framing reduces delimiter and
+multiline ambiguity but is not a sandbox and cannot guarantee that a model will
+ignore malicious content. Verify important claims against the cited source and
+its full digest before relying on them.
+
 ## Preflight and provider policy
 
 External launch preflight binds the exact work root, task, base revision,

@@ -18,6 +18,16 @@ The archive is private local state. Keep it outside repositories with
 owner-only permissions and never attach it wholesale to an issue or support
 request.
 
+Archive mutations use a private `.history.lock` file to serialize both threads
+and independent processes. A Beads import is written first to the private
+`.history-pending-update.json` transaction journal, then imported using stable
+IDs, and finally committed to the archive manifest. If a process stops during
+that sequence, the next mutating archive operation validates and replays the
+journal before proceeding; replay is an upsert, not duplicate creation. The
+journal is cleared only after both the import and manifest replacement finish.
+Do not remove or edit a pending journal manually; use the history command again
+to let recovery run, or retain the archive for investigation if recovery fails.
+
 ## Commands
 
 ```sh
