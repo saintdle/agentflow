@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import io
 import json
 import os
 from pathlib import Path
 import plistlib
 import stat
 import subprocess
-import contextlib
-import dataclasses
-import io
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -48,7 +51,7 @@ class HistoryTest(unittest.TestCase):
             included.write_text("public locator only", encoding="utf-8")
             watched.write_text("watch-secret-content", encoding="utf-8")
             archive = root / "archive"
-            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700)):
+            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700, exist_ok=True)):
                 result = history.register_artifact(
                     "docs", source, title="Documentation", kind="reference",
                     description="Curated docs", include=["*.md"], watch=["*.txt"], archive=archive,
@@ -83,7 +86,7 @@ class HistoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "source"
             source.mkdir()
-            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700)):
+            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700, exist_ok=True)):
                 with self.assertRaises(history.HistoryError):
                     history.register_artifact("docs", source, title="Docs", kind="doc", description="safe", archive=Path(temp) / "archive")
                 with self.assertRaises(history.HistoryError):
@@ -134,7 +137,7 @@ class HistoryTest(unittest.TestCase):
             source = root / "source"; source.mkdir()
             outside = root / "outside.md"; outside.write_text("outside", encoding="utf-8")
             link = source / "linked.md"; link.symlink_to(outside)
-            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700)):
+            with mock.patch.object(history, "ensure_archive", side_effect=lambda value: value.mkdir(mode=0o700, exist_ok=True)):
                 with self.assertRaises(history.HistoryError):
                     history.register_artifact("docs", link, title="Docs", kind="doc", description="safe", archive=root / "archive")
             item = {"name": "docs", "bead_id": history.stable_artifact_id("docs"), "path": str(source), "title": "Docs", "kind": "doc", "description": "safe", "source_type": "directory", "include": ["*.md"], "watch": []}
@@ -594,6 +597,224 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual(second["unchanged"], 1)
             self.assertEqual([len(batch) for batch in imported], [1, 0])
             self.assertEqual(first["model_work"], 0)
+
+    def test_sync_and_summary_serialize_and_preserve_both_beads_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            source = home / f".claude/projects/work/{CLAUDE_ID}.jsonl"
+            write_jsonl(source, [{"type": "result", "sessionId": CLAUDE_ID}])
+            record = history.scan_claude(self.roots(home), home=home)[0]
+            stale = record.manifest_value()
+            stale.update({"disposition": "missing", "missing_scans": 1, "bead_updated_at": "2026-01-01T00:00:00+00:00"})
+            (archive / history.MANIFEST_NAME).write_text(
+                json.dumps({"schema_version": 1, "sessions": {record.bead_id: stale}}),
+                encoding="utf-8",
+            )
+            summary = {
+                "session_id": record.bead_id,
+                "source_fingerprint": record.fingerprint,
+                "goal": "Fix session indexing",
+                "outcome": "Completed",
+            }
+            sync_import_entered = threading.Event()
+            release_sync_import = threading.Event()
+            summary_started = threading.Event()
+            summary_finished = threading.Event()
+            imported: list[list[dict[str, object]]] = []
+            outcomes: dict[str, object] = {}
+            failures: list[BaseException] = []
+
+            def import_rows(_archive: Path, values: object) -> dict[str, object]:
+                batch = list(values)  # type: ignore[arg-type]
+                imported.append(batch)
+                if batch and batch[0].get("disposition") == "pending_summary":
+                    sync_import_entered.set()
+                    if not release_sync_import.wait(timeout=5):
+                        raise TimeoutError("sync import barrier was not released")
+                return {}
+
+            def run_sync() -> None:
+                try:
+                    outcomes["sync"] = history.sync(
+                        archive=archive,
+                        providers=("claude",),
+                        roots=self.roots(home),
+                        home=home,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            def run_summary() -> None:
+                summary_started.set()
+                try:
+                    outcomes["summary"] = history.apply_summary(
+                        summary, archive=archive, home=home
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    summary_finished.set()
+
+            with mock.patch.object(history, "ensure_archive", return_value="existing"), mock.patch.object(
+                history, "_import_rows", side_effect=import_rows
+            ):
+                sync_thread = threading.Thread(target=run_sync)
+                sync_thread.start()
+                self.assertTrue(sync_import_entered.wait(timeout=5))
+                summary_thread = threading.Thread(target=run_summary)
+                summary_thread.start()
+                self.assertTrue(summary_started.wait(timeout=5))
+                # The summary is contending for the archive while sync has a
+                # stale manifest snapshot and is paused at the Beads boundary.
+                self.assertFalse(summary_finished.wait(timeout=0.1))
+                release_sync_import.set()
+                sync_thread.join(timeout=5)
+                summary_thread.join(timeout=5)
+
+            self.assertFalse(sync_thread.is_alive())
+            self.assertFalse(summary_thread.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(outcomes["sync"]["changed"], 1)  # type: ignore[index]
+            self.assertEqual(outcomes["summary"]["disposition"], "summarized")  # type: ignore[index]
+            self.assertEqual(len(imported), 2)
+            self.assertEqual(imported[0][0]["disposition"], "pending_summary")
+            self.assertEqual(imported[1][0]["disposition"], "summarized")
+
+            final_manifest = history.load_manifest(archive)
+            final = final_manifest["sessions"][record.bead_id]
+            self.assertEqual(final["summary"]["goal"], summary["goal"])
+            self.assertEqual(final, imported[1][0])
+            bead_row = history._bead_row(imported[1][0])
+            self.assertEqual(bead_row["metadata"]["agentflow_history"], final)
+            self.assertFalse((archive / history.TRANSACTION_NAME).exists())
+
+    def test_summary_replays_ambiguous_beads_import_before_retrying(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            source = home / f".claude/projects/work/{CLAUDE_ID}.jsonl"
+            write_jsonl(source, [{"type": "result", "sessionId": CLAUDE_ID}])
+            record = history.scan_claude(self.roots(home), home=home)[0]
+            value = record.manifest_value()
+            value["bead_updated_at"] = "2026-01-01T00:00:00+00:00"
+            (archive / history.MANIFEST_NAME).write_text(
+                json.dumps({"schema_version": 1, "sessions": {record.bead_id: value}}),
+                encoding="utf-8",
+            )
+            summary = {
+                "session_id": record.bead_id,
+                "source_fingerprint": record.fingerprint,
+                "goal": "Recover accepted summary",
+                "outcome": "Replay the prepared import",
+            }
+            attempts: list[list[dict[str, object]]] = []
+
+            def ambiguous_once(_archive: Path, values: object) -> dict[str, object]:
+                batch = list(values)  # type: ignore[arg-type]
+                attempts.append(batch)
+                if len(attempts) == 1:
+                    # Simulate Beads applying the upsert while its caller loses
+                    # the acknowledgement: recovery must safely replay by ID.
+                    raise history.HistoryError("simulated ambiguous import outcome")
+                return {}
+
+            with mock.patch.object(history, "ensure_archive", return_value="existing"), mock.patch.object(
+                history, "_import_rows", side_effect=ambiguous_once
+            ):
+                with self.assertRaisesRegex(history.HistoryError, "ambiguous import"):
+                    history.apply_summary(summary, archive=archive, home=home)
+                journal = archive / history.TRANSACTION_NAME
+                self.assertTrue(journal.is_file())
+                self.assertEqual(stat.S_IMODE(journal.stat().st_mode), 0o600)
+                self.assertNotIn("summary", history.load_manifest(archive)["sessions"][record.bead_id])
+
+                result = history.apply_summary(summary, archive=archive, home=home)
+
+            self.assertEqual(result["disposition"], "summarized")
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0], attempts[1])
+            final = history.load_manifest(archive)["sessions"][record.bead_id]
+            self.assertEqual(final, attempts[1][0])
+            self.assertEqual(history._bead_row(attempts[1][0])["metadata"]["agentflow_history"], final)
+            self.assertFalse((archive / history.TRANSACTION_NAME).exists())
+
+    def test_archive_process_lock_blocks_independent_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive = root / "archive"
+            archive.mkdir(mode=0o700)
+            ready = root / "ready"
+            acquired = root / "acquired"
+            script = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "from agentflow.history import _archive_lock\n"
+                "archive, ready, acquired = map(Path, sys.argv[1:])\n"
+                "ready.write_text('ready', encoding='utf-8')\n"
+                "with _archive_lock(archive):\n"
+                "    acquired.write_text('yes', encoding='utf-8')\n"
+            )
+            environment = os.environ.copy()
+            source_root = str(Path(history.__file__).parents[1])
+            environment["PYTHONPATH"] = os.pathsep.join(
+                filter(None, (source_root, environment.get("PYTHONPATH", "")))
+            )
+            with history._archive_lock(archive):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", script, str(archive), str(ready), str(acquired)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=environment,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "child process did not reach the lock")
+                time.sleep(0.1)
+                remained_blocked = not acquired.exists()
+
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, msg=f"{stdout}\n{stderr}")
+            self.assertTrue(remained_blocked)
+            self.assertTrue(acquired.exists())
+
+    def test_atomic_json_uses_unique_private_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / history.MANIFEST_NAME
+            barrier = threading.Barrier(2)
+            original_replace = Path.replace
+            failures: list[BaseException] = []
+
+            def rendezvous_replace(source: Path, target: Path) -> Path:
+                barrier.wait(timeout=5)
+                return original_replace(source, target)
+
+            def write(writer: str) -> None:
+                try:
+                    history._atomic_json(manifest, {"writer": writer})
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with mock.patch.object(Path, "replace", rendezvous_replace):
+                threads = [threading.Thread(target=write, args=(writer,)) for writer in ("one", "two")]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=5)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(failures, [])
+            self.assertIn(json.loads(manifest.read_text(encoding="utf-8"))["writer"], {"one", "two"})
+            self.assertFalse((root / f"{history.MANIFEST_NAME}.tmp").exists())
+            self.assertEqual(list(root.glob(f".{history.MANIFEST_NAME}.*.tmp")), [])
+            self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o600)
 
     def test_sync_clears_stale_summary_when_source_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
