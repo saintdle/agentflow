@@ -6,7 +6,8 @@
 - Keep messages and handoffs terse. Report outcomes, evidence, blockers, and next action; omit narration.
 - Use the smallest context that can change the result. Point to files instead of pasting them.
 - When `bd where --json` succeeds, use Beads for durable goals, task dependencies, decisions, and review dispositions. Keep provider prompts and transcripts out of Beads.
-- In user-facing Beads reports, write `<human title> (<id>)`, translate ready/blocked reasons, distinguish a claimed bead from a live agent session, and end with one copy/paste-ready next request. Never make the user decode bare IDs.
+- In private controller-chat Beads reports, write `<human title> (<id>)`, translate ready/blocked reasons, distinguish a claimed bead from a live agent session, and end with one copy/paste-ready next request. Never make the user decode bare IDs. These report conventions are for private chat, not public GitHub PR descriptions, comments, or commit messages.
+- Write public GitHub PR descriptions, comments, and commit messages for readers without access to local tools or coordination state. Explain the goal, user impact, and relevant public issue/commit/test/CI links; translate approved internal contracts into a self-contained public summary. Link only published specifications and issues. Never include private Beads IDs, statuses, dependency graphs, actor/session IDs, local paths, transcripts, or private model-spend details. Generic Beads product documentation and clearly illustrative placeholder examples are fine; private records do not need to be published.
 
 ## Shape work
 
