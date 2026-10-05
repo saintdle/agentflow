@@ -3,9 +3,13 @@ from __future__ import annotations
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -19,6 +23,18 @@ from agentflow.provider_capabilities import (
     capability_for,
     provider_capabilities,
 )
+
+
+PROVIDERS_DOC = Path(__file__).resolve().parents[1] / "docs/PROVIDERS.md"
+
+
+def _smoke_shell_block() -> str:
+    markdown = PROVIDERS_DOC.read_text(encoding="utf-8")
+    smoke_section = markdown.split("## Opt-in live smoke", 1)[1]
+    match = re.search(r"```sh\n(.*?)\n```", smoke_section, re.DOTALL)
+    if match is None:
+        raise AssertionError("provider live-smoke shell block is missing")
+    return match.group(1)
 
 
 class ProviderCapabilityContractTests(unittest.TestCase):
@@ -112,6 +128,93 @@ class ProviderCapabilityContractTests(unittest.TestCase):
         with mock.patch.object(cli, "_provider_command", return_value=None), \
              self.assertRaisesRegex(ValueError, "2.1.251 or newer"):
             cli._require_claude_model_switch_version()
+
+
+class ProviderSmokeRunbookTests(unittest.TestCase):
+    """Execute the actual Markdown recipe against fake local commands only."""
+
+    def _run_smoke(
+        self, shell: str, *, live: str | None, provider: str,
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, list[str]]]:
+        with tempfile.TemporaryDirectory(prefix="agentflow smoke ") as temporary:
+            base = Path(temporary)
+            root = base / "workspace with spaces"
+            bin_dir = base / "bin"
+            logs_dir = base / "logs"
+            root.mkdir()
+            bin_dir.mkdir()
+            logs_dir.mkdir()
+            for name in ("agentflow", "bd"):
+                command = bin_dir / name
+                command.write_text(
+                    "#!/bin/sh\n"
+                    f"printf '%s\\n' \"$*\" >> \"$CALL_LOG_DIR/{name}.log\"\n",
+                    encoding="utf-8",
+                )
+                command.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment.pop("LIVE", None)
+            environment.update({
+                "ROOT": str(root),
+                "ROOT_ID": "workflow-smoke",
+                "TASK_ID": "task-smoke",
+                "PROVIDER": provider,
+                "MODEL": "synthetic-model",
+                "ROLE": "coding",
+                "EFFORT": "medium",
+                "CALL_LOG_DIR": str(logs_dir),
+                "PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+            })
+            if live is not None:
+                environment["LIVE"] = live
+            result = subprocess.run(
+                [shell, "-c", _smoke_shell_block()],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=environment,
+                check=False,
+            )
+            logs = {
+                name: (logs_dir / f"{name}.log").read_text(encoding="utf-8").splitlines()
+                for name in ("agentflow", "bd")
+                if (logs_dir / f"{name}.log").is_file()
+            }
+            return result, logs
+
+    def test_unset_zero_or_invalid_live_guards_never_reach_fake_commands(self) -> None:
+        shells = [shell for shell in ("/bin/sh", "/bin/bash") if shutil.which(shell)]
+        self.assertTrue(shells, "a POSIX shell is required for the runbook contract test")
+        blocked = (
+            ("unset-live", None, "codex"),
+            ("zero-live", "0", "codex"),
+            ("copilot-is-not-a-herdr-worker", "1", "copilot"),
+            ("unknown-provider", "1", "not-a-provider"),
+        )
+        for shell in shells:
+            for case, live, provider in blocked:
+                with self.subTest(shell=shell, case=case):
+                    result, logs = self._run_smoke(shell, live=live, provider=provider)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(logs, {})
+
+    def test_live_one_invokes_exactly_one_fake_controller_start(self) -> None:
+        shells = [shell for shell in ("/bin/sh", "/bin/bash") if shutil.which(shell)]
+        for shell in shells:
+            with self.subTest(shell=shell):
+                result, logs = self._run_smoke(shell, live="1", provider="codex")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                agentflow_calls = logs.get("agentflow", [])
+                controller_calls = [
+                    call for call in agentflow_calls if call.startswith("controller start ")
+                ]
+                self.assertEqual(len(controller_calls), 1)
+                self.assertIn("beads explain workflow-smoke task-smoke", agentflow_calls)
+                self.assertEqual(logs.get("bd"), ["show task-smoke --json"])
+                self.assertIn("--deadline 180", controller_calls[0])
+                self.assertIn("--workflow-root workflow-smoke", controller_calls[0])
+                self.assertIn("provider=codex model=synthetic-model role=coding effort=medium", result.stdout)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,8 @@ stop, inspect durable state and the existing Herdr session, and do not retry or
 resume this smoke. The deadline does not forcibly terminate a provider pane.
 
 ```sh
+(
+set -eu
 : "${LIVE:?Set LIVE=1 only after approving one bounded provider smoke}"
 test "$LIVE" = "1"
 : "${ROOT:?Set ROOT to the exact workspace path}"
@@ -114,6 +116,7 @@ LIVE=1 agentflow controller start \
   --controller agentflow-controller \
   --deadline 180 \
   --json
+)
 ```
 
 The values above are deliberate human guards; the controller independently
