@@ -28,6 +28,8 @@ The persistent external-dispatch path in this guide requires Herdr and the
 selected provider CLI. Herdr is not needed for planning-only sessions or work
 dispatched exclusively through native subagents. `tmux` may be used for manual
 terminal sessions, but is not a controller-managed persistent worker transport.
+See the [provider compatibility matrix](PROVIDERS.md) for per-provider native,
+direct-CLI, and persistent-worker limits.
 
 The workflow has one deliberate human approval gate:
 

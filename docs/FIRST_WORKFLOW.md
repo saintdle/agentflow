@@ -14,6 +14,9 @@ install the Codex integration if needed with `herdr integration install codex`;
 Agentflow cannot authenticate its session identity without that integration.
 The controller starts a stopped local Herdr server on first launch, but will
 not install a global provider integration without your action.
+Review the [provider compatibility matrix](PROVIDERS.md) before selecting a
+provider, especially for Claude lifecycle evidence and Copilot persistent-worker
+fail-closed behavior.
 
 The example uses the Codex 5.6 Luna coding route bundled in `models-v2`.
 Check that your signed-in account can use the chosen model; a policy-approved
@@ -43,7 +46,7 @@ launch route and bounded output:
 ```sh
 ROOT_ID=$(bd create "Publish a first-run note" \
   --type epic \
-  --labels "agentflow,af:stage:plan,af:role:controller" \
+  --labels "agentflow,af:kind:workflow" \
   --description "Add a short first-run note without changing application code." \
   --acceptance "The child task closes with evidence and docs/first-run-note.md exists." \
   --silent)
@@ -52,6 +55,7 @@ TASK_ID=$(bd create "Write the first-run note" \
   --type task \
   --parent "$ROOT_ID" \
   --labels "agentflow,af:stage:code,af:role:writer" \
+  --no-inherit-labels \
   --description "Create docs/first-run-note.md with one verified setup example." \
   --acceptance "docs/first-run-note.md exists, is non-empty, and contains no private data." \
   --metadata '{"agentflow":{"launch":{"provider":"codex","model":"gpt-5.6-luna","role":"coding","effort":"medium"},"lane":"external","tool_profile":"shell-write","output_boundary":".","context":["AGENTS.md"],"constraints":["Write only docs/first-run-note.md. Create docs/ if needed. Preserve unrelated files and do not expose secrets."],"checks":["test -s docs/first-run-note.md"],"budget":["20 minutes; one retry; stop if blocked."]}}' \

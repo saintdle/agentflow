@@ -191,7 +191,9 @@ only when that collaboration model is intentional.
 
 Continue with the executable [first workflow tutorial](docs/FIRST_WORKFLOW.md)
 to create and approve a root/task graph, run the controller, handle a halt, and
-record completion evidence.
+record completion evidence. See the [provider compatibility matrix](docs/PROVIDERS.md)
+for supported lanes, Claude/Copilot boundaries, and the guarded opt-in live-smoke
+procedure.
 
 If you prefer to work entirely through a ChatGPT/Codex or Claude chat, or a
 [GitHub Copilot Chat agent-mode session](https://docs.github.com/en/copilot/how-tos/chat-with-copilot/chat-in-ide)

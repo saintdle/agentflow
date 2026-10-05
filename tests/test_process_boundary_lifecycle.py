@@ -23,6 +23,15 @@ from tests import _state_home  # noqa: F401  # external controller authority
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_INTEGRATION = os.environ.get("AGENTFLOW_INTEGRATION") == "1"
+NATIVE_PAYLOAD_FIXTURES = ROOT / "tests/fixtures/provider-native-payloads"
+
+
+def _native_payload(name: str, *, session_id: str, cwd: str) -> dict:
+    payload = json.loads((NATIVE_PAYLOAD_FIXTURES / name).read_text(encoding="utf-8"))
+    session_key = "sessionId" if "sessionId" in payload else "session_id"
+    payload[session_key] = session_id
+    payload["cwd"] = cwd
+    return payload
 
 
 def _issue_from_create(root: Path, *arguments: str) -> dict:
@@ -321,26 +330,17 @@ class SterileSessionHookLifecycleTests(unittest.TestCase):
                     )
 
                 if provider == "claude":
-                    invoke_hook("SessionStart", {
-                        "hook_event_name": "SessionStart",
-                        "session_id": native_session,
-                        "timestamp": "2026-09-30T09:00:00.000Z",
-                        "cwd": str(stage),
-                        "model": "claude-sonnet-5",
-                    })
+                    invoke_hook("SessionStart", _native_payload(
+                        "claude-session-start.json", session_id=native_session, cwd=str(stage),
+                    ))
                     with mock.patch.dict(
                         os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False
                     ):
                         cli._require_attested_model("claude", native_session, "claude-sonnet-5")
-                        invoke_hook("PostModelSwitch", {
-                            "hook_event_name": "PostModelSwitch",
-                            "session_id": native_session,
-                            "timestamp": "2026-09-30T09:01:00.000Z",
-                            "cwd": str(stage),
-                            "source": "fallback",
-                            "from_model": "claude-sonnet-5",
-                            "to_model": "claude-sonnet-4.6",
-                        })
+                        invoke_hook("PostModelSwitch", _native_payload(
+                            "claude-post-model-switch.json",
+                            session_id=native_session, cwd=str(stage),
+                        ))
                         with self.assertRaisesRegex(ValueError, "provider model mismatch"):
                             cli._require_attested_model(
                                 "claude", native_session, "claude-sonnet-5"
@@ -359,13 +359,9 @@ class SterileSessionHookLifecycleTests(unittest.TestCase):
                     # camelCase sessionId and a millisecond timestamp, with
                     # no model field. It must still normalize as lifecycle
                     # metadata without fabricating model attestation.
-                    invoke_hook("sessionStart", {
-                        "hookEventName": "sessionStart",
-                        "sessionId": native_session,
-                        "timestamp": 1724954400000,
-                        "cwd": str(stage),
-                        "source": "startup",
-                    })
+                    invoke_hook("sessionStart", _native_payload(
+                        "copilot-session-start.json", session_id=native_session, cwd=str(stage),
+                    ))
                     rows = cli.events_backend.EventSpool(
                         state_home / "events.jsonl"
                     ).read()
