@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Start a stopped local Herdr server before provider launch, and fail early
+  when the Codex Herdr session integration is missing.
+- Surface Codex's first-use directory-trust prompt as a resumable, exact-pane
+  `USER_ACTION_REQUIRED` response in serial and parallel controllers rather
+  than silently waiting for provider identity or relaunching the task.
+- Spell out the machine result enum and acceptance evidence shape in external
+  handoffs so a worker does not submit a prose outcome the validator rejects.
+
 ## [0.0.6] - 2026-10-04
 
 ### Added

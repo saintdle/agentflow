@@ -226,6 +226,10 @@ class ValidLaunch:
         body = stdout if stdout is not None else _agent_started_stdout(self.provider)
 
         def _run(argv, **kwargs):
+            if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["status", "server"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
+            if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
             if (
                 argv
                 and Path(str(argv[0])).name == "claude"
@@ -672,6 +676,10 @@ class AgentflowTests(unittest.TestCase):
             real_run = subprocess.run
 
             def flaky_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["status", "server"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(
                         argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
@@ -784,6 +792,10 @@ class AgentflowTests(unittest.TestCase):
             real_run = subprocess.run
 
             def slow_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["status", "server"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(
                         argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
@@ -3627,6 +3639,8 @@ class ControllerRunTests(unittest.TestCase):
             handoff_text = handoff_path.read_text(encoding="utf-8")
             self.assertIn("## Done when", handoff_text)
             self.assertIn("## Authority boundary", handoff_text)
+            self.assertIn('Set `outcome` to exactly `completed`, `failed`,', handoff_text)
+            self.assertIn('"status":"passed","evidence":"Exact check and observed result"', handoff_text)
             manifest = json.loads(handoff_path.with_suffix(".json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["bead_id"], "task-1")
             self.assertEqual(manifest["provider"], "claude")
@@ -3829,6 +3843,29 @@ class ControllerRunTests(unittest.TestCase):
             # nothing relaunched); a retry attempt still collides.
             state = json.loads((root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))
             self.assertEqual(state["sessions"]["task-1"]["status"], "identity_pending")
+
+    def test_codex_trust_prompt_pauses_serial_controller_without_terminalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            args = _controller_args(root)
+            self._seed_in_flight_checkpoint(
+                args, task_id="task-1", session_id="", state="identity_pending",
+            )
+            cli._private_atomic_json(root / ".agentflow/herdr/sessions.json", {
+                "schema": "agentflow.herdr", "version": 1,
+                "sessions": {"task-1": {
+                    "status": "identity_pending", "pane_id": "pane-real",
+                    "provider": "codex", "identity_pending_since": cli._now(),
+                }},
+            })
+            attention = {"code": "codex_project_trust_required", "pane_id": "pane-real", "path": str(root)}
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=self._issue("wf-root")), \
+                 mock.patch.object(cli, "_resolve_pending_identity"), \
+                 mock.patch.object(cli, "_codex_trust_attention", return_value=attention):
+                payload = _run_controller_json(cli.controller_resume, args)
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertEqual(payload["action_required"], attention)
+            self.assertFalse(payload["result"]["terminal"])
 
     def _run_reject_disposition(self, root, *, acceptance_ids=None, acceptance_results=None, outcome="completed"):
         """Drive the controller's step-1 disposition against a consumed
@@ -4802,6 +4839,50 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
 class ControllerParallelDispatchTests(unittest.TestCase):
     """The root scheduler admits a bounded launch wave before polling results."""
 
+    def test_codex_trust_prompt_pauses_parallel_controller_without_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            task_id = str(fixture.task_issue["id"])
+            task = dict(fixture.task_issue, status="in_progress")
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": task_id, "root": str(fixture.root), "actor": fixture.controller,
+                "claim_id": "claim-task-1",
+            }, lease=lease)
+            controller.bind_active_task(task_id, session_id="", state="identity_pending", lease=lease)
+            args = argparse.Namespace(workflow_root=fixture.workflow_root, _authority_secret="test-secret")
+            attention = {
+                "code": "codex_project_trust_required", "task_id": task_id,
+                "pane_id": "w1:p1", "path": str(fixture.root),
+            }
+            record = {
+                "status": "identity_pending", "pane_id": "w1:p1",
+                "identity_pending_since": cli._now(),
+            }
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else task), \
+                 mock.patch.object(cli, "_herdr_session_record", return_value=record), \
+                 mock.patch.object(cli, "_resolve_pending_identity"), \
+                 mock.patch.object(cli, "_codex_trust_attention", return_value=attention), \
+                 mock.patch.object(cli, "_ingest_submitted_result") as ingest, \
+                 mock.patch.object(cli.beads_backend, "claim_ready") as claim:
+                payload, stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+            self.assertTrue(stop)
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertEqual(payload["action_required"], attention)
+            self.assertEqual(controller.active_tasks()[0]["state"], "identity_pending")
+            self.assertFalse(payload["result"]["terminal"])
+            ingest.assert_not_called()
+            claim.assert_not_called()
+
     def test_authenticated_resume_finalizes_empty_drain_without_claiming_ready_child(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp).resolve()
@@ -5369,6 +5450,10 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             real_subprocess_run = subprocess.run
 
             def fake_herdr_run(argv, **kwargs):
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["status", "server"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(argv, 0, stdout="2.1.281 (Claude Code)\n", stderr="")
                 if argv and Path(str(argv[0])).name == "herdr" and "start" in argv:
