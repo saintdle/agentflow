@@ -21,6 +21,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Bundled refresh now uses ownership evidence, merges only Agentflow-owned
   Codex handlers, and preserves edited or unknown assets for review.
+- Managed tree refresh now refuses symlink entries instead of treating matching
+  target bytes as owned content.
+- Documented the complete no-ready-halt resume command with its root and
+  controller identity arguments.
 - History archive mutations serialize across threads and processes and recover
   interrupted Beads imports from a validated private journal.
 - Documented the advisory nature of local memory approval metadata and updated

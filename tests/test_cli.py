@@ -4,10 +4,14 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import importlib
+from importlib import resources as importlib_resources
 import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -15,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -5088,6 +5093,12 @@ class ManagedInstallCliTests(unittest.TestCase):
             destination.mkdir(parents=True)
             old_skill = destination / "SKILL.md"
             old_skill.write_text("previous bundled skill\n", encoding="utf-8")
+            old_skill.chmod(0o755)
+            executable_digest = cli.installation_backend._tree_digest(destination)
+            old_skill.chmod(0o600)
+            self.assertEqual(
+                cli.installation_backend._tree_digest(destination), executable_digest
+            )
             parts = ("synthetic", "example-skill")
             manifest = {
                 "schema": cli.MANAGED_INSTALL_SCHEMA,
@@ -5111,6 +5122,114 @@ class ManagedInstallCliTests(unittest.TestCase):
                 backups = list((root / "state/agentflow/backups").rglob("example-skill"))
                 self.assertEqual(len(backups), 1)
                 self.assertEqual((backups[0] / "SKILL.md").read_text(encoding="utf-8"), "previous bundled skill\n")
+
+    def test_owned_tree_refresh_refuses_file_directory_and_dangling_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parts = ("synthetic", "example-skill")
+            old_contents = {
+                "SKILL.md": b"old bundled skill\n",
+                "nested/data.txt": b"old nested data\n",
+            }
+            new_contents = {
+                "SKILL.md": b"new bundled skill\n",
+                "nested/data.txt": b"new nested data\n",
+            }
+
+            for link_kind in ("file", "directory", "dangling"):
+                with self.subTest(link_kind=link_kind):
+                    case_root = root / link_kind
+                    package_v1 = case_root / "package-v1/skill"
+                    package_v2 = case_root / "package-v2/skill"
+                    for package, contents in (
+                        (package_v1, old_contents), (package_v2, new_contents)
+                    ):
+                        (package / "nested").mkdir(parents=True)
+                        (package / "SKILL.md").write_bytes(contents["SKILL.md"])
+                        (package / "nested/data.txt").write_bytes(contents["nested/data.txt"])
+
+                    destination = case_root / "home/skill"
+                    manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+                    with mock.patch.object(
+                        cli.packaged_resources, "item", return_value=package_v1
+                    ):
+                        self.assertEqual(
+                            cli._install_managed_resource(
+                                parts, destination, manifest, is_tree=True,
+                                dry_run=False, refresh=True,
+                            ),
+                            "installed",
+                        )
+
+                    link_target_root = case_root / "external"
+                    (link_target_root / "nested").mkdir(parents=True)
+                    (link_target_root / "SKILL.md").write_bytes(old_contents["SKILL.md"])
+                    (link_target_root / "nested/data.txt").write_bytes(
+                        old_contents["nested/data.txt"]
+                    )
+                    if link_kind == "file":
+                        linked_path = destination / "SKILL.md"
+                        linked_path.unlink()
+                        linked_path.symlink_to(link_target_root / "SKILL.md")
+                    elif link_kind == "directory":
+                        linked_path = destination / "nested"
+                        shutil.rmtree(linked_path)
+                        linked_path.symlink_to(link_target_root / "nested", target_is_directory=True)
+                    else:
+                        linked_path = destination / "SKILL.md"
+                        linked_path.unlink()
+                        linked_path.symlink_to(case_root / "missing-target")
+                    original_link_target = os.readlink(linked_path)
+
+                    owned_record = dict(
+                        manifest["resources"][cli._managed_destination_key(destination)]
+                    )
+                    with mock.patch.dict(
+                        os.environ, {"XDG_STATE_HOME": str(case_root / "state")}
+                    ), mock.patch.object(
+                        cli.packaged_resources, "item", return_value=package_v2
+                    ):
+                        for dry_run in (True, False):
+                            with self.subTest(dry_run=dry_run):
+                                self.assertEqual(
+                                    cli._install_managed_resource(
+                                        parts, destination, manifest, is_tree=True,
+                                        dry_run=dry_run, refresh=True,
+                                    ),
+                                    "refused",
+                                )
+                                self.assertTrue(linked_path.is_symlink())
+                                self.assertEqual(
+                                    os.readlink(linked_path),
+                                    original_link_target,
+                                )
+                                self.assertEqual(
+                                    manifest["resources"][cli._managed_destination_key(destination)],
+                                    owned_record,
+                                )
+                        self.assertFalse((case_root / "state/agentflow/backups").exists())
+
+    def test_tree_digest_supports_zip_importlib_traversables_without_symlink_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package_name = f"agentflow_zip_resources_{os.getpid()}_{time.time_ns()}"
+            archive = root / "resources.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr(f"{package_name}/__init__.py", "")
+                bundle.writestr(f"{package_name}/tree/nested/data.txt", "packaged data\n")
+
+            sys.path.insert(0, str(archive))
+            try:
+                package = importlib.import_module(package_name)
+                traversable = importlib_resources.files(package).joinpath("tree")
+                self.assertFalse(hasattr(traversable.joinpath("nested"), "lstat"))
+                self.assertEqual(
+                    cli.installation_backend._tree_contents(traversable),
+                    {"nested/data.txt": b"packaged data\n"},
+                )
+            finally:
+                sys.path.remove(str(archive))
+                sys.modules.pop(package_name, None)
 
     def test_invalid_codex_json_is_refused_and_dry_run_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -5182,6 +5301,30 @@ class ManagedInstallCliTests(unittest.TestCase):
                 self.assertIn("SessionStart", merged["hooks"])
                 self.assertEqual(cli.install(args), 0)
                 self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), first_manifest)
+
+
+class ControllerDocumentationTests(unittest.TestCase):
+    def test_documented_no_ready_recovery_example_parses_without_execution(self) -> None:
+        document = (Path(__file__).resolve().parents[1] / "docs/CONTROLLER.md").read_text(
+            encoding="utf-8"
+        )
+        shell_blocks = re.findall(r"```(?:sh|shell)\s*\n(.*?)\n```", document, re.DOTALL)
+        command = next(
+            line.strip()
+            for block in shell_blocks
+            for line in block.splitlines()
+            if line.strip().startswith("agentflow controller resume ")
+        )
+        args = cli.build_parser().parse_args(shlex.split(command)[1:])
+
+        self.assertIs(args.func, cli.controller_resume)
+        self.assertEqual(args.root, "/path/to/workspace")
+        self.assertEqual(args.workflow_root, "ROOT")
+        self.assertEqual(args.controller, "agentflow-controller")
+        self.assertTrue(args.acknowledge_no_ready_halt)
+        self.assertFalse(args.takeover)
+        self.assertEqual(args.resume_token, "")
+        self.assertEqual(args.resume_key_file, "")
 
 
 class IsolationCliTests(unittest.TestCase):

@@ -133,18 +133,32 @@ def save_managed_install_manifest(manifest: Mapping[str, Any], path: Path | None
 def _tree_contents(root: Any) -> dict[str, bytes]:
     contents: dict[str, bytes] = {}
 
+    def reject_symlink(entry: Any, relative: str) -> None:
+        # importlib.resources Traversables (including zip-backed ones) need not
+        # expose Path's is_symlink/lstat APIs. When available, check the link
+        # without resolving or reading it; otherwise use the Traversable API.
+        is_symlink = getattr(entry, "is_symlink", None)
+        if callable(is_symlink) and is_symlink():
+            raise _UnsupportedTreeEntryError(f"symlink resource entry: {relative}")
+
     def walk(current: Any, prefix: str = "") -> None:
         for child in sorted(current.iterdir(), key=lambda item: item.name):
             relative = f"{prefix}/{child.name}" if prefix else child.name
+            reject_symlink(child, relative)
             if child.is_dir():
                 walk(child, relative)
             elif child.is_file():
                 contents[relative] = child.read_bytes()
             else:
-                raise OSError(f"unsupported resource entry: {relative}")
+                raise _UnsupportedTreeEntryError(f"unsupported resource entry: {relative}")
 
+    reject_symlink(root, ".")
     walk(root)
     return contents
+
+
+class _UnsupportedTreeEntryError(OSError):
+    """A non-regular entry cannot safely participate in ownership evidence."""
 
 
 def _tree_digest(root: Any) -> str:
@@ -271,15 +285,25 @@ def _copy_tree(parts: tuple[str, ...], destination: Path, *, refresh: bool = Fal
             return "stale"
 
     def copy_directory(source: Any, target: Path) -> None:
+        is_symlink = getattr(source, "is_symlink", None)
+        if callable(is_symlink) and is_symlink():
+            raise _UnsupportedTreeEntryError("symlink packaged resource directory")
         target.mkdir(parents=True, exist_ok=False)
         for child in source.iterdir():
             child_target = target / child.name
+            is_symlink = getattr(child, "is_symlink", None)
+            if callable(is_symlink) and is_symlink():
+                raise _UnsupportedTreeEntryError(
+                    f"symlink packaged resource entry: {child.name}"
+                )
             if child.is_dir():
                 copy_directory(child, child_target)
             elif child.is_file():
                 child_target.write_bytes(child.read_bytes())
             else:
-                raise OSError(f"unsupported packaged resource: {child.name}")
+                raise _UnsupportedTreeEntryError(
+                    f"unsupported packaged resource: {child.name}"
+                )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     backup: Path | None = None
@@ -306,6 +330,8 @@ def install_resource(
     kind = "tree" if is_tree else "file"
     try:
         packaged_digest = _resource_digest(parts, is_tree=is_tree)
+    except _UnsupportedTreeEntryError:
+        return "refused"
     except OSError:
         return "unreadable"
     existed = destination.exists() or destination.is_symlink()
@@ -325,6 +351,8 @@ def install_resource(
         return "refused"
     try:
         current_digest = _destination_digest(destination, is_tree=is_tree)
+    except _UnsupportedTreeEntryError:
+        return "refused"
     except OSError:
         return "unreadable"
     if current_digest == packaged_digest:
