@@ -114,9 +114,9 @@ jobs:
       - name: Build wheel and source distribution
         run: python -m build
       - name: Inspect package contents and privacy boundary
-        run: python scripts/ci/inspect_distribution.py dist --expected-version 0.0.7
+        run: python scripts/ci/inspect_distribution.py dist --expected-version 0.0.8
       - name: Smoke-test wheel outside the checkout
-        run: python scripts/ci/smoke_wheel.py dist/*.whl --expected-version 0.0.7
+        run: python scripts/ci/smoke_wheel.py dist/*.whl --expected-version 0.0.8
       - name: Upload inspected distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

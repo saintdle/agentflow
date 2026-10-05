@@ -20,7 +20,7 @@ from agentflow import preflight
 
 class PackagingConfigTests(unittest.TestCase):
     def test_version_and_resources_are_distribution_owned(self) -> None:
-        self.assertEqual(__version__, "0.0.7")
+        self.assertEqual(__version__, "0.0.8")
         self.assertEqual(
             model_policy.DEFAULT_POLICY_PATH,
             resources.item("policies", "models-v2.json"),
