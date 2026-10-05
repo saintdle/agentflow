@@ -76,7 +76,7 @@ class AgentLedDocumentationTests(unittest.TestCase):
         for required in (
             "uv tool install --reinstall",
             "pipx install --force",
-            "@v0.0.6",
+            "@v0.0.7",
             "Herdr is required",
             "Agent mode",
             "terminal access",

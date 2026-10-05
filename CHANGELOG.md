@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-10-05
+
 ### Fixed
 
 - Start a stopped local Herdr server before provider launch, and fail early
@@ -197,7 +199,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/saintdle/agentflow/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/saintdle/agentflow/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/saintdle/agentflow/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/saintdle/agentflow/compare/v0.0.3...v0.0.4

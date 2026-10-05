@@ -1,6 +1,6 @@
 # Transactional migration from a legacy checkout
 
-Agentflow `0.0.6` can replace user-level links owned by a recognized legacy
+Agentflow `0.0.7` can replace user-level links owned by a recognized legacy
 source checkout without importing that checkout's private data. The migration
 is deliberately narrow, journaled, and reversible.
 
@@ -14,7 +14,7 @@ inside the supplied legacy checkout are eligible:
 - Agentflow controller, worker, explorer, reviewer, and PR-gatekeeper profile links;
 - the Agentflow Codex hook link.
 
-The replacement executable must already be a packaged `0.0.6` command in an
+The replacement executable must already be a packaged `0.0.7` command in an
 isolated environment outside the legacy checkout. Skill, profile, and hook
 links are replaced by immutable files from that same installed distribution.
 
@@ -48,10 +48,10 @@ closed.
 Install the reviewed wheel into a separate environment. One portable example:
 
 ```sh
-python3 -m venv ~/.local/share/agentflow/versions/0.0.6
-~/.local/share/agentflow/versions/0.0.6/bin/python -m pip install \
-  ./saintdle_agentflow-0.0.6-py3-none-any.whl
-NEW_AGENTFLOW=~/.local/share/agentflow/versions/0.0.6/bin/agentflow
+python3 -m venv ~/.local/share/agentflow/versions/0.0.7
+~/.local/share/agentflow/versions/0.0.7/bin/python -m pip install \
+  ./saintdle_agentflow-0.0.7-py3-none-any.whl
+NEW_AGENTFLOW=~/.local/share/agentflow/versions/0.0.7/bin/agentflow
 "$NEW_AGENTFLOW" --version
 ```
 
@@ -105,7 +105,7 @@ agentflow migrate legacy --rollback <migration-id>
 Rollback first verifies every installed destination against the digest stored
 at apply time. If any destination has changed, it refuses before mutating any
 entry. A successful rollback restores the original symbolic links. It does not
-delete the isolated `0.0.6` environment or legacy checkout.
+delete the isolated `0.0.7` environment or legacy checkout.
 
 Migration manifests and backups are intentionally retained for audit and
 recovery. Remove them only after reviewing their exact paths and deciding the
