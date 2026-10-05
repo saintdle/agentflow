@@ -1026,8 +1026,12 @@ def _dispatch_via_herdr(
         # output must be the only thing on stdout (same reasoning as
         # _materialize_launch_handoff above) -- dispatch reads the Herdr
         # state file directly afterward, never herdr_launch's own printout.
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            launch_exit_code = herdr_launch(herdr_ns)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                launch_exit_code = herdr_launch(herdr_ns)
+        except ValueError as exc:
+            beads_backend.add_comment(cwd, task_id, f"agentflow provider startup blocked: {exc}")
+            return {"state": "blocked", "session_id": ""}
         if launch_exit_code != 0:
             return {"state": "blocked", "session_id": ""}
         herdr_state = _load_herdr_state(_herdr_state_path(herdr_ns, root))
@@ -1132,6 +1136,11 @@ def _controller_step_serial(
             _resolve_pending_identity(root, in_flight_task)
             record = _herdr_session_record(root, in_flight_task)
             if isinstance(record, dict) and record.get("status") == "identity_pending":
+                attention = _codex_trust_attention(root, in_flight_task)
+                if attention:
+                    payload = _payload(controller.resume([], lease=lease), "USER_ACTION_REQUIRED")
+                    payload["action_required"] = attention
+                    return payload, True
                 since_raw = str(record.get("identity_pending_since") or "")
                 deadline_seconds = float(getattr(args, "identity_deadline", 300.0) or 300.0)
                 expired = False
@@ -1419,6 +1428,7 @@ def _controller_step_parallel(
     # Migrate a v1/v2 single slot before examining or scheduling anything.
     controller.migrate_active_tasks(lease=lease)
     active = controller.active_tasks()
+    attention_required: dict[str, str] | None = None
     for entry in list(active):
         task_id = entry["task"]
         if entry["state"] == "claimed_no_session":
@@ -1497,6 +1507,10 @@ def _controller_step_parallel(
             _resolve_pending_identity(root, task_id)
             session_record = _herdr_session_record(root, task_id) or {}
             if isinstance(session_record, dict) and session_record.get("status") == "identity_pending":
+                attention = _codex_trust_attention(root, task_id)
+                if attention:
+                    attention_required = attention
+                    continue
                 since_raw = str(session_record.get("identity_pending_since") or "")
                 deadline_seconds = float(getattr(args, "identity_deadline", 300.0) or 300.0)
                 expired = False
@@ -1642,7 +1656,7 @@ def _controller_step_parallel(
 
     # Tasks returned as in_progress after a crash can be adopted only from a
     # durable Herdr binding; a claimed_no_session marker above is never retried.
-    while not draining and len(active) < policy.max_parallel_workers:
+    while not draining and not attention_required and len(active) < policy.max_parallel_workers:
         descendants = beads_backend.root_descendants(cwd, workflow_root)
         active_ids = {item["task"] for item in active}
         orphaned = [
@@ -1777,6 +1791,10 @@ def _controller_step_parallel(
     active = controller.active_tasks()
     if active:
         result = controller.resume([], lease=lease)
+        if attention_required and all(item["state"] == "identity_pending" for item in active):
+            response = payload(result, "USER_ACTION_REQUIRED")
+            response["action_required"] = attention_required
+            return response, True
         if draining and "USER_ACTION_REQUIRED:" in drain_reason and all(
             item["state"] in {"claimed_no_session", "identity_pending"} for item in active
         ):
@@ -2040,6 +2058,10 @@ def controller_status(args: argparse.Namespace) -> int:
                 descendants = beads_backend.root_descendants(root, workflow_root)
                 herdr_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
                 sessions = herdr_state.get("sessions")
+                if isinstance(sessions, Mapping) and isinstance(checkpoint, Mapping):
+                    attention = _pending_startup_attention(checkpoint, sessions)
+                    if attention:
+                        payload["action_required"] = attention
                 payload["lifecycle_reconciliation"] = reconciliation_backend.reconcile(
                     descendants, sessions if isinstance(sessions, Mapping) else {}
                 )
@@ -3311,8 +3333,108 @@ def _resolve_pending_identity(root: Path, task_id: str) -> bool:
             "created_at": _now(), "launched_at": _now(),
         }
         record["status"] = "launched"
+        record.pop("startup_attention", None)
         record.setdefault("attempts", []).append({"status": "launched", "resolved_from": "identity_pending"})
         return True
+
+
+def _codex_trust_attention(root: Path, task_id: str) -> dict[str, str] | None:
+    """Detect Codex's project-trust prompt without granting trust or relaunching."""
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, dict) or record.get("status") != "identity_pending" or record.get("provider") != "codex":
+        return None
+    pane_id = str(record.get("pane_id") or "")
+    herdr = _provider_command("herdr")
+    if not pane_id or not herdr:
+        return None
+    try:
+        probe = subprocess.run(
+            [herdr, "pane", "read", pane_id, "--source", "recent-unwrapped", "--lines", "40", "--format", "text"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    visible = re.sub(r"\s+", " ", probe.stdout or "").casefold()
+    if probe.returncode or "do you trust the contents of this directory?" not in visible:
+        return None
+    attention = {
+        "code": "codex_project_trust_required", "pane_id": pane_id,
+        "path": str(Path(str(record.get("execution_root") or root)).resolve()),
+        "message": "Verify and approve Codex project trust for this exact directory in the live Herdr pane, then resume this controller. Agentflow will not approve trust or relaunch the worker.",
+    }
+    with _herdr_transaction(root / ".agentflow/herdr/sessions.json") as state:
+        current = state.get("sessions", {}).get(task_id)
+        if isinstance(current, dict) and current.get("status") == "identity_pending" and current.get("pane_id") == pane_id:
+            current["startup_attention"] = attention
+    return attention
+
+
+def _pending_startup_attention(
+    checkpoint: Mapping[str, Any], sessions: Mapping[str, Any],
+) -> dict[str, str] | None:
+    active_rows = checkpoint.get("active_tasks")
+    task_ids = [str(item.get("task") or "") for item in active_rows
+                if isinstance(item, Mapping)] if isinstance(active_rows, list) else []
+    task_ids.append(str(checkpoint.get("in_flight_task") or ""))
+    for task_id in task_ids:
+        record = sessions.get(task_id)
+        if isinstance(record, Mapping) and record.get("status") == "identity_pending":
+            attention = record.get("startup_attention")
+            if isinstance(attention, Mapping):
+                return {str(key): str(value) for key, value in attention.items()}
+    return None
+
+
+def _herdr_server_running(herdr: str) -> bool:
+    try:
+        status = subprocess.run([herdr, "status", "server"], capture_output=True, text=True,
+                                timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"cannot inspect Herdr server readiness: {exc}") from exc
+    lines = {line.strip() for line in (status.stdout or "").splitlines()}
+    if status.returncode or "compatible: no" in lines:
+        raise ValueError("Herdr server status is unavailable or incompatible; inspect `herdr status server`")
+    if "status: running" in lines:
+        return True
+    if "status: not running" in lines:
+        return False
+    raise ValueError("Herdr server status was not recognized; inspect `herdr status server`")
+
+
+def _ensure_herdr_server(herdr: str) -> bool:
+    """Start a stopped server once; ambiguous status fails closed."""
+    if _herdr_server_running(herdr):
+        return False
+    try:
+        subprocess.Popen([herdr, "server"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, start_new_session=(os.name == "posix"))
+    except OSError as exc:
+        raise ValueError(f"cannot start Herdr server: {exc}") from exc
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if _herdr_server_running(herdr):
+            return True
+    raise ValueError("Herdr server did not become ready within 8 seconds; inspect `herdr status server`")
+
+
+def _require_herdr_provider_integration(herdr: str, provider: str) -> None:
+    """Fail before Codex launch when Herdr cannot report session identity."""
+    if provider != "codex":
+        return
+    try:
+        status = subprocess.run([herdr, "integration", "status"], capture_output=True,
+                                text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"cannot inspect Herdr Codex integration: {exc}") from exc
+    if status.returncode:
+        raise ValueError("cannot inspect Herdr Codex integration; run `herdr integration status`")
+    line = next((item.strip() for item in (status.stdout or "").splitlines()
+                 if item.strip().startswith("codex:")), "")
+    if not (line.startswith("codex: current ") or line == "codex: current"):
+        raise ValueError("Herdr Codex integration is not current; inspect `herdr integration status` "
+                         "and install it with `herdr integration install codex` before launching")
 
 
 def herdr_launch(args: argparse.Namespace) -> int:
@@ -3450,6 +3572,10 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 "live Herdr launch is controller-owned; start or resume the "
                 "workflow root controller instead"
             )
+        herdr = _provider_command("herdr")
+        if herdr:
+            _require_herdr_provider_integration(herdr, provider)
+            _ensure_herdr_server(herdr)
         agent_name = getattr(args, "agent_name", "") or task_id
         launch_id = str(uuid.uuid4())
         attempt = 1
@@ -3563,7 +3689,6 @@ def herdr_launch(args: argparse.Namespace) -> int:
         except controller_backend.FencedLease as exc:
             raise ValueError(f"launch authority revalidation failed before reservation: {exc}") from exc
 
-        herdr = _provider_command("herdr")
         resolved_provider = _provider_command(provider)
         if not herdr:
             error_code = "herdr_unavailable"
@@ -6762,6 +6887,14 @@ def handoff_create(args: argparse.Namespace) -> int:
     )
     machine_return_section = ""
     if machine_return_contract is not None:
+        example_result = {
+            "outcome": "completed",
+            "acceptance_results": [
+                {"acceptance_id": criterion_id, "status": "passed",
+                 "evidence": "Exact check and observed result"}
+                for criterion_id in acceptance_ids
+            ],
+        }
         machine_return_section = f"""## Machine return contract
 
 ```json
@@ -6770,8 +6903,18 @@ def handoff_create(args: argparse.Namespace) -> int:
 
 Use only the protected paths exposed as `AGENTFLOW_HANDOFF_PATH`,
 `AGENTFLOW_RESULT_CONTRACT`, and `AGENTFLOW_RESULT_FILE`. The controller
-keeps the return capability private. Write bounded JSON to the result path and
-invoke exactly:
+keeps the return capability private. The result file must use the machine
+schema, not your prose summary. Set `outcome` to exactly `completed`, `failed`,
+or `blocked` (never a sentence). For each required acceptance ID, include one
+`acceptance_results` object with `acceptance_id`, `status: "passed"`, and a
+short string `evidence`; if the criterion cannot pass, stop and report the
+blocker instead of inventing evidence. For example:
+
+```json
+{json.dumps(example_result, separators=(',', ':'))}
+```
+
+Write bounded JSON to the result path and invoke exactly:
 
 `{machine_return_contract['submit_command']}`
 

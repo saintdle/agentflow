@@ -9,11 +9,17 @@ Agentflow controller dispatch it through Herdr, and records evidence before the
 controller declares the goal complete. It is a persistent, controller-managed
 external workflow: install Beads, Herdr, Agentflow, and the selected provider
 CLI before starting. Herdr is required for this path; `tmux` is not a transport
-for this controller workflow.
+for this controller workflow. For Codex, check `herdr integration status` and
+install the Codex integration if needed with `herdr integration install codex`;
+Agentflow cannot authenticate its session identity without that integration.
+The controller starts a stopped local Herdr server on first launch, but will
+not install a global provider integration without your action.
 
-The example uses the Codex coding route bundled in `models-v2`. If that route is
-not available to you, first replace all four launch values—provider, model,
-role, and effort—with one exact route approved by your project policy.
+The example uses the Codex 5.6 Luna coding route bundled in `models-v2`.
+Check that your signed-in account can use the chosen model; a policy-approved
+route is not proof of account availability. If that route is not available to
+you, first replace all four launch values—provider, model, role, and
+effort—with one exact route approved by your project policy.
 
 ## 1. Initialize and discover the workspace
 
@@ -48,7 +54,7 @@ TASK_ID=$(bd create "Write the first-run note" \
   --labels "agentflow,af:stage:code,af:role:writer" \
   --description "Create docs/first-run-note.md with one verified setup example." \
   --acceptance "docs/first-run-note.md exists, is non-empty, and contains no private data." \
-  --metadata '{"agentflow":{"launch":{"provider":"codex","model":"gpt-6-luna","role":"coding","effort":"medium"},"lane":"external","tool_profile":"shell-write","output_boundary":".","context":["AGENTS.md"],"constraints":["Write only docs/first-run-note.md. Create docs/ if needed. Preserve unrelated files and do not expose secrets."],"checks":["test -s docs/first-run-note.md"],"budget":["20 minutes; one retry; stop if blocked."]}}' \
+  --metadata '{"agentflow":{"launch":{"provider":"codex","model":"gpt-5.6-luna","role":"coding","effort":"medium"},"lane":"external","tool_profile":"shell-write","output_boundary":".","context":["AGENTS.md"],"constraints":["Write only docs/first-run-note.md. Create docs/ if needed. Preserve unrelated files and do not expose secrets."],"checks":["test -s docs/first-run-note.md"],"budget":["20 minutes; one retry; stop if blocked."]}}' \
   --silent)
 ```
 
@@ -93,6 +99,14 @@ A successful start claims the ready child, materializes and preflights its
 handoff, and starts the provider through Herdr. The provider writes its bounded
 result and submits it through the return command supplied by Agentflow. A pane
 being live or exited is not completion evidence.
+
+On a new Codex directory, the controller may return `USER_ACTION_REQUIRED`
+with `codex_project_trust_required`, the exact directory, and the live Herdr
+pane ID. Verify that directory and approve its trust prompt in that pane if
+appropriate. Then run `controller resume` with the same root, workflow root,
+and controller name. Agentflow preserves the task and pane; it does not approve
+trust for you or relaunch a second worker. Do not blindly trust unfamiliar
+directories or use a trust-bypass flag to silence the prompt.
 
 After the provider has submitted its result, advance one transition:
 
