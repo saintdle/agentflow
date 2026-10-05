@@ -45,6 +45,7 @@ from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
 from agentflow import installation as installation_backend
 from agentflow import isolation as isolation_backend
+from agentflow import launch_recovery as launch_recovery_backend
 from agentflow import readiness as readiness_backend
 from agentflow import reconciliation as reconciliation_backend
 from agentflow import search as search_backend
@@ -1131,7 +1132,19 @@ def _controller_step_serial(
                 lease=lease,
             )
             return _payload(result, "USER_ACTION_REQUIRED"), True
-        if in_flight_state == "identity_pending":
+        recovery = launch_recovery_backend.reduce_incomplete_launch(
+            in_flight_state, in_flight_record, task_id=in_flight_task,
+        )
+        if recovery.action == "require_operator":
+            result = controller.halt("blocked", recovery.reason, lease=lease)
+            response = _payload(result, "USER_ACTION_REQUIRED")
+            response["action_required"] = _launch_action_required(
+                in_flight_task, in_flight_record, recovery,
+            )
+            return response, True
+        if in_flight_state == "identity_pending" or recovery.action in {
+            "poll_identity", "reattach_identity_pending",
+        }:
             # AFREL-025: poll the live pane for its now-available
             # provider session identity instead of relaunching.
             _resolve_pending_identity(root, in_flight_task)
@@ -1310,16 +1323,65 @@ def _controller_step_serial(
             "root": str(root), "claim_id": identity.claim_id,
             "claim_token": identity.token, "actor": lease.controller,
         })
+        if orphaned:
+            existing_record = _herdr_session_record(root, task_id)
+            if isinstance(existing_record, Mapping):
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", existing_record, task_id=task_id,
+                )
+                if recovery.action == "require_operator":
+                    # Reconstruct the exact durable claim pointer, then halt
+                    # with the shared recovery decision. Never run preflight
+                    # or dispatch over an existing incomplete Herdr record.
+                    controller.resume([selected], lease=lease)
+                    result = controller.halt("blocked", recovery.reason, lease=lease)
+                    response = _payload(result, "USER_ACTION_REQUIRED")
+                    response["action_required"] = _launch_action_required(
+                        task_id, existing_record, recovery,
+                    )
+                    return response, True
+                if recovery.action in {"reattach_identity_pending", "reattach_running"}:
+                    dispatch_state = (
+                        "identity_pending"
+                        if recovery.action == "reattach_identity_pending" else "running"
+                    )
+                    result = controller.resume(
+                        [selected],
+                        dispatch=lambda _selected: {
+                            "state": dispatch_state,
+                            "session_id": recovery.session_id,
+                        },
+                        lease=lease,
+                    )
+                    if result.dispatched:
+                        controller.record_session_event(
+                            event="dispatch", task_class=_controller_session_task_class(claimed),
+                            task=task_id, phase=_controller_session_phase(claimed), lease=lease,
+                        )
+                    return _payload(result, ""), False
         result = controller.resume(
             [selected], dispatch=_dispatch_via_herdr(args, root, cwd, workflow_root, lease), lease=lease,
         )
+        action_required: dict[str, str] | None = None
         if result.dispatched:
             controller.record_session_event(
                 event="dispatch", task_class=_controller_session_task_class(claimed),
                 task=task_id, phase=_controller_session_phase(claimed), lease=lease,
             )
         if result.state == "blocked":
-            stop_reason = "TASK_BLOCKED"
+            launch_record = _herdr_session_record(root, task_id)
+            if isinstance(launch_record, Mapping) and launch_record.get("status") == "launching":
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", launch_record, task_id=task_id,
+                )
+            else:
+                recovery = launch_recovery_backend.LaunchRecoveryDecision(action="continue")
+            if recovery.action == "require_operator":
+                result = controller.halt("blocked", recovery.reason, lease=lease)
+                stop_reason = "USER_ACTION_REQUIRED"
+                action_required = _launch_action_required(task_id, launch_record, recovery)
+            else:
+                stop_reason = "TASK_BLOCKED"
         # AFREL-020: a fresh dispatch that is now running/identity_pending
         # is progress, not a stop condition -- the loop keeps polling it.
         stop = bool(stop_reason)
@@ -1358,7 +1420,10 @@ def _controller_step_serial(
             result = controller.resume([], lease=lease)
             stop = False
 
-    return _payload(result, stop_reason), stop
+    response = _payload(result, stop_reason)
+    if claimed is not None and action_required:
+        response["action_required"] = action_required
+    return response, stop
 
 
 def _controller_step_parallel(
@@ -1430,54 +1495,39 @@ def _controller_step_parallel(
     controller.migrate_active_tasks(lease=lease)
     active = controller.active_tasks()
     attention_required: dict[str, str] | None = None
+    launch_attention_required: dict[str, str] | None = None
     for entry in list(active):
         task_id = entry["task"]
+        session_record = _herdr_session_record(root, task_id) or {}
+        recovery = launch_recovery_backend.reduce_incomplete_launch(
+            entry["state"], session_record, task_id=task_id,
+        )
+        if recovery.action == "require_operator":
+            note_failure(
+                task_id, recovery.reason,
+                provider_terminal=recovery.provider_terminal,
+            )
+            launch_attention_required = _launch_action_required(
+                task_id, session_record, recovery,
+            )
+            continue
         if entry["state"] == "claimed_no_session":
-            session_record = _herdr_session_record(root, task_id) or {}
-            lifecycle_status = str(session_record.get("status") or "") if isinstance(session_record, Mapping) else ""
-            binding = session_record.get("binding") if isinstance(session_record, Mapping) else None
-            session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
-            terminal_provider_states = {"completed", "failed", "blocked", "cancelled", "canceled"}
-            if not session_record:
-                # Keep the durable pre-launch reservation for operator review.
-                # Even if no provider process was started, silently clearing a
-                # claimed task would make a later retry indistinguishable from
-                # a fresh claim and weaken crash recovery's no-duplicate rule.
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but no Herdr lifecycle record; "
-                    "inspect the launch before retrying",
-                )
-                continue
-            if lifecycle_status in terminal_provider_states:
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has terminal Herdr state {lifecycle_status} "
-                    "but no provider session binding",
-                    provider_terminal=True,
-                )
-                continue
-            if lifecycle_status == "identity_pending" and str(session_record.get("pane_id") or ""):
+            if recovery.action == "reattach_identity_pending":
                 controller.bind_active_task(
                     task_id, session_id="", state="identity_pending", lease=lease,
                 )
                 entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
-            elif lifecycle_status in {"launched", "running", "completed"} and session_id:
+            elif recovery.action == "reattach_running":
                 controller.bind_active_task(
-                    task_id, session_id=session_id, state="running", lease=lease,
+                    task_id, session_id=recovery.session_id, state="running", lease=lease,
                 )
                 entry = next(item for item in controller.active_tasks() if item["task"] == task_id)
             else:
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has a durable claim but Herdr state "
-                    f"{lifecycle_status or 'unknown'} has no committed provider identity; inspect the live pane",
-                )
+                note_failure(task_id, f"USER_ACTION_REQUIRED: task {task_id} has no safe launch recovery action")
                 continue
 
         issue = beads_backend.get_issue(cwd, task_id)
         terminal = str(issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
-        session_record = _herdr_session_record(root, task_id) or {}
         if terminal and not session_record:
             note_failure(
                 task_id,
@@ -1485,26 +1535,6 @@ def _controller_step_parallel(
             )
             continue
         if entry["state"] == "identity_pending":
-            if isinstance(session_record, Mapping) and session_record.get("status") == "launching":
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} remains identity-pending in the checkpoint but "
-                    "Herdr has no committed pane/session identity; inspect the launch before further action",
-                )
-                continue
-            if (
-                isinstance(session_record, Mapping)
-                and session_record.get("status") == "identity_pending"
-                and (
-                    not str(session_record.get("pane_id") or "")
-                    or not str(session_record.get("identity_pending_since") or "")
-                )
-            ):
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: task {task_id} has incomplete identity-pending lifecycle metadata",
-                )
-                continue
             _resolve_pending_identity(root, task_id)
             session_record = _herdr_session_record(root, task_id) or {}
             if isinstance(session_record, dict) and session_record.get("status") == "identity_pending":
@@ -1677,66 +1707,46 @@ def _controller_step_parallel(
             break
         if orphaned:
             existing_record = _herdr_session_record(root, task_id)
-            binding = existing_record.get("binding") if isinstance(existing_record, Mapping) else None
-            lifecycle_status = str(existing_record.get("status") or "") if isinstance(existing_record, Mapping) else ""
-            if isinstance(existing_record, Mapping) and lifecycle_status == "launching":
-                adopted = dict(claimed)
-                adopted.update({"root": str(root), "actor": lease.controller})
-                controller.reserve_active_task(adopted, lease=lease)
-                note_failure(
-                    task_id,
-                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has an incomplete Herdr launching "
-                    "record without a committed binding; inspect the pane before further action",
-                )
-                break
-            if isinstance(existing_record, Mapping) and lifecycle_status in {
-                "identity_pending", "launched", "running", "completed",
-            }:
-                session_id = str(binding.get("session_id") or "") if isinstance(binding, Mapping) else ""
-                if lifecycle_status == "identity_pending" and not str(existing_record.get("pane_id") or ""):
-                    adopted = dict(claimed)
-                    adopted.update({"root": str(root), "actor": lease.controller})
-                    controller.reserve_active_task(adopted, lease=lease)
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} is identity-pending without a pane ID",
-                    )
-                    break
-                if lifecycle_status != "identity_pending" and not session_id:
-                    adopted = dict(claimed)
-                    adopted.update({"root": str(root), "actor": lease.controller})
-                    controller.reserve_active_task(adopted, lease=lease)
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has Herdr state "
-                        f"{lifecycle_status} without a committed provider session binding",
-                    )
-                    break
-                adopted = dict(claimed)
-                adopted.update({"root": str(root), "actor": lease.controller})
-                controller.reserve_active_task(adopted, lease=lease)
-                adopted_state = "running" if session_id else "identity_pending"
-                controller.bind_active_task(
-                    task_id, session_id=session_id, state=adopted_state, lease=lease,
-                )
-                active = controller.active_tasks()
-                continue
             if isinstance(existing_record, Mapping):
-                if lifecycle_status in {"failed", "blocked", "cancelled", "canceled"}:
-                    note_failure(
-                        task_id,
-                        f"USER_ACTION_REQUIRED: orphaned task {task_id} has terminal Herdr state "
-                        f"{lifecycle_status} without an authenticated result",
-                        provider_terminal=True,
-                    )
-                    break
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", existing_record, task_id=task_id,
+                )
                 adopted = dict(claimed)
                 adopted.update({"root": str(root), "actor": lease.controller})
                 controller.reserve_active_task(adopted, lease=lease)
+                if recovery.action == "require_operator":
+                    note_failure(
+                        task_id, recovery.reason,
+                        provider_terminal=recovery.provider_terminal,
+                    )
+                    launch_attention_required = _launch_action_required(
+                        task_id, existing_record, recovery,
+                    )
+                    break
+                if recovery.action in {"reattach_identity_pending", "reattach_running"}:
+                    session_id = recovery.session_id
+                    adopted_state = (
+                        "identity_pending"
+                        if recovery.action == "reattach_identity_pending" else "running"
+                    )
+                    controller.bind_active_task(
+                        task_id, session_id=session_id, state=adopted_state, lease=lease,
+                    )
+                    active = controller.active_tasks()
+                    continue
+                # A lifecycle record exists but has no recognized committed
+                # recovery transition. Preserve the reservation and fail closed.
                 note_failure(
                     task_id,
-                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has a non-relaunchable Herdr "
-                    f"state {lifecycle_status or 'unknown'}; inspect lifecycle before retrying",
+                    f"USER_ACTION_REQUIRED: orphaned task {task_id} has an unrecognized Herdr "
+                    "recovery state; inspect lifecycle before retrying",
+                )
+                launch_attention_required = _launch_action_required(
+                    task_id, existing_record,
+                    launch_recovery_backend.LaunchRecoveryDecision(
+                        action="require_operator",
+                        reason=f"USER_ACTION_REQUIRED: orphaned task {task_id} has an unrecognized Herdr recovery state",
+                    ),
                 )
                 break
 
@@ -1771,13 +1781,28 @@ def _controller_step_parallel(
         if dispatch_state == "blocked" or (not session_id and dispatch_state != "identity_pending"):
             launch_record = _herdr_session_record(root, task_id) or {}
             launch_status = str(launch_record.get("status") or "") if isinstance(launch_record, Mapping) else ""
-            note_failure(
-                task_id, f"task {task_id} failed preflight or provider launch",
-                provider_terminal=(
-                    not launch_record
-                    or launch_status in {"failed", "blocked", "cancelled", "canceled"}
-                ),
-            )
+            if launch_status == "launching":
+                recovery = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", launch_record, task_id=task_id,
+                )
+            else:
+                recovery = launch_recovery_backend.LaunchRecoveryDecision(action="continue")
+            if recovery.action == "require_operator":
+                note_failure(
+                    task_id, recovery.reason,
+                    provider_terminal=recovery.provider_terminal,
+                )
+                launch_attention_required = _launch_action_required(
+                    task_id, launch_record, recovery,
+                )
+            else:
+                note_failure(
+                    task_id, f"task {task_id} failed preflight or provider launch",
+                    provider_terminal=(
+                        not launch_record
+                        or launch_status in {"failed", "blocked", "cancelled", "canceled"}
+                    ),
+                )
             break
         dispatch_state = dispatch_state if dispatch_state in {"running", "launched", "identity_pending"} else "running"
         result = controller.bind_active_task(
@@ -1802,11 +1827,17 @@ def _controller_step_parallel(
             # No provider result can be polled for these unresolved identities.
             # Keep them durable and fail closed, but stop the autonomous loop
             # once all trackable sibling sessions have drained.
-            return payload(result, "USER_ACTION_REQUIRED"), True
-        return payload(
+            response = payload(result, "USER_ACTION_REQUIRED")
+            if launch_attention_required:
+                response["action_required"] = launch_attention_required
+            return response, True
+        response = payload(
             result,
             "DRAINING_AFTER_TASK_FAILURE" if draining else "",
-        ), False
+        )
+        if launch_attention_required:
+            response["action_required"] = launch_attention_required
+        return response, False
     if draining:
         result = controller.halt(
             "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
@@ -3376,14 +3407,46 @@ def _pending_startup_attention(
     active_rows = checkpoint.get("active_tasks")
     task_ids = [str(item.get("task") or "") for item in active_rows
                 if isinstance(item, Mapping)] if isinstance(active_rows, list) else []
-    task_ids.append(str(checkpoint.get("in_flight_task") or ""))
+    for field in ("in_flight_task", "task"):
+        task_id = str(checkpoint.get(field) or "")
+        if task_id and task_id != str(checkpoint.get("root") or ""):
+            task_ids.append(task_id)
     for task_id in task_ids:
         record = sessions.get(task_id)
-        if isinstance(record, Mapping) and record.get("status") == "identity_pending":
+        if isinstance(record, Mapping):
             attention = record.get("startup_attention")
             if isinstance(attention, Mapping):
                 return {str(key): str(value) for key, value in attention.items()}
+            if record.get("status") == "launching":
+                decision = launch_recovery_backend.reduce_incomplete_launch(
+                    "claimed_no_session", record, task_id=task_id,
+                )
+                return _launch_action_required(task_id, record, decision)
     return None
+
+
+def _launch_action_required(
+    task_id: str,
+    record: Mapping[str, Any] | None,
+    decision: launch_recovery_backend.LaunchRecoveryDecision,
+) -> dict[str, str]:
+    """Project a pure recovery decision into concise operator guidance."""
+    if isinstance(record, Mapping):
+        attention = record.get("startup_attention")
+        if isinstance(attention, Mapping):
+            return {str(key): str(value) for key, value in attention.items()}
+    observed = record.get("launch_observation") if isinstance(record, Mapping) else None
+    pane_id = str(observed.get("pane_id") or "") if isinstance(observed, Mapping) else ""
+    ambiguous = (
+        isinstance(record, Mapping)
+        and str(record.get("launch_outcome") or "").lower() == "ambiguous"
+    )
+    return {
+        "code": "herdr_start_ambiguous" if ambiguous else "incomplete_herdr_launch",
+        "task_id": task_id,
+        "pane_id": pane_id,
+        "message": decision.reason.removeprefix("USER_ACTION_REQUIRED: "),
+    }
 
 
 def _herdr_server_running(herdr: str) -> bool:
@@ -3580,6 +3643,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
         agent_name = getattr(args, "agent_name", "") or task_id
         launch_id = str(uuid.uuid4())
         attempt = 1
+        launch_timeout: subprocess.TimeoutExpired | None = None
         return_channel: dict[str, Any] | None = None
 
         def _mark_failed(code: str) -> None:
@@ -3591,6 +3655,64 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     record.setdefault("attempts", []).append(
                         {"attempt": attempt, "status": "failed", "error": record["error"]}
                     )
+
+        def _mark_ambiguous_start(exc: subprocess.TimeoutExpired) -> None:
+            """Keep a timed-out spawn reservation live and record only observed identity."""
+            output = getattr(exc, "stdout", None)
+            if output is None:
+                output = getattr(exc, "output", None)
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            observation: dict[str, str] = {}
+            if isinstance(output, str) and output:
+                try:
+                    binding = _actual_herdr_binding(
+                        output, root=root, task_id=task_id,
+                        claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                        provider=provider, launch_id=launch_id,
+                    )
+                except IdentityPending as pending:
+                    observation["pane_id"] = pending.pane_id
+                except (herdr_backend.HerdrError, ValueError):
+                    pass
+                else:
+                    observation.update({
+                        "pane_id": binding.pane_id,
+                        "session_id": binding.session_id,
+                    })
+            pane_id = observation.get("pane_id", "")
+            message = (
+                "Herdr agent start timed out; inspect the Herdr pane/session and verify whether "
+                "provider work started before any retry. Do not relaunch while the outcome is uncertain."
+            )
+            attention = {
+                "code": "herdr_start_ambiguous",
+                "task_id": task_id,
+                "launch_id": launch_id,
+                "pane_id": pane_id,
+                "message": message,
+            }
+            with _herdr_transaction(state_path) as state:
+                record = state.get("sessions", {}).get(task_id)
+                if not isinstance(record, dict) or record.get("status") != "launching":
+                    raise ValueError("Herdr launch reservation was replaced after start timeout")
+                record["launch_outcome"] = "ambiguous"
+                record["launch_timeout"] = {
+                    "timeout_seconds": exc.timeout,
+                    "observed_at": _now(),
+                }
+                if observation:
+                    # This is diagnostic evidence only, not a committed
+                    # binding and never authority to ingest a provider result.
+                    record["launch_observation"] = {
+                        "state": "uncommitted", **observation,
+                    }
+                record["startup_attention"] = attention
+                record.setdefault("attempts", []).append({
+                    "attempt": attempt,
+                    "status": "ambiguous",
+                    "reason": "herdr_start_timeout",
+                })
 
         # AFREL-027/AFREL-016: lock order is always controller-then-Herdr.
         # Holding the controller's own lock (fence()) across each
@@ -3753,10 +3875,33 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         *sum((["--env", value] for value in safe_env), []),
                         "--", *provider_tail,
                     ]
-                    launched = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+                    try:
+                        launched = subprocess.run(
+                            argv, capture_output=True, text=True, timeout=30, check=False,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        # The timeout bounds our wait; it does not prove that
+                        # Herdr failed to create a pane. Persist ambiguity while
+                        # the controller fence is still held, and never mark the
+                        # reserved attempt failed or authorize an automatic retry.
+                        _mark_ambiguous_start(exc)
+                        launch_timeout = exc
+                        launched = None
             except (ValueError, controller_backend.FencedLease) as exc:
                 _mark_failed("authority_superseded")
                 raise ValueError(f"launch authority revalidation failed before spawn: {exc}") from exc
+            if launch_timeout is not None:
+                payload = {
+                    "operation": "launch", "ok": False, "retryable": False,
+                    "state_path": str(state_path), "root": str(root),
+                    "task_id": task_id, "status": "ambiguous",
+                    "error": {"code": "herdr_start_timeout"},
+                }
+                _json_or_status(
+                    payload, as_json=bool(getattr(args, "json", False)),
+                    title="HERDR LAUNCH OUTCOME AMBIGUOUS",
+                )
+                return 2
             error_code = "herdr_exit" if launched.returncode else ""
 
         if launched is None or launched.returncode:

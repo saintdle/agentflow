@@ -4004,6 +4004,51 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(payload["result"]["task"], "task-1")
             self.assertEqual(payload["result"]["state"], "running")
 
+    def test_claimed_checkpoint_reattaches_committed_result_through_authority_checks(self) -> None:
+        """A committed Herdr identity can safely repair a claim-only
+        checkpoint; result consumption and disposition still use the existing
+        authenticated path, and no replacement provider is launched."""
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.root_issue["metadata"]["agentflow"]["acceptance"] = {
+                "version": 1, "task_id": fixture.workflow_root,
+                "rows": [{
+                    "id": "R1", "outcome": "root complete", "owner": "eng",
+                    "lane": "static", "planned_evidence": "task closes",
+                    "status": "passed", "actual_evidence": "task result authenticated",
+                }],
+            }
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            self._seed_in_flight_checkpoint(
+                args, task_id="task-1", session_id="", state="claimed_no_session",
+            )
+            cli._private_atomic_json(
+                fixture.root / ".agentflow/herdr/sessions.json",
+                self._consumed_session_record(fixture.root, "task-1", session_id="sess-1"),
+            )
+            fixture.task_issue["status"] = "in_progress"
+            closed: list[str] = []
+
+            def get_issue(_cwd, issue_id):
+                return fixture.root_issue if issue_id == fixture.workflow_root else fixture.task_issue
+
+            def close_issue(_cwd, task_id, _reason):
+                fixture.task_issue["status"] = "closed"
+                closed.append(task_id)
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "close_issue", side_effect=close_issue), \
+                 mock.patch.object(cli, "_dispatch_via_herdr") as dispatch_builder:
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertEqual(payload["stop_reason"], "GOAL_COMPLETE")
+            self.assertEqual(payload["result"]["state"], "completed")
+            self.assertEqual(closed, ["task-1"])
+            dispatch_builder.assert_not_called()
+
     def test_controller_run_advances_after_matching_result_then_claims_next(self) -> None:
         """After a matching authenticated completed result for the in-flight
         task, the controller closes it exactly once, advances, and claims +
@@ -5832,6 +5877,235 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             final = [item for item in payloads if item.get("operation") == "resume"][-1]
             self.assertEqual(final["stop_reason"], "GOAL_COMPLETE")
             self.assertEqual(final["result"]["state"], "completed")
+
+
+class LaunchRecoveryLifecycleTests(unittest.TestCase):
+    @staticmethod
+    def _is_herdr_start(argv) -> bool:
+        return bool(
+            argv and Path(str(argv[0])).name == "herdr"
+            and "agent" in argv and "start" in argv
+        )
+
+    def _timeout_after_pane_created(self, fixture: ValidLaunch, spawned: list[list[str]]):
+        herdr_run = fixture.herdr_run(on_spawn=lambda argv: spawned.append(argv))
+
+        def timeout_run(argv, **kwargs):
+            if self._is_herdr_start(argv):
+                # The fake Herdr has created a pane and emitted its structured
+                # identity, but the CLI process times out before returning.
+                started = herdr_run(argv, **kwargs)
+                raise subprocess.TimeoutExpired(
+                    argv, kwargs.get("timeout", 30), output=started.stdout,
+                    stderr="Herdr client stopped responding after pane creation",
+                )
+            return herdr_run(argv, **kwargs)
+
+        return timeout_run
+
+    def _execution_policy_for_parallel(self, fixture: ValidLaunch) -> None:
+        fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+            "schema": "agentflow.execution-policy@1", "controller_only": True,
+            "max_parallel_workers": 2, "max_delegation_depth": 1,
+            "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+            "max_expensive_execution_children": 0,
+        }
+
+    def test_timeout_after_pane_creation_is_durable_ambiguous_in_both_schedulers(self) -> None:
+        for scheduler in ("serial", "parallel"):
+            with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                if scheduler == "parallel":
+                    self._execution_policy_for_parallel(fixture)
+                args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+                spawned: list[list[str]] = []
+                payloads: list[dict] = []
+                claim_ready = mock.Mock(return_value=fixture.task_issue)
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                ), mock.patch.object(
+                    cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
+                ), mock.patch.object(
+                    cli.beads_backend, "root_descendants", return_value=[fixture.task_issue],
+                ), mock.patch.object(
+                    cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None,
+                ), mock.patch.object(
+                    cli.beads_backend, "claim_ready", claim_ready,
+                ), mock.patch.object(
+                    cli.beads_backend, "update_agentflow_metadata",
+                ), mock.patch.object(
+                    cli, "_provider_command", side_effect=fixture.provider_command,
+                ), mock.patch.object(
+                    cli.subprocess, "run", side_effect=self._timeout_after_pane_created(fixture, spawned),
+                ), mock.patch.object(
+                    cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value),
+                ):
+                    self.assertEqual(cli.controller_resume(args), 0)
+                    first = payloads[-1]
+                    self.assertEqual(first["stop_reason"], "USER_ACTION_REQUIRED")
+                    self.assertIn("ambiguous", first["result"]["checkpoint"]["terminal_reason"])
+                    self.assertEqual(first["action_required"]["pane_id"], "pane-1")
+
+                    state_path = fixture.root / ".agentflow/herdr/sessions.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    record = state["sessions"]["task-1"]
+                    self.assertEqual(record["status"], "launching")
+                    self.assertEqual(record["launch_outcome"], "ambiguous")
+                    self.assertNotIn("error", record)
+                    self.assertIsNone(record["binding"])
+                    self.assertEqual(record["return_channel"]["state"], "issued")
+                    self.assertEqual(record["launch_observation"], {
+                        "state": "uncommitted", "pane_id": "pane-1", "session_id": "sess-1",
+                    })
+                    self.assertEqual(record["attempts"][-1]["status"], "ambiguous")
+                    self.assertEqual(len(spawned), 1)
+
+                    # A subsequent resume observes the same durable decision;
+                    # it neither spends another launch attempt nor re-claims.
+                    self.assertEqual(cli.controller_resume(args), 0)
+                    self.assertEqual(payloads[-1]["stop_reason"], "USER_ACTION_REQUIRED")
+                    self.assertEqual(len(spawned), 1)
+                    self.assertEqual(claim_ready.call_count, 1)
+
+                    status_args = _controller_args(
+                        fixture.root, workflow_root=fixture.workflow_root,
+                    )
+                    self.assertEqual(cli.controller_status(status_args), 0)
+                    status = payloads[-1]
+                    self.assertEqual(status["action_required"]["code"], "herdr_start_ambiguous")
+                    self.assertEqual(status["action_required"]["pane_id"], "pane-1")
+
+    def test_serial_orphaned_launching_record_is_reconciled_before_any_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture.task_issue.update(status="in_progress", assignee=fixture.controller)
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            launch_record = {
+                "root": str(fixture.root), "task_id": "task-1", "claim_id": "claim-1",
+                "launch_id": "interrupted-launch", "status": "launching",
+                "launch_outcome": "ambiguous", "binding": None,
+                "launch_observation": {"state": "uncommitted", "pane_id": "pane-1"},
+            }
+            cli._private_atomic_json(
+                fixture.root / ".agentflow/herdr/sessions.json",
+                {"schema": "agentflow.herdr", "version": 1,
+                 "sessions": {"task-1": launch_record}},
+            )
+            payloads: list[dict] = []
+
+            with mock.patch.dict(
+                os.environ,
+                {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+            ), mock.patch.object(
+                cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
+            ), mock.patch.object(
+                cli.beads_backend, "root_descendants", return_value=[fixture.task_issue],
+            ), mock.patch.object(
+                cli.beads_backend, "claim_ready",
+            ) as claim_ready, mock.patch.object(
+                cli.beads_backend, "update_agentflow_metadata",
+            ), mock.patch.object(
+                cli, "_dispatch_via_herdr",
+            ) as dispatch_builder, mock.patch.object(
+                cli, "_json_or_status",
+                side_effect=lambda value, **_kwargs: payloads.append(value),
+            ):
+                self.assertEqual(cli.controller_resume(args), 0, payloads)
+
+            payload = payloads[-1]
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertIn("ambiguous", payload["result"]["checkpoint"]["terminal_reason"])
+            self.assertEqual(payload["result"]["checkpoint"]["task"], "task-1")
+            self.assertEqual(payload["result"]["checkpoint"]["claim_id"], "claim-1")
+            self.assertEqual(payload["action_required"]["pane_id"], "pane-1")
+            claim_ready.assert_not_called()
+            dispatch_builder.assert_not_called()
+
+    def test_interrupted_launching_reservation_recovers_without_dispatch_in_both_modes(self) -> None:
+        for scheduler in ("serial", "parallel"):
+            with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                if scheduler == "parallel":
+                    self._execution_policy_for_parallel(fixture)
+                args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+                task = dict(fixture.task_issue, status="in_progress", assignee=fixture.controller)
+                selected = {
+                    "task": "task-1", "root": str(fixture.root),
+                    "actor": fixture.controller, "claim_id": "claim-1",
+                }
+                payloads: list[dict] = []
+
+                with mock.patch.dict(
+                    os.environ,
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                ):
+                    controller, _root = cli._controller_instance(args)
+                    lease = controller.acquire()
+                    args.resume_token = lease.resume_secret
+                    if scheduler == "parallel":
+                        controller.reserve_active_task(selected, lease=lease)
+                    else:
+                        controller.resume([selected], lease=lease)
+                    launch_record = {
+                        "root": str(fixture.root), "task_id": "task-1",
+                        "claim_id": "claim-1", "lease_id": lease.token,
+                        "launch_id": "launch-preserved", "provider": "claude",
+                        "status": "launching",
+                        "binding": None,
+                        "return_channel": {"state": "issued", "launch_id": "launch-preserved"},
+                    }
+                    cli._private_atomic_json(
+                        fixture.root / ".agentflow/herdr/sessions.json",
+                        {"schema": "agentflow.herdr", "version": 1,
+                         "sessions": {"task-1": launch_record}},
+                    )
+
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue",
+                        side_effect=lambda _cwd, issue_id: (
+                            fixture.root_issue if issue_id == fixture.workflow_root else task
+                        ),
+                    ), mock.patch.object(
+                        cli.beads_backend, "root_descendants", return_value=[task],
+                    ), mock.patch.object(
+                        cli.beads_backend, "claim_ready",
+                    ) as claim_ready, mock.patch.object(
+                        cli, "_dispatch_via_herdr",
+                    ) as dispatch_builder, mock.patch.object(
+                        cli, "_json_or_status",
+                        side_effect=lambda value, **_kwargs: payloads.append(value),
+                    ):
+                        self.assertEqual(cli.controller_resume(args), 0, payloads)
+                        first = payloads[-1]
+                        self.assertEqual(first["stop_reason"], "USER_ACTION_REQUIRED")
+                        self.assertIn(
+                            "incomplete Herdr launching reservation",
+                            first["result"]["checkpoint"]["terminal_reason"],
+                        )
+                        # The authenticated resume rotated its proof; a fresh
+                        # process reads the updated protected credential file.
+                        args.resume_token = ""
+                        self.assertEqual(cli.controller_resume(args), 0, payloads)
+                        self.assertEqual(payloads[-1]["stop_reason"], "USER_ACTION_REQUIRED")
+
+                    claim_ready.assert_not_called()
+                    dispatch_builder.assert_not_called()
+                    recovered_state = json.loads(
+                        (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+                    )["sessions"]["task-1"]
+                    self.assertEqual(recovered_state["launch_id"], "launch-preserved")
+                    self.assertEqual(recovered_state["claim_id"], "claim-1")
+                    self.assertEqual(recovered_state["status"], "launching")
+                    checkpoint = first["result"]["checkpoint"]
+                    if scheduler == "parallel":
+                        self.assertEqual(checkpoint["active_tasks"][0]["task"], "task-1")
+                        self.assertEqual(checkpoint["active_tasks"][0]["claim_id"], "claim-1")
+                        self.assertEqual(checkpoint["active_tasks"][0]["state"], "claimed_no_session")
+                    else:
+                        self.assertEqual(checkpoint["task"], "task-1")
+                        self.assertEqual(checkpoint["claim_id"], "claim-1")
 
 
 if __name__ == "__main__":
