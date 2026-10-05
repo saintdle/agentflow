@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -4610,6 +4612,334 @@ class GenuineLifecycleTests(unittest.TestCase):
                         result, ("R1",), contract,
                         beads_cwd=root, task_id="task-1",
                     )
+
+
+class ManagedInstallCliTests(unittest.TestCase):
+    def test_codex_hook_merge_retains_user_data_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / ".codex/hooks.json"
+            destination.parent.mkdir(parents=True)
+            packaged = json.loads(
+                cli.packaged_resources.text("templates", "user", "codex-hooks.json")
+            )
+            session_handler = packaged["hooks"]["SessionStart"][0]["hooks"][0]
+            herdr_handler = {"type": "command", "command": "herdr event handler"}
+            custom_agentflow_handler = {
+                **session_handler,
+                "timeout": 19,
+                "command": session_handler["command"] + " --customized",
+            }
+            existing = {
+                "description": "user-owned description",
+                "metadata": {"retained": True},
+                "hooks": {
+                    "SessionStart": [{
+                        "matcher": "user-start-matcher",
+                        "label": "keep this wrapper",
+                        "hooks": [session_handler, herdr_handler, custom_agentflow_handler],
+                    }],
+                    "HerdrEvent": [{
+                        "matcher": "herdr-only",
+                        "hooks": [herdr_handler],
+                    }],
+                },
+            }
+            destination.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("templates", "user", "codex-hooks.json")
+
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "xdg")}):
+                result = cli._install_merged_codex_hooks(
+                    destination, parts, manifest, dry_run=False, refresh=True
+                )
+                self.assertEqual(result, "updated")
+                merged = json.loads(destination.read_text(encoding="utf-8"))
+                session = merged["hooks"]["SessionStart"][0]
+                self.assertEqual(session["matcher"], "user-start-matcher")
+                self.assertEqual(session["label"], "keep this wrapper")
+                self.assertIn(herdr_handler, session["hooks"])
+                self.assertIn(custom_agentflow_handler, session["hooks"])
+                self.assertEqual(merged["description"], "user-owned description")
+                self.assertEqual(merged["metadata"], {"retained": True})
+                self.assertEqual(merged["hooks"]["HerdrEvent"][0]["matcher"], "herdr-only")
+                self.assertEqual(
+                    sum(item == session_handler for item in session["hooks"]), 1
+                )
+                for event, handlers in cli._managed_hook_inventory(packaged).items():
+                    installed = [
+                        item
+                        for group in merged["hooks"][event]
+                        for item in group.get("hooks", [])
+                    ]
+                    for handler in handlers:
+                        self.assertEqual(installed.count(handler), 1, event)
+
+                first_bytes = destination.read_bytes()
+                backup_root = root / "xdg/agentflow/backups"
+                backups_before = sorted(backup_root.rglob("hooks.json"))
+                self.assertEqual(len(backups_before), 1)
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=False, refresh=True
+                    ),
+                    "unchanged",
+                )
+                self.assertEqual(destination.read_bytes(), first_bytes)
+                self.assertEqual(sorted(backup_root.rglob("hooks.json")), backups_before)
+
+    def test_hook_merge_replaces_only_proven_handler_and_preserves_matcher(self) -> None:
+        packaged = json.loads(
+            cli.packaged_resources.text("templates", "user", "codex-hooks.json")
+        )
+        prior = cli._managed_hook_inventory(packaged)
+        old = packaged["hooks"]["SessionStart"][0]["hooks"][0]
+        updated_package = json.loads(json.dumps(packaged))
+        new = updated_package["hooks"]["SessionStart"][0]["hooks"][0]
+        new["timeout"] = old["timeout"] + 7
+        custom = {"command": "keep unrelated command", "type": "command"}
+        existing = {
+            "topLevel": "keep",
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "user-customized-matcher",
+                    "metadata": {"keep": 1},
+                    "hooks": [old, custom],
+                }]
+            },
+        }
+        merged, _ = cli._merge_agentflow_hook_config(
+            existing, updated_package, previously_owned=prior
+        )
+        group = merged["hooks"]["SessionStart"][0]
+        self.assertEqual(group["matcher"], "user-customized-matcher")
+        self.assertEqual(group["metadata"], {"keep": 1})
+        self.assertIn(custom, group["hooks"])
+        self.assertIn(new, group["hooks"])
+        self.assertNotIn(old, group["hooks"])
+        self.assertEqual(merged["topLevel"], "keep")
+
+    def test_shared_merge_api_handles_claude_settings_shape(self) -> None:
+        packaged = json.loads(
+            cli.packaged_resources.text("templates", "project", "claude-settings.json")
+        )
+        existing = {
+            "model": "user-model",
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "user-session-filter",
+                    "customMetadata": "preserve",
+                    "hooks": [{"type": "command", "command": "custom session hook"}],
+                }],
+                "UserEvent": [{"hooks": [{"type": "command", "command": "user hook"}]}],
+            },
+        }
+        merged, handlers = cli._merge_agentflow_hook_config(existing, packaged)
+        session_rules = merged["hooks"]["SessionStart"]
+        self.assertEqual(session_rules[0]["matcher"], "user-session-filter")
+        self.assertEqual(session_rules[0]["customMetadata"], "preserve")
+        self.assertEqual(session_rules[0]["hooks"][0]["command"], "custom session hook")
+        self.assertIn("PostModelSwitch", merged["hooks"])
+        self.assertIn("PostModelSwitch", handlers)
+        self.assertEqual(merged["hooks"]["UserEvent"][0]["hooks"][0]["command"], "user hook")
+        self.assertEqual(merged["model"], "user-model")
+
+    def test_legacy_exact_package_match_establishes_ownership_but_edits_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            skill = cli.packaged_resources.names("skills")[0]
+            source = cli.packaged_resources.item("skills", skill)
+            exact_destination = root / "exact" / skill
+            exact_destination.parent.mkdir(parents=True)
+            shutil.copytree(source, exact_destination)
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("skills", skill)
+            self.assertEqual(
+                cli._install_managed_resource(
+                    parts, exact_destination, manifest, is_tree=True,
+                    dry_run=False, refresh=True,
+                ),
+                "unchanged",
+            )
+            self.assertIn(cli._managed_destination_key(exact_destination), manifest["resources"])
+
+            modified_destination = root / "modified" / skill
+            modified_destination.parent.mkdir(parents=True)
+            shutil.copytree(source, modified_destination)
+            skill_md = modified_destination / "SKILL.md"
+            skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8")
+            before = skill_md.read_bytes()
+            untracked_manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            self.assertEqual(
+                cli._install_managed_resource(
+                    parts, modified_destination, untracked_manifest, is_tree=True,
+                    dry_run=False, refresh=True,
+                ),
+                "preserved",
+            )
+            self.assertEqual(skill_md.read_bytes(), before)
+            self.assertEqual(untracked_manifest["resources"], {})
+
+    def test_recorded_assets_refresh_once_and_dry_run_never_mutates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "package" / "profile.md"
+            source.parent.mkdir()
+            source.write_text("new packaged profile\n", encoding="utf-8")
+            destination = root / "home" / ".codex/agents/profile.md"
+            destination.parent.mkdir(parents=True)
+            old_bytes = b"previous bundled profile\n"
+            destination.write_bytes(old_bytes)
+            parts = ("synthetic", "profile.md")
+            manifest = {
+                "schema": cli.MANAGED_INSTALL_SCHEMA,
+                "resources": {
+                    cli._managed_destination_key(destination): {
+                        "resource": list(parts), "kind": "file",
+                        "sha256": hashlib.sha256(old_bytes).hexdigest(),
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}), \
+                    mock.patch.object(cli.packaged_resources, "item", return_value=source):
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=True, refresh=True,
+                    ),
+                    "would-refresh",
+                )
+                self.assertEqual(destination.read_bytes(), old_bytes)
+                self.assertEqual(
+                    manifest["resources"][cli._managed_destination_key(destination)]["sha256"],
+                    hashlib.sha256(old_bytes).hexdigest(),
+                )
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=False, refresh=True,
+                    ),
+                    "updated",
+                )
+                self.assertEqual(destination.read_text(encoding="utf-8"), "new packaged profile\n")
+                backups = list((root / "state/agentflow/backups").rglob("profile.md"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), old_bytes)
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=False,
+                        dry_run=False, refresh=True,
+                    ),
+                    "unchanged",
+                )
+                self.assertEqual(len(list((root / "state/agentflow/backups").rglob("profile.md"))), 1)
+
+    def test_recorded_skill_tree_can_refresh_but_backup_remains_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "package/skill"
+            package.mkdir(parents=True)
+            (package / "SKILL.md").write_text("new bundled skill\n", encoding="utf-8")
+            destination = root / "home/.agents/skills/example-skill"
+            destination.mkdir(parents=True)
+            old_skill = destination / "SKILL.md"
+            old_skill.write_text("previous bundled skill\n", encoding="utf-8")
+            parts = ("synthetic", "example-skill")
+            manifest = {
+                "schema": cli.MANAGED_INSTALL_SCHEMA,
+                "resources": {
+                    cli._managed_destination_key(destination): {
+                        "resource": list(parts), "kind": "tree",
+                        "sha256": cli.installation_backend._tree_digest(destination),
+                    }
+                },
+            }
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}), \
+                    mock.patch.object(cli.packaged_resources, "item", return_value=package):
+                self.assertEqual(
+                    cli._install_managed_resource(
+                        parts, destination, manifest, is_tree=True,
+                        dry_run=False, refresh=True,
+                    ),
+                    "refreshed",
+                )
+                self.assertEqual((destination / "SKILL.md").read_text(encoding="utf-8"), "new bundled skill\n")
+                backups = list((root / "state/agentflow/backups").rglob("example-skill"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual((backups[0] / "SKILL.md").read_text(encoding="utf-8"), "previous bundled skill\n")
+
+    def test_invalid_codex_json_is_refused_and_dry_run_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            destination = root / ".codex/hooks.json"
+            destination.parent.mkdir(parents=True)
+            invalid = b'{"hooks": [}\n'
+            destination.write_bytes(invalid)
+            manifest = {"schema": cli.MANAGED_INSTALL_SCHEMA, "resources": {}}
+            parts = ("templates", "user", "codex-hooks.json")
+            with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "state")}):
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=False, refresh=True
+                    ),
+                    "refused",
+                )
+                self.assertEqual(destination.read_bytes(), invalid)
+                self.assertEqual(manifest["resources"], {})
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+                destination.write_text(json.dumps({"hooks": {"UserEvent": []}, "keep": 1}), encoding="utf-8")
+                before = destination.read_bytes()
+                self.assertEqual(
+                    cli._install_merged_codex_hooks(
+                        destination, parts, manifest, dry_run=True, refresh=True
+                    ),
+                    "would-refresh",
+                )
+                self.assertEqual(destination.read_bytes(), before)
+                self.assertEqual(manifest["resources"], {})
+                self.assertFalse((root / "state/agentflow/backups").exists())
+
+    def test_install_writes_private_manifest_and_refreshes_mixed_codex_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            home.mkdir()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            hook = home / ".codex/hooks.json"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(json.dumps({
+                "customTopLevel": "retained",
+                "hooks": {"UserEvent": [{"hooks": [{"command": "user handler"}]}]},
+            }), encoding="utf-8")
+            args = argparse.Namespace(
+                path=str(workspace), force=False, dry_run=True, refresh_bundled=True,
+            )
+            with mock.patch.object(Path, "home", return_value=home), \
+                    mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(root / "xdg")}), \
+                    mock.patch("sys.stdout", new_callable=io.StringIO):
+                original_hook = hook.read_bytes()
+                self.assertEqual(cli.install(args), 0)
+                self.assertEqual(hook.read_bytes(), original_hook)
+                self.assertFalse((home / ".agents/skills").exists())
+                self.assertFalse((root / "xdg/agentflow/install/managed-assets.json").exists())
+
+                args.dry_run = False
+                self.assertEqual(cli.install(args), 0)
+                manifest_path = root / "xdg/agentflow/install/managed-assets.json"
+                self.assertTrue(manifest_path.is_file())
+                self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o600)
+                first_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertGreater(len(first_manifest["resources"]), 1)
+                merged = json.loads(hook.read_text(encoding="utf-8"))
+                self.assertEqual(merged["customTopLevel"], "retained")
+                self.assertEqual(merged["hooks"]["UserEvent"][0]["hooks"][0]["command"], "user handler")
+                self.assertIn("SessionStart", merged["hooks"])
+                self.assertEqual(cli.install(args), 0)
+                self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), first_manifest)
 
 
 class IsolationCliTests(unittest.TestCase):

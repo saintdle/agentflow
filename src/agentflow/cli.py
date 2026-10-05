@@ -43,6 +43,7 @@ from agentflow import migration as migration_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
+from agentflow import installation as installation_backend
 from agentflow import isolation as isolation_backend
 from agentflow import readiness as readiness_backend
 from agentflow import reconciliation as reconciliation_backend
@@ -4700,6 +4701,56 @@ def _copy_resource_tree(
     return "refreshed" if existed else "installed"
 
 
+MANAGED_INSTALL_SCHEMA = installation_backend.MANAGED_INSTALL_SCHEMA
+
+
+def _managed_install_manifest_path() -> Path:
+    return installation_backend.managed_install_manifest_path()
+
+
+def _managed_destination_key(destination: Path) -> str:
+    return installation_backend.managed_destination_key(destination)
+
+
+def _load_managed_install_manifest(path: Path | None = None) -> dict[str, Any]:
+    return installation_backend.load_managed_install_manifest(path)
+
+
+def _save_managed_install_manifest(manifest: Mapping[str, Any], path: Path | None = None) -> None:
+    installation_backend.save_managed_install_manifest(manifest, path)
+
+
+def _install_managed_resource(
+    parts: tuple[str, ...], destination: Path, manifest: dict[str, Any], *,
+    is_tree: bool, dry_run: bool, refresh: bool,
+) -> str:
+    return installation_backend.install_resource(
+        parts, destination, manifest, is_tree=is_tree, dry_run=dry_run, refresh=refresh
+    )
+
+
+def _managed_hook_inventory(document: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    return installation_backend._managed_hook_inventory(document)
+
+
+def _merge_agentflow_hook_config(
+    existing: Mapping[str, Any], packaged: Mapping[str, Any], *,
+    previously_owned: Mapping[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    return installation_backend.merge_agentflow_hook_config(
+        existing, packaged, previously_owned=previously_owned
+    )
+
+
+def _install_merged_codex_hooks(
+    destination: Path, parts: tuple[str, ...], manifest: dict[str, Any], *,
+    dry_run: bool, refresh: bool,
+) -> str:
+    return installation_backend.install_codex_hooks(
+        destination, parts, manifest, dry_run=dry_run, refresh=refresh
+    )
+
+
 def _install_beads_formula(
     workspace_data: dict[str, Any], *, refresh: bool = False
 ) -> tuple[str, Path]:
@@ -5287,6 +5338,12 @@ def skills_remove(args: argparse.Namespace) -> int:
 
 def install(args: argparse.Namespace) -> int:
     """Install bundled workflow skills, profiles, hooks, then configured skills."""
+    try:
+        manifest = _load_managed_install_manifest()
+    except ValueError as exc:
+        print(f"Cannot trust managed install ownership: {exc}", file=sys.stderr)
+        return 2
+    original_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     mappings: list[tuple[tuple[str, ...], Path, bool]] = []
     skill_homes = (
         Path.home() / ".agents/skills",
@@ -5307,47 +5364,29 @@ def install(args: argparse.Namespace) -> int:
 
     failed = False
     for parts, destination, is_tree in mappings:
-        if is_tree:
-            result = _copy_resource_tree(
-                parts, destination, dry_run=args.dry_run,
-                refresh=bool(getattr(args, "refresh_bundled", False)),
-            )
-        elif args.dry_run:
-            status = _resource_status(parts, destination)
-            if status == "missing":
-                result = "would-install"
-            elif status == "installed":
-                result = "unchanged"
-            elif getattr(args, "refresh_bundled", False) and destination.is_file() and not destination.is_symlink():
-                result = "would-refresh"
-            else:
-                result = "preserved"
-        else:
-            result = _copy_resource(
-                parts, destination,
-                refresh=bool(getattr(args, "refresh_bundled", False)),
-            )
+        result = _install_managed_resource(
+            parts, destination, manifest, is_tree=is_tree,
+            dry_run=args.dry_run,
+            refresh=bool(getattr(args, "refresh_bundled", False)),
+        )
         print(f"{result:<17} {_safe_cwd(str(destination))}")
         failed = failed or result in {"stale", "preserved", "refused", "unreadable"}
 
     hook = Path.home() / ".codex/hooks.json"
     hook_parts = ("templates", "user", "codex-hooks.json")
-    if args.dry_run:
-        hook_status = _resource_status(hook_parts, hook)
-        if hook_status == "missing":
-            hook_result = "would-install"
-        elif hook_status == "installed":
-            hook_result = "unchanged"
-        elif getattr(args, "refresh_bundled", False) and hook.is_file() and not hook.is_symlink():
-            hook_result = "would-refresh"
-        else:
-            hook_result = "preserved"
-    else:
-        hook_result = _copy_resource(
-            hook_parts, hook, refresh=bool(getattr(args, "refresh_bundled", False))
-        )
+    hook_result = _install_merged_codex_hooks(
+        hook, hook_parts, manifest, dry_run=args.dry_run,
+        refresh=bool(getattr(args, "refresh_bundled", False)),
+    )
     print(f"{hook_result:<17} {_safe_cwd(str(hook))}")
     failed = failed or hook_result in {"stale", "preserved", "refused", "unreadable"}
+
+    if not args.dry_run and json.dumps(manifest, sort_keys=True, separators=(",", ":")) != original_manifest:
+        try:
+            _save_managed_install_manifest(manifest)
+        except OSError as exc:
+            print(f"Cannot save managed install ownership: {exc}", file=sys.stderr)
+            failed = True
 
     root = Path(args.path).expanduser().resolve()
     if project_config_backend.config_path(root).is_file():
@@ -5355,8 +5394,10 @@ def install(args: argparse.Namespace) -> int:
         failed = failed or sync_result != 0
     if failed:
         print(
-            "Stale or conflicting bundled files were preserved. Review them, then use "
-            "--refresh-bundled; --force applies only to custom skill links.",
+            "Stale or unowned bundled files were preserved. Review conflicts manually; "
+            "--refresh-bundled updates only assets matching their ownership records, "
+            "and --force applies "
+            "only to custom skill links.",
             file=sys.stderr,
         )
         return 2
@@ -9446,7 +9487,10 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--dry-run", action="store_true")
     install_parser.add_argument(
         "--refresh-bundled", action="store_true",
-        help="Refresh reviewed stale bundled assets; skill trees are backed up beside their destination",
+        help=(
+            "Refresh only assets matching ownership records; keep private backups "
+            "and preserve user edits"
+        ),
     )
     install_parser.set_defaults(func=install)
 
