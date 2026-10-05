@@ -32,6 +32,7 @@ from agentflow import audit as audit_backend
 from agentflow import beads as beads_backend
 from agentflow import checkpoint as checkpoint_backend
 from agentflow import controller as controller_backend
+from agentflow import config_commands as config_commands_backend
 from agentflow import context_budget as context_budget_backend
 from agentflow import execution as execution_backend
 from agentflow import guidance as guidance_backend
@@ -5288,14 +5289,7 @@ def _link(source: Path, destination: Path, force: bool, dry_run: bool) -> str:
 
 
 def config_show(args: argparse.Namespace) -> int:
-    root = Path(args.path).expanduser().resolve()
-    try:
-        data = project_config_backend.load(root)
-    except (project_config_backend.ConfigError, OSError) as exc:
-        print(f"Invalid Agentflow configuration: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(data, indent=2, sort_keys=True))
-    return 0
+    return config_commands_backend.config_show(args, project_config=project_config_backend)
 
 
 def skills_list(args: argparse.Namespace) -> int:
@@ -5980,41 +5974,36 @@ def search_query(args: argparse.Namespace) -> int:
 
 
 def memory_status(args: argparse.Namespace) -> int:
-    root = Path(args.root).expanduser().resolve()
-    try:
-        config_path = project_config_backend.config_path(root)
-        config = (
-            project_config_backend.load(root)
-            if config_path.exists() or config_path.is_symlink()
-            else project_config_backend.default_data()
-        )
-        settings = project_config_backend.memory_settings(config)
-        value = memory_runtime_backend.health(root, settings)
-        value = {"enabled": bool(settings["enabled"]), "root": str(root), **value}
-    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
-        print(f"memory status: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory: {value.get('status', 'unknown')}")
-    return 0
+    return config_commands_backend.memory_status(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
 
 
 def memory_maintain(args: argparse.Namespace) -> int:
-    root = Path(args.root).expanduser().resolve()
-    try:
-        config_path = project_config_backend.config_path(root)
-        config = (
-            project_config_backend.load(root)
-            if config_path.exists() or config_path.is_symlink()
-            else project_config_backend.default_data()
-        )
-        settings = project_config_backend.memory_settings(config)
-        runtime = memory_runtime_backend.MemoryRuntime(root, settings)
-        value = runtime.maintain(force=True)
-    except (project_config_backend.ConfigError, OSError, ValueError) as exc:
-        print(f"memory maintain: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(value, indent=2, sort_keys=True) if args.json else f"memory maintenance: {value.get('status', 'unknown')}")
-    return 0
+    return config_commands_backend.memory_maintain(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
+
+
+def memory_toggle(args: argparse.Namespace) -> int:
+    return config_commands_backend.memory_toggle(
+        args,
+        project_config=project_config_backend,
+        memory_runtime=memory_runtime_backend,
+    )
+
+
+def config_hooks_merge(args: argparse.Namespace) -> int:
+    return config_commands_backend.hooks_merge(
+        args,
+        project_config=project_config_backend,
+        installation=installation_backend,
+        memory_runtime=memory_runtime_backend,
+    )
 
 
 def usage_yield(args: argparse.Namespace) -> int:
@@ -9611,17 +9600,6 @@ def build_parser() -> argparse.ArgumentParser:
     search_query_parser.add_argument("--json", action="store_true")
     search_query_parser.set_defaults(func=search_query)
 
-    memory_parser = sub.add_parser("memory", help="Inspect or maintain optional governed local memory")
-    memory_sub = memory_parser.add_subparsers(dest="memory_command", required=True)
-    memory_status_parser = memory_sub.add_parser("status")
-    memory_status_parser.add_argument("--root", default=".")
-    memory_status_parser.add_argument("--json", action="store_true")
-    memory_status_parser.set_defaults(func=memory_status)
-    memory_maintain_parser = memory_sub.add_parser("maintain")
-    memory_maintain_parser.add_argument("--root", default=".")
-    memory_maintain_parser.add_argument("--json", action="store_true")
-    memory_maintain_parser.set_defaults(func=memory_maintain)
-
     doctor_parser = sub.add_parser("doctor", help="Inspect prerequisites and project configuration without revealing credentials")
     doctor_parser.add_argument("path", nargs="?", default=".")
     doctor_parser.set_defaults(func=doctor)
@@ -9661,11 +9639,15 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_legacy_parser.add_argument("--json", action="store_true")
     migrate_legacy_parser.set_defaults(func=migrate_legacy)
 
-    config_parser = sub.add_parser("config", help="Inspect schema-versioned project configuration")
-    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
-    config_show_parser = config_sub.add_parser("show", help="Validate and print the active configuration")
-    config_show_parser.add_argument("path", nargs="?", default=".")
-    config_show_parser.set_defaults(func=config_show)
+    config_commands_backend.register_parser(
+        sub,
+        providers=PROVIDERS,
+        config_show_handler=config_show,
+        memory_status_handler=memory_status,
+        memory_maintain_handler=memory_maintain,
+        memory_toggle_handler=memory_toggle,
+        hooks_merge_handler=config_hooks_merge,
+    )
 
     skills_parser = sub.add_parser("skills", help="Manage project-registered local skills")
     skills_sub = skills_parser.add_subparsers(dest="skills_command", required=True)

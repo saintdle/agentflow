@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import copy
+import datetime as dt
+import hashlib
 import json
 import os
 import re
+import stat
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -356,6 +361,240 @@ def write_layer(root: Path, data: dict[str, Any], *, local: bool) -> Path:
     temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
     return path
+
+
+def prepare_memory_update(
+    root: Path, *, enabled: bool, local: bool = False
+) -> tuple[Path, dict[str, Any], bytes | None, bool]:
+    """Validate both config layers and prepare a memory-only update.
+
+    Legacy schema-v1 files may omit ``memory``. Updating such a file materializes
+    the complete current defaults before changing only ``enabled``. Unknown or
+    invalid data is never discarded as part of this operation.
+    """
+
+    root = Path(root).resolve()
+    shared_path = config_path(root)
+    local_path = local_config_path(root)
+    if shared_path.parent.is_symlink() or local_path.parent.is_symlink():
+        raise ConfigError(".agentflow must not be a symlink")
+
+    def read(path: Path, *, is_local: bool, allow_missing: bool = False) -> tuple[dict[str, Any], bytes | None]:
+        if path.is_symlink():
+            raise ConfigError(f"configuration path must not be a symlink: {path}")
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            if allow_missing:
+                data = default_local_data() if is_local else default_data()
+                errors = validate(data, root, local=is_local)
+                if errors:
+                    raise ConfigError("; ".join(errors))
+                return data, None
+            raise ConfigError(f"configuration not found: {path}; run `agentflow init`")
+        except OSError as exc:
+            raise ConfigError(f"configuration is unreadable: {exc}") from exc
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"configuration is unreadable: {exc}") from exc
+        errors = validate(data, root, local=is_local)
+        if errors:
+            raise ConfigError(f"{path}: {'; '.join(errors)}")
+        return data, raw
+
+    shared, shared_raw = read(shared_path, is_local=False)
+    local_data, local_raw = read(local_path, is_local=True, allow_missing=True)
+    target_path = local_path if local else shared_path
+    target = copy.deepcopy(local_data if local else shared)
+    original = local_raw if local else shared_raw
+    if not local and "memory" in local_data:
+        raise ConfigError(
+            "shared memory is shadowed by .agentflow/config.local.json; use --local to change the effective setting"
+        )
+    previous = copy.deepcopy(target)
+    memory = target.get("memory")
+    if memory is None:
+        memory = dict(DEFAULT_MEMORY)
+        target["memory"] = memory
+    elif isinstance(memory, dict):
+        memory = dict(memory)
+        target["memory"] = memory
+    else:  # validate() normally rejects this; keep the mutation boundary explicit.
+        raise ConfigError("memory must be an object")
+    memory["enabled"] = bool(enabled)
+    errors = validate(target, root, local=local)
+    if errors:
+        raise ConfigError(f"refusing invalid memory update: {'; '.join(errors)}")
+    return target_path, target, original, target != previous
+
+
+def _current_uid() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    return getuid() if getuid is not None else None
+
+
+def _check_owned_regular(path: Path) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ConfigError(f"refusing non-regular or symlink destination: {path}")
+    uid = _current_uid()
+    if uid is not None and info.st_uid != uid:
+        raise ConfigError(f"destination is not owned by the current user: {path}")
+    return info
+
+
+def _ensure_directory(path: Path, *, private: bool = False) -> None:
+    """Create a directory chain without following symlink components."""
+
+    path = Path(path)
+    component = path
+    while True:
+        if component.is_symlink():
+            raise ConfigError(f"refusing symlink directory component: {component}")
+        if component.parent == component:
+            break
+        component = component.parent
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        if current.is_symlink():
+            raise ConfigError(f"refusing symlink directory: {current}")
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            raise ConfigError(f"cannot create directory: {path}")
+        current = parent
+    if current.is_symlink() or not current.is_dir():
+        raise ConfigError(f"directory is not a real directory: {current}")
+    uid = _current_uid()
+    if uid is not None and current.stat().st_uid != uid:
+        raise ConfigError(f"directory is not owned by the current user: {current}")
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        except OSError as exc:
+            raise ConfigError(f"cannot create directory {directory}: {exc}") from exc
+    if private:
+        try:
+            path.chmod(0o700)
+        except OSError as exc:
+            raise ConfigError(f"cannot make backup directory private: {exc}") from exc
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"directory changed while preparing write: {path}")
+    if uid is not None and info.st_uid != uid:
+        raise ConfigError(f"directory is not owned by the current user: {path}")
+
+
+def _private_backup(path: Path, original: bytes, state_home: Path) -> Path:
+    state_home = Path(state_home).expanduser()
+    _ensure_directory(state_home)
+    backup_root = state_home / "config-backups"
+    _ensure_directory(backup_root, private=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    target_id = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()[:12]
+    transaction = backup_root / f"{stamp}-{target_id}"
+    try:
+        transaction.mkdir(mode=0o700)
+        transaction.chmod(0o700)
+        backup = transaction / path.name
+        descriptor = os.open(
+            backup,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        directory = os.open(transaction, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return backup
+    except OSError as exc:
+        raise ConfigError(f"cannot create private backup for {path}: {exc}") from exc
+
+
+def write_private_file(
+    path: Path, payload: bytes, *, expected_original: bytes | None,
+    state_home: Path,
+) -> Path | None:
+    """Atomically replace an owned regular file, retaining a private backup."""
+
+    path = Path(path).expanduser()
+    if path.parent.is_symlink():
+        raise ConfigError(f"refusing symlink parent directory: {path.parent}")
+    _ensure_directory(path.parent)
+    exists = path.exists() or path.is_symlink()
+    original: bytes | None = None
+    if exists:
+        _check_owned_regular(path)
+        try:
+            original = path.read_bytes()
+        except OSError as exc:
+            raise ConfigError(f"cannot read {path}: {exc}") from exc
+    if original != expected_original:
+        raise ConfigError(f"{path} changed since it was inspected; refusing to overwrite")
+    backup = _private_backup(path, original, state_home) if original is not None else None
+
+    # Recheck after backup creation so a concurrent edit is never replaced.
+    now_exists = path.exists() or path.is_symlink()
+    if now_exists != exists:
+        raise ConfigError(f"{path} changed since it was inspected; refusing to overwrite")
+    if now_exists:
+        _check_owned_regular(path)
+        try:
+            if path.read_bytes() != expected_original:
+                raise ConfigError(f"{path} changed since it was inspected; refusing to overwrite")
+        except OSError as exc:
+            raise ConfigError(f"cannot recheck {path}: {exc}") from exc
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory = -1
+        if directory >= 0:
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except BaseException as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f"cannot atomically replace {path}: {exc}") from exc
+    return backup
 
 
 def load_managed_links(root: Path) -> list[dict[str, str]]:

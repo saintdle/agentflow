@@ -6,6 +6,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added explicit project memory enable/disable commands with strict layered
+  validation, dry-run diffs, owner-only atomic writes, and private backups.
+- Added targeted Codex and Claude hook merges that preserve custom handlers and
+  metadata and retain private exact-handler ownership receipts for later
+  upgrades.
+
+### Changed
+
+- Bundled refresh now uses ownership evidence, merges only Agentflow-owned
+  Codex handlers, and preserves edited or unknown assets for review.
+- History archive mutations serialize across threads and processes and recover
+  interrupted Beads imports from a validated private journal.
+- Documented the advisory nature of local memory approval metadata and updated
+  the project Claude hook example with current provider events.
+
 ## [0.0.7] - 2026-10-05
 
 ### Fixed

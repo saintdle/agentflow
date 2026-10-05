@@ -87,6 +87,15 @@ preserved for manual review. User-provided skills are registered and managed
 with `agentflow skills add`, `sync`, `list`, and `doctor`; they are not bundled
 into the distribution.
 
+An ordinary install does not replace existing assets. `--refresh-bundled`
+refreshes only assets whose ownership is established by the private install
+manifest; on a manifest-less older install, a file or tree is considered owned
+only when it exactly matches the bundled resource. Edited or otherwise unknown
+assets are preserved and the refresh fails closed rather than claiming them.
+Codex hook refresh merges exact Agentflow handler leaves, retaining other event
+handlers, rule matchers, and top-level metadata. Changed files receive private
+backups before atomic replacement.
+
 ## Initialize a project
 
 ```sh
@@ -112,11 +121,35 @@ uv tool install --reinstall "git+https://github.com/saintdle/agentflow.git@v0.0.
 # or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.7"
 agentflow --version
 agentflow install --dry-run
-# After reviewing stale bundled assets and private-state backup behavior:
+# Review each proposed refresh; edited/unknown assets remain untouched.
 agentflow install --refresh-bundled
+agentflow config hooks merge --provider codex --root . --dry-run
+agentflow config hooks merge --provider claude --root . --dry-run
 agentflow doctor
 agentflow skills doctor
 ```
+
+Apply a hook merge only after reviewing its preview. Codex targets the
+user-level `~/.codex/hooks.json`; Claude targets the selected project's
+`.claude/settings.json`. The command preserves custom handlers and metadata,
+creates a private ownership receipt for future exact-leaf upgrades, and makes
+a private backup of a changed target. Invalid JSON or unowned custom data is
+not treated as Agentflow-owned. Memory settings have explicit commands too:
+
+```sh
+agentflow config memory enable --root . --dry-run
+agentflow config memory enable --root .
+agentflow config memory disable --root . --local
+agentflow config show .
+agentflow memory status --root .
+agentflow memory maintain --root .
+```
+
+The memory toggle materializes strict defaults when needed and preserves the
+rest of the selected config. It validates both shared and local layers, refuses
+to change a shared value shadowed by local memory settings, and never silently
+migrates schemas or drops unknown fields. See [Memory](MEMORY.md) and
+[Configuration](CONFIGURATION.md) for the layer and trust contracts.
 
 When an upgrade introduces a new model-policy file, Agentflow preserves the
 project's existing policy. Review the versioned policy diff, copy the new file

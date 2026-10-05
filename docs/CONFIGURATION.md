@@ -103,6 +103,30 @@ agentflow skills add /path/on/this/machine/personal-domain-skill --local
 agentflow skills list
 ```
 
+Enable or disable the optional memory feature without replacing other policy
+values. Use `--local` only for an intentional machine override; a shared toggle
+is refused when a local memory section shadows it. Both layers are validated
+before either can be changed. A dry run previews the exact diff without writing
+or creating a backup:
+
+```sh
+agentflow config memory enable --root . --dry-run
+agentflow config memory enable --root .
+agentflow config memory disable --root . --local
+```
+
+To add current Agentflow hook handlers to an existing configuration while
+preserving custom handlers and metadata, preview the explicit target first.
+Codex uses the user-level `~/.codex/hooks.json`; Claude uses the selected
+project's `.claude/settings.json`:
+
+```sh
+agentflow config hooks merge --provider codex --root . --dry-run
+agentflow config hooks merge --provider claude --root . --dry-run
+```
+
+See [Installation](INSTALLATION.md#upgrade) for applying the reviewed merge.
+
 ## Beads state
 
 `agentflow init . --beads` creates a local Beads workspace. The default is a

@@ -31,12 +31,17 @@ def managed_destination_key(destination: Path) -> str:
 
 def load_managed_install_manifest(path: Path | None = None) -> dict[str, Any]:
     manifest_path = path or managed_install_manifest_path()
+    if manifest_path.parent.is_symlink():
+        raise ValueError("managed install manifest directory is a symlink; refusing to trust it")
     if manifest_path.is_symlink():
         raise ValueError("managed install manifest is a symlink; refusing to trust it")
     if not manifest_path.exists():
         return {"schema": MANAGED_INSTALL_SCHEMA, "resources": {}}
     if not manifest_path.is_file():
         raise ValueError("managed install manifest is not a regular file")
+    uid = getattr(os, "getuid", lambda: None)()
+    if uid is not None and manifest_path.stat().st_uid != uid:
+        raise ValueError("managed install manifest is not owned by the current user")
     try:
         value = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -55,7 +60,7 @@ def load_managed_install_manifest(path: Path | None = None) -> dict[str, Any]:
             not isinstance(record.get("resource"), list)
             or any(not isinstance(part, str) for part in record["resource"])
             or not isinstance(kind, str)
-            or kind not in {"file", "tree", "codex-hooks"}
+            or kind not in {"file", "tree", "codex-hooks", "claude-hooks"}
         ):
             raise ValueError("managed install manifest contains an invalid resource identity")
         digest = record.get("sha256")
@@ -79,7 +84,19 @@ def load_managed_install_manifest(path: Path | None = None) -> dict[str, Any]:
 
 def save_managed_install_manifest(manifest: Mapping[str, Any], path: Path | None = None) -> None:
     manifest_path = path or managed_install_manifest_path()
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_path.parent.is_symlink() or manifest_path.is_symlink():
+        raise ValueError("managed install manifest path contains a symlink")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not manifest_path.parent.is_dir():
+        raise ValueError("managed install manifest directory is not a directory")
+    uid = getattr(os, "getuid", lambda: None)()
+    if uid is not None and manifest_path.parent.stat().st_uid != uid:
+        raise ValueError("managed install manifest directory is not owned by the current user")
+    if manifest_path.exists():
+        if not manifest_path.is_file():
+            raise ValueError("managed install manifest is not a regular file")
+        if uid is not None and manifest_path.stat().st_uid != uid:
+            raise ValueError("managed install manifest is not owned by the current user")
     manifest_path.parent.chmod(0o700)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{manifest_path.name}.", dir=manifest_path.parent)
     temporary = Path(temporary_name)
@@ -163,6 +180,33 @@ def _record_asset(
             for event, items in sorted(managed_handlers.items())
         }
     manifest["resources"][managed_destination_key(destination)] = record
+
+
+def record_managed_hook_config(
+    destination: Path,
+    *,
+    provider: str,
+    handlers: Mapping[str, list[dict[str, Any]]],
+    path: Path | None = None,
+) -> None:
+    """Persist exact managed handler leaves for a Codex or Claude hook target."""
+
+    resources = {
+        "codex": (("templates", "user", "codex-hooks.json"), "codex-hooks"),
+        "claude": (("templates", "project", "claude-settings.json"), "claude-hooks"),
+    }
+    if provider not in resources:
+        raise ValueError("managed hook provider must be codex or claude")
+    parts, kind = resources[provider]
+    manifest = load_managed_install_manifest(path)
+    _record_asset(
+        manifest,
+        destination,
+        parts,
+        kind=kind,
+        managed_handlers=handlers,
+    )
+    save_managed_install_manifest(manifest, path)
 
 
 def _refresh_backup_path(destination: Path) -> Path:
