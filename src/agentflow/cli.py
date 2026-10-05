@@ -1404,7 +1404,7 @@ def _controller_step_serial(
             )
             result = controller.halt(
                 "blocked",
-                f"USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: {titles}",
+                f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
                 lease=lease,
             )
             stop_reason = "USER_ACTION_REQUIRED"
@@ -1858,7 +1858,7 @@ def _controller_step_parallel(
             f"{item.get('title') or item.get('id')} ({item.get('id')})" for item in nonterminal[:5]
         )
         result = controller.halt(
-            "blocked", f"USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: {titles}",
+            "blocked", f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
             lease=lease,
         )
         return payload(result, "USER_ACTION_REQUIRED"), True
@@ -1890,6 +1890,105 @@ def _controller_step(
     return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
+def _verify_no_ready_ack_candidate(
+    root: Path, workflow_root: str,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+) -> str:
+    """Read-only proof that this same root has ready work and nothing live."""
+    document = controller._load_checkpoint()
+    reason = str(document.get("terminal_reason") or "")
+    if not (
+        reason.startswith("USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: ")
+        or reason.startswith("USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: ")
+    ):
+        raise controller_backend.ControllerError("checkpoint is not a recognized no-ready-work halt")
+    if controller.active_tasks():
+        raise controller_backend.ControllerError("cannot acknowledge while controller workers remain active")
+    ledger = controller.session_ledger()
+    if ledger.get("blocked"):
+        raise controller_backend.ControllerError("cannot acknowledge a repeated-approach blocked controller")
+    current_root = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(current_root.get("id") or "") != workflow_root
+        or str(current_root.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise controller_backend.ControllerError("workflow root is missing, mismatched, or terminal")
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    for descendant in descendants:
+        task_id = str(descendant.get("id") or "")
+        if str(descendant.get("status") or "").lower() == "in_progress":
+            raise controller_backend.ControllerError(
+                "cannot acknowledge while a descendant remains claimed in progress"
+            )
+        record = _herdr_session_record(root, task_id) if task_id else None
+        if record is None:
+            continue
+        if not isinstance(record, Mapping):
+            raise controller_backend.ControllerError("Herdr session state is malformed")
+        status = str(record.get("status") or "").lower()
+        channel = record.get("return_channel")
+        result = record.get("result")
+        binding = record.get("binding")
+        safely_completed = (
+            status == "completed"
+            and isinstance(channel, Mapping) and channel.get("state") == "consumed"
+            and isinstance(result, Mapping) and result.get("outcome") == "completed"
+            and isinstance(binding, Mapping)
+            and str(binding.get("root") or "") == str(root.resolve())
+            and str(binding.get("task_id") or "") == task_id
+            and str(result.get("workflow_root") or "") == workflow_root
+            and str(result.get("workspace_root") or "") == str(root.resolve())
+            and str(result.get("task_id") or "") == task_id
+            and str(result.get("session_id") or "") == str(binding.get("session_id") or "")
+            and str(result.get("launch_id") or "") == str(binding.get("launch_id") or "")
+        )
+        if not safely_completed:
+            raise controller_backend.ControllerError(
+                "cannot acknowledge while a descendant has an unconsumed, failed, "
+                "ambiguous, or unknown Herdr lifecycle"
+            )
+    eligible = {
+        str(item.get("id") or "")
+        for item in descendants
+        if str(item.get("status") or "").lower() not in reconciliation_backend.TERMINAL
+    }
+    if not eligible:
+        raise controller_backend.ControllerError(
+            "no eligible nonterminal descendant remains under this workflow root"
+        )
+    common = ["ready", "--parent", workflow_root, "--limit", "1", "--sort", "priority"]
+
+    def ready_rows(value: Any, operation: str) -> list[Any]:
+        if isinstance(value, Mapping):
+            if isinstance(value.get("issues"), list):
+                return value["issues"]
+            return [value] if value.get("id") else []
+        if isinstance(value, list):
+            return value
+        raise beads_backend.BeadsError(f"{operation} returned an unexpected JSON shape")
+
+    assigned = beads_backend._json_output(
+        beads_backend.run(root, *common, "--assignee", lease.controller, "--json"),
+        "bd ready --assignee",
+    )
+    rows = ready_rows(assigned, "bd ready --assignee")
+    if not rows:
+        shared = beads_backend._json_output(
+            beads_backend.run(root, *common, "--unassigned", "--json"),
+            "bd ready --unassigned",
+        )
+        rows = ready_rows(shared, "bd ready --unassigned")
+    if len(rows) != 1 or not isinstance(rows[0], Mapping):
+        raise controller_backend.ControllerError("no single ready descendant can be verified for this workflow root")
+    task_id = str(rows[0].get("id") or "")
+    if not task_id or task_id not in eligible:
+        raise controller_backend.ControllerError(
+            "the ready candidate is not a current descendant of this workflow root"
+        )
+    return task_id
+
+
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
@@ -1904,6 +2003,11 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         if operation == "supervise" and str(getattr(args, "resume_token", "") or ""):
             raise ValueError("controller supervise requires its protected credential file, not --resume-token")
         controller, root = _controller_instance(args)
+        acknowledge_no_ready = operation == "resume" and bool(
+            getattr(args, "acknowledge_no_ready_halt", False)
+        )
+        if acknowledge_no_ready and bool(getattr(args, "takeover", False)):
+            raise ValueError("--acknowledge-no-ready-halt requires authenticated reattach, not takeover")
 
         # Validate the exact Beads root before acquiring a lease or writing
         # protected credentials.  The lock covers every long-running root
@@ -1945,6 +2049,30 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     legacy = _legacy_resume_key_path(args)
                     if not resume_proof and legacy is not None:
                         resume_proof = _read_resume_key(legacy)
+                if acknowledge_no_ready:
+                    state = (
+                        json.loads(controller.state_path.read_text(encoding="utf-8"))
+                        if controller.state_path.exists() else {}
+                    )
+                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
+                    credentials = _read_controller_credentials(key_path)
+                    legacy = _legacy_resume_key_path(args)
+                    if not credentials and legacy is not None:
+                        credentials = _read_controller_credentials(legacy)
+                    if (
+                        previous is None
+                        or previous.root != str(root)
+                        or previous.controller != controller.controller
+                        or not previous.verify_resume_proof(resume_proof)
+                        or credentials.get("workspace_root") != str(root.resolve())
+                        or credentials.get("workflow_root") != workflow_root
+                        or credentials.get("continuity_id") != previous.continuity_id
+                        or not credentials.get("authority_secret")
+                    ):
+                        raise controller_backend.LeaseConflict(
+                            "--acknowledge-no-ready-halt requires the protected credential "
+                            "for this workflow incarnation"
+                        )
                 lease = controller.acquire(
                     takeover=bool(getattr(args, "takeover", False)),
                     resume_proof=resume_proof,
@@ -1953,6 +2081,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             # Internal-only: never serialized into a handoff, command argv,
             # Herdr state, environment variable, checkpoint, or payload.
             args._authority_secret = credentials["authority_secret"]
+            if acknowledge_no_ready:
+                ready_task = _verify_no_ready_ack_candidate(root, workflow_root, controller, lease)
+                controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
             _bind_current_controller_sessions(root, workflow_root, lease)
 
             # An authenticated resume acknowledges a required safe-boundary
@@ -9322,6 +9453,10 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="Reattach to a resumable root and continue its durable workflow"
     )
     add_controller_common(controller_resume_parser)
+    controller_resume_parser.add_argument(
+        "--acknowledge-no-ready-halt", action="store_true",
+        help="explicitly acknowledge a recognized no-ready-work halt after a fresh safe-boundary check",
+    )
     controller_resume_parser.set_defaults(func=controller_resume)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",

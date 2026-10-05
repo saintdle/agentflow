@@ -2877,6 +2877,203 @@ class ControllerRunTests(unittest.TestCase):
         issue.update(overrides)
         return issue
 
+    def test_acknowledge_no_ready_halt_is_same_root_authenticated_and_shared_by_schedulers(self) -> None:
+        """The explicit acknowledgement reopens only a proven safe no-ready boundary."""
+        for workers in (1, 2):
+            with self.subTest(max_parallel_workers=workers), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                fixture = ValidLaunch(base / "workspace", seed_lease=False)
+                key_file = base / "resume.key"
+                ready = dict(fixture.task_issue, id="task-10", title="Newly ready child", status="open")
+                ready["metadata"] = {"agentflow": {}}
+                prior = self._issue("task-9", status="closed", parent=fixture.workflow_root)
+                if workers > 1:
+                    fixture.root_issue["metadata"]["agentflow"]["execution"] = {
+                        "schema": "agentflow.execution-policy@1", "controller_only": True,
+                        "max_parallel_workers": 2, "max_delegation_depth": 1,
+                        "max_attempts_per_task": 2, "launch_budget_multiplier": 2,
+                        "max_expensive_execution_children": 0,
+                    }
+                args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root,
+                    resume_key_file=str(key_file),
+                )
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    controller, _ = cli._controller_instance(args)
+                    lease = controller.acquire()
+                    cli._controller_credentials(args, lease)
+                    checkpoint = controller._load_checkpoint()
+                    checkpoint["completed_evidence"] = "prior authenticated result preserved"
+                    checkpoint["changed_files"] = ["src/previous.py"]
+                    controller._save_checkpoint(checkpoint, lease=lease)
+                    controller.halt(
+                        "blocked",
+                        "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: old (.12)",
+                        lease=lease,
+                    )
+                    cli._private_atomic_json(
+                        fixture.root / ".agentflow/herdr/sessions.json",
+                        {"schema": "agentflow.herdr", "version": 1, "sessions": {
+                            "task-9": {
+                                "status": "completed",
+                                "binding": {
+                                    "root": str(fixture.root), "task_id": "task-9",
+                                    "provider": "claude", "session_id": "session-old",
+                                    "launch_id": "launch-old", "claim_id": "claim-old", "lease_id": "lease-old",
+                                },
+                                "return_channel": {
+                                    "state": "consumed", "consumed_at": "then",
+                                    "result_sha256": "d" * 64,
+                                },
+                                "result": {
+                                    "acceptance_results": [], "actor": fixture.controller,
+                                    "claim_token_sha256": "e" * 64, "evidence": "done",
+                                    "launch_id": "launch-old", "lease_id": "lease-old",
+                                    "outcome": "completed", "provider": "claude",
+                                    "session_id": "session-old", "task_id": "task-9",
+                                    "workflow_root": fixture.workflow_root,
+                                    "workspace_root": str(fixture.root),
+                                },
+                            },
+                        }},
+                    )
+
+                    args.acknowledge_no_ready_halt = True
+                    args.workflow_root = "wf-other"
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue", return_value=fixture.root_issue,
+                    ):
+                        wrong_root = _run_controller_json(cli.controller_resume, args)
+                    self.assertFalse(wrong_root["ok"])
+                    self.assertEqual(controller._load_checkpoint()["state"], "blocked")
+                    args.workflow_root = fixture.workflow_root
+                    args.resume_token = "not-the-protected-reattach-proof"
+                    with mock.patch.object(
+                        cli.beads_backend, "get_issue",
+                        side_effect=lambda _cwd, _id: fixture.root_issue,
+                    ):
+                        unauthorized = _run_controller_json(cli.controller_resume, args)
+                    self.assertFalse(unauthorized["ok"])
+                    self.assertEqual(controller._load_checkpoint()["state"], "blocked")
+                    args.resume_token = ""
+                    args.acknowledge_no_ready_halt = False
+
+                    get_issue = lambda _cwd, issue_id: (
+                        fixture.root_issue if issue_id == fixture.workflow_root else ready
+                    )
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                         mock.patch.object(cli.beads_backend, "claim_ready") as claim:
+                        stale = _run_controller_json(cli.controller_resume, args)
+                    self.assertEqual(stale["result"]["state"], "blocked")
+                    self.assertTrue(stale["result"]["terminal"])
+                    claim.assert_not_called()
+
+                    args.acknowledge_no_ready_halt = True
+                    def read_ready(_cwd, *argv):
+                        rows = [] if "--assignee" in argv else [{"id": "task-10"}]
+                        return subprocess.CompletedProcess(["bd"], 0, json.dumps(rows), "")
+
+                    ready["status"] = "open"
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=[prior, ready]), \
+                         mock.patch.object(cli.beads_backend, "run", side_effect=read_ready), \
+                         mock.patch.object(cli.beads_backend, "claim_ready", side_effect=[ready, None]) as claim, \
+                         mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                         mock.patch.object(cli, "_persist_claim_identity"), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                         mock.patch.object(cli, "_dispatch_via_herdr", return_value=lambda _task: {
+                             "state": "running", "session_id": "session-new",
+                         }):
+                        resumed = _run_controller_json(cli.controller_resume, args)
+                    self.assertTrue(resumed["ok"], resumed)
+                    self.assertFalse(resumed["result"]["terminal"])
+                    self.assertEqual(resumed["result"]["state"], "running")
+                    self.assertIn("task-10", resumed["result"]["checkpoint"]["last_check"])
+                    self.assertIn(
+                        "nonterminal descendant(s) remain",
+                        resumed["result"]["checkpoint"]["terminal_reason"],
+                    )
+                    self.assertEqual(
+                        resumed["result"]["checkpoint"]["completed_evidence"],
+                        "prior authenticated result preserved",
+                    )
+                    self.assertEqual(resumed["result"]["checkpoint"]["changed_files"], ["src/previous.py"])
+                    self.assertEqual(claim.call_count, workers)
+
+    def test_acknowledgement_rejects_unknown_or_completed_terminal_reason(self) -> None:
+        for state in ("blocked", "completed", "failed"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(state, "USER_ACTION_REQUIRED: a worker may still be live", lease=lease)
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    controller.acknowledge_no_ready_halt(fixture.workflow_root, "task-1", lease=lease)
+
+    def test_acknowledgement_fails_closed_on_unresolved_or_unknown_herdr_lifecycle(self) -> None:
+        for status in ("launching", "identity_pending", "failed", "unknown", "completed"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(
+                    "blocked",
+                    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    lease=lease,
+                )
+                cli._private_atomic_json(
+                    fixture.root / ".agentflow/herdr/sessions.json",
+                    {"schema": "agentflow.herdr", "version": 1,
+                     "sessions": {"task-1": {"status": status}}},
+                )
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value=fixture.root_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]):
+                    with self.assertRaises(cli.controller_backend.ControllerError):
+                        cli._verify_no_ready_ack_candidate(
+                            fixture.root, fixture.workflow_root, controller, lease,
+                        )
+
+    def test_acknowledgement_requires_unblocked_ledger_and_a_current_ready_descendant(self) -> None:
+        for mode in ("blocked-ledger", "no-ready", "foreign-ready"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller,
+                )
+                lease = controller.acquire()
+                controller.halt(
+                    "blocked",
+                    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    lease=lease,
+                )
+                if mode == "no-ready":
+                    ready_rows = []
+                elif mode == "foreign-ready":
+                    ready_rows = [{"id": "outside-root"}]
+                else:
+                    ready_rows = []
+
+                def run_ready(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else ready_rows
+                    return subprocess.CompletedProcess(["bd"], 0, json.dumps(rows), "")
+
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value=fixture.root_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready), \
+                     mock.patch.object(
+                         controller, "session_ledger",
+                         return_value={"blocked": mode == "blocked-ledger"},
+                     ):
+                    with self.assertRaises(cli.controller_backend.ControllerError):
+                        cli._verify_no_ready_ack_candidate(
+                            fixture.root, fixture.workflow_root, controller, lease,
+                        )
+
     def _consumed_session_record(self, root: Path, task_id: str, *, session_id: str = "sess-1",
                                  launch_id: str = "launch-1", acceptance_id: str = "R1",
                                  acceptance_ids: object = None, acceptance_results: object = None,

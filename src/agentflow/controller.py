@@ -958,6 +958,61 @@ class RootController:
         )
         return self._result(self._save_checkpoint(document, lease=current))
 
+    def acknowledge_no_ready_halt(
+        self, workflow_root: str, ready_task: str, *, lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Reopen only the known no-ready-work halt after a caller proves readiness.
+
+        This deliberately does not dispatch or claim. The normal scheduler owns
+        those operations after this fenced, durable acknowledgement transition.
+        """
+        if not workflow_root or not ready_task:
+            raise ControllerError("workflow root and ready descendant are required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            reason = str(document.get("terminal_reason") or "")
+            recognized = reason.startswith(
+                "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
+            ) or reason.startswith(
+                "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: "
+            )
+            if (
+                checkpoint.admission_phase(document) != "terminal"
+                or checkpoint.resume_state(document) not in {"blocked", "halted"}
+                or not document.get("terminal")
+                or not recognized
+                or str(document.get("root") or "") != self.root
+                or str(document.get("controller") or "") != self.controller
+                or str(document.get("task") or "") != self.root
+                or document.get("active_tasks")
+                or document.get("actor")
+                or document.get("claim_id")
+                or document.get("session_id")
+            ):
+                raise ControllerError("checkpoint is not an eligible no-ready-work halt")
+            acknowledgement = (
+                f"authenticated NO_READY_WORK acknowledgement for {workflow_root}; "
+                f"ready descendant {ready_task}"
+            )
+            if len(acknowledgement) > checkpoint.FIELD_MAX:
+                raise ControllerError("workflow and ready task IDs are too long to acknowledge safely")
+            prior_check = str(document.get("last_check") or "")
+            prior_budget = checkpoint.FIELD_MAX - len(acknowledgement) - 2
+            last_check = (
+                f"{prior_check[:prior_budget]}; {acknowledgement}"
+                if prior_check and prior_budget > 0 else acknowledgement
+            )
+            document.update({
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "advancing",
+                "status": "advancing",
+                "terminal": False,
+                "next_action": "select next ready descendant",
+                "last_check": last_check,
+            })
+            return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+
     def complete(self, *, reason: str = "", lease: Lease | str | None = None) -> ResumeResult:
         return self.halt("completed", reason, lease=lease)
 

@@ -8,6 +8,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Added a narrowly scoped, authenticated `controller resume --acknowledge-no-ready-halt`
+  recovery path for a verified no-ready-work checkpoint after a dependency gate
+  changes, while keeping other terminal and safety halts closed.
 - Added explicit project memory enable/disable commands with strict layered
   validation, dry-run diffs, owner-only atomic writes, and private backups.
 - Added targeted Codex and Claude hook merges that preserve custom handlers and
