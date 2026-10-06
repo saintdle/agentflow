@@ -25,6 +25,40 @@ def _receipt_writer(path: str, start: int) -> None:
 
 
 class MemoryValidationTests(unittest.TestCase):
+    def test_fitting_receipt_replaces_stale_overflow_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "injections.jsonl"
+            spool = ReceiptSpool(path, max_events=10, max_bytes=512, retention_days=30)
+            spool.append({
+                "schema": "agentflow.memory-receipt@2",
+                "timestamp": "2099-01-01T00:00:00Z",
+                "padding": "x" * 600,
+                "privacy": "metadata-only",
+            })
+            old_marker = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(old_marker["schema"], "agentflow.memory-receipt-storage@1")
+
+            fitting_legacy = {
+                "schema": "agentflow.memory-receipt@1",
+                "timestamp": "2099-01-01T00:00:01Z",
+                "session_id": "s" * 60,
+                "event_id": "e" * 60,
+                "items": 1,
+                "characters": 20_000,
+                "source_digests": ["a" * 64],
+                "privacy": "metadata-only",
+            }
+            encoded_legacy = (
+                json.dumps(fitting_legacy, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            self.assertEqual(len(encoded_legacy), 366)
+            spool.append(fitting_legacy)
+
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertLessEqual(len(path.read_bytes()), 512)
+            self.assertEqual([row["schema"] for row in rows], ["agentflow.memory-receipt@1"])
+            self.assertEqual(spool.count(), 1)
+
     def test_hook_receipt_overflow_preserves_legacy_row_and_records_diagnostic(self) -> None:
         for cap in (256, 512):
             with self.subTest(cap=cap), tempfile.TemporaryDirectory() as state:

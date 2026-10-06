@@ -173,17 +173,21 @@ class ReceiptSpool:
         before = len(rows)
         cutoff = _now() - dt.timedelta(days=self.retention_days)
         kept: list[dict[str, Any]] = []
+        timestamps: dict[int, dt.datetime] = {}
         for row in rows:
             stamp = row.get("timestamp")
             try:
                 parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 parsed = _now()
+            timestamps[id(row)] = parsed
             if parsed >= cutoff:
                 kept.append(row)
+        kept.sort(key=lambda row: timestamps[id(row)])
         diagnostics = [row for row in kept if row.get("schema") == RECEIPT_STORAGE_SCHEMA]
         receipts = [row for row in kept if row.get("schema") != RECEIPT_STORAGE_SCHEMA]
-        rows[:] = [*receipts[-self.max_events:], *diagnostics[-1:]]
+        retained_ids = {id(row) for row in (*receipts[-self.max_events:], *diagnostics[-1:])}
+        rows[:] = [row for row in kept if id(row) in retained_ids]
         while rows:
             encoded = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in rows)
             if len(encoded) <= self.max_bytes:
