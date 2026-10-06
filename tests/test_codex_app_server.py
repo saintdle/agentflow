@@ -133,6 +133,21 @@ class CodexDiagnosticsTests(unittest.TestCase):
         for private in ("private@example.invalid", "private-id", "accountId"):
             self.assertNotIn(private, wire)
 
+    def test_diagnostic_constructor_errors_are_redacted(self) -> None:
+        sdk = SimpleNamespace(__version__=app_server.SUPPORTED_SDK_VERSION)
+        for client_factory, config_type in (
+            (None, lambda: (_ for _ in ()).throw(RuntimeError("secret account config"))),
+            (lambda _config: (_ for _ in ()).throw(RuntimeError("private client secret")), lambda: object()),
+        ):
+            with mock.patch.object(
+                app_server, "_sdk_modules",
+                return_value=({}, sdk, lambda _config: None, config_type),
+            ):
+                report = app_server.diagnostics_report(client_factory=client_factory)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["error_code"], "rpc_failed")
+            self.assertNotIn("secret", json.dumps(report))
+
 
 class CodexPermissionAndTurnTests(unittest.TestCase):
     def test_only_shell_readonly_is_supported(self) -> None:
@@ -182,7 +197,7 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
 
         class Client:
             def __init__(self, _config):
-                pass
+                captured["client_config"] = getattr(_config, "kwargs", _config)
 
             def start(self):
                 pass
@@ -219,13 +234,49 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
         self.assertEqual(start["cwd"], "/workspace")
         self.assertEqual(start["sandbox"], "read-only")
         self.assertEqual(start["approval_policy"].kwargs["root"], "never")
-        self.assertEqual(start["config"], {"features": {"multi_agent": False}})
+        self.assertEqual(captured["client_config"]["cwd"], "/workspace")
+        self.assertIn("mcp_servers={}", captured["client_config"]["config_overrides"])
+        self.assertIn("plugins={}", captured["client_config"]["config_overrides"])
+        self.assertIn('web_search="disabled"', captured["client_config"]["config_overrides"])
+        self.assertEqual(start["config"]["mcp_servers"], {})
+        self.assertEqual(start["config"]["plugins"], {})
+        self.assertEqual(start["config"]["apps"], {})
+        self.assertEqual(start["config"]["web_search"], "disabled")
+        self.assertEqual(start["config"]["sandbox_mode"], "read-only")
+        self.assertFalse(start["config"]["features"]["multi_agent"])
+        self.assertFalse(start["config"]["features"]["web_search"])
         turn = captured["turn"]
         self.assertEqual(turn["model"], "gpt-6-luna")
         self.assertEqual(turn["cwd"], "/workspace")
         self.assertEqual(turn["sandbox"], "read-only")
         self.assertEqual(turn["approval_mode"], "deny_all")
         self.assertIn(("skill", {"name": "skill-a", "path": "/skills/skill-a/SKILL.md"}), captured["inputs"])
+
+    def test_stream_deadline_records_interrupted_without_blocking_controller(self) -> None:
+        closed = threading.Event()
+        completed = threading.Event()
+        observed = []
+
+        class Client:
+            def close(self):
+                closed.set()
+
+        class Handle:
+            id = "turn-timeout"
+
+            def stream(self):
+                threading.Event().wait(2)
+                return iter(())
+
+        app_server._watch_turn(
+            Client(), Handle(), "thread-timeout",
+            lambda observation, _output: (observed.append(observation), completed.set()),
+            timeout_seconds=0.02,
+        )
+        self.assertTrue(completed.wait(0.5))
+        self.assertTrue(closed.wait(0.5))
+        self.assertEqual(observed[0].status, "interrupted")
+        self.assertEqual(observed[0].reason_code, "worker_timeout")
 
 
 class CodexControllerBridgeTests(unittest.TestCase):
@@ -236,40 +287,75 @@ class CodexControllerBridgeTests(unittest.TestCase):
             )
             fixture.task_issue["metadata"]["agentflow"]["tool_profile"] = "shell-readonly"
             fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
-            completed = threading.Event()
+            worker_script = fixture.root / "fake_sdk_worker.py"
+            worker_script.write_text(
+                "import fcntl, json, sys, time\n"
+                "from pathlib import Path\n"
+                "request_path=Path(sys.argv[1]); d=request_path.parent; r=json.loads(request_path.read_text())\n"
+                "lock=(d/'codex-worker.lock').open('a'); fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+                "def save(status, **extra):\n"
+                " value={'request_id':r['request_id'],'status':status,**extra}; p=d/'codex-worker.state.json'; t=p.with_suffix('.tmp'); t.write_text(json.dumps(value)); t.replace(p)\n"
+                "save('thread_created',thread_id='thread-accepted',model=r['model'],cwd=r['cwd'])\n"
+                "deadline=time.time()+3\n"
+                "while not (d/'codex-worker.thread-ack').exists() and time.time()<deadline: time.sleep(.01)\n"
+                "save('running',thread_id='thread-accepted',turn_id='turn-accepted',model=r['model'],cwd=r['cwd'])\n"
+                "time.sleep(.2)\n"
+                "out={'outcome':'completed','acceptance_results':[{'acceptance_id':'R1','status':'passed','evidence':'mocked acceptance passed','source':'provider'}],'evidence':[]}\n"
+                "(d/'codex-worker.output.json').write_text(json.dumps({'request_id':r['request_id'],'output':json.dumps(out)}))\n"
+                "save('completed',thread_id='thread-accepted',turn_id='turn-accepted',model=r['model'],cwd=r['cwd'],rerouted=False,reason_code='',output_available=True)\n"
+                "lock.close()\n",
+                encoding="utf-8",
+            )
+            real_start = app_server.start_supervised_turn
+            startup_errors = []
+            start_arguments = {}
 
-            def fake_start(**kwargs):
-                kwargs["on_thread"]("thread-accepted")
-                kwargs["on_turn"]("turn-accepted")
-                def finish():
-                    kwargs["on_complete"](
-                        app_server.TurnObservation("completed"),
-                        json.dumps({
-                            "outcome": "completed",
-                            "acceptance_results": [{
-                                "acceptance_id": "R1", "status": "passed",
-                                "evidence": "mocked acceptance passed", "source": "provider",
-                            }],
-                            "evidence": [],
-                        }),
-                    )
-                    completed.set()
-                threading.Thread(target=finish, daemon=True).start()
-                return "thread-accepted", "turn-accepted"
+            def fake_sdk_worker(**kwargs):
+                try:
+                    start_arguments.update(kwargs)
+                    return real_start(**kwargs, _worker_command=[sys.executable, str(worker_script)])
+                except Exception as exc:
+                    startup_errors.append(str(exc))
+                    raise
 
             args = fixture.launch_args(transport="app-server")
             with fixture.beads_patches(), mock.patch.object(
-                cli.codex_app_server_backend, "start_background_turn", side_effect=fake_start,
+                cli.codex_app_server_backend, "start_supervised_turn", side_effect=fake_sdk_worker,
+            ), mock.patch.object(
+                app_server, "_sdk_modules",
+                return_value=({}, SimpleNamespace(__version__=app_server.SUPPORTED_SDK_VERSION), object, lambda **kwargs: kwargs),
             ):
-                self.assertEqual(cli.herdr_launch(args), 0)
-                self.assertTrue(completed.wait(3), "controller collector did not finish")
+                launch_result = cli.herdr_launch(args)
+                self.assertEqual(launch_result, 0, json.dumps(json.loads(
+                    (fixture.root / ".agentflow/herdr/sessions.json").read_text()
+                )["sessions"][fixture.task_id].get("codex_app_server")) + repr(startup_errors))
+                with self.assertRaises(app_server.CodexAppServerError):
+                    real_start(**start_arguments, _worker_command=[sys.executable, str(worker_script)])
+                state_path = app_server._supervisor_paths(
+                    cli._runtime_launch_dir(fixture.root, fixture.workflow_root,
+                                            json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text())["sessions"][fixture.task_id]["launch_id"])
+                )[1]
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    worker_state = json.loads(state_path.read_text())
+                    if worker_state.get("status") == "completed":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(worker_state.get("status"), "completed")
+                # This collection occurs after dispatch returned, from durable helper files.
+                with app_server._ACTIVE_TURNS_LOCK:
+                    app_server._ACTIVE_TURNS.clear()
+                self.assertTrue(cli._collect_codex_app_server_result(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
                 first = cli._ingest_submitted_result(
                     fixture.root, fixture.task_id, authority_secret=fixture.authority_secret,
                 )
                 second = cli._ingest_submitted_result(
                     fixture.root, fixture.task_id, authority_secret=fixture.authority_secret,
                 )
-            self.assertEqual(first.status, "consumed")
+            self.assertEqual(first.status, "consumed", first.error)
             self.assertEqual(second.status, "pending")
             state = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text())
             record = state["sessions"][fixture.task_id]

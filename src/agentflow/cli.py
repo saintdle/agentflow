@@ -1273,11 +1273,12 @@ def _dispatch_via_herdr(
             # packaged defaults; an existing malformed config still fails
             # closed instead of being silently ignored.
             root_issue = beads_backend.get_issue(cwd, workflow_root)
-            project_config = project_config_backend.load(cwd)
+            project_config = project_config_backend.load_for_dispatch(cwd)
             configured_transport = project_config_backend.codex_transport(project_config)
             transport = requested_transport or (
                 configured_transport if launch_meta["provider"] == "codex" else "herdr"
             )
+            codex_worker_timeout_seconds = project_config_backend.codex_worker_timeout_seconds(project_config)
             launch_policy = _controller_execution_policy(
                 cwd, root, workflow_root, root_issue=root_issue
             )
@@ -1414,6 +1415,7 @@ def _dispatch_via_herdr(
             execution_limits=execution_limits.to_dict() if execution_limits else None,
             transport=transport,
             _authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            codex_worker_timeout_seconds=codex_worker_timeout_seconds,
         )
         # herdr_launch prints its own diagnostics; the controller's JSON
         # output must be the only thing on stdout (same reasoning as
@@ -1518,24 +1520,28 @@ def _controller_step_serial(
         if in_flight_record.get("provider_transport") == "app-server":
             lifecycle = in_flight_record.get("codex_app_server")
             lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
-            identity = lifecycle.get("identity")
-            identity = identity if isinstance(identity, Mapping) else {}
-            local_state = codex_app_server_backend.local_turn_state(
-                str(identity.get("thread_id") or ""), str(identity.get("turn_id") or ""),
+            worker_state = _sync_codex_app_server_supervisor(
+                root, workflow_root, in_flight_task,
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
             )
-            terminal_status = str(lifecycle.get("status") or "")
+            terminal_status = str(
+                worker_state.get("status") if isinstance(worker_state, Mapping)
+                else lifecycle.get("status") or ""
+            )
             unsafe_status = terminal_status in {"failed", "interrupted", "server_lost", "ambiguous"}
-            if lifecycle.get("rerouted") is True or unsafe_status:
+            if (lifecycle.get("rerouted") is True or (
+                isinstance(worker_state, Mapping) and worker_state.get("rerouted") is True
+            ) or unsafe_status):
                 reason = (
                     "USER_ACTION_REQUIRED: Codex App Server turn ended without an accepted result "
                     "(or reported a route change); inspect the persisted thread/turn and do not retry"
                 )
                 result = controller.halt("blocked", reason, lease=lease)
                 return _payload(result, "USER_ACTION_REQUIRED"), True
-            if local_state is None:
+            if worker_state is None:
                 reason = (
-                    "USER_ACTION_REQUIRED: the persisted Codex App Server turn has no live local "
-                    "watcher; inspect its exact thread/turn before any recovery, never start a duplicate turn"
+                    "USER_ACTION_REQUIRED: the persisted Codex SDK helper cannot be safely reattached; "
+                    "inspect its exact thread/turn before any recovery, never start a duplicate turn"
                 )
                 result = controller.halt("blocked", reason, lease=lease)
                 return _payload(result, "USER_ACTION_REQUIRED"), True
@@ -1598,6 +1604,10 @@ def _controller_step_serial(
         # Provider submission is an untrusted inbox. Only this controller
         # path may validate it against the external authority credential and
         # consume the Herdr capability/state transaction.
+        _collect_codex_app_server_result(
+            root, workflow_root, in_flight_task,
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
         ingestion = _ingest_submitted_result(
             root,
             in_flight_task,
@@ -1917,13 +1927,17 @@ def _controller_step_parallel(
         if session_record.get("provider_transport") == "app-server":
             lifecycle = session_record.get("codex_app_server")
             lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
-            identity = lifecycle.get("identity")
-            identity = identity if isinstance(identity, Mapping) else {}
-            local_state = codex_app_server_backend.local_turn_state(
-                str(identity.get("thread_id") or ""), str(identity.get("turn_id") or ""),
+            worker_state = _sync_codex_app_server_supervisor(
+                root, workflow_root, task_id,
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
             )
-            status = str(lifecycle.get("status") or "")
-            if lifecycle.get("rerouted") is True or status in {
+            status = str(
+                worker_state.get("status") if isinstance(worker_state, Mapping)
+                else lifecycle.get("status") or ""
+            )
+            if lifecycle.get("rerouted") is True or (
+                isinstance(worker_state, Mapping) and worker_state.get("rerouted") is True
+            ) or status in {
                 "failed", "interrupted", "server_lost", "ambiguous",
             }:
                 reason = (
@@ -1936,10 +1950,10 @@ def _controller_step_parallel(
                     "message": reason,
                 }
                 continue
-            if local_state is None:
+            if worker_state is None:
                 reason = (
-                    f"USER_ACTION_REQUIRED: Codex App Server task {task_id} has no live local "
-                    "watcher after reattach; inspect the exact thread/turn, never start a duplicate turn"
+                    f"USER_ACTION_REQUIRED: Codex App Server task {task_id} has no verifiable "
+                    "supervised helper state; inspect the exact thread/turn, never start a duplicate turn"
                 )
                 note_failure(task_id, reason)
                 launch_attention_required = {
@@ -2007,6 +2021,10 @@ def _controller_step_parallel(
                     )
                     continue
 
+        _collect_codex_app_server_result(
+            root, workflow_root, task_id,
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
         ingestion = _ingest_submitted_result(
             root, task_id, authority_secret=str(getattr(args, "_authority_secret", "") or "")
         )
@@ -3415,6 +3433,7 @@ def _mint_return_channel(
     deadline_epoch: float | None = None,
     attempt: int = 1,
     max_attempts: int | None = None,
+    claim_id: str = "",
 ) -> dict[str, Any]:
     """Create a signed per-launch contract without persisting its signing key."""
     launch_dir = _runtime_launch_dir(root, workflow_root, launch_id)
@@ -3429,6 +3448,7 @@ def _mint_return_channel(
         "workspace_root": str(root.resolve()),
         "workflow_root": workflow_root,
         "task_id": task_id,
+        **({"claim_id": claim_id} if claim_id else {}),
         "actor": actor,
         "controller_id": controller_id,
         "lease_epoch": lease_epoch,
@@ -4313,6 +4333,231 @@ def _codex_skill_inputs(root: Path, manifest: Mapping[str, Any]) -> list[tuple[s
     return inputs
 
 
+def _sync_codex_app_server_supervisor(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> dict[str, Any] | None:
+    """Adopt the exact detached helper state after a same-owner controller reattach."""
+    state_path = _herdr_state_path(argparse.Namespace(), root)
+    record = _herdr_session_record(root, task_id) or {}
+    if record.get("provider_transport") != "app-server":
+        return None
+    lifecycle = record.get("codex_app_server")
+    lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+    supervisor = lifecycle.get("supervisor")
+    supervisor = supervisor if isinstance(supervisor, Mapping) else {}
+    launch_id = str(record.get("launch_id") or "")
+    request_id = str(supervisor.get("request_id") or "")
+    channel = record.get("return_channel")
+    channel = channel if isinstance(channel, Mapping) else {}
+    contract = channel.get("contract_binding")
+    if not launch_id or request_id != launch_id or not isinstance(contract, Mapping):
+        return None
+    if channel.get("state") == "consumed" and lifecycle.get("status") == "completed":
+        identity = lifecycle.get("identity")
+        identity = identity if isinstance(identity, Mapping) else {}
+        return {
+            "status": "completed", "thread_id": str(identity.get("thread_id") or ""),
+            "turn_id": str(identity.get("turn_id") or ""),
+        }
+    runtime_dir = _runtime_launch_dir(root, workflow_root, launch_id)
+    if str(supervisor.get("runtime_dir") or "") != str(runtime_dir.resolve()):
+        return None
+    state = codex_app_server_backend.supervised_turn_state(runtime_dir, request_id)
+    if not isinstance(state, Mapping):
+        return None
+    status = str(state.get("status") or "")
+    thread_id = str(state.get("thread_id") or "")
+    turn_id = str(state.get("turn_id") or "")
+    expected_cwd = str(record.get("execution_root") or root.resolve())
+    expected_model = str(contract.get("model") or "")
+    if state.get("model") not in {None, expected_model} or state.get("cwd") not in {None, expected_cwd}:
+        status = "server_lost"
+        state = {**dict(state), "status": status, "reason_code": "helper_route_mismatch"}
+    try:
+        with _return_controller_fence(
+            root, workflow_root, str(contract.get("controller_id") or ""),
+            str(contract.get("continuity_id") or ""),
+        ):
+            with _herdr_transaction(state_path) as sessions:
+                current = sessions.get("sessions", {}).get(task_id)
+                current_channel = current.get("return_channel") if isinstance(current, Mapping) else None
+                if (
+                    not isinstance(current, dict) or current.get("launch_id") != launch_id
+                    or not isinstance(current_channel, Mapping)
+                    or current_channel.get("state") != "issued"
+                ):
+                    return None
+                _verify_return_contract_binding(
+                    contract, Path(str(current_channel.get("contract_path") or "")),
+                    task_id, current, root=root, authority_secret=authority_secret,
+                )
+                if thread_id:
+                    launch_snapshot = {
+                        **dict(contract), "claim_id": str(contract.get("claim_id") or current.get("claim_id") or ""),
+                        "cwd": str(current.get("execution_root") or root.resolve()),
+                    }
+                    prior = current.get("codex_app_server", {}).get("identity", {})
+                    if isinstance(prior, Mapping) and prior.get("thread_id"):
+                        if str(prior.get("thread_id")) != thread_id:
+                            raise ValueError("Codex helper thread changed after launch")
+                        if turn_id and prior.get("turn_id") and str(prior.get("turn_id")) != turn_id:
+                            raise ValueError("Codex helper turn changed after launch")
+                        identity = dict(prior)
+                    else:
+                        identity = {
+                            "workspace_root": str(contract.get("workspace_root") or ""),
+                            "workflow_root": workflow_root, "task_id": task_id,
+                            "claim_id": str(current.get("claim_id") or ""),
+                            "lease_epoch": contract.get("lease_epoch"),
+                            "lease_continuity_id": str(contract.get("continuity_id") or ""),
+                            "lease_token_sha256": str(contract.get("lease_token_sha256") or ""),
+                            "cwd": expected_cwd, "model": expected_model,
+                            "effort": str(contract.get("effort") or ""),
+                            "thread_id": thread_id, "turn_id": turn_id,
+                            "sdk_version": codex_app_server_backend.SUPPORTED_SDK_VERSION,
+                            "model_evidence": "codex-app-server-protocol-cooperative",
+                        }
+                    if turn_id:
+                        codex_app_server_backend.bind_recovered_identity(
+                            identity, launch_snapshot=launch_snapshot,
+                            current_continuity_id=str(contract.get("continuity_id") or ""),
+                        )
+                        identity.update(thread_id=thread_id, turn_id=turn_id)
+                    elif status != "thread_created":
+                        raise ValueError("Codex helper returned an incomplete turn identity")
+                    current_lifecycle = current.setdefault("codex_app_server", {})
+                    current_lifecycle["identity"] = identity
+                    current_lifecycle["supervisor"] = {
+                        "request_id": request_id, "runtime_dir": str(runtime_dir.resolve()),
+                    }
+                current_lifecycle = current.setdefault("codex_app_server", {})
+                current_lifecycle["status"] = status
+                current_lifecycle["rerouted"] = bool(state.get("rerouted", False))
+                current_lifecycle["reason_code"] = str(state.get("reason_code") or "")
+                if status in {"failed", "interrupted", "server_lost"}:
+                    current["status"] = status
+                    current["launch_outcome"] = status
+                if status == "thread_created" and thread_id:
+                    codex_app_server_backend.acknowledge_supervised_thread(runtime_dir, request_id)
+    except Exception:
+        return None
+    return dict(state, status=status, thread_id=thread_id, turn_id=turn_id)
+
+
+def _collect_codex_app_server_result(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> bool:
+    """Turn a completed helper output into the existing authenticated inbox."""
+    state = _sync_codex_app_server_supervisor(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    )
+    if not isinstance(state, Mapping) or state.get("status") != "completed":
+        return False
+    record = _herdr_session_record(root, task_id) or {}
+    channel_state = record.get("return_channel")
+    if isinstance(channel_state, Mapping) and channel_state.get("state") == "consumed":
+        return False
+    lifecycle = record.get("codex_app_server")
+    lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+    supervisor = lifecycle.get("supervisor")
+    supervisor = supervisor if isinstance(supervisor, Mapping) else {}
+    request_id = str(supervisor.get("request_id") or "")
+    runtime_dir = Path(str(supervisor.get("runtime_dir") or ""))
+    output = codex_app_server_backend.supervised_turn_output(runtime_dir, request_id)
+    observation = codex_app_server_backend.TurnObservation(
+        "completed", rerouted=bool(state.get("rerouted")),
+        reason_code=str(state.get("reason_code") or ""),
+    )
+    parsed: dict[str, Any] | None = None
+    if output is not None and not observation.rerouted:
+        try:
+            candidate = json.loads(output)
+            if (
+                isinstance(candidate, dict)
+                and set(candidate).issubset({"outcome", "acceptance_results", "evidence"})
+                and candidate.get("outcome") == "completed"
+                and isinstance(candidate.get("acceptance_results"), list)
+                and isinstance(candidate.get("evidence", []), list)
+            ):
+                parsed = candidate
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if parsed is None:
+        observation = codex_app_server_backend.TurnObservation(
+            "failed", reason_code="structured_result_invalid",
+        )
+    state_path = _herdr_state_path(argparse.Namespace(), root)
+    try:
+        current_record = _herdr_session_record(root, task_id) or {}
+        channel_before = current_record.get("return_channel")
+        contract_before = channel_before.get("contract_binding") if isinstance(channel_before, Mapping) else None
+        if not isinstance(contract_before, Mapping):
+            return False
+        with _return_controller_fence(
+            root, workflow_root, str(contract_before.get("controller_id") or ""),
+            str(contract_before.get("continuity_id") or ""),
+        ):
+            with _herdr_transaction(state_path) as sessions:
+                current = sessions.get("sessions", {}).get(task_id)
+                if not isinstance(current, dict) or current.get("launch_id") != request_id:
+                    return False
+                channel = current.get("return_channel")
+                contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+                if not isinstance(channel, Mapping) or not isinstance(contract, Mapping) or channel.get("state") != "issued":
+                    return False
+                contract_path = Path(str(channel.get("contract_path") or ""))
+                _verify_return_contract_binding(
+                    contract, contract_path, task_id, current,
+                    root=root, authority_secret=authority_secret,
+                )
+                persisted = current.get("codex_app_server")
+                persisted = persisted if isinstance(persisted, Mapping) else {}
+                identity = persisted.get("identity")
+                if not isinstance(identity, Mapping):
+                    return False
+                launch_snapshot = {
+                    **dict(contract), "claim_id": str(contract.get("claim_id") or current.get("claim_id") or ""),
+                    "cwd": str(current.get("execution_root") or root.resolve()),
+                }
+                codex_app_server_backend.bind_recovered_identity(
+                    identity, launch_snapshot=launch_snapshot,
+                    current_continuity_id=str(contract.get("continuity_id") or ""),
+                )
+                result_path = Path(str(channel.get("result_path") or ""))
+                submission_path = Path(str(channel.get("submission_file") or ""))
+                current["codex_app_server"] = {
+                    **dict(persisted), "status": observation.status,
+                    "rerouted": observation.rerouted, "reason_code": observation.reason_code,
+                    "thread_id": str(identity.get("thread_id") or ""),
+                    "turn_id": str(identity.get("turn_id") or ""),
+                    "model": str(contract.get("model") or ""),
+                    "effort": str(contract.get("effort") or ""),
+                    "sdk_version": codex_app_server_backend.SUPPORTED_SDK_VERSION,
+                    "model_evidence": "codex-app-server-protocol-cooperative",
+                    "observed_at": _now(),
+                }
+                if observation.status != "completed" or parsed is None:
+                    current["status"] = "failed"
+                    current["launch_outcome"] = "failed"
+                    return False
+                result = dict(parsed)
+                result["evidence"] = result.get("evidence", [])
+                result["session_id"] = (
+                    f"codex-app-server:{identity.get('thread_id')}:{identity.get('turn_id')}"
+                )
+                _private_atomic_json(result_path, result)
+                _private_atomic_json(submission_path, {
+                    "schema": "agentflow.result-submission@1",
+                    "contract_sha256": _file_sha256(contract_path),
+                    "result_sha256": _file_sha256(result_path), "submitted_at": _now(),
+                })
+                current["status"] = "completed"
+                current["codex_app_server"]["status"] = "completed"
+    except Exception:
+        return False
+    return True
+
+
 def _start_codex_app_server_launch(
     args: argparse.Namespace, *, root: Path, workflow_root: str, task_id: str,
     actor: str, claim_id: str, lease_id: str, lease_epoch: int,
@@ -4333,6 +4578,7 @@ def _start_codex_app_server_launch(
     contract_path = Path(str(return_channel.get("contract_path") or ""))
     result_path = Path(str(return_channel.get("result_path") or ""))
     submission_path = Path(str(return_channel.get("submission_path") or ""))
+    runtime_dir = _runtime_launch_dir(root, workflow_root, launch_id)
     session_id = ""
     fence_context: Any = None
     identity_base = {
@@ -4361,6 +4607,9 @@ def _start_codex_app_server_launch(
             if not isinstance(record, dict) or record.get("launch_id") != launch_id:
                 raise ValueError("Codex launch reservation was replaced")
             current = record.setdefault("codex_app_server", {})
+            current["supervisor"] = {
+                "request_id": launch_id, "runtime_dir": str(runtime_dir.resolve()),
+            }
             current["identity"] = {**identity_base, field: value, **(
                 {"thread_id": current.get("identity", {}).get("thread_id")}
                 if field == "turn_id" and isinstance(current.get("identity"), Mapping) else {}
@@ -4445,7 +4694,8 @@ def _start_codex_app_server_launch(
             root, task_id, str(getattr(args, "claim", "") or ""), lease_id,
             workflow_root=workflow_root, beads_cwd=root, actor=actor,
         )
-        thread_id, turn_id = codex_app_server_backend.start_background_turn(
+        thread_id, turn_id = codex_app_server_backend.start_supervised_turn(
+            runtime_dir=runtime_dir, request_id=launch_id,
             cwd=str(cwd.resolve()), model=model, effort=effort,
             instruction=(typed_handoff.instruction + "\n\nReturn only the exact structured "
                          "Agentflow acceptance result. Do not write or submit result files; "
@@ -4456,7 +4706,7 @@ def _start_codex_app_server_launch(
             sterile=False, output_schema=_codex_result_schema(acceptance_ids),
             on_thread=lambda value: save_identity("thread_id", value),
             on_turn=lambda value: save_identity("turn_id", value),
-            on_complete=collect_result,
+            timeout_seconds=int(getattr(args, "codex_worker_timeout_seconds", 1800)),
         )
     except Exception as exc:
         if fence_context is not None:
@@ -4840,6 +5090,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     deadline_epoch=float(limit_entry["deadline_epoch"]) if limit_entry else None,
                     attempt=attempt,
                     max_attempts=int(limit_entry["max_attempts"]) if limit_entry else None,
+                    claim_id=str(identity["claim_id"]),
                 )
                 with _herdr_transaction(state_path) as state:
                     sessions = state.setdefault("sessions", {})
@@ -5272,6 +5523,8 @@ def _verify_return_contract_binding(
     ):
         if not str(binding.get(field) or ""):
             raise ValueError(f"return contract binding is missing {field}")
+    if binding.get("claim_id") and str(binding.get("claim_id")) != str(record.get("claim_id") or ""):
+        raise ValueError("return contract claim identity changed")
     return binding
 
 

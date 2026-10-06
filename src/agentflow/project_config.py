@@ -34,7 +34,7 @@ DEFAULT_EXECUTION = {
     "launch_budget_multiplier": 2,
     "max_expensive_execution_children": 0,
 }
-DEFAULT_CODEX = {"transport": "herdr"}
+DEFAULT_CODEX = {"transport": "herdr", "worker_timeout_seconds": 1800}
 DEFAULT_GUIDANCE = {
     "strategic_compaction": False,
     "verification": False,
@@ -185,10 +185,18 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
                     errors.append(f"execution.{field} must be an integer of at least {minimum}")
     if "codex" in data:
         codex = data.get("codex")
-        if not isinstance(codex, dict) or set(codex) != {"transport"}:
-            errors.append("codex must contain exactly a transport field")
-        elif codex.get("transport") not in {"herdr", "app-server"}:
-            errors.append("codex.transport must be 'herdr' or 'app-server'")
+        allowed_codex = {"transport", "worker_timeout_seconds"}
+        if (
+            not isinstance(codex, dict) or set(codex) - allowed_codex
+            or (not local and "transport" not in codex)
+        ):
+            errors.append("codex must contain a transport field and only supported Codex settings")
+        elif isinstance(codex, dict):
+            if "transport" in codex and codex.get("transport") not in {"herdr", "app-server"}:
+                errors.append("codex.transport must be 'herdr' or 'app-server'")
+            timeout = codex.get("worker_timeout_seconds", DEFAULT_CODEX["worker_timeout_seconds"])
+            if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 86400:
+                errors.append("codex.worker_timeout_seconds must be an integer between 1 and 86400")
     if "guidance" in data:
         guidance = data.get("guidance")
         if not isinstance(guidance, dict) or set(guidance) != set(DEFAULT_GUIDANCE):
@@ -303,7 +311,7 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
     if "execution" in local:
         result["execution"] = local["execution"]
     if "codex" in local:
-        result["codex"] = local["codex"]
+        result["codex"] = {**dict(DEFAULT_CODEX), **dict(shared.get("codex", {})), **local["codex"]}
     if "guidance" in local:
         result["guidance"] = local["guidance"]
     if "memory" in local:
@@ -320,6 +328,20 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
 def load(root: Path) -> dict[str, Any]:
     shared, local = load_layers(root)
     return merge(shared, local)
+
+
+def load_for_dispatch(root: Path) -> dict[str, Any]:
+    """Load dispatch settings, allowing only wholly absent legacy config."""
+    root = Path(root).resolve()
+    shared_path = config_path(root)
+    local_path = local_config_path(root)
+    if (
+        not shared_path.exists() and not shared_path.is_symlink()
+        and not local_path.exists() and not local_path.is_symlink()
+        and not shared_path.parent.is_symlink()
+    ):
+        return default_data()
+    return load(root)
 
 
 def prose_editor(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -343,6 +365,12 @@ def codex_transport(data: dict[str, Any]) -> str:
     if not isinstance(value, dict):
         return str(DEFAULT_CODEX["transport"])
     return str(value.get("transport") or DEFAULT_CODEX["transport"])
+
+
+def codex_worker_timeout_seconds(data: dict[str, Any]) -> int:
+    value = data.get("codex")
+    timeout = value.get("worker_timeout_seconds") if isinstance(value, dict) else None
+    return timeout if isinstance(timeout, int) and not isinstance(timeout, bool) else int(DEFAULT_CODEX["worker_timeout_seconds"])
 
 
 def guidance_settings(data: dict[str, Any]) -> dict[str, Any]:
