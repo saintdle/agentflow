@@ -13,7 +13,7 @@ from unittest import mock
 
 from agentflow import cli, project_config
 from agentflow.events import normalize_event
-from agentflow.memory_runtime import MemoryRuntime, ReceiptSpool, state_home
+from agentflow.memory_runtime import MemoryRuntime, ReceiptSpool, _now, state_home
 from agentflow.project_config import DEFAULT_MEMORY
 from agentflow.search import KnowledgeDocument, KnowledgeIndex, SearchError
 
@@ -86,7 +86,10 @@ class MemoryValidationTests(unittest.TestCase):
                     if cap == 512:
                         legacy = {
                             "schema": "agentflow.memory-receipt@1",
-                            "timestamp": "2026-10-06T18:10:00Z",
+                            "timestamp": (
+                                (_now() - dt.timedelta(seconds=1))
+                                .isoformat(timespec="seconds").replace("+00:00", "Z")
+                            ),
                             "session_id": "s" * 52,
                             "event_id": "e" * 52,
                             "items": 1,
