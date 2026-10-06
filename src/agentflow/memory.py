@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import uuid
 from typing import Any, Mapping, Sequence
 
 from agentflow.privacy import require_safe_text
@@ -52,6 +53,7 @@ class RecallPlan:
     text: str
     character_budget: int
     item_budget: int
+    reservation_id: str = dataclasses.field(default="", repr=False, compare=False)
 
     @property
     def character_count(self) -> int:
@@ -130,6 +132,8 @@ def find_first(
     max_summary_chars: int = 480,
     session_id: str = "",
     session_ledger_limit: int = 256,
+    record_usage: bool = True,
+    reservation_id: str = "",
     now: dt.datetime | None = None,
 ) -> RecallPlan:
     """Return a deterministic, bounded plan of approved fresh memories.
@@ -164,6 +168,8 @@ def find_first(
         raise SearchError("max_age_days cannot be negative")
     if max_summary_chars < 1 or max_summary_chars > 4_096:
         raise SearchError("max_summary_chars must be between 1 and 4096")
+    if not record_usage and session_id and not reservation_id:
+        reservation_id = uuid.uuid4().hex
     instant = now or dt.datetime.now(dt.timezone.utc)
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=dt.timezone.utc)
@@ -221,7 +227,10 @@ def find_first(
             if best is None:
                 break
             item, line = best, best_line
-        if session_id and not index.claim_injection(session_id, item.source_digest, item.document_id, limit=session_ledger_limit):
+        if session_id and not index.claim_injection(
+            session_id, item.source_digest, item.document_id,
+            limit=session_ledger_limit, reservation_id=reservation_id,
+        ):
             continue
         rendered.append(line)
         items.append(item)
@@ -229,12 +238,13 @@ def find_first(
         used += separator + len(line)
         if len(items) >= max_items:
             break
-    # Injection counts represent inclusion in a recall plan, not merely a
-    # search hit. Updates happen after selection, in deterministic order.
-    for item in items:
-        index.mark_used(item.document_id, injected=True)
+    # Direct recall callers retain the historical accounting behavior. Hook
+    # callers may defer this update until the assembled context was written.
+    if record_usage:
+        for item in items:
+            index.mark_used(item.document_id, injected=True)
     text = _UNTRUSTED_HEADER + "\n" + "\n".join(rendered) if rendered else ""
-    return RecallPlan(query, tuple(items), text, max_chars, max_items)
+    return RecallPlan(query, tuple(items), text, max_chars, max_items, reservation_id)
 
 
 recall = find_first

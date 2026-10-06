@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +22,7 @@ from agentflow.context_delivery import (
     serialize_context,
 )
 from agentflow.memory import RecallItem
+from agentflow.memory_runtime import MemoryRuntime
 from agentflow.project_config import DEFAULT_MEMORY, default_data, memory_settings
 from agentflow.search import KnowledgeDocument, KnowledgeIndex
 
@@ -46,6 +49,51 @@ def _template_events(path: Path) -> set[str]:
 
 
 class ContextDeliveryTests(unittest.TestCase):
+    def _seed_recall(self, root: Path, state: Path) -> dict[str, object]:
+        config = default_data()
+        config["memory"].update(enabled=True, startup_query="synthetic recall")
+        config_path = root / ".agentflow/config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+            runtime = MemoryRuntime(root, memory_settings(config))
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            with KnowledgeIndex(runtime.database) as index:
+                index.add(KnowledgeDocument(
+                    "synthetic-retry-doc", "Synthetic recall title", "synthetic recall summary",
+                    "docs/synthetic-recall.md", authority=90, last_verified_at=now,
+                ))
+                index.approve(
+                    "synthetic-retry-doc", approval_by="human:test", approval_ref="review-1", approved_at=now,
+                )
+        return config
+
+    def _run_hook(
+        self, root: Path, state: Path, payload: dict[str, object], *, output: object | None = None,
+        guidance: str | None = None,
+    ) -> str:
+        stdout = output if output is not None else io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}), mock.patch(
+            "sys.stdin", io.StringIO(json.dumps(payload)),
+        ), mock.patch("sys.stdout", stdout), mock.patch.object(cli.beads_backend, "prime", return_value=""):
+            if guidance is None:
+                cli.hook(SimpleNamespace(provider="codex", event=""))
+            else:
+                original = plan_context
+                with mock.patch.object(
+                    cli.context_delivery_backend, "plan_context",
+                    side_effect=lambda provider, event, **kwargs: original(
+                        provider, event, guidance=guidance, **kwargs,
+                    ),
+                ):
+                    cli.hook(SimpleNamespace(provider="codex", event=""))
+        return stdout.getvalue() if isinstance(stdout, io.StringIO) else ""
+
+    @staticmethod
+    def _receipt_rows(state: Path) -> list[dict[str, object]]:
+        path = next((state / "memory").rglob("injections.jsonl"))
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
     def test_all_bundled_template_events_are_explicitly_classified(self) -> None:
         templates = {
             "codex": ("templates/user/codex-hooks.json", "src/agentflow/resources/templates/user/codex-hooks.json"),
@@ -298,6 +346,182 @@ class ContextDeliveryTests(unittest.TestCase):
             self.assertEqual(rows[0]["recall_status"], "empty")
             self.assertEqual(rows[-1]["event"], "PreCompact")
             self.assertEqual(rows[-1]["reason"], "event_has_no_documented_context_field")
+
+    def test_inactive_supported_and_unsupported_hooks_record_receipts_without_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            state = Path(temp) / "state"
+            config_path = root / ".agentflow/config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(json.dumps(default_data()), encoding="utf-8")
+            self._run_hook(root, state, {"hook_event_name": "UserPromptSubmit", "cwd": str(root)})
+            self._run_hook(root, state, {"hook_event_name": "PreCompact", "cwd": str(root)})
+            rows = self._receipt_rows(state)
+            self.assertEqual([row["stage"] for row in rows], ["omitted", "omitted"])
+            self.assertEqual([row["event"] for row in rows], ["UserPromptSubmit", "PreCompact"])
+            self.assertEqual(rows[0]["reason"], "recall_disabled")
+            self.assertEqual(rows[0]["recall_status"], "disabled")
+            self.assertEqual(rows[1]["reason"], "event_has_no_documented_context_field")
+            self.assertTrue(all(row["retained_item_count"] == 0 for row in rows))
+
+    def test_hook_omission_releases_claim_retry_emits_and_then_suppresses(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            state = Path(temp) / "state"
+            self._seed_recall(root, state)
+            payload = {"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "same-session"}
+
+            self._run_hook(root, state, payload, guidance="g" * 1_900)
+            first = self._receipt_rows(state)[-1]
+            self.assertEqual(first["stage"], "emitted")
+            self.assertEqual(first["retained_item_count"], 0)
+            self.assertEqual(first["omitted_item_count"], 1)
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                runtime = MemoryRuntime(root)
+                with KnowledgeIndex(runtime.database) as index:
+                    self.assertEqual(index.get("synthetic-retry-doc").injection_count, 0)
+
+            retry_output = self._run_hook(root, state, payload)
+            self.assertIn("synthetic recall summary", retry_output)
+            rows = self._receipt_rows(state)
+            self.assertEqual(rows[-1]["stage"], "emitted")
+            self.assertEqual(rows[-1]["retained_item_count"], 1)
+            self._run_hook(root, state, payload)
+            final_rows = self._receipt_rows(state)
+            self.assertEqual(final_rows[-1]["stage"], "emitted")
+            self.assertEqual(final_rows[-1]["recall_status"], "empty")
+            self.assertEqual(final_rows[-1]["retained_item_count"], 0)
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                with KnowledgeIndex(runtime.database) as index:
+                    self.assertEqual(index.get("synthetic-retry-doc").injection_count, 1)
+
+    def test_hook_failed_write_releases_claim_for_retry(self) -> None:
+        class BrokenOutput:
+            def write(self, _value: str) -> int:
+                raise BrokenPipeError("closed")
+
+            def flush(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            state = Path(temp) / "state"
+            self._seed_recall(root, state)
+            payload = {"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "retry-session"}
+            self._run_hook(root, state, payload, output=BrokenOutput())
+            rows = self._receipt_rows(state)
+            self.assertEqual([row["stage"] for row in rows], ["prepared", "failed"])
+            self.assertEqual(rows[-1]["retained_item_count"], 0)
+            self.assertEqual(rows[-1]["omitted_item_count"], 1)
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                runtime = MemoryRuntime(root)
+                with KnowledgeIndex(runtime.database) as index:
+                    self.assertEqual(index.get("synthetic-retry-doc").injection_count, 0)
+            retry_output = self._run_hook(root, state, payload)
+            self.assertIn("synthetic recall summary", retry_output)
+            self.assertEqual(self._receipt_rows(state)[-1]["stage"], "emitted")
+
+    def test_runtime_claims_are_atomic_across_concurrent_hook_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            state = Path(temp) / "state"
+            config = self._seed_recall(root, state)
+            payload = {"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "race-session"}
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                runtime = MemoryRuntime(root, memory_settings(config))
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(runtime.process, "codex", payload, "SessionStart", record_usage=False) for _ in range(2)]
+                    results = [future.result(timeout=10) for future in futures]
+            self.assertEqual(sorted(len(plan.items) if plan is not None else 0 for _, plan, _ in results), [0, 1])
+
+    def test_stale_cleanup_cannot_release_a_newer_session_reservation(self) -> None:
+        with KnowledgeIndex() as index:
+            digest = "a" * 64
+            self.assertTrue(index.claim_injection("same-session", digest, "doc", reservation_id="old-plan"))
+            index.reset_session("same-session")
+            self.assertTrue(index.claim_injection("same-session", digest, "doc", reservation_id="new-plan"))
+            self.assertEqual(index.release_injection("same-session", digest, "old-plan"), 0)
+            self.assertFalse(index.claim_injection("same-session", digest, "doc", reservation_id="third-plan"))
+
+    def test_legacy_session_claim_survives_concurrent_reservation_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "memory.sqlite3"
+            with KnowledgeIndex(database):
+                pass
+            digest = "b" * 64
+            connection = sqlite3.connect(database)
+            connection.execute("DROP TABLE session_injections")
+            connection.execute("""CREATE TABLE session_injections (
+                session_id TEXT NOT NULL, source_digest TEXT NOT NULL, document_id TEXT NOT NULL,
+                injected_at TEXT NOT NULL, PRIMARY KEY (session_id, source_digest)
+            )""")
+            connection.execute(
+                "INSERT INTO session_injections VALUES (?, ?, ?, ?)",
+                ("legacy-session", digest, "legacy-doc", "2026-10-06T00:00:00+00:00"),
+            )
+            connection.commit()
+            connection.close()
+
+            def open_and_claim() -> bool:
+                with KnowledgeIndex(database) as index:
+                    return index.claim_injection(
+                        "legacy-session", digest, "legacy-doc", reservation_id="new-plan",
+                    )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _index: open_and_claim(), range(2)))
+            self.assertEqual(results, [False, False])
+            with KnowledgeIndex(database) as index:
+                row = index.connection.execute(
+                    "SELECT reservation_id FROM session_injections WHERE session_id = ? AND source_digest = ?",
+                    ("legacy-session", digest),
+                ).fetchone()
+                self.assertEqual(row["reservation_id"], "")
+
+    def test_component_inventory_covers_forty_and_one_hundred_records(self) -> None:
+        for count in (40, 100):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "project"
+                root.mkdir()
+                state = Path(temp) / "state"
+                components = [
+                    {"id": f"memory_{i}", "kind": "memory_record", "digest": f"{i:064x}", "characters": 10, "bytes": 10}
+                    for i in range(count)
+                ]
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                    runtime = MemoryRuntime(root)
+                    runtime.record_delivery({
+                        "provider": "copilot", "event": "sessionStart", "stage": "emitted",
+                        "included": components, "omitted": [], "retained_item_count": count,
+                    })
+                row = self._receipt_rows(state)[0]
+                self.assertEqual(len(row["included"]), count)
+                self.assertEqual(row["component_inventory"]["complete"], True)
+
+    def test_component_inventory_reports_explicit_limit_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            state = Path(temp) / "state"
+            components = [
+                {"id": f"memory_{i}", "kind": "memory_record", "digest": f"{i:064x}", "characters": 1, "bytes": 1}
+                for i in range(140)
+            ]
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                MemoryRuntime(root).record_delivery({
+                    "provider": "copilot", "event": "sessionStart", "stage": "emitted",
+                    "included": components, "omitted": [],
+                })
+            row = self._receipt_rows(state)[0]
+            self.assertEqual(len(row["included"]), 128)
+            self.assertEqual(row["component_inventory"]["included_input_count"], 140)
+            self.assertEqual(row["component_inventory"]["included_recorded_count"], 128)
+            self.assertFalse(row["component_inventory"]["complete"])
+            self.assertEqual(row["component_inventory"]["diagnostic"], "included_limit_exceeded")
 
     def test_failed_write_does_not_create_emitted_receipt(self) -> None:
         class BrokenOutput:

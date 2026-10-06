@@ -32,6 +32,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Hook receipts now record configured inactive and unsupported events. Capped or
+  failed context releases its session reservation, and memory-use counts update
+  only after a complete local stdout write. Receipts retain up to 128 validated
+  components and explicitly diagnose any incomplete inventory.
 - Launch budgets now count each reserved attempt once across pending and resolved
   lifecycle records, retain verified history across controller key rotations, and
   include spend proven by exact workflow ancestry.

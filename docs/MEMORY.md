@@ -38,6 +38,10 @@ Source digests are recorded per session so a digest is not injected twice;
 explicit compaction/session reset is the only reset policy. `Stop` maintenance
 is model-free, idempotent, lock-protected, rate-limited, retryable, and reports
 durable health through `agentflow doctor` or `agentflow memory status`.
+Hook recall holds an atomic reservation while it builds the response. A
+complete successful stdout write records local use; omitted or failed hook
+output releases the reservation so a later event can retry. Direct recall API
+calls keep their existing selection-based accounting behavior.
 
 The local receipt spool uses `agentflow.memory-receipt@2` for hook context
 delivery. It records separate prepared and emitted stages, bounded component
@@ -47,7 +51,9 @@ response was serialized and written to hook stdout; it does not establish that
 the provider accepted it or included it in model input. Receipts contain no
 prompt, recalled summary, source path, or prime text. Older `@1` receipts remain
 historical records of preparation. Recall selection counters also describe
-local selection and are not provider-consumption evidence.
+local selection and are not provider-consumption evidence. The receipt inventory
+covers the configured limit of 100 recall items and reports an explicit
+incomplete-inventory diagnostic if the bounded 128-component limit is exceeded.
 
 ```json
 {

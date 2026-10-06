@@ -7166,13 +7166,49 @@ def hook(args: argparse.Namespace) -> int:
         runtime = memory_runtime_backend.MemoryRuntime(
             workflow_workspace, project_config_backend.memory_settings(config)
         )
-        runtime_event, plan, _ = runtime.process(args.provider, payload, event)
+        runtime_event, plan, _ = runtime.process(args.provider, payload, event, record_usage=False)
     except Exception:  # noqa: BLE001 - provider hooks must fail open
         runtime = None
         runtime_event = None
         plan = None
 
     if event.lower() not in {"sessionstart", "session_start"} and plan is None:
+        inactive = context_delivery_backend.plan_context(args.provider, event)
+        if inactive.get("status") == "unsupported_event":
+            reason = inactive.get("reason") or "unsupported_event"
+        elif runtime is None or (runtime.enabled and runtime_event is None):
+            reason = "recall_unavailable"
+        elif not runtime.enabled:
+            reason = "recall_disabled"
+        else:
+            reason = "recall_not_requested"
+        if runtime is not None:
+            try:
+                runtime.record_delivery({
+                    "provider": inactive.get("provider", args.provider),
+                    "event": inactive.get("event", "unknown"),
+                    "capability": inactive.get("capability", "unknown"),
+                    "client_version": payload.get("client_version"),
+                    "event_envelope": runtime_event or event_envelope,
+                    "recall_status": (
+                        "unavailable" if runtime.enabled and runtime_event is None else
+                        "disabled" if not runtime.enabled else "not_requested"
+                    ),
+                    "selected_item_count": 0,
+                    "retained_item_count": 0,
+                    "omitted_item_count": 0,
+                    "context_characters": 0,
+                    "context_bytes": 0,
+                    "context_sha256": None,
+                    "cap_unit": inactive.get("cap_unit"),
+                    "cap_value": inactive.get("cap_value"),
+                    "included": [],
+                    "omitted": [],
+                    "stage": "omitted",
+                    "reason": reason,
+                })
+            except Exception:  # noqa: BLE001 - receipt storage must not break provider hooks
+                pass
         return 0
     context_plan: dict[str, Any]
     try:
@@ -7218,17 +7254,47 @@ def hook(args: argparse.Namespace) -> int:
         if runtime is None:
             return
         try:
-            runtime.record_delivery({**receipt_base, "stage": stage, "reason": reason})
+            receipt = {**receipt_base, "stage": stage, "reason": reason}
+            if stage in {"failed", "omitted"}:
+                planned_included = receipt_base.get("included", [])
+                failed_memory = [
+                    component for component in planned_included
+                    if component.get("kind") == "memory_record"
+                ]
+                receipt["included"] = [
+                    component for component in planned_included
+                    if component.get("kind") != "memory_record"
+                ]
+                receipt["omitted"] = [
+                    *receipt_base.get("omitted", []),
+                    *(
+                        {**component, "reason": reason or stage}
+                        for component in failed_memory
+                    ),
+                ]
+                receipt["retained_item_count"] = 0
+                receipt["omitted_item_count"] = selected_count
+            runtime.record_delivery(receipt)
         except Exception:  # noqa: BLE001 - receipt storage must not break provider hooks
+            pass
+
+    def finish_delivery(retained_items: Any = ()) -> None:
+        if runtime is None:
+            return
+        try:
+            runtime.finish_delivery(runtime_event, plan, tuple(retained_items))
+        except Exception:  # noqa: BLE001 - usage accounting must not break provider hooks
             pass
 
     if context_plan.get("status") != "ready":
         reason = context_plan.get("reason") or "unsupported_event"
         stage = "failed" if reason == "mandatory_context_exceeds_cap" else "omitted"
+        finish_delivery()
         record(stage, reason)
         return 0
     output = context_delivery_backend.serialize_context(context_plan)
     if output is None:
+        finish_delivery()
         record("omitted", "unsupported_event")
         return 0
 
@@ -7236,6 +7302,7 @@ def hook(args: argparse.Namespace) -> int:
     try:
         serialized = json.dumps(output)
     except (TypeError, ValueError, UnicodeError):
+        finish_delivery()
         record("failed", "serialization_failed")
         return 0
     try:
@@ -7244,8 +7311,10 @@ def hook(args: argparse.Namespace) -> int:
             raise OSError("hook response was only partially written")
         sys.stdout.flush()
     except Exception:  # noqa: BLE001 - provider hooks remain fail-open on a closed pipe
+        finish_delivery()
         record("failed", "output_write_failed")
         return 0
+    finish_delivery(context_plan.get("retained_memory_items", ()))
     record("emitted")
     return 0
 

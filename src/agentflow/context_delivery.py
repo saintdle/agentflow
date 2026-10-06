@@ -136,13 +136,28 @@ def plan_context(
 ) -> dict[str, Any]:
     """Build a complete context string without cutting optional components."""
     provider = provider.casefold()
+    items = tuple(memory_items)
+
+    def omitted_memory(reason: str) -> list[dict[str, Any]]:
+        return [
+            {
+                **_component(
+                    _memory_id(item.document_id), "memory_record", _render(item),
+                    source_digest=item.source_digest,
+                ),
+                "reason": reason,
+            }
+            for item in items
+        ]
+
     event_info = _event(provider, event)
     if event_info is None:
         return {
             "status": "unsupported_event", "reason": "unsupported_event",
             "provider": provider, "event": "unknown", "capability": "unsupported", "cap_unit": None,
-            "cap_value": None, "text": None, "included": [], "omitted": [],
+            "cap_value": None, "text": None, "included": [], "omitted": omitted_memory("unsupported_event"),
             "context_characters": 0, "context_bytes": 0, "context_sha256": None,
+            "retained_memory_items": (),
         }
     canonical_event, event_supported, capability = event_info
     unit_cap = CAPS[provider]
@@ -152,10 +167,11 @@ def plan_context(
             "status": "unsupported_event", "reason": "event_has_no_documented_context_field",
             "provider": provider, "event": canonical_event, "capability": capability,
             "cap_unit": cap_unit, "cap_value": cap_value, "text": None,
-            "included": [], "omitted": [], "context_characters": 0, "context_bytes": 0,
+            "included": [], "omitted": omitted_memory("event_has_no_documented_context_field"),
+            "context_characters": 0, "context_bytes": 0,
+            "retained_memory_items": (),
         }
 
-    items = tuple(memory_items)
     text = guidance
     included: list[dict[str, Any]] = [_component("agentflow_guidance", "guidance", guidance)]
     omitted: list[dict[str, Any]] = []
@@ -181,6 +197,7 @@ def plan_context(
             "cap_unit": cap_unit, "cap_value": cap_value, "text": None,
             "included": [], "omitted": omitted, "context_characters": len(text),
             "context_bytes": len(text.encode("utf-8")), "context_sha256": _digest(text),
+            "retained_memory_items": (),
         }
 
     if prime:
@@ -195,6 +212,7 @@ def plan_context(
 
     if items:
         prefix_added = False
+        retained_memory_items: list[RecallItem] = []
         for (item, line), component in zip(memory_lines, memory_components):
             if not prefix_added:
                 guard_segment = "\n\n" + MEMORY_PREFIX + "\n"
@@ -213,6 +231,7 @@ def plan_context(
                     component["id"], "memory_record", record_segment,
                     source_digest=item.source_digest,
                 ))
+                retained_memory_items.append(item)
             else:
                 omit(component, "over_budget")
 
@@ -224,6 +243,7 @@ def plan_context(
         "included": included, "omitted": omitted,
         "context_characters": characters, "context_bytes": byte_count,
         "context_sha256": _digest(text),
+        "retained_memory_items": tuple(retained_memory_items) if items else (),
     }
 
 

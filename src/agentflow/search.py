@@ -278,11 +278,27 @@ class KnowledgeIndex:
             document_id TEXT NOT NULL, relation TEXT NOT NULL, target_id TEXT NOT NULL,
             PRIMARY KEY (document_id, relation, target_id)
         )""")
-        self.connection.execute("""CREATE TABLE IF NOT EXISTS session_injections (
-            session_id TEXT NOT NULL, source_digest TEXT NOT NULL, document_id TEXT NOT NULL,
-            injected_at TEXT NOT NULL, PRIMARY KEY (session_id, source_digest)
-        )""")
         self.connection.commit()
+        # Serialize first-open migrations so two hooks cannot both observe a
+        # missing column and race the same ALTER TABLE.
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS session_injections (
+                session_id TEXT NOT NULL, source_digest TEXT NOT NULL, document_id TEXT NOT NULL,
+                injected_at TEXT NOT NULL, reservation_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (session_id, source_digest)
+            )""")
+            session_columns = {
+                row["name"] for row in self.connection.execute("PRAGMA table_info(session_injections)")
+            }
+            if "reservation_id" not in session_columns:
+                self.connection.execute(
+                    "ALTER TABLE session_injections ADD COLUMN reservation_id TEXT NOT NULL DEFAULT ''"
+                )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
 
     def _migrate_columns(self) -> None:
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(documents)")}
@@ -442,17 +458,25 @@ class KnowledgeIndex:
 
     fetch_for_recall = fetch_approved
 
-    def claim_injection(self, session_id: str, source_digest: str, document_id: str, *, limit: int = SESSION_LEDGER_MAX) -> bool:
+    def claim_injection(
+        self, session_id: str, source_digest: str, document_id: str, *,
+        limit: int = SESSION_LEDGER_MAX, reservation_id: str = "",
+    ) -> bool:
         """Atomically claim a digest for a session; repeated claims are suppressed."""
         session_id = require_safe_text(session_id, "session_id", limit=240)
         source_digest = require_safe_text(source_digest, "source_digest", limit=128)
         document_id = require_safe_text(document_id, "document_id", limit=240)
+        if reservation_id:
+            reservation_id = require_safe_text(reservation_id, "reservation_id", limit=128)
         if limit < 1 or limit > SESSION_LEDGER_MAX:
             raise SearchError(f"session ledger limit must be between 1 and {SESSION_LEDGER_MAX}")
         timestamp = _now()
         try:
             self.connection.execute("BEGIN IMMEDIATE")
-            cursor = self.connection.execute("INSERT OR IGNORE INTO session_injections(session_id, source_digest, document_id, injected_at) VALUES (?, ?, ?, ?)", (session_id, source_digest, document_id, timestamp))
+            cursor = self.connection.execute(
+                "INSERT OR IGNORE INTO session_injections(session_id, source_digest, document_id, injected_at, reservation_id) VALUES (?, ?, ?, ?, ?)",
+                (session_id, source_digest, document_id, timestamp, reservation_id),
+            )
             if cursor.rowcount != 1:
                 self.connection.commit()
                 return False
@@ -462,6 +486,18 @@ class KnowledgeIndex:
         except sqlite3.OperationalError as exc:
             self.connection.rollback()
             raise SearchError("session injection ledger could not acquire the knowledge lock") from exc
+
+    def release_injection(self, session_id: str, source_digest: str, reservation_id: str) -> int:
+        """Release only the matching hook plan's uncommitted reservation."""
+        session_id = require_safe_text(session_id, "session_id", limit=240)
+        source_digest = require_safe_text(source_digest, "source_digest", limit=128)
+        reservation_id = require_safe_text(reservation_id, "reservation_id", limit=128)
+        cursor = self.connection.execute(
+            "DELETE FROM session_injections WHERE session_id = ? AND source_digest = ? AND reservation_id = ?",
+            (session_id, source_digest, reservation_id),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
 
     def reset_session(self, session_id: str) -> int:
         """Forget per-session injection claims after an explicit compaction/reset."""

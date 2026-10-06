@@ -24,9 +24,12 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 from agentflow.events import EventEnvelope, EventSpool, normalize_event, record_event_safely
-from agentflow.memory import RecallPlan, find_first
+from agentflow.memory import RecallItem, RecallPlan, find_first
 from agentflow.project_config import DEFAULT_MEMORY
 from agentflow.search import KnowledgeIndex
+
+
+DELIVERY_COMPONENT_LIMIT = 128
 
 
 def _now() -> dt.datetime:
@@ -256,6 +259,7 @@ class MemoryRuntime:
         reasons = {
             "", "unsupported_event", "event_has_no_documented_context_field",
             "mandatory_context_exceeds_cap", "serialization_failed", "output_write_failed",
+            "recall_disabled", "recall_not_requested", "recall_unavailable",
         }
         recall_states = {"disabled", "empty", "selected", "not_requested", "unavailable"}
         providers = {"codex", "claude", "copilot"}
@@ -283,22 +287,37 @@ class MemoryRuntime:
         def safe_count(name: str, maximum: int = 1_000_000_000) -> int:
             return safe_count_from(value.get(name), maximum)
 
+        component_input_counts: dict[str, int] = {}
+        component_diagnostics: dict[str, str] = {}
+
         def safe_components(name: str, *, omissions: bool = False) -> list[dict[str, Any]]:
             entries = value.get(name)
-            if not isinstance(entries, list):
+            if name not in value:
+                component_input_counts[name] = 0
+                component_diagnostics[name] = ""
                 return []
+            if not isinstance(entries, list):
+                component_input_counts[name] = 0
+                component_diagnostics[name] = f"{name}_invalid_container"
+                return []
+            component_input_counts[name] = min(len(entries), 1_000_000_000)
             result: list[dict[str, Any]] = []
-            for entry in entries[:32]:
+            invalid_entries = False
+            for entry in entries[:DELIVERY_COMPONENT_LIMIT]:
                 if not isinstance(entry, Mapping):
+                    invalid_entries = True
                     continue
                 component_id = entry.get("id")
                 kind = entry.get("kind")
                 digest = entry.get("digest")
                 if not isinstance(component_id, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", component_id):
+                    invalid_entries = True
                     continue
                 if not isinstance(kind, str) or not re.fullmatch(r"[a-z0-9_]{1,32}", kind):
+                    invalid_entries = True
                     continue
                 if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    invalid_entries = True
                     continue
                 record = {
                     "id": component_id,
@@ -314,10 +333,21 @@ class MemoryRuntime:
                     omission_reason = entry.get("reason")
                     record["reason"] = (
                         omission_reason
-                        if isinstance(omission_reason, str) and omission_reason in {"over_budget", "mandatory_overflow"}
+                        if isinstance(omission_reason, str) and omission_reason in {
+                            "over_budget", "mandatory_overflow", "unsupported_event",
+                            "event_has_no_documented_context_field", "serialization_failed",
+                            "output_write_failed", "recall_disabled", "recall_not_requested",
+                            "recall_unavailable",
+                        }
                         else "unknown"
                     )
                 result.append(record)
+            diagnostics = []
+            if len(entries) > DELIVERY_COMPONENT_LIMIT:
+                diagnostics.append(f"{name}_limit_exceeded")
+            if invalid_entries:
+                diagnostics.append(f"{name}_invalid_entries")
+            component_diagnostics[name] = "_and_".join(diagnostics)
             return result
 
         event_envelope = value.get("event_envelope")
@@ -339,6 +369,20 @@ class MemoryRuntime:
             client_version = None
         included = safe_components("included")
         omitted = safe_components("omitted", omissions=True)
+        included_diagnostic = component_diagnostics["included"]
+        omitted_diagnostic = component_diagnostics["omitted"]
+        inventory_diagnostic = "_and_".join(
+            value for value in (included_diagnostic, omitted_diagnostic) if value
+        )
+        component_inventory = {
+            "limit": DELIVERY_COMPONENT_LIMIT,
+            "included_input_count": component_input_counts["included"],
+            "included_recorded_count": len(included),
+            "omitted_input_count": component_input_counts["omitted"],
+            "omitted_recorded_count": len(omitted),
+            "complete": not inventory_diagnostic,
+            "diagnostic": inventory_diagnostic,
+        }
         self.receipts.append({
             "schema": "agentflow.memory-receipt@2",
             "timestamp": _iso(),
@@ -361,11 +405,14 @@ class MemoryRuntime:
             "cap_value": cap_value,
             "included": included,
             "omitted": omitted,
+            "component_inventory": component_inventory,
             "reason": reason,
             "privacy": "metadata-only",
         })
 
-    def recall(self, event: EventEnvelope, payload: Mapping[str, Any]) -> RecallPlan | None:
+    def recall(
+        self, event: EventEnvelope, payload: Mapping[str, Any], *, record_usage: bool = True,
+    ) -> RecallPlan | None:
         if not self.enabled:
             return None
         if event.event == "prompt.submit" and not bool(self.settings.get("on_prompt")):
@@ -383,10 +430,36 @@ class MemoryRuntime:
                     max_age_days=float(self.settings["max_age_days"]),
                     session_id=event.session_id,
                     session_ledger_limit=int(self.settings["session_ledger_limit"]),
+                    record_usage=record_usage,
                 )
             return plan
         except Exception:  # noqa: BLE001 - hook fail-open
             return None
+
+    def finish_delivery(
+        self,
+        event: EventEnvelope | None,
+        plan: RecallPlan | None,
+        retained_items: tuple[RecallItem, ...] = (),
+    ) -> None:
+        """Commit usage for written recall and release this plan's omissions."""
+        if event is None or plan is None:
+            return
+        retained = {(item.document_id, item.source_digest) for item in retained_items}
+        try:
+            with KnowledgeIndex(self.database) as index:
+                for item in plan.items:
+                    try:
+                        if (item.document_id, item.source_digest) in retained:
+                            index.mark_used(item.document_id, injected=True)
+                        elif plan.reservation_id:
+                            index.release_injection(
+                                event.session_id, item.source_digest, plan.reservation_id,
+                            )
+                    except Exception:  # noqa: BLE001 - per-item accounting stays fail-open
+                        continue
+        except Exception:  # noqa: BLE001 - usage accounting must not break provider hooks
+            pass
 
     def maintain(self, *, force: bool = False) -> dict[str, Any]:
         """Run bounded, idempotent local maintenance under one process lock."""
@@ -440,7 +513,10 @@ class MemoryRuntime:
             _write_json(self.health_path, health)
             return health
 
-    def process(self, provider: str, payload: Mapping[str, Any], event_name: str = "") -> tuple[EventEnvelope | None, RecallPlan | None, dict[str, Any]]:
+    def process(
+        self, provider: str, payload: Mapping[str, Any], event_name: str = "", *,
+        record_usage: bool = True,
+    ) -> tuple[EventEnvelope | None, RecallPlan | None, dict[str, Any]]:
         if not self.enabled:
             return None, None, {}
         try:
@@ -458,7 +534,7 @@ class MemoryRuntime:
                         index.reset_session(event.session_id)
                 except Exception:  # noqa: BLE001 - compaction reset is fail-open
                     pass
-            plan = self.recall(event, payload)
+            plan = self.recall(event, payload, record_usage=record_usage)
             health = self.maintain() if event.event == "session.stop" else {}
             return event, plan, health
         except Exception:  # noqa: BLE001 - provider hooks are fail-open

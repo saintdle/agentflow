@@ -92,6 +92,9 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
                 "base": f"main@{base[:12]}",
                 "acceptance": task_matrix,
+                "context": ["README.md"],
+                "tool_profile": "shell-write",
+                "budget": ["10 minutes; one retry; stop on blocker"],
                 "checks": ["process-boundary"],
                 # Controller dispatch materializes this as an external lane;
                 # provide the same explicit context/profile/budget a manual
@@ -112,6 +115,9 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
                 "base": f"main@{base[:12]}",
                 "acceptance": second_matrix,
+                "context": ["README.md"],
+                "tool_profile": "shell-write",
+                "budget": ["10 minutes; one retry; stop on blocker"],
                 "checks": ["process-boundary"],
                 "context": ["README.md"],
                 "tool_profile": "shell-write",
@@ -224,7 +230,14 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stderr)
             first_payload = json.loads(first.stdout)
             herdr_debug = (root / ".agentflow/herdr/sessions.json").read_text() if (root / ".agentflow/herdr/sessions.json").exists() else "<no herdr state>"
-            self.assertEqual(first_payload["result"]["state"], "running", first.stdout + "\n" + herdr_debug)
+            selected_task_id = str(first_payload.get("result", {}).get("task") or task_id)
+            task_issue_debug = beads.get_issue(root, selected_task_id)
+            automatic_handoff = root / ".agentflow/tmp/handoffs" / f"{cli._slug(selected_task_id)}-codex.json"
+            handoff_debug = automatic_handoff.read_text(encoding="utf-8") if automatic_handoff.is_file() else "<no automatic handoff manifest>"
+            self.assertEqual(
+                first_payload["result"]["state"], "running",
+                first.stdout + "\n" + herdr_debug + "\n" + json.dumps(task_issue_debug, sort_keys=True) + "\n" + handoff_debug,
+            )
 
             # The first controller process is deliberately treated as crashed
             # after dispatch. A new process consumes the provider's result,
