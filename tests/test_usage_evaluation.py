@@ -15,6 +15,25 @@ from agentflow import cli, usage
 
 
 class UsageEvaluationTests(unittest.TestCase):
+    def test_case_id_alone_is_reported_as_incomplete_evaluation_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            with mock.patch.object(cli, "_state_dir", return_value=state), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main([
+                    "usage", "record", "codex", "--task-class", "implementation",
+                    "--model", "gpt-6-sol", "--effort", "high", "--case-id", "case-01",
+                ]), 0)
+
+            record = json.loads((state / "usage.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(record["case_id"], "case-01")
+            output = io.StringIO()
+            with mock.patch.object(cli, "_state_dir", return_value=state), contextlib.redirect_stdout(output):
+                self.assertEqual(cli.main(["usage", "yield", "--evaluation", "--json"]), 0)
+            result = json.loads(output.getvalue())["evaluation"]
+            self.assertEqual(result["records"], 1)
+            self.assertEqual(result["cohorts"], [])
+            self.assertEqual(result["excluded"], {"missing:evaluation_id,variant": 1})
+
     def test_default_usage_yield_reads_one_jsonl_record_for_both_modes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
@@ -142,9 +161,15 @@ class UsageEvaluationTests(unittest.TestCase):
         codex_default = next(row for row in result["cohorts"] if row["provider"] == "codex" and row["model"] == "model-x" and row["effort"] == "high")
         paired = codex_default["comparisons"][0]
         self.assertEqual(paired["matched_cases"], 1)
-        self.assertEqual(paired["unmatched_cases"], 3)
+        self.assertEqual(paired["unmatched_cases"], 2)
         self.assertEqual(paired["ambiguous_duplicate_cases"], 1)
         self.assertEqual(paired["ambiguous_duplicate_records"], 2)
+        self.assertEqual(codex_default["unmatched_case_counts"], {
+            "baseline_only": 1,
+            "treatment_only": 1,
+            "ambiguous_duplicate_cases": 1,
+            "ambiguous_duplicate_records": 2,
+        })
         delta = paired["metric_deltas"]["rework_rounds"]
         self.assertEqual(delta["mean_treatment_minus_baseline"], -1)
         self.assertEqual(delta["n"], 1)

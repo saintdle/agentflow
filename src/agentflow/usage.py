@@ -121,7 +121,7 @@ def evaluation_report(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     for row in records:
         evaluation_id = row.get("evaluation_id")
         variant = row.get("variant")
-        if not evaluation_id and not variant:
+        if not any(row.get(field) for field in ("evaluation_id", "variant", "case_id")):
             continue
         evaluation_rows += 1
         required = ("evaluation_id", "variant", "case_id", "task_class", *_EVALUATION_DIMENSIONS)
@@ -163,8 +163,8 @@ def evaluation_report(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
                 right_cases[_label(row.get("case_id"))].append(row)
             common = set(left_cases) & set(right_cases)
             matched = sorted(case for case in common if len(left_cases[case]) == len(right_cases[case]) == 1)
-            unmatched_left = sum(len(left_cases[case]) for case in set(left_cases) - set(right_cases))
-            unmatched_right = sum(len(right_cases[case]) for case in set(right_cases) - set(left_cases))
+            unmatched_left = len(set(left_cases) - set(right_cases))
+            unmatched_right = len(set(right_cases) - set(left_cases))
             ambiguous_case_ids = [
                 case for case in set(left_cases) | set(right_cases)
                 if len(left_cases.get(case, [])) > 1 or len(right_cases.get(case, [])) > 1
