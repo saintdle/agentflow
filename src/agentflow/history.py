@@ -251,6 +251,7 @@ class SessionRecord:
     context_window_tokens: int = 0
     peak_context_tokens: int = 0
     diagnostics: tuple[str, ...] = ()
+    usage_metadata: dict[str, Any] | None = None
 
     @property
     def bead_id(self) -> str:
@@ -258,7 +259,7 @@ class SessionRecord:
         return f"history-s-{digest[:12]}"
 
     def manifest_value(self) -> dict[str, Any]:
-        return {
+        value = {
             "bead_id": self.bead_id,
             "provider": self.provider,
             "source_id": self.source_id,
@@ -287,6 +288,11 @@ class SessionRecord:
             "peak_context_tokens": self.peak_context_tokens,
             "diagnostics": list(self.diagnostics),
         }
+        if self.provider == "codex":
+            value["peak_context_semantics"] = "input_plus_output_proxy"
+        if self.usage_metadata is not None:
+            value["usage_metadata"] = self.usage_metadata
+        return value
 
 
 def archive_path(value: str | Path | None = None) -> Path:
@@ -898,6 +904,240 @@ def _record_for_legacy_json(
     )
 
 
+_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _usage_counter_values(raw: Any) -> tuple[dict[str, int | None], set[str]]:
+    """Read only bounded token counters from one provider usage object."""
+    values: dict[str, int | None] = {name: None for name in _USAGE_FIELDS}
+    invalid: set[str] = set()
+    if not isinstance(raw, dict):
+        return values, {"usage_object_invalid"}
+
+    def read(name: str, *aliases: str) -> int | None:
+        for key in (name, *aliases):
+            if key in raw:
+                value = raw[key]
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+                invalid.add(f"{key}_invalid")
+                return None
+        return None
+
+    values["input_tokens"] = read("input_tokens")
+    values["output_tokens"] = read("output_tokens")
+    values["reasoning_output_tokens"] = read("reasoning_output_tokens")
+    if values["reasoning_output_tokens"] is None:
+        details = raw.get("output_tokens_details")
+        if isinstance(details, dict) and "reasoning_tokens" in details:
+            candidate = details["reasoning_tokens"]
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                values["reasoning_output_tokens"] = candidate
+            else:
+                invalid.add("reasoning_tokens_invalid")
+
+    cached = read("cached_input_tokens")
+    if cached is None:
+        details = raw.get("input_tokens_details")
+        if isinstance(details, dict) and "cached_tokens" in details:
+            candidate = details["cached_tokens"]
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                cached = candidate
+            else:
+                invalid.add("cached_tokens_invalid")
+        elif "cache_read_input_tokens" in raw and "cache_creation_input_tokens" in raw:
+            cache_values: list[int] = []
+            cache_invalid = False
+            for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                candidate = raw[key]
+                if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+                    cache_values.append(candidate)
+                else:
+                    invalid.add(f"{key}_invalid")
+                    cache_invalid = True
+            if not cache_invalid:
+                cached = sum(cache_values)
+        elif "cache_read_input_tokens" in raw or "cache_creation_input_tokens" in raw:
+            cached = None
+    values["cached_input_tokens"] = cached
+
+    supplied_total = read("total_tokens")
+    if supplied_total is not None:
+        values["total_tokens"] = supplied_total
+    elif values["input_tokens"] is not None and values["output_tokens"] is not None:
+        values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+
+    if (
+        values["input_tokens"] is not None
+        and values["output_tokens"] is not None
+        and values["total_tokens"] is not None
+        and values["total_tokens"] != values["input_tokens"] + values["output_tokens"]
+    ):
+        invalid.add("total_does_not_match_input_and_output")
+    if (
+        values["cached_input_tokens"] is not None
+        and values["input_tokens"] is not None
+        and values["cached_input_tokens"] > values["input_tokens"]
+    ):
+        invalid.add("cached_input_exceeds_input")
+    if (
+        values["reasoning_output_tokens"] is not None
+        and values["output_tokens"] is not None
+        and values["reasoning_output_tokens"] > values["output_tokens"]
+    ):
+        invalid.add("reasoning_exceeds_output")
+    return values, invalid
+
+
+def _codex_usage_metadata(
+    response_records: list[tuple[str, dict[str, int | None]]],
+    event_snapshots: list[tuple[dict[str, int | None], dict[str, int | None]]],
+    *,
+    client_version: str | None,
+    diagnostics: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Reconcile response-level usage with token_count snapshots without adding views."""
+    issues = set(diagnostics)
+    by_response: dict[str, dict[str, int | None]] = {}
+    ordered_records: list[dict[str, int | None]] = []
+    duplicate_seen = False
+    for response_id, counters in response_records:
+        previous = by_response.get(response_id)
+        if previous is not None:
+            if previous == counters:
+                duplicate_seen = True
+                continue
+            issues.add("conflicting_duplicate_response_id")
+            continue
+        by_response[response_id] = counters
+        ordered_records.append(counters)
+    if duplicate_seen:
+        issues.add("duplicate_response_id_ignored")
+
+    record_sum: dict[str, int | None] = {}
+    if ordered_records:
+        for name in _USAGE_FIELDS:
+            entries = [item[name] for item in ordered_records]
+            record_sum[name] = sum(entries) if all(item is not None for item in entries) else None
+
+    ambiguous = any(
+        item in issues
+        for item in (
+            "conflicting_duplicate_response_id",
+            "malformed_response_usage",
+            "malformed_token_count_usage",
+            "cumulative_counter_reset",
+            "conflicting_cumulative_snapshot",
+            "usage_view_conflict",
+            "request_view_conflict",
+        )
+    )
+    cross_check = "not_available"
+    cross_check_source: str | None = "codex-event-msg-token-count" if event_snapshots else None
+    if ordered_records and event_snapshots:
+        checked = True
+        event_totals = event_snapshots[-1][0]
+        for name in _USAGE_FIELDS:
+            left, right = record_sum.get(name), event_totals.get(name)
+            if left is not None and right is not None:
+                if left != right:
+                    issues.add("usage_view_conflict")
+                    ambiguous = True
+            elif name in {"input_tokens", "output_tokens", "total_tokens"}:
+                checked = False
+        if len(event_snapshots) != len(ordered_records):
+            checked = False
+            issues.add("cumulative_prefix_count_unverified")
+        else:
+            prefix: dict[str, int] = {name: 0 for name in _USAGE_FIELDS}
+            prefix_complete = {name: True for name in _USAGE_FIELDS}
+            for native, (event_cumulative, _) in zip(ordered_records, event_snapshots):
+                for name in _USAGE_FIELDS:
+                    if native[name] is None:
+                        prefix_complete[name] = False
+                    elif prefix_complete[name]:
+                        prefix[name] += native[name]
+                    expected = prefix[name] if prefix_complete[name] else None
+                    observed = event_cumulative[name]
+                    if expected is not None and observed is not None:
+                        if expected != observed:
+                            issues.add("usage_view_conflict")
+                            ambiguous = True
+                    elif name in {"input_tokens", "output_tokens", "total_tokens"}:
+                        checked = False
+        event_requests = [last for _, last in event_snapshots if any(value is not None for value in last.values())]
+        if len(event_requests) != len(ordered_records):
+            checked = False
+            issues.add("request_view_count_unverified")
+        else:
+            for native, event in zip(ordered_records, event_requests):
+                for name in _USAGE_FIELDS:
+                    if native[name] is not None and event[name] is not None and native[name] != event[name]:
+                        issues.add("request_view_conflict")
+                        ambiguous = True
+        cross_check = "matched" if checked and not ambiguous else "partial"
+        if ambiguous:
+            cross_check = "conflict"
+
+    if ordered_records:
+        source = "codex-native-token-usage-record"
+        counters = record_sum
+        request_count: int | None = len(ordered_records)
+        max_request_input = (
+            max(item["input_tokens"] for item in ordered_records if item["input_tokens"] is not None)
+            if all(item["input_tokens"] is not None for item in ordered_records)
+            else None
+        )
+        if any(item["input_tokens"] is None or item["output_tokens"] is None for item in ordered_records):
+            issues.add("incomplete_response_usage")
+            ambiguous = True
+    elif event_snapshots:
+        source = "codex-event-msg-token-count"
+        counters = event_snapshots[-1][0]
+        request_count = None
+        max_request_input = None
+    else:
+        source = "unavailable"
+        counters = {name: None for name in _USAGE_FIELDS}
+        request_count = None
+        max_request_input = None
+
+    if ambiguous:
+        availability = "ambiguous"
+        counters = {name: None for name in _USAGE_FIELDS}
+        request_count = None
+        max_request_input = None
+    elif ordered_records:
+        availability = "complete"
+    elif event_snapshots and any(value is not None for value in counters.values()):
+        availability = "partial"
+    else:
+        availability = "unavailable"
+
+    return {
+        "schema_version": 1,
+        "source": source,
+        "client_version": client_version,
+        "availability": availability,
+        "cross_check": cross_check,
+        "cross_check_source": cross_check_source,
+        "input_tokens": counters.get("input_tokens"),
+        "cached_input_tokens": counters.get("cached_input_tokens"),
+        "output_tokens": counters.get("output_tokens"),
+        "reasoning_output_tokens": counters.get("reasoning_output_tokens"),
+        "total_tokens": counters.get("total_tokens"),
+        "request_count": request_count,
+        "max_request_input_tokens": max_request_input,
+        "diagnostics": sorted(issues),
+    }
+
+
 def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None) -> SessionRecord:
     preferred = max(paths, key=lambda item: (item.stat().st_size, item.stat().st_mtime_ns))
     before = _source_snapshot(paths)
@@ -924,6 +1164,13 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
     terminal = False
     saw_meta = False
     diagnostics: list[str] = []
+    usage_response_records: list[tuple[str, dict[str, int | None]]] = []
+    usage_event_snapshots: list[tuple[dict[str, int | None], dict[str, int | None]]] = []
+    usage_diagnostics: set[str] = set()
+    client_version: str | None = None
+    seen_event_snapshots: set[tuple[tuple[int | None, ...], tuple[int | None, ...]]] = set()
+    cumulative_last_by_value: dict[tuple[int | None, ...], tuple[int | None, ...]] = {}
+    previous_cumulative: dict[str, int | None] | None = None
     if not filename_id:
         diagnostics.append("invalid_filename_session_id")
     try:
@@ -950,6 +1197,11 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                             meta_id = _canonical_uuid(payload["id"])
                         if isinstance(payload.get("cwd"), str):
                             workspace_ref = _workspace_ref(payload["cwd"])
+                        raw_client_version = payload.get("client_version", payload.get("cli_version"))
+                        if isinstance(raw_client_version, str) and len(raw_client_version) <= 64 and re.fullmatch(
+                            r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?", raw_client_version
+                        ):
+                            client_version = raw_client_version
                         if payload.get("parent_thread_id") is not None:
                             parent_ref = _normalized_parent(payload.get("parent_thread_id"))
                             if not parent_ref:
@@ -989,6 +1241,24 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                     if isinstance(raw_effort, str) and re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", raw_effort):
                         if raw_effort not in efforts:
                             efforts.append(raw_effort)
+                native_usage = isinstance(payload, dict) and payload.get("type") == "token_usage_record"
+                native_usage = native_usage or value.get("type") == "token_usage_record"
+                if native_usage:
+                    usage_record = payload if isinstance(payload, dict) else value
+                    response_id = usage_record.get("response_id")
+                    if not isinstance(response_id, str) or not response_id.strip() or len(response_id) > 256:
+                        usage_diagnostics.add("malformed_response_usage")
+                    else:
+                        raw_usage = usage_record.get("token_usage", usage_record.get("usage"))
+                        if raw_usage is None and isinstance(usage_record.get("info"), dict):
+                            raw_usage = usage_record["info"].get("token_usage")
+                        if raw_usage is None:
+                            raw_usage = usage_record
+                        counters, invalid_usage = _usage_counter_values(raw_usage)
+                        if invalid_usage or counters["input_tokens"] is None or counters["output_tokens"] is None:
+                            usage_diagnostics.add("malformed_response_usage")
+                        else:
+                            usage_response_records.append((response_id.strip(), counters))
                 if value.get("type") == "event_msg" and isinstance(payload, dict):
                     if payload.get("type") in {"task_complete", "turn_aborted", "session_configured"}:
                         terminal = payload.get("type") in {"task_complete", "turn_aborted"} or terminal
@@ -996,19 +1266,55 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                         info = payload["info"]
                         total = info.get("total_token_usage")
                         last = info.get("last_token_usage")
+                        if ("total_token_usage" in info and not isinstance(total, dict)) or (
+                            "last_token_usage" in info and not isinstance(last, dict)
+                        ):
+                            usage_diagnostics.add("malformed_token_count_usage")
                         raw_window = info.get("model_context_window")
                         if isinstance(raw_window, int) and not isinstance(raw_window, bool) and raw_window > 0:
                             context_window_tokens = max(context_window_tokens, raw_window)
                         if isinstance(last, dict):
-                            raw_peak = last.get("total_tokens")
-                            if isinstance(raw_peak, int) and not isinstance(raw_peak, bool) and raw_peak >= 0:
+                            last_values, last_invalid = _usage_counter_values(last)
+                            if last_invalid:
+                                usage_diagnostics.add("malformed_token_count_usage")
+                            raw_peak = last_values.get("total_tokens")
+                            if raw_peak is not None:
                                 peak_context_tokens = max(peak_context_tokens, raw_peak)
+                        else:
+                            last_values = {name: None for name in _USAGE_FIELDS}
                         if isinstance(total, dict):
-                            raw_total = total.get("total_tokens")
-                            if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= token_usage["total_tokens"]:
+                            total_values, total_invalid = _usage_counter_values(total)
+                            if total_invalid:
+                                usage_diagnostics.add("malformed_token_count_usage")
+                            if any(value is not None for value in total_values.values()):
+                                cumulative_key = tuple(total_values[name] for name in _USAGE_FIELDS)
+                                last_key = tuple(last_values[name] for name in _USAGE_FIELDS)
+                                previous_last = cumulative_last_by_value.get(cumulative_key)
+                                if previous_last is not None:
+                                    if previous_last != last_key:
+                                        usage_diagnostics.add("conflicting_cumulative_snapshot")
+                                    else:
+                                        usage_diagnostics.add("duplicate_token_count_snapshot_ignored")
+                                else:
+                                    cumulative_last_by_value[cumulative_key] = last_key
+                                    snapshot_key = (cumulative_key, last_key)
+                                    if snapshot_key not in seen_event_snapshots:
+                                        if previous_cumulative is not None:
+                                            for name in _USAGE_FIELDS:
+                                                before_value = previous_cumulative.get(name)
+                                                after_value = total_values.get(name)
+                                                if before_value is not None and after_value is not None and after_value < before_value:
+                                                    usage_diagnostics.add("cumulative_counter_reset")
+                                        previous_cumulative = total_values
+                                        usage_event_snapshots.append((total_values, last_values))
+                                        seen_event_snapshots.add(snapshot_key)
+                                    else:
+                                        usage_diagnostics.add("duplicate_token_count_snapshot_ignored")
+                            raw_total = total_values.get("total_tokens")
+                            if raw_total is not None and raw_total >= token_usage["total_tokens"]:
                                 def token_value(name: str) -> int:
-                                    candidate = total.get(name)
-                                    return candidate if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0 else 0
+                                    candidate = total_values.get(name)
+                                    return candidate if candidate is not None else 0
 
                                 token_usage = {
                                     "total_tokens": raw_total,
@@ -1016,6 +1322,8 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
                                     "output_tokens": token_value("output_tokens"),
                                     "reasoning_tokens": token_value("reasoning_output_tokens"),
                                 }
+                    elif payload.get("type") == "token_count":
+                        usage_diagnostics.add("malformed_token_count_usage")
     except OSError:
         malformed += 1
     if not saw_meta:
@@ -1049,6 +1357,24 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
         if _is_volatile(preferred) and not terminal
         else "pending_summary"
     )
+    usage_metadata = _codex_usage_metadata(
+        usage_response_records,
+        usage_event_snapshots,
+        client_version=client_version,
+        diagnostics=usage_diagnostics,
+    )
+    if usage_metadata["availability"] == "complete":
+        if not usage_event_snapshots:
+            for name in ("total_tokens", "input_tokens", "output_tokens"):
+                value = usage_metadata[name]
+                if value is not None:
+                    token_usage[name] = value
+            token_usage["reasoning_tokens"] = usage_metadata["reasoning_output_tokens"] or 0
+        if usage_metadata["total_tokens"] is not None:
+            peak_context_tokens = max(
+                peak_context_tokens,
+                max((item[1]["total_tokens"] or 0 for item in usage_response_records), default=0),
+            )
     return SessionRecord(
         provider="codex",
         source_id=safe_source_id,
@@ -1076,6 +1402,7 @@ def _codex_record(source_id: str, paths: list[Path], *, home: Path | None = None
         context_window_tokens=context_window_tokens,
         peak_context_tokens=peak_context_tokens,
         diagnostics=tuple(diagnostics),
+        usage_metadata=usage_metadata,
     )
 
 

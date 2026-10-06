@@ -290,7 +290,7 @@ class ContextAuditTests(unittest.TestCase):
                         "model_context_window": 1000,
                         "last_token_usage": {"total_tokens": 700},
                         "total_token_usage": {"total_tokens": 900, "input_tokens": 800,
-                                              "output_tokens": 70, "reasoning_output_tokens": 30},
+                                              "output_tokens": 100, "reasoning_output_tokens": 30},
                     },
                 }},
                 {"type": "event_msg", "timestamp": "2026-09-14T00:03:00Z", "payload": {"type": "task_complete"}},
@@ -359,6 +359,206 @@ class ContextAuditTests(unittest.TestCase):
             self.assertEqual(value["models"], ["claude-sonnet-4.6", "claude-opus-4.8"])
             self.assertEqual(value["efforts"], ["medium", "high"])
             self.assertNotIn("private prompt", json.dumps(value))
+
+
+class CodexUsageProjectionTests(unittest.TestCase):
+    session_id = "019fd336-dd42-7e22-894b-d969f2d90408"
+
+    def _record(self, rows: list[dict[str, object]], *, version: str = "0.153.4") -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / f"rollout-{self.session_id}.jsonl"
+            all_rows = [{
+                "type": "session_meta", "timestamp": "2026-09-14T00:00:00Z", "payload": {
+                    "id": self.session_id, "cwd": "/repo",
+                    "timestamp": "2026-09-14T00:00:00Z", "client_version": version,
+                },
+            }, *rows, {"type": "event_msg", "payload": {"type": "task_complete"}}]
+            path.write_text("".join(json.dumps(row) + "\n" for row in all_rows), encoding="utf-8")
+            return history._codex_record(self.session_id, [path], home=Path(temp)).manifest_value()
+
+    @staticmethod
+    def _native(response_id: str, input_tokens: int, cached: int, output_tokens: int, reasoning: int) -> dict[str, object]:
+        return {
+            "type": "response_item", "payload": {
+                "type": "token_usage_record", "response_id": response_id,
+                "token_usage": {
+                    "input_tokens": input_tokens, "cached_input_tokens": cached,
+                    "output_tokens": output_tokens, "reasoning_output_tokens": reasoning,
+                    "total_tokens": input_tokens + output_tokens,
+                },
+            },
+        }
+
+    @staticmethod
+    def _token_count(
+        input_tokens: int, cached: int, output_tokens: int, reasoning: int,
+        total_input: int, total_cached: int, total_output: int, total_reasoning: int,
+    ) -> dict[str, object]:
+        return {
+            "type": "event_msg", "payload": {
+                "type": "token_count", "info": {
+                    "model_context_window": 258400,
+                    "last_token_usage": {
+                        "input_tokens": input_tokens, "cached_input_tokens": cached,
+                        "output_tokens": output_tokens, "reasoning_output_tokens": reasoning,
+                        "total_tokens": input_tokens + output_tokens,
+                    },
+                    "total_token_usage": {
+                        "input_tokens": total_input, "cached_input_tokens": total_cached,
+                        "output_tokens": total_output,
+                        "reasoning_output_tokens": total_reasoning,
+                        "total_tokens": total_input + total_output,
+                    },
+                },
+            },
+        }
+
+    def test_eight_request_views_reconcile_once_and_audit_uses_request_input(self) -> None:
+        requests = [
+            (18580, 9984, 173, 41), (21309, 18176, 400, 238),
+            (24529, 9984, 392, 173), (26895, 20224, 145, 42),
+            (28147, 26368, 160, 12), (28331, 27392, 257, 78),
+            (29809, 27392, 228, 122), (31126, 29440, 265, 192),
+        ]
+        rows: list[dict[str, object]] = []
+        total_input = total_cached = total_output = total_reasoning = 0
+        for index, (inputs, cached, outputs, reasoning) in enumerate(requests, start=1):
+            rows.append(self._native(f"synthetic-response-{index}", inputs, cached, outputs, reasoning))
+            total_input += inputs
+            total_cached += cached
+            total_output += outputs
+            total_reasoning += reasoning
+            rows.append(self._token_count(
+                inputs, cached, outputs, reasoning,
+                total_input, total_cached, total_output, total_reasoning,
+            ))
+        rows.extend((rows[-2], rows[-1]))
+
+        value = self._record(rows)
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "complete")
+        self.assertEqual(usage["cross_check"], "matched")
+        self.assertEqual(usage["source"], "codex-native-token-usage-record")
+        self.assertEqual(usage["cross_check_source"], "codex-event-msg-token-count")
+        self.assertEqual(usage["client_version"], "0.153.4")
+        self.assertEqual(usage["input_tokens"], 208726)
+        self.assertEqual(usage["cached_input_tokens"], 168960)
+        self.assertEqual(usage["output_tokens"], 2020)
+        self.assertEqual(usage["total_tokens"], 210746)
+        self.assertEqual(usage["request_count"], 8)
+        self.assertEqual(usage["max_request_input_tokens"], 31126)
+        self.assertEqual(value["peak_context_tokens"], 31391)
+        self.assertEqual(value["peak_context_semantics"], "input_plus_output_proxy")
+        self.assertIn("duplicate_response_id_ignored", usage["diagnostics"])
+        self.assertIn("duplicate_token_count_snapshot_ignored", usage["diagnostics"])
+
+        report = context_budget.audit(
+            [value], now=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
+            thresholds=context_budget.ContextThresholds(context_pressure_percent=10),
+        )
+        pressure = next(item for item in report["findings"] if item["id"] == "context-pressure")
+        self.assertEqual(pressure["basis"], "request_input")
+        self.assertIn("12.0%", pressure["message"])
+        self.assertEqual(report["context_pressure_basis"]["request_input"], 1)
+
+    def test_cumulative_only_preserves_reported_cache_and_unknown_request_fields(self) -> None:
+        value = self._record([{
+            "type": "event_msg", "payload": {
+                "type": "token_count", "info": {
+                    "total_token_usage": {
+                        "input_tokens": 500, "cached_input_tokens": 320,
+                        "output_tokens": 50, "total_tokens": 550,
+                    },
+                },
+            },
+        }])
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "partial")
+        self.assertEqual(usage["input_tokens"], 500)
+        self.assertEqual(usage["cached_input_tokens"], 320)
+        self.assertIsNone(usage["request_count"])
+        self.assertIsNone(usage["max_request_input_tokens"])
+
+    def test_missing_usage_is_unknown_and_legacy_manifest_peak_is_labeled_proxy(self) -> None:
+        value = self._record([])
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "unavailable")
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["cached_input_tokens"])
+        self.assertIsNone(usage["request_count"])
+        long_version = self._record([], version="9" * 100)["usage_metadata"]
+        self.assertIsNone(long_version["client_version"])
+
+        old_manifest = {
+            "bead_id": "history-safe-legacy", "source_id": "legacy",
+            "started_at": "2026-09-14T00:00:00+00:00", "total_tokens": 210746,
+            "context_window_tokens": 40000, "peak_context_tokens": 31391,
+        }
+        report = context_budget.audit(
+            [old_manifest], now=dt.datetime(2026, 9, 15, tzinfo=dt.timezone.utc),
+        )
+        pressure = next(item for item in report["findings"] if item["id"] == "context-pressure")
+        self.assertEqual(pressure["basis"], "legacy_total_proxy")
+        self.assertIn("78.5%", pressure["message"])
+
+    def test_conflicting_request_and_event_views_are_ambiguous(self) -> None:
+        value = self._record([
+            self._native("synthetic-conflict", 101, 50, 9, 2),
+            self._token_count(100, 50, 10, 2, 100, 50, 10, 2),
+        ])
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "ambiguous")
+        self.assertEqual(usage["cross_check"], "conflict")
+        self.assertIsNone(usage["input_tokens"])
+        self.assertIsNone(usage["max_request_input_tokens"])
+        self.assertIn("usage_view_conflict", usage["diagnostics"])
+        self.assertIn("request_view_conflict", usage["diagnostics"])
+
+    def test_intermediate_cumulative_prefix_conflict_is_not_hidden_by_matching_final_total(self) -> None:
+        value = self._record([
+            self._native("synthetic-prefix-1", 100, 50, 10, 2),
+            self._token_count(100, 50, 10, 2, 90, 50, 20, 2),
+            self._native("synthetic-prefix-2", 200, 100, 20, 4),
+            self._token_count(200, 100, 20, 4, 300, 150, 30, 6),
+        ])
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "ambiguous")
+        self.assertIn("usage_view_conflict", usage["diagnostics"])
+
+    def test_conflicting_duplicate_response_id_is_ambiguous(self) -> None:
+        value = self._record([
+            self._native("synthetic-duplicate", 100, 50, 10, 2),
+            self._native("synthetic-duplicate", 101, 50, 9, 2),
+        ])
+        usage = value["usage_metadata"]
+        self.assertEqual(usage["availability"], "ambiguous")
+        self.assertIsNone(usage["request_count"])
+        self.assertIn("conflicting_duplicate_response_id", usage["diagnostics"])
+
+    def test_cumulative_reset_and_malformed_request_are_ambiguous(self) -> None:
+        first = self._token_count(500, 300, 50, 10, 500, 300, 50, 10)
+        reset = self._token_count(400, 250, 40, 8, 400, 250, 40, 8)
+        reset_value = self._record([first, reset])
+        self.assertEqual(reset_value["usage_metadata"]["availability"], "ambiguous")
+        self.assertIn("cumulative_counter_reset", reset_value["usage_metadata"]["diagnostics"])
+
+        malformed = {
+            "type": "response_item", "payload": {
+                "type": "token_usage_record", "response_id": "synthetic-malformed",
+                "token_usage": {"input_tokens": True, "output_tokens": 7},
+            },
+        }
+        malformed_value = self._record([malformed])
+        self.assertEqual(malformed_value["usage_metadata"]["availability"], "ambiguous")
+        self.assertIn("malformed_response_usage", malformed_value["usage_metadata"]["diagnostics"])
+
+        malformed_event = self._record([{
+            "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": "invalid"},
+            },
+        }])
+        self.assertEqual(malformed_event["usage_metadata"]["availability"], "ambiguous")
+        self.assertIn("malformed_token_count_usage", malformed_event["usage_metadata"]["diagnostics"])
 
 
 class PolicyGuidanceAndReconciliationTests(unittest.TestCase):

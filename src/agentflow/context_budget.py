@@ -90,6 +90,7 @@ def audit(
     effort_counts: dict[str, int] = {}
     role_counts: dict[str, int] = {}
     total_tokens = 0
+    pressure_basis_counts = {"request_input": 0, "legacy_total_proxy": 0, "unavailable": 0}
     for value in selected:
         bead_id = str(value.get("bead_id") or "unknown")
         raw_models = value.get("models")
@@ -125,13 +126,37 @@ def audit(
                     "id": "unapproved-model-route", "severity": "high", "session": bead_id,
                     "message": f"model route {model!r} is ambiguous or disallowed",
                 })
-        window = int(value.get("context_window_tokens") or 0)
-        peak = int(value.get("peak_context_tokens") or 0)
-        pressure = round((peak / window) * 100, 1) if window and peak else 0.0
+        raw_window = value.get("context_window_tokens")
+        window = raw_window if isinstance(raw_window, int) and not isinstance(raw_window, bool) and raw_window > 0 else 0
+        usage = value.get("usage_metadata")
+        request_input = (
+            usage.get("max_request_input_tokens")
+            if isinstance(usage, Mapping)
+            and usage.get("availability") in {"complete", "partial"}
+            else None
+        )
+        if isinstance(request_input, int) and not isinstance(request_input, bool) and request_input >= 0:
+            pressure_basis = "request_input"
+            measured_tokens = request_input
+        else:
+            raw_peak = value.get("peak_context_tokens")
+            if isinstance(raw_peak, int) and not isinstance(raw_peak, bool) and raw_peak > 0:
+                pressure_basis = "legacy_total_proxy"
+                measured_tokens = raw_peak
+            else:
+                pressure_basis = "unavailable"
+                measured_tokens = 0
+        pressure_basis_counts[pressure_basis] += 1
+        pressure = round((measured_tokens / window) * 100, 1) if window and measured_tokens else 0.0
         if pressure >= limits.context_pressure_percent:
             findings.append({
                 "id": "context-pressure", "severity": "medium", "session": bead_id,
-                "message": f"peak context pressure was {pressure:.1f}%",
+                "basis": pressure_basis,
+                "message": (
+                    f"maximum request input pressure was {pressure:.1f}%"
+                    if pressure_basis == "request_input"
+                    else f"legacy input-plus-output proxy pressure was {pressure:.1f}%"
+                ),
             })
         parent = str(value.get("source_id") or "")
         children = child_counts.get(parent, 0)
@@ -155,6 +180,7 @@ def audit(
         "efforts": dict(sorted(effort_counts.items())),
         "roles": dict(sorted(role_counts.items())),
         "recorded_total_tokens": total_tokens,
+        "context_pressure_basis": pressure_basis_counts,
         "findings": findings,
         "finding_counts": {
             severity: sum(item["severity"] == severity for item in findings)
@@ -167,7 +193,9 @@ def audit(
         },
         "measurement_note": (
             "Token counters are provider-recorded metadata when available; provider usage "
-            "dashboards remain authoritative for billed usage and cost."
+            "dashboards remain authoritative for billed usage and cost. Context pressure uses "
+            "maximum request input when available; legacy peak_context_tokens is an "
+            "input-plus-output proxy. Aggregate session totals are not occupancy."
         ),
     }
 
