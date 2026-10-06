@@ -708,6 +708,22 @@ class AgentflowTests(unittest.TestCase):
                 raw = state_file.read_text(encoding="utf-8")
                 self.assertNotIn("SECRETVALUE", raw)
                 self.assertNotIn("TOKENVALUE", raw)
+                # Model a version-skewed history that retained both numbered
+                # launches but omitted the optional top-level attempt field.
+                # The next reservation must use the normalized highwater.
+                state = json.loads(state_file.read_text(encoding="utf-8"))
+                failed = state["sessions"]["task-1"]
+                failed.pop("attempt", None)
+                failed["launch_id"] = "launch-two"
+                failed["attempts"] = [
+                    {"attempt": 1, "launch_id": "launch-one",
+                     "workflow_root": fixture.workflow_root, "status": "failed"},
+                    {"attempt": 2, "launch_id": "launch-two",
+                     "workflow_root": fixture.workflow_root, "status": "failed"},
+                ]
+                failed.pop("binding", None)
+                failed.pop("return_channel", None)
+                cli._private_atomic_json(state_file, state)
                 self.assertEqual(cli.herdr_launch(fixture.launch_args()), 0)
             record = json.loads(state_file.read_text(encoding="utf-8"))["sessions"]["task-1"]
             self.assertEqual(record["status"], "launched")
@@ -715,7 +731,16 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(record["binding"]["launch_id"], record["launch_id"])
             self.assertEqual(record["binding"]["session_id"], "sess-1")
             self.assertEqual(oct(state_file.stat().st_mode & 0o777), "0o600")
-            self.assertEqual(record["attempt"], 2)
+            self.assertEqual(record["attempt"], 3)
+            self.assertEqual(record["workflow_root"], fixture.workflow_root)
+            self.assertEqual(
+                {event["workflow_root"] for event in record["attempts"]},
+                {fixture.workflow_root},
+            )
+            self.assertEqual(
+                len({event["launch_id"] for event in record["attempts"]}), 3,
+            )
+            self.assertEqual(cli.execution_backend.summarize_attempts([record])[0], 3)
 
     def test_launch_fails_closed_on_stale_lease_and_never_spawns(self) -> None:
         """Stale authority: a different owner takes the lease over (rotating
@@ -873,6 +898,9 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(record["status"], "identity_pending")
             self.assertEqual(record["pane_id"], "pane-1")
             self.assertIsNone(record["binding"])
+            self.assertEqual(record["workflow_root"], fixture.workflow_root)
+            self.assertEqual(record["attempts"][0]["workflow_root"], fixture.workflow_root)
+            self.assertEqual(record["attempts"][0]["launch_id"], record["launch_id"])
             # A retry while the pane is live must be rejected, not spawn again.
             with fixture.beads_patches(), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
@@ -924,6 +952,7 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["binding"]["session_id"], "now-resolved-session")
             self.assertEqual(record["binding"]["pane_id"], "pane-real")
+            self.assertEqual(cli.execution_backend.summarize_attempts([record])[0], 1)
 
     def test_resolve_pending_identity_stays_pending_when_still_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -5554,6 +5583,372 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
 class ControllerParallelDispatchTests(unittest.TestCase):
     """The root scheduler admits a bounded launch wave before polling results."""
 
+    def test_dispatch_uses_normalized_history_for_per_task_retry_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            task = dict(fixture.task_issue)
+            state_path = fixture.root / ".agentflow/herdr/sessions.json"
+            cli._private_atomic_json(state_path, {
+                "schema": "agentflow.herdr", "version": 1,
+                "sessions": {
+                    str(task["id"]): {
+                        "root": str(fixture.root),
+                        "workflow_root": fixture.workflow_root,
+                        "task_id": str(task["id"]),
+                        "launch_id": "launch-two",
+                        "status": "completed", "model": fixture.model,
+                        "role": fixture.role,
+                        # Top-level attempt is absent, but exact history proves
+                        # the task has already spent both allowed launches.
+                        "attempts": [
+                            {"attempt": 1, "launch_id": "launch-one", "status": "failed"},
+                            {"attempt": 2, "launch_id": "launch-two", "status": "failed"},
+                        ],
+                    },
+                },
+            })
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller,
+                state_path=cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json",
+            )
+            lease = controller.acquire()
+            policy = cli.execution_backend.ExecutionPolicy(
+                max_parallel_workers=2, max_attempts_per_task=2,
+                launch_budget_multiplier=10, max_expensive_execution_children=0,
+            )
+            args = argparse.Namespace(workflow_root=fixture.workflow_root)
+            handoff = cli.provider_argv_backend.ConfinedHandoff(
+                path=fixture.root / ".agentflow/tmp/handoffs/synthetic.md",
+                manifest={
+                    "context": [], "required_tools": [],
+                    "output_boundary": str(fixture.root),
+                    "machine_return_contract": {"acceptance_ids": ["R1"]},
+                },
+                content_sha256="a" * 64,
+                manifest_sha256="b" * 64,
+                preflight_sha256="c" * 64,
+            )
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task] * 10), \
+                 mock.patch.object(cli.beads_backend, "add_comment") as add_comment, \
+                 mock.patch.object(cli, "_controller_execution_policy", return_value=policy), \
+                 mock.patch.object(cli, "_materialize_launch_handoff", return_value=handoff.path), \
+                 mock.patch.object(cli.provider_argv_backend, "validate_confined_handoff", return_value=handoff), \
+                 mock.patch.object(cli, "_run_actual_root_preflight", return_value=({}, "d" * 64)), \
+                 mock.patch.object(cli, "herdr_launch") as launch:
+                dispatch = cli._dispatch_via_herdr(
+                    args, fixture.root, fixture.root, fixture.workflow_root, lease,
+                )
+                result = dispatch(task)
+
+            self.assertEqual(result["state"], "blocked", result)
+            add_comment.assert_called_once()
+            self.assertIn("task attempt 3 exceeds limit 2", add_comment.call_args.args[2])
+            launch.assert_not_called()
+
+    def test_accounting_key_lookup_rejects_workspace_local_state_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            local_state_home = workspace / ".agentflow/controller-state"
+            local_state_home.mkdir(parents=True)
+            linked_state_home = base / "state-home-link"
+            linked_state_home.symlink_to(local_state_home, target_is_directory=True)
+
+            for state_home in (local_state_home, linked_state_home):
+                with self.subTest(state_home=state_home.name), mock.patch.dict(
+                    os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}
+                ):
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError,
+                        "outside the worker workspace",
+                    ):
+                        cli._accounting_authority_secret(
+                            workspace, "wf-root", continuity_id="old-incarnation",
+                            authority_key_id="a" * 24,
+                        )
+
+    def test_dispatch_accounts_signed_sessions_by_workflow_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            root_a = "root-a"
+            root_b = "root-b"
+            fixture.workflow_root = root_b
+            fixture.root_issue["id"] = root_b
+            task = json.loads(json.dumps(fixture.task_issue))
+            task.update(id="task-b-new", parent=root_b)
+            task["metadata"]["agentflow"].update(root=root_b, task="task-b-new")
+            previous = json.loads(json.dumps(task))
+            previous.update(id="task-b-prior", parent=root_b)
+            previous["metadata"]["agentflow"].update(root=root_b, task="task-b-prior")
+
+            def make_lease(workflow_root: str):
+                state_path = cli._controller_state_dir(fixture.root, workflow_root) / "state.json"
+                controller = cli.controller_backend.RootController(
+                    str(fixture.root), fixture.controller, state_path=state_path,
+                )
+                lease = controller.acquire()
+                _, credentials = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=workflow_root,
+                        resume_key_file="",
+                    ),
+                    lease,
+                )
+                return controller, lease, credentials["authority_secret"]
+
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                controller_a, lease_a, secret_a = make_lease(root_a)
+                _controller_b, lease_b, secret_b = make_lease(root_b)
+                handoff = cli.provider_argv_backend.ConfinedHandoff(
+                    path=fixture.root / ".agentflow/tmp/handoffs/synthetic.md",
+                    manifest={
+                        "context": [], "required_tools": [],
+                        "output_boundary": str(fixture.root),
+                        "machine_return_contract": {"acceptance_ids": ["R1"]},
+                    },
+                    content_sha256="a" * 64,
+                    manifest_sha256="b" * 64,
+                    preflight_sha256="c" * 64,
+                )
+
+                def signed_record(workflow_root, lease, authority_secret, task_id, launches):
+                    current_launch = launches[-1]
+                    minted = cli._mint_return_channel(
+                        fixture.root, workflow_root,
+                        task_id=task_id, actor=fixture.controller,
+                        claim_token="opaque-claim-token-0123456789abcdef0123456789ab",
+                        lease_id=f"lease-{workflow_root}", launch_id=current_launch,
+                        provider="claude", model="claude-sonnet-5", effort="medium",
+                        handoff=handoff, acceptance_ids=("R1",),
+                        state_path=cli._controller_state_dir(fixture.root, workflow_root) / "state.json",
+                        controller_id=lease.controller, lease_epoch=lease.epoch,
+                        continuity_id=lease.continuity_id, authority_secret=authority_secret,
+                    )
+                    events = [
+                        {"attempt": index, "launch_id": launch, "status": "launched"}
+                        for index, launch in enumerate(launches, start=1)
+                    ]
+                    return {
+                        "root": str(fixture.root), "workflow_root": workflow_root,
+                        "task_id": task_id, "launch_id": current_launch,
+                        "attempt": len(launches), "attempts": events,
+                        "status": "completed", "model": "claude-sonnet-5", "role": "coding",
+                        "return_channel": {
+                            "state": "consumed",
+                            "contract_path": str(minted["contract_path"]),
+                            "capability_file": str(minted["capability_path"]),
+                            "contract_sha256": minted["contract_sha256"],
+                            "contract_binding": minted["contract"],
+                            "acceptance_ids": ["R1"], "approved_waivers": [],
+                        },
+                    }
+
+                old_root_records = {
+                    "task-a-one": signed_record(root_a, lease_a, secret_a, "task-a-one", ["a-1"]),
+                    "task-a-two": signed_record(root_a, lease_a, secret_a, "task-a-two", ["a-2"]),
+                }
+                # A normal release/reacquire starts a new continuity and
+                # signing key. Historical snapshots must remain verifiable
+                # for accounting without making the old key live authority.
+                controller_a.release(lease_a)
+                renewed_lease_a = controller_a.acquire()
+                _, renewed_credentials_a = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=root_a,
+                        resume_key_file="",
+                    ),
+                    renewed_lease_a,
+                )
+                self.assertNotEqual(secret_a, renewed_credentials_a["authority_secret"])
+                archive_path = cli._accounting_key_archive_path(
+                    cli._resume_key_path(argparse.Namespace(
+                        root=str(fixture.root), workflow_root=root_a,
+                        resume_key_file="",
+                    )),
+                    lease_a.continuity_id,
+                )
+                self.assertEqual(archive_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    cli._accounting_authority_secret(
+                        fixture.root, root_a,
+                        continuity_id=lease_a.continuity_id,
+                        authority_key_id=cli._credential_key_id(secret_a),
+                    ),
+                    secret_a,
+                )
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._authority_secret(
+                        fixture.root, root_a, continuity_id=lease_a.continuity_id,
+                    )
+
+                state_path = fixture.root / ".agentflow/herdr/sessions.json"
+                cli._private_atomic_json(state_path, {
+                    "schema": "agentflow.herdr", "version": 1,
+                    "sessions": old_root_records,
+                })
+
+                args = argparse.Namespace(
+                    workflow_root=root_b, _authority_secret=secret_b,
+                )
+                policy = cli.execution_backend.ExecutionPolicy(
+                    max_parallel_workers=2, max_attempts_per_task=2,
+                    launch_budget_multiplier=1, max_expensive_execution_children=0,
+                )
+                bead_issues = {root_b: fixture.root_issue, str(task["id"]): task}
+
+                def get_issue(_cwd, issue_id):
+                    return bead_issues.get(issue_id, task)
+
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task, previous]), \
+                     mock.patch.object(cli.beads_backend, "add_comment"), \
+                     mock.patch.object(cli, "_controller_execution_policy", return_value=policy), \
+                     mock.patch.object(cli, "_materialize_launch_handoff", return_value=handoff.path), \
+                     mock.patch.object(cli.provider_argv_backend, "validate_confined_handoff", return_value=handoff), \
+                     mock.patch.object(cli, "_run_actual_root_preflight", return_value=({}, "d" * 64)), \
+                     mock.patch.object(cli, "herdr_launch", return_value=0) as launch:
+                    dispatch = cli._dispatch_via_herdr(
+                        args, fixture.root, fixture.root, root_b, lease_b,
+                    )
+                    admitted = dispatch(task)
+                    self.assertEqual(admitted["state"], "running", admitted)
+                    launch.assert_called_once()
+
+                    conflicting_ids = dict(old_root_records)
+                    conflicting_record = signed_record(
+                        root_b, lease_b, secret_b, "task-b-conflicting-ids", ["launch-two"],
+                    )
+                    conflicting_record["attempts"] = [
+                        {"attempt": 1, "launch_id": "launch-one", "status": "identity_pending"},
+                        {"attempt": 1, "launch_id": "launch-two", "status": "launched",
+                         "resolved_from": "identity_pending"},
+                    ]
+                    conflicting_ids["task-b-conflicting-ids"] = conflicting_record
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": conflicting_ids,
+                    })
+                    conflicting_result = dispatch(task)
+
+                    # The archived key can authenticate the old snapshot for
+                    # accounting only. Result ingestion still requires the
+                    # current controller incarnation and rejects old output.
+                    stale_result_record = json.loads(json.dumps(old_root_records["task-a-one"]))
+                    stale_result_record["return_channel"]["state"] = "issued"
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": {"task-a-one": stale_result_record},
+                    })
+                    stale_result_path = Path(
+                        stale_result_record["return_channel"]["contract_binding"]["result_path"]
+                    )
+                    stale_result_path.write_text(json.dumps({
+                        "outcome": "completed",
+                        "acceptance_results": [{
+                            "acceptance_id": "R1", "status": "passed",
+                            "evidence": "synthetic stale result", "source": "provider",
+                        }],
+                    }), encoding="utf-8")
+                    stale_channel = stale_result_record["return_channel"]
+                    stale_args = argparse.Namespace(
+                        root=str(fixture.root), contract=stale_channel["contract_path"],
+                        file=str(stale_result_path), json=True,
+                        _controller_ingest=True,
+                        _capability_file=stale_channel["capability_file"],
+                        _authority_secret=secret_a,
+                    )
+                    stale_payloads: list[dict] = []
+                    with fixture.beads_patches(), mock.patch.object(
+                        cli, "_json_or_status",
+                        side_effect=lambda payload, **_kwargs: stale_payloads.append(payload),
+                    ):
+                        self.assertEqual(cli.herdr_result(stale_args), 2)
+                    self.assertIn("superseded controller incarnation", stale_payloads[-1]["error"])
+
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": old_root_records,
+                    })
+
+                    own_root_at_cap = dict(old_root_records)
+                    own_root_at_cap["task-b-prior"] = signed_record(
+                        root_b, lease_b, secret_b, "task-b-prior", ["b-1", "b-2"],
+                    )
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": own_root_at_cap,
+                    })
+                    blocked = dispatch(task)
+                    self.assertEqual(blocked["state"], "blocked")
+
+                    corrupt_history = dict(old_root_records)
+                    corrupt_record = signed_record(
+                        root_b, lease_b, secret_b, "task-b-corrupt", ["b-corrupt"],
+                    )
+                    corrupt_record["attempts"] = "corrupt"
+                    corrupt_history["task-b-corrupt"] = corrupt_record
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": corrupt_history,
+                    })
+                    corrupt_result = dispatch(task)
+
+                    tampered = json.loads(json.dumps(old_root_records))
+                    tampered["task-a-one"]["return_channel"]["contract_binding"]["workflow_root"] = root_b
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": tampered,
+                    })
+                    tampered_result = dispatch(task)
+
+                    unknown_ancestry = dict(old_root_records)
+                    unknown_ancestry["legacy-unknown"] = {
+                        "task_id": "legacy-unknown", "root": str(fixture.root),
+                        "attempt": 1, "attempts": [], "status": "completed",
+                    }
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": unknown_ancestry,
+                    })
+                    unknown_result = dispatch(task)
+
+                    legacy_task = {
+                        "id": "legacy-task", "parent": "phase",
+                        "status": "closed", "metadata": {},
+                    }
+                    bead_issues.update({
+                        "legacy-task": legacy_task,
+                        "phase": {"id": "phase", "parent": root_b},
+                    })
+                    # The unsigned field names a valid intermediate ancestor.
+                    # Exact ancestry still proves this spend belongs beneath
+                    # root B, so the retained root cap must include it.
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": {
+                            "legacy-task": {
+                                "root": str(fixture.root),
+                                "workflow_root": "phase",
+                                "task_id": "legacy-task", "attempt": 2,
+                                "attempts": [], "status": "completed",
+                                "model": "claude-sonnet-5", "role": "coding",
+                            },
+                        },
+                    })
+                    legacy_at_cap = dispatch(task)
+
+            self.assertTrue(corrupt_result.get("accounting_indeterminate"), corrupt_result)
+            self.assertTrue(conflicting_result.get("accounting_indeterminate"), conflicting_result)
+            self.assertTrue(tampered_result.get("accounting_indeterminate"), tampered_result)
+            self.assertTrue(unknown_result.get("accounting_indeterminate"), unknown_result)
+            self.assertEqual(legacy_at_cap["state"], "blocked", legacy_at_cap)
+            launch.assert_called_once()
+
     def test_codex_trust_prompt_pauses_parallel_controller_without_relaunch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
@@ -6071,7 +6466,8 @@ class ControllerParallelDispatchTests(unittest.TestCase):
 
     def test_two_authenticated_results_are_dispositioned_out_of_launch_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
             first = dict(fixture.task_issue)
             second = json.loads(json.dumps(fixture.task_issue))
             second.update(id="task-2", title="Second bounded task")
@@ -6197,7 +6593,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                 poll_interval=0.01, deadline=12.0,
             )
             payloads: list[dict] = []
-            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")}), \
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
                  mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
                  mock.patch.object(cli.beads_backend, "root_descendants", side_effect=root_descendants), \
                  mock.patch.object(cli.beads_backend, "claim_ready", side_effect=claim_ready), \

@@ -399,6 +399,164 @@ def _write_resume_key(
     })
 
 
+def _accounting_key_archive_path(canonical_path: Path, continuity_id: str) -> Path:
+    """Return a controller-derived archive path for one incarnation key."""
+    continuity_hash = hashlib.sha256(continuity_id.encode("utf-8")).hexdigest()
+    return canonical_path.parent / "accounting-verification" / f"{continuity_hash}.json"
+
+
+def _credential_key_id(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:24]
+
+
+def _require_external_accounting_storage(path: Path, workspace_root: str) -> None:
+    """Refuse accounting key material stored inside a worker-writable tree."""
+    try:
+        workspace = Path(workspace_root).expanduser().resolve()
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(workspace)
+    except ValueError:
+        return
+    except (OSError, RuntimeError) as exc:
+        raise controller_backend.ControllerError(
+            "canonical accounting credential storage cannot be resolved safely"
+        ) from exc
+    raise controller_backend.ControllerError(
+        "accounting verification material must be stored outside the worker workspace"
+    )
+
+
+def _archive_accounting_authority_key(
+    canonical_path: Path,
+    credentials: Mapping[str, str],
+    *,
+    workspace_root: str,
+    workflow_root: str,
+) -> None:
+    """Retain a prior canonical key only for immutable accounting snapshots."""
+    _require_external_accounting_storage(canonical_path, workspace_root)
+    secret = str(credentials.get("authority_secret") or "")
+    continuity_id = str(credentials.get("continuity_id") or "")
+    if (
+        not secret
+        or not continuity_id
+        or credentials.get("workspace_root") != workspace_root
+        or credentials.get("workflow_root") != workflow_root
+    ):
+        return
+    key_id = _credential_key_id(secret)
+    archive_path = _accounting_key_archive_path(canonical_path, continuity_id)
+    if archive_path.parent.is_symlink():
+        raise controller_backend.ControllerError(
+            "protected accounting verification directory must not be a symlink"
+        )
+    if archive_path.exists() or archive_path.is_symlink():
+        archived = _read_accounting_authority_archive(
+            archive_path, workspace_root=workspace_root,
+            workflow_root=workflow_root, continuity_id=continuity_id,
+            authority_key_id=key_id,
+        )
+        if not hmac.compare_digest(archived, secret):
+            raise controller_backend.ControllerError(
+                "protected accounting verification archive conflicts with the prior controller key"
+            )
+        return
+    _private_atomic_json(archive_path, {
+        "schema": "agentflow.accounting_verification_key",
+        "version": 1,
+        "authority_secret": secret,
+        "authority_key_id": key_id,
+        "continuity_id": continuity_id,
+        "workspace_root": workspace_root,
+        "workflow_root": workflow_root,
+    })
+
+
+def _read_accounting_authority_archive(
+    path: Path,
+    *,
+    workspace_root: str,
+    workflow_root: str,
+    continuity_id: str,
+    authority_key_id: str,
+) -> str:
+    """Load a protected accounting-only key after validating every binding."""
+    if not re.fullmatch(r"[0-9a-f]{24}", authority_key_id):
+        raise controller_backend.ControllerError("signed accounting authority key ID is malformed")
+    if path.is_symlink() or not path.is_file() or path.parent.is_symlink():
+        raise controller_backend.ControllerError("protected accounting verification key is unavailable")
+    try:
+        if os.name == "posix":
+            file_mode = path.stat().st_mode & 0o777
+            directory_mode = path.parent.stat().st_mode & 0o777
+            if file_mode & 0o077 or directory_mode & 0o077:
+                raise controller_backend.ControllerError(
+                    "protected accounting verification key permissions are too broad"
+                )
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise controller_backend.ControllerError(
+            "protected accounting verification key cannot be read"
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise controller_backend.ControllerError("protected accounting verification key is malformed")
+    secret = str(value.get("authority_secret") or "")
+    stored_key_id = str(value.get("authority_key_id") or "")
+    if (
+        value.get("schema") != "agentflow.accounting_verification_key"
+        or value.get("version") != 1
+        or value.get("workspace_root") != workspace_root
+        or value.get("workflow_root") != workflow_root
+        or value.get("continuity_id") != continuity_id
+        or not secret
+        or not re.fullmatch(r"[0-9a-f]{24}", stored_key_id)
+        or not hmac.compare_digest(stored_key_id, authority_key_id)
+        or not hmac.compare_digest(_credential_key_id(secret), stored_key_id)
+    ):
+        raise controller_backend.ControllerError(
+            "protected accounting verification key does not match the signed snapshot"
+        )
+    return secret
+
+
+def _accounting_authority_secret(
+    root: Path,
+    workflow_root: str,
+    *,
+    continuity_id: str,
+    authority_key_id: str,
+) -> str:
+    """Verify snapshot MACs using current or archived accounting-only material."""
+    if not re.fullmatch(r"[0-9a-f]{24}", authority_key_id):
+        raise controller_backend.ControllerError("signed accounting authority key ID is malformed")
+    canonical_args = argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file=""
+    )
+    canonical_path = _resume_key_path(canonical_args)
+    _require_external_accounting_storage(canonical_path, str(root.resolve()))
+    credentials = (
+        {} if canonical_path.is_symlink()
+        else _read_controller_credentials(canonical_path)
+    )
+    if (
+        credentials.get("workspace_root") == str(root.resolve())
+        and credentials.get("workflow_root") == workflow_root
+        and credentials.get("continuity_id") == continuity_id
+        and credentials.get("authority_secret")
+    ):
+        current_secret = credentials["authority_secret"]
+        current_key_id = _credential_key_id(current_secret)
+        if hmac.compare_digest(current_key_id, authority_key_id):
+            return current_secret
+
+    archive_path = _accounting_key_archive_path(canonical_path, continuity_id)
+    return _read_accounting_authority_archive(
+        archive_path,
+        workspace_root=str(root.resolve()), workflow_root=workflow_root,
+        continuity_id=continuity_id, authority_key_id=authority_key_id,
+    )
+
+
 def _controller_credentials(
     args: argparse.Namespace,
     lease: controller_backend.Lease,
@@ -424,6 +582,23 @@ def _controller_credentials(
         )
     root = _root_arg(args)
     workflow_root = str(getattr(args, "workflow_root", "") or "")
+    canonical_args = argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file=""
+    )
+    canonical_path = _resume_key_path(canonical_args)
+    canonical_credentials = (
+        {} if canonical_path.is_symlink()
+        else _read_controller_credentials(canonical_path)
+    )
+    prior_canonical_secret = str(canonical_credentials.get("authority_secret") or "")
+    if prior_canonical_secret and (
+        canonical_credentials.get("continuity_id") != lease.continuity_id
+        or not hmac.compare_digest(prior_canonical_secret, authority_secret)
+    ):
+        _archive_accounting_authority_key(
+            canonical_path, canonical_credentials,
+            workspace_root=str(root.resolve()), workflow_root=workflow_root,
+        )
     _write_resume_key(
         path,
         resume_secret,
@@ -432,10 +607,6 @@ def _controller_credentials(
         workspace_root=str(root),
         workflow_root=workflow_root,
     )
-    canonical_args = argparse.Namespace(
-        root=str(root), workflow_root=workflow_root, resume_key_file=""
-    )
-    canonical_path = _resume_key_path(canonical_args)
     if canonical_path != path:
         # Result/waiver verification never follows a worker-controlled path.
         # Keep a canonical authority-only copy outside the workspace even
@@ -893,6 +1064,164 @@ def _controller_execution_policy(
     return execution_backend.policy_from_root_metadata(root_execution, fallback=settings)
 
 
+def _accounting_indeterminate(message: str) -> execution_backend.AccountingIndeterminate:
+    return execution_backend.AccountingIndeterminate(execution_backend.AccountingFinding(
+        "execution-accounting-indeterminate",
+        message,
+        "Verify the launch record and its signed workflow ancestry before dispatching another worker.",
+    ))
+
+
+def _history_bead_parent(issue: Mapping[str, Any]) -> str:
+    for field in ("parent", "parent_id", "root_id", "workflow_root"):
+        value = issue.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _history_task_ancestry(cwd: Path, task_id: str) -> tuple[str, ...]:
+    """Resolve complete Beads ancestry without readiness or assignee checks."""
+    ancestry: list[str] = []
+    current = task_id
+    while current:
+        if current in ancestry:
+            raise _accounting_indeterminate(
+                f"task {task_id!r} has cyclic Beads ancestry; launch ownership is unknown"
+            )
+        try:
+            issue = beads_backend.get_issue(cwd, current)
+        except (beads_backend.BeadsError, OSError, ValueError) as exc:
+            raise _accounting_indeterminate(
+                f"task {task_id!r} has incomplete Beads ancestry at {current!r}; launch ownership is unknown"
+            ) from exc
+        observed_id = str(issue.get("id") or "")
+        if observed_id != current:
+            raise _accounting_indeterminate(
+                f"Beads returned {observed_id!r} while resolving task {task_id!r}; launch ownership is unknown"
+            )
+        ancestry.append(current)
+        current = _history_bead_parent(issue)
+    return tuple(ancestry)
+
+
+def _workflow_session_records(
+    cwd: Path,
+    root: Path,
+    workflow_root: str,
+    sessions: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Select only records owned by this exact root, failing on unknown history."""
+    if not isinstance(sessions, Mapping):
+        raise _accounting_indeterminate("Herdr session history is malformed; workflow ownership is unknown")
+
+    selected: list[Mapping[str, Any]] = []
+    for raw_task_id, raw_record in sessions.items():
+        task_id = str(raw_task_id or "")
+        if not task_id or not isinstance(raw_record, Mapping):
+            raise _accounting_indeterminate("Herdr session history contains an unidentified record")
+        record = raw_record
+        recorded_task = str(record.get("task_id") or task_id)
+        if recorded_task != task_id:
+            raise _accounting_indeterminate(
+                f"Herdr task identity conflicts with session key {task_id!r}; launch ownership is unknown"
+            )
+        recorded_workspace = str(record.get("root") or "")
+        if recorded_workspace and recorded_workspace != str(root.resolve()):
+            raise _accounting_indeterminate(
+                f"Herdr workspace identity conflicts for task {task_id!r}; launch ownership is unknown"
+            )
+
+        channel = record.get("return_channel")
+        if channel is not None and not isinstance(channel, Mapping):
+            raise _accounting_indeterminate(
+                f"task {task_id!r} has a malformed return-contract snapshot; launch ownership is unknown"
+            )
+        snapshot_fields = ("contract_binding", "contract_sha256", "contract_path")
+        snapshot_present = isinstance(channel, Mapping) and any(field in channel for field in snapshot_fields)
+        if snapshot_present:
+            binding = channel.get("contract_binding")
+            digest = str(channel.get("contract_sha256") or "")
+            contract_path_value = str(channel.get("contract_path") or "")
+            if (
+                not isinstance(binding, Mapping)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not contract_path_value
+            ):
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} has an incomplete signed return-contract snapshot"
+                )
+            signed_root = str(binding.get("workflow_root") or "")
+            continuity_id = str(binding.get("continuity_id") or "")
+            if not signed_root or not continuity_id:
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed snapshot lacks workflow or controller identity"
+                )
+            try:
+                authority_secret = _accounting_authority_secret(
+                    root, signed_root, continuity_id=continuity_id,
+                    authority_key_id=str(binding.get("authority_key_id") or ""),
+                )
+                _verify_return_contract_binding(
+                    binding, Path(contract_path_value), task_id, record,
+                    root=root, authority_secret=authority_secret, require_issued=False,
+                )
+            except (controller_backend.ControllerError, OSError, ValueError, TypeError) as exc:
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed return-contract snapshot cannot be verified: {exc}"
+                ) from exc
+            if _canonical_json_digest(binding) != digest:
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed return-contract digest does not match its snapshot"
+                )
+            if str(binding.get("workspace_root") or "") != str(root.resolve()):
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed snapshot belongs to another workspace"
+                )
+            if str(binding.get("task_id") or "") != task_id:
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed snapshot has conflicting task identity"
+                )
+            record_launch = str(record.get("launch_id") or "")
+            if not record_launch or record_launch != str(binding.get("launch_id") or ""):
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed snapshot has conflicting launch identity"
+                )
+            record_binding = record.get("binding")
+            if record_binding is not None:
+                if not isinstance(record_binding, Mapping):
+                    raise _accounting_indeterminate(
+                        f"task {task_id!r} provider binding is malformed"
+                    )
+                for field, expected in (
+                    ("root", str(root.resolve())), ("task_id", task_id),
+                    ("launch_id", str(binding.get("launch_id") or "")),
+                ):
+                    observed = str(record_binding.get(field) or "")
+                    if not observed or observed != expected:
+                        raise _accounting_indeterminate(
+                            f"task {task_id!r} provider binding conflicts with signed {field} identity"
+                        )
+            recorded_root = str(record.get("workflow_root") or "")
+            if recorded_root and recorded_root != signed_root:
+                raise _accounting_indeterminate(
+                    f"task {task_id!r} signed snapshot conflicts with its workflow-root field"
+                )
+            if signed_root == workflow_root:
+                selected.append(record)
+            continue
+
+        ancestry = _history_task_ancestry(cwd, task_id)
+        recorded_root = str(record.get("workflow_root") or "")
+        if recorded_root and recorded_root not in ancestry:
+            raise _accounting_indeterminate(
+                f"legacy task {task_id!r} workflow root is not proven by its Beads ancestry"
+            )
+        if workflow_root in ancestry:
+            selected.append(record)
+    return selected
+
+
 def _dispatch_via_herdr(
     args: argparse.Namespace, root: Path, cwd: Path, workflow_root: str, lease: controller_backend.Lease,
 ) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
@@ -923,14 +1252,21 @@ def _dispatch_via_herdr(
             launch_policy = _controller_execution_policy(
                 cwd, root, workflow_root, root_issue=root_issue
             )
-            current_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
-            session_values = [
-                value for value in current_state.get("sessions", {}).values()
-                if isinstance(value, Mapping)
-            ]
+            try:
+                current_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+            except (OSError, ValueError) as exc:
+                raise _accounting_indeterminate(
+                    f"Herdr session history is corrupt; root launch accounting is unavailable: {exc}"
+                ) from exc
+            session_values = _workflow_session_records(
+                cwd, root, workflow_root, current_state.get("sessions", {})
+            )
             total_attempts, active_workers, expensive_children = execution_backend.summarize_attempts(session_values)
             existing = current_state.get("sessions", {}).get(task_id)
-            task_attempt = int(existing.get("attempt") or 0) + 1 if isinstance(existing, Mapping) else 1
+            task_attempt = (
+                execution_backend.attempt_count(existing) + 1
+                if isinstance(existing, Mapping) else 1
+            )
             descendants = beads_backend.root_descendants(cwd, workflow_root)
             planned_tasks = sum(bool(_launch_task_metadata(item)) for item in descendants)
             admission = execution_backend.evaluate_launch(
@@ -948,6 +1284,17 @@ def _dispatch_via_herdr(
                     + "; ".join(finding.message for finding in admission.findings),
                 )
                 return {"state": "blocked", "session_id": ""}
+        except execution_backend.AccountingIndeterminate as exc:
+            beads_backend.add_comment(
+                cwd, task_id,
+                "agentflow launch accounting indeterminate: " + exc.finding.message
+                + " " + exc.finding.recommendation,
+            )
+            return {
+                "state": "blocked", "session_id": "",
+                "accounting_indeterminate": True,
+                "reason": exc.finding.message,
+            }
         except (project_config_backend.ConfigError, execution_backend.ExecutionPolicyError, ValueError):
             return {"state": "blocked", "session_id": ""}
 
@@ -3498,7 +3845,12 @@ def _resolve_pending_identity(root: Path, task_id: str) -> bool:
         }
         record["status"] = "launched"
         record.pop("startup_attention", None)
-        record.setdefault("attempts", []).append({"status": "launched", "resolved_from": "identity_pending"})
+        record.setdefault("attempts", []).append({
+            "attempt": int(record.get("attempt") or 1),
+            "launch_id": str(record.get("launch_id") or ""),
+            "workflow_root": str(record.get("workflow_root") or ""),
+            "status": "launched", "resolved_from": "identity_pending",
+        })
         return True
 
 
@@ -3785,7 +4137,9 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     record["status"] = "failed"
                     record["error"] = {"code": code}
                     record.setdefault("attempts", []).append(
-                        {"attempt": attempt, "status": "failed", "error": record["error"]}
+                        {"attempt": attempt, "launch_id": launch_id,
+                         "workflow_root": workflow_root, "status": "failed",
+                         "error": record["error"]}
                     )
 
         def _mark_ambiguous_start(exc: subprocess.TimeoutExpired) -> None:
@@ -3842,6 +4196,8 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 record["startup_attention"] = attention
                 record.setdefault("attempts", []).append({
                     "attempt": attempt,
+                    "launch_id": launch_id,
+                    "workflow_root": workflow_root,
                     "status": "ambiguous",
                     "reason": "herdr_start_timeout",
                 })
@@ -3896,12 +4252,13 @@ def herdr_launch(args: argparse.Namespace) -> int:
                             raise herdr_backend.HerdrError(
                                 f"collision: task {task_id!r} has an active or completed Herdr binding"
                             )
-                        attempt = int(existing.get("attempt") or 1) + 1
+                        attempt = execution_backend.attempt_count(existing) + 1
                         attempts = list(existing.get("attempts") or [])
                     else:
                         attempts = []
                     reservation = {
-                        "root": str(root), "task_id": task_id,
+                        "root": str(root), "workflow_root": workflow_root,
+                        "task_id": task_id,
                         "claim_id": str(identity["claim_id"]), "lease_id": lease_id,
                         "claim_token_sha256": hashlib.sha256(
                             str(identity.get("claim_token") or "").encode("utf-8")
@@ -4043,7 +4400,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     raise ValueError("Herdr launch reservation was replaced")
                 record["status"] = "failed"
                 record["error"] = {"code": error_code, "exit_code": launched.returncode if launched else None}
-                record.setdefault("attempts", []).append({"attempt": attempt, "status": "failed", "error": record["error"]})
+                record.setdefault("attempts", []).append({
+                    "attempt": attempt, "launch_id": launch_id,
+                    "workflow_root": workflow_root, "status": "failed",
+                    "error": record["error"],
+                })
             payload = {"operation": "launch", "ok": False, "retryable": True,
                        "state_path": str(state_path), "task_id": task_id,
                        "status": "failed", "error": {"code": error_code}}
@@ -4075,7 +4436,9 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     # LOOP_DEADLINE_EXCEEDED with the pane/lease stranded).
                     record.setdefault("identity_pending_since", _now())
                     record.setdefault("attempts", []).append(
-                        {"attempt": attempt, "status": "identity_pending", "pane_id": exc.pane_id}
+                        {"attempt": attempt, "launch_id": launch_id,
+                         "workflow_root": workflow_root, "status": "identity_pending",
+                         "pane_id": exc.pane_id}
                     )
             payload = {
                 "operation": "launch", "ok": True, "state_path": str(state_path),
@@ -4106,14 +4469,19 @@ def herdr_launch(args: argparse.Namespace) -> int:
                             record["status"] = "failed"
                             record["error"] = {"code": "authority_superseded"}
                             record.setdefault("attempts", []).append(
-                                {"attempt": attempt, "status": "failed", "error": record["error"]}
+                                {"attempt": attempt, "launch_id": launch_id,
+                                 "workflow_root": workflow_root, "status": "failed",
+                                 "error": record["error"]}
                             )
                     else:
                         if not isinstance(record, dict) or record.get("status") != "launching":
                             raise ValueError("Herdr launch reservation was replaced")
                         record["binding"] = binding.to_dict()
                         record["status"] = "launched"
-                        record.setdefault("attempts", []).append({"attempt": attempt, "status": "launched", "launch_id": binding.launch_id})
+                        record.setdefault("attempts", []).append({
+                            "attempt": attempt, "launch_id": binding.launch_id,
+                            "workflow_root": workflow_root, "status": "launched",
+                        })
         except controller_backend.FencedLease as exc:
             authority_failure = str(exc)
             _mark_failed("authority_superseded")
@@ -4199,10 +4567,13 @@ def _verify_return_contract_binding(
     *,
     root: Path,
     authority_secret: str,
+    require_issued: bool = True,
 ) -> Mapping[str, Any]:
     """Verify the immutable launch snapshot before any result disposition."""
     channel = record.get("return_channel")
-    if not isinstance(channel, Mapping) or channel.get("state") != "issued":
+    if not isinstance(channel, Mapping):
+        raise ValueError("return contract snapshot is unavailable")
+    if require_issued and channel.get("state") != "issued":
         raise ValueError("return capability is already consumed or unavailable")
     binding = channel.get("contract_binding")
     digest = str(channel.get("contract_sha256") or "")
