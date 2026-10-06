@@ -58,6 +58,9 @@ own skills and instructions remain authoritative.
 See [Conditional prose quality](docs/PROSE_QUALITY.md) for controller-driven
 blog, documentation, and Instruqt examples.
 
+The experimental, opt-in [Codex SDK integration](docs/CODEX_SDK.md) documents
+its setup boundary, diagnostics, consent requirements, and observability limits.
+
 ## How the components fit together
 
 Agentflow is the coordination layer between a human-approved goal, durable

@@ -24,12 +24,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Copilot's existing response shape is preserved without a new provider-limit
   claim.
 
+- Documented the experimental, opt-in Codex SDK integration and its diagnostic,
+  consent, workflow-authority, and session-observability boundaries.
+
 ### Changed
 
 - Separated provider quota provenance from local task outcomes and yield
   measurements. `agentflow usage yield` now reads its default single-record
   JSONL history correctly while preserving the task-class report.
-
 ### Fixed
 
 - Managed Herdr launches now clear inherited Python import and home overrides so
