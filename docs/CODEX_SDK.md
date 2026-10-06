@@ -17,8 +17,9 @@ pipx install '.[codex]'
 ```
 
 Keep the extra out of the default installation if you do not need the SDK.
-Select the transport explicitly in the top-level `codex` project setting in
-`.agentflow/config.json`; existing configurations continue to use Herdr:
+Merge this setting into the existing top-level config in
+`.agentflow/config.json` or the ignored `.agentflow/config.local.json`; do not
+replace the full config file. Existing configurations continue to use Herdr:
 
 ```json
 {
@@ -37,7 +38,8 @@ a standalone unauthenticated worker-run command. Review the resolved
 configuration and run local diagnostics before launching work. Do not copy
 provider credentials into project configuration.
 
-The SDK uses the Codex CLI runtime and the user's existing ChatGPT/Codex
+The SDK uses its own pinned Codex runtime, not necessarily the globally
+installed `codex` executable, and the user's existing ChatGPT/Codex
 authentication. Authentication and availability remain controlled by OpenAI
 and the user's account. Check the optional integration without starting an
 inference or paid worker turn:
@@ -71,7 +73,10 @@ an inference or worker, change authentication, or modify configuration. Report
 only the supported/redacted diagnostic fields and any unavailable checks.
 ```
 
-Then authorize a bounded workflow separately, using its placeholder ID:
+The next prompt is planning-only. To approve execution after reviewing the
+persisted contract, use [the chat workflow's approval and run step](CHAT_WORKFLOWS.md#3-approve-and-run-one-persistent-controller).
+That approval authorizes the persistent controller to continue within the
+root's saved limits; it does not require approval for each wave.
 
 ```text
 For Agentflow workflow [workflow-id], inspect the approved contract and exact
