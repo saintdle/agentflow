@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in paired baseline/treatment usage evaluation with explicit case
+  IDs, provider/model/effort boundaries, accepted-result deltas, observed task
+  metrics, and visible missing, invalid, unmatched, or duplicate data.
+
+### Changed
+
+- Separated provider quota provenance from local task outcomes and yield
+  measurements. `agentflow usage yield` now reads its default single-record
+  JSONL history correctly while preserving the task-class report.
+
 ### Fixed
 
 - Launch budgets now count each reserved attempt once across pending and resolved

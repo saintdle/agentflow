@@ -6305,14 +6305,38 @@ def usage_record(args: argparse.Namespace) -> int:
     remaining = legacy_remaining if legacy_remaining is not None else remaining_after
     findings = getattr(args, "findings", None)
     accepted_findings = getattr(args, "accepted_findings", None)
-    if getattr(args, "retries", 0) < 0:
-        print("--retries cannot be negative.", file=sys.stderr)
+    elapsed_seconds = getattr(args, "elapsed_seconds", None)
+    for field in ("remaining", "remaining_before", "remaining_after", "credits_used", "elapsed_seconds"):
+        value = getattr(args, field, None)
+        if value is not None:
+            try:
+                finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                print(f"--{field.replace('_', '-')} must be a finite number.", file=sys.stderr)
+                return 2
+    if elapsed_seconds is not None and elapsed_seconds < 0:
+        print("--elapsed-seconds must be a finite non-negative number.", file=sys.stderr)
+        return 2
+    retries = getattr(args, "retries", None)
+    evaluation_identity = any(getattr(args, field, "") for field in ("evaluation_id", "variant", "case_id"))
+    if retries is None and not evaluation_identity:
+        retries = 0  # Preserve the legacy record default; evaluation omissions stay unknown.
+    for field in ("retries", "rework_rounds", "unrequested_changes", "human_interventions"):
+        value = getattr(args, field, None)
+        if value is not None and value < 0:
+            print(f"--{field.replace('_', '-')} cannot be negative.", file=sys.stderr)
+            return 2
+    accepted_result = getattr(args, "accepted_result", "")
+    if accepted_result not in {"", "accepted", "rejected"}:
+        print("--accepted-result must be accepted or rejected.", file=sys.stderr)
         return 2
     if findings is not None and accepted_findings is not None and accepted_findings > findings:
         print("--accepted-findings cannot exceed --findings.", file=sys.stderr)
         return 2
     try:
-        for field in ("auth_mode", "plan", "model", "effort", "project", "task", "role", "window", "reset_at", "outcome", "source", "note"):
+        for field in ("auth_mode", "plan", "model", "effort", "project", "task", "role", "task_class", "evaluation_id", "variant", "case_id", "window", "reset_at", "outcome", "source", "note"):
             value = getattr(args, field, "")
             if value:
                 privacy_backend.require_safe_text(value, field, limit=1_000)
@@ -6333,19 +6357,26 @@ def usage_record(args: argparse.Namespace) -> int:
         "task": getattr(args, "task", ""),
         "role": getattr(args, "role", ""),
         "task_class": getattr(args, "task_class", ""),
+        "evaluation_id": getattr(args, "evaluation_id", ""),
+        "variant": getattr(args, "variant", ""),
+        "case_id": getattr(args, "case_id", ""),
         "remaining_percent": remaining,
         "remaining_before_percent": getattr(args, "remaining_before", None),
         "remaining_after_percent": remaining_after,
         "credits_used": getattr(args, "credits_used", None),
         "window": args.window,
         "reset_at": args.reset_at,
-        "elapsed_seconds": getattr(args, "elapsed_seconds", None),
-        "retries": getattr(args, "retries", 0),
+        "elapsed_seconds": elapsed_seconds,
+        "retries": retries,
         "checks": getattr(args, "check", []),
         "files": getattr(args, "files", None),
         "bytes": getattr(args, "bytes", None),
         "findings": findings,
         "accepted_findings": accepted_findings,
+        "accepted_result": accepted_result,
+        "rework_rounds": getattr(args, "rework_rounds", None),
+        "unrequested_changes": getattr(args, "unrequested_changes", None),
+        "human_interventions": getattr(args, "human_interventions", None),
         "outcome": getattr(args, "outcome", ""),
         "source": args.source,
         "measurement_authority": usage_backend.measurement_authority(args.source),
@@ -6510,18 +6541,42 @@ def config_hooks_merge(args: argparse.Namespace) -> int:
 
 def usage_yield(args: argparse.Namespace) -> int:
     try:
-        value = _read_json_value(args.file) if args.file else _read_json_value(str(_state_dir() / "usage.jsonl"))
+        value = _read_json_value(args.file) if args.file else _read_jsonl(_state_dir() / "usage.jsonl")
     except (OSError, json.JSONDecodeError) as exc:
-        if args.file:
-            print(f"usage yield: {exc}", file=sys.stderr)
-            return 2
-        value = _read_jsonl(_state_dir() / "usage.jsonl")
+        print(f"usage yield: {exc}", file=sys.stderr)
+        return 2
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         print("usage yield: input must be a JSON list of usage records", file=sys.stderr)
         return 2
+    if getattr(args, "evaluation", False):
+        result = {"evaluation": usage_backend.evaluation_report(value)}
+        print(json.dumps(result, indent=2, sort_keys=True) if args.json else _format_usage_evaluation(result["evaluation"]))
+        return 0
     result = usage_backend.report(value)
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else "\n".join(f"{item['task_class']}: success={item['success_yield']:.1%} evidence={item['evidence_yield'] if item['evidence_yield'] is not None else 'n/a'} ({item['measurement']})" for item in result["task_classes"]) or "No comparable task-class records.")
     return 0
+
+
+def _format_usage_evaluation(value: Mapping[str, Any]) -> str:
+    lines = [f"Evaluation records: {value['records']}"]
+    for cohort in value["cohorts"]:
+        lines.append("/".join((cohort["evaluation_id"], cohort["task_class"], cohort["provider"], cohort["model"], cohort["effort"])))
+        for variant, summary in cohort["variants"].items():
+            lines.append(f"  {variant}: attempts={summary['attempts']} completed={summary['completed']} usage={summary['usage_measurement_authority']}; outcomes/metrics=local observations")
+        for comparison in cohort["comparisons"]:
+            lines.append(f"  baseline vs treatment: matched={comparison['matched_cases']} unmatched={comparison['unmatched_cases']} ambiguous-cases={comparison['ambiguous_duplicate_cases']} ambiguous-records={comparison['ambiguous_duplicate_records']}")
+            accepted = comparison["accepted_results"]
+            lines.append(f"    accepted results: baseline={accepted['counts']['baseline']} treatment={accepted['counts']['treatment']} complete={accepted['complete_pairs']} missing={accepted['missing_pairs']} accepted-count-delta={accepted['accepted_count_delta']} acceptance-rate-delta={accepted['acceptance_rate_delta'] if accepted['acceptance_rate_delta'] is not None else 'n/a'}")
+            for metric, delta in comparison["metric_deltas"].items():
+                metric_value = delta["mean_treatment_minus_baseline"]
+                shown = "n/a" if metric_value is None else f"{metric_value:g}"
+                lines.append(f"    {metric} (local): treatment-baseline={shown} n={delta['n']} missing={delta['missing']} invalid={delta['invalid']}")
+    if value["excluded"]:
+        lines.append(f"Excluded records: {json.dumps(value['excluded'], sort_keys=True)}")
+    if not value["cohorts"]:
+        lines.append("No comparable evaluation cohorts.")
+    lines.append(value["note"])
+    return "\n".join(lines)
 
 
 def usage_optimize(args: argparse.Namespace) -> int:
@@ -10291,6 +10346,9 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--task", default="")
     record_parser.add_argument("--role", default="")
     record_parser.add_argument("--task-class", choices=TASK_CLASSES, default="")
+    record_parser.add_argument("--evaluation-id", default="", help="Shared ID for a paired evaluation run")
+    record_parser.add_argument("--variant", choices=("baseline", "treatment"), default="")
+    record_parser.add_argument("--case-id", default="", help="Stable task case identifier used to pair variants")
     record_parser.add_argument("--remaining", type=float)
     record_parser.add_argument("--remaining-before", type=float)
     record_parser.add_argument("--remaining-after", type=float)
@@ -10298,18 +10356,23 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--window", default="")
     record_parser.add_argument("--reset-at", default="")
     record_parser.add_argument("--elapsed-seconds", type=float)
-    record_parser.add_argument("--retries", type=int, default=0)
+    record_parser.add_argument("--retries", type=int, help="Observed retry count; omitted evaluation values remain unknown")
     record_parser.add_argument("--check", action="append", default=[])
     record_parser.add_argument("--files", type=int)
     record_parser.add_argument("--bytes", type=int)
     record_parser.add_argument("--findings", type=int)
     record_parser.add_argument("--accepted-findings", type=int)
+    record_parser.add_argument("--accepted-result", choices=("accepted", "rejected"), default="", help="Observed acceptance of this task result; omitted values remain unknown")
+    record_parser.add_argument("--rework-rounds", type=int, help="Observed correction or rework rounds")
+    record_parser.add_argument("--unrequested-changes", type=int, help="Observed changes outside the requested scope")
+    record_parser.add_argument("--human-interventions", type=int, help="Observed human interventions during the run")
     record_parser.add_argument("--outcome", default="")
     record_parser.add_argument("--source", default="manual")
     record_parser.add_argument("--note", default="")
     record_parser.set_defaults(func=usage_record)
     yield_parser = usage_sub.add_parser("yield", help="Compare accepted-result yield within identical task classes")
     yield_parser.add_argument("--file", default="", help="JSON list, or omit to use local usage records")
+    yield_parser.add_argument("--evaluation", action="store_true", help="Report paired cohorts within matching evaluation identities")
     yield_parser.add_argument("--json", action="store_true")
     yield_parser.set_defaults(func=usage_yield)
     optimize_parser = usage_sub.add_parser(
