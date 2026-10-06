@@ -4611,6 +4611,12 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         f"AGENTFLOW_SUBMISSION_FILE={return_channel['submission_path']}",
                         f"AGENTFLOW_HERDR_AGENT_NAME={agent_name}",
                         f"AGENTFLOW_TASK_ID={task_id}",
+                        # Herdr's daemon can outlive this controller and keep
+                        # an older AGENTFLOW_STATE_HOME in its environment.
+                        # Pin the managed provider and its lifecycle hooks to
+                        # the state root this controller actually uses so
+                        # model evidence lands in the spool we verify.
+                        f"AGENTFLOW_STATE_HOME={_state_dir().expanduser().resolve()}",
                     ]
                     launch_env: list[str] = []
                     # Fix #2: the installed Herdr API is `herdr agent start
