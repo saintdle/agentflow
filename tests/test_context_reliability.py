@@ -131,6 +131,68 @@ class ContextAuditTests(unittest.TestCase):
             {item["id"] for item in report["findings"]},
         )
 
+    def test_launch_attempt_accounting_collapses_lifecycle_events(self) -> None:
+        pending = {
+            "attempt": 1,
+            "launch_id": "launch-one",
+            "status": "identity_pending",
+            "model": "gpt-6-sol",
+            "role": "coding",
+            "attempts": [
+                {"attempt": 1, "launch_id": "launch-one", "status": "identity_pending"},
+                {"attempt": 1, "launch_id": "launch-one", "status": "launched",
+                 "resolved_from": "identity_pending"},
+            ],
+        }
+        retry = {
+            "attempt": 2,
+            "attempts": [
+                {"attempt": 1, "launch_id": "launch-one", "status": "failed"},
+                {"attempt": 2, "launch_id": "launch-two", "status": "launched"},
+            ],
+        }
+        reservation = {"attempt": 1, "attempts": [], "status": "launching"}
+        failed_start = {
+            "attempt": 1,
+            "attempts": [{"attempt": 1, "launch_id": "launch-failed", "status": "failed"}],
+            "status": "failed",
+        }
+        ambiguous = {
+            "attempt": 1,
+            "attempts": [{"attempt": 1, "launch_id": "launch-ambiguous", "status": "ambiguous"}],
+            "status": "launching",
+        }
+
+        self.assertEqual(execution.summarize_attempts([pending]), (1, 1, 1))
+        self.assertEqual(execution.summarize_attempts([retry])[0], 2)
+        self.assertEqual(execution.summarize_attempts([reservation])[0], 1)
+        self.assertEqual(execution.summarize_attempts([failed_start])[0], 1)
+        self.assertEqual(execution.summarize_attempts([ambiguous])[0], 1)
+        self.assertEqual(execution.summarize_attempts([{"attempts": [{}, {}, {}]}])[0], 3)
+
+        report = context_budget.add_execution_attempts(
+            context_budget.audit([], days=30), {"task-1": pending},
+            policy=execution.ExecutionPolicy(max_attempts_per_task=1),
+        )
+        self.assertEqual(report["execution"]["recorded_attempts"], 1)
+        self.assertEqual(report["execution"]["active_workers"], 1)
+        self.assertEqual(report["execution"]["expensive_execution_children"], 1)
+        self.assertEqual(report["execution"]["tasks_over_attempt_budget"], 0)
+
+    def test_corrupt_attempt_history_is_an_actionable_audit_finding(self) -> None:
+        report = context_budget.add_execution_attempts(
+            context_budget.audit([], days=30),
+            {"task-1": {"attempt": 1, "attempts": "corrupt", "status": "running"}},
+            policy=execution.ExecutionPolicy(),
+        )
+
+        self.assertTrue(report["execution"]["accounting_indeterminate"])
+        self.assertIsNone(report["execution"]["recorded_attempts"])
+        finding = next(item for item in report["findings"]
+                       if item["id"] == "execution-accounting-indeterminate")
+        self.assertEqual(finding["severity"], "high")
+        self.assertTrue(finding["recommendation"])
+
     def test_codex_scanner_extracts_only_bounded_metadata(self) -> None:
         session_id = "019fd336-dd42-7e22-894b-d969f2d90404"
         with tempfile.TemporaryDirectory() as temp:

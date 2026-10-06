@@ -183,13 +183,30 @@ def add_execution_attempts(
     result = dict(report)
     findings = list(result.get("findings") or [])
     values = [value for value in sessions.values() if isinstance(value, Mapping)]
-    total, active, expensive = execution.summarize_attempts(values)
+    accounting_errors: dict[str, execution.AccountingFinding] = {}
+    try:
+        total, active, expensive = execution.summarize_attempts(values)
+    except execution.AccountingIndeterminate:
+        total = active = expensive = None
+        for task_id, record in sessions.items():
+            if not isinstance(record, Mapping):
+                continue
+            try:
+                execution.attempt_count(record)
+            except execution.AccountingIndeterminate as exc:
+                accounting_errors[str(task_id)] = exc.finding
+                findings.append({
+                    "id": exc.finding.id, "severity": "high",
+                    "session": str(task_id), "message": exc.finding.message,
+                    "recommendation": exc.finding.recommendation,
+                })
     over_budget: list[dict[str, Any]] = []
     for task_id, record in sessions.items():
         if not isinstance(record, Mapping):
             continue
-        attempts = record.get("attempts")
-        count = len(attempts) if isinstance(attempts, list) else int(bool(record.get("attempt")))
+        if str(task_id) in accounting_errors:
+            continue
+        count = execution.attempt_count(record)
         if count > policy.max_attempts_per_task:
             finding = {
                 "id": "task-attempt-budget-exceeded", "severity": "high",
@@ -209,6 +226,8 @@ def add_execution_attempts(
         "active_workers": active,
         "expensive_execution_children": expensive,
         "tasks_over_attempt_budget": len(over_budget),
+        "accounting_indeterminate": bool(accounting_errors),
+        "indeterminate_tasks": sorted(accounting_errors),
     }
     return result
 

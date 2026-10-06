@@ -42,6 +42,21 @@ class ExecutionPolicyError(ValueError):
 
 
 @dataclasses.dataclass(frozen=True)
+class AccountingFinding:
+    id: str
+    message: str
+    recommendation: str
+
+
+class AccountingIndeterminate(ExecutionPolicyError):
+    """A launch history cannot be safely included in or excluded from a budget."""
+
+    def __init__(self, finding: AccountingFinding) -> None:
+        super().__init__(finding.message)
+        self.finding = finding
+
+
+@dataclasses.dataclass(frozen=True)
 class ExecutionPolicy:
     controller_only: bool = True
     max_parallel_workers: int = 3
@@ -205,8 +220,7 @@ def summarize_attempts(sessions: Iterable[Mapping[str, Any]]) -> tuple[int, int,
     total = active = expensive = 0
     active_states = {"launching", "launched", "identity_pending", "running"}
     for record in sessions:
-        attempts = record.get("attempts")
-        total += len(attempts) if isinstance(attempts, list) else int(bool(record.get("attempt")))
+        total += attempt_count(record)
         if str(record.get("status") or "") in active_states:
             active += 1
         if str(record.get("model") or "") in EXPENSIVE_MODELS and str(record.get("role") or "") in EXECUTION_ROLES:
@@ -214,9 +228,99 @@ def summarize_attempts(sessions: Iterable[Mapping[str, Any]]) -> tuple[int, int,
     return total, active, expensive
 
 
+def attempt_count(record: Mapping[str, Any]) -> int:
+    """Count distinct reserved launches, collapsing events from one launch.
+
+    New events carry a launch ID. Older history often carries only the task
+    attempt number, while very old anonymous rows remain conservatively
+    additive. The record-level attempt preserves an empty reservation and
+    histories whose lifecycle row was not yet appended.
+    """
+
+    raw_attempt = record.get("attempt")
+    if raw_attempt in (None, ""):
+        record_attempt = 0
+    elif isinstance(raw_attempt, int) and not isinstance(raw_attempt, bool) and raw_attempt > 0:
+        record_attempt = raw_attempt
+    else:
+        raise _accounting_indeterminate("record-level launch attempt is malformed")
+    record_launch = record.get("launch_id")
+    if record_launch not in (None, "") and not isinstance(record_launch, str):
+        raise _accounting_indeterminate("record-level launch ID is malformed")
+    record_binding = record.get("binding")
+    if record_binding is not None and not isinstance(record_binding, Mapping):
+        raise _accounting_indeterminate("provider binding is malformed")
+    binding_launch = record_binding.get("launch_id") if isinstance(record_binding, Mapping) else None
+    if binding_launch not in (None, "") and not isinstance(binding_launch, str):
+        raise _accounting_indeterminate("provider binding launch ID is malformed")
+
+    raw_events = record.get("attempts")
+    if raw_events is None:
+        return record_attempt
+    if not isinstance(raw_events, list):
+        raise _accounting_indeterminate("launch attempt history is not a list")
+
+    groups: set[tuple[str, str | int]] = set()
+    launch_groups: dict[str, tuple[str, str | int]] = {}
+    attempt_groups: dict[int, tuple[str, str | int]] = {}
+    pending_groups: list[tuple[str, str | int]] = []
+    anonymous_index = 0
+
+    for event in raw_events:
+        if not isinstance(event, Mapping):
+            raise _accounting_indeterminate("launch attempt history contains a malformed event")
+        launch_id = event.get("launch_id")
+        if launch_id not in (None, "") and not isinstance(launch_id, str):
+            raise _accounting_indeterminate("launch attempt event has a malformed launch ID")
+        event_attempt = event.get("attempt")
+        if event_attempt in (None, ""):
+            event_attempt = None
+        elif not isinstance(event_attempt, int) or isinstance(event_attempt, bool) or event_attempt < 1:
+            raise _accounting_indeterminate("launch attempt event has a malformed attempt number")
+
+        if launch_id:
+            group = launch_groups.setdefault(launch_id, ("launch", launch_id))
+            if event_attempt is not None:
+                attempt_groups.setdefault(event_attempt, group)
+        elif event_attempt is not None and event_attempt in attempt_groups:
+            group = attempt_groups[event_attempt]
+        elif event_attempt is not None:
+            group = ("attempt", event_attempt)
+            attempt_groups[event_attempt] = group
+        elif event.get("resolved_from") == "identity_pending" and pending_groups:
+            group = pending_groups.pop()
+        else:
+            anonymous_index += 1
+            group = ("anonymous", anonymous_index)
+
+        groups.add(group)
+        status = str(event.get("status") or "")
+        if status == "identity_pending":
+            pending_groups.append(group)
+        elif event.get("resolved_from") == "identity_pending":
+            # A resolution may have an ID while its pending observation did
+            # not. Pair it with that prior observation instead of billing a
+            # second launch.
+            if group in pending_groups:
+                pending_groups.remove(group)
+
+    has_reserved_launch = bool(record_launch or binding_launch)
+    return max(record_attempt, len(groups), int(has_reserved_launch))
+
+
+def _accounting_indeterminate(message: str) -> AccountingIndeterminate:
+    return AccountingIndeterminate(AccountingFinding(
+        "execution-accounting-indeterminate",
+        message,
+        "Repair or verify the recorded launch history before dispatching another worker.",
+    ))
+
+
 __all__ = [
     "AdmissionFinding",
     "AdmissionReport",
+    "AccountingFinding",
+    "AccountingIndeterminate",
     "EXECUTION_ROLES",
     "EXPENSIVE_MODELS",
     "POLICY_FIELDS",
@@ -225,6 +329,7 @@ __all__ = [
     "SCHEMA",
     "SELECTIVE_MODELS",
     "evaluate_launch",
+    "attempt_count",
     "policy_from_root_metadata",
     "summarize_attempts",
 ]
