@@ -5422,7 +5422,8 @@ def herdr_launch(args: argparse.Namespace) -> int:
                    "status": "launched", "attempt": attempt}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="HERDR LAUNCH")
         return 0
-    except (herdr_backend.HerdrError, model_policy_backend.ModelPolicyError, beads_backend.BeadsError,
+    except (codex_app_server_backend.CodexAppServerError,
+            herdr_backend.HerdrError, model_policy_backend.ModelPolicyError, beads_backend.BeadsError,
             controller_backend.ControllerError, OSError, ValueError, json.JSONDecodeError) as exc:
         payload = {"operation": "launch", "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="HERDR LAUNCH FAILED")
