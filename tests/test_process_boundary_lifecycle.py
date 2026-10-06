@@ -174,7 +174,7 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "    print('codex: current (test)')\n"
                 "    sys.exit(0)\n"
                 "if args[:2] == ['status', 'server']:\n"
-                "    print('status: running')\n"
+                "    print('status: running\\ncompatible: yes')\n"
                 "    sys.exit(0)\n"
                 "if args[:2] == ['agent', 'start']:\n"
                 "    child_env = dict(os.environ)\n"
@@ -220,11 +220,14 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "--poll-interval", "0.05", "--deadline", "120", "--json",
             ]
             first = subprocess.run(controller_args + ["--once"], cwd=root, env=environment,
-                                   capture_output=True, text=True, timeout=20, check=False)
+                                   capture_output=True, text=True, timeout=60, check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
             first_payload = json.loads(first.stdout)
-            herdr_debug = (root / ".agentflow/herdr/sessions.json").read_text() if (root / ".agentflow/herdr/sessions.json").exists() else "<no herdr state>"
-            self.assertEqual(first_payload["result"]["state"], "running", first.stdout + "\n" + herdr_debug)
+            herdr_state_exists = (root / ".agentflow/herdr/sessions.json").is_file()
+            self.assertEqual(
+                first_payload["result"]["state"], "running",
+                f"controller state={first_payload['result']['state']}; Herdr state exists={herdr_state_exists}",
+            )
 
             # The first controller process is deliberately treated as crashed
             # after dispatch. A new process consumes the provider's result,

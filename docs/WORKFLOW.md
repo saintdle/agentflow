@@ -223,6 +223,25 @@ provide a workflow reminder, but they do not inspect prompts to select domain
 expertise, publish issues, approve goals, or decide that work is complete.
 Initialization preserves custom hooks for deliberate manual merging.
 
+Codex context is returned through `hookSpecificOutput` with the native
+`hookEventName` and `additionalContext`; Codex events without a documented
+context field receive no context output. Claude keeps the same supported
+response shape, and Copilot keeps its existing `additionalContext` shape
+without a new provider-limit claim. Agentflow limits its assembled hook string to 2,000 UTF-8
+bytes for Codex and 9,000 Unicode characters for Claude. These local limits
+include the full guidance, Beads authority guard, separators, memory safety
+header, records, and provenance. They do not estimate tokens or promise provider
+acceptance. Optional Beads prime and memory records are included whole or
+omitted with a reason.
+
+Versioned local receipts distinguish preparation from a successful write to
+hook stdout. A receipt for emitted output proves only that Agentflow serialized
+and wrote its local response. It does not prove provider acceptance or model
+input. Earlier receipt records remain preparation observations. Receipts keep
+component hashes, sizes, counts, and event metadata; they do not store prompt,
+prime, or memory text. Installed-client acceptance and exact model-input
+delivery remain unvalidated.
+
 ## Evidence and privacy
 
 Record commands, revisions, test results, and links that substantiate the goal.

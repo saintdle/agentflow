@@ -84,6 +84,16 @@ anomalies such as expensive execution routes, excessive child/depth budgets,
 ambiguous models, and high recorded context pressure. Token counters are
 provider metadata and are not billing evidence.
 
+New Codex manifests add `usage_metadata` with source, client version,
+availability, cross-check diagnostics, aggregate input/cached-input/output/total
+counters, request count, and maximum request input. Cached input is a subset of
+input. Context-pressure audits use maximum request input when available; older
+manifests use the explicitly labeled input-plus-output proxy in
+`peak_context_tokens` (`peak_context_semantics: input_plus_output_proxy` on new
+manifests). Aggregate totals are not treated as request occupancy. Missing or
+ambiguous usage stays explicit, with available reconciliation diagnostics
+retained in the manifest.
+
 Use `agentflow context compact` for an explicit one-time, transcript-free
 compaction recommendation. It tells the controller to persist decisions and
 evidence, disposition the current result, rotate only at a safe boundary, and

@@ -12,6 +12,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   IDs, provider/model/effort boundaries, accepted-result deltas, observed task
   metrics, and visible missing, invalid, unmatched, or duplicate data.
 
+- Codex history manifests now retain request-level usage metadata. Context audits
+  distinguish maximum request input from aggregate totals and the explicitly
+  labeled legacy input-plus-output pressure proxy; missing or ambiguous values
+  remain unknown.
+- Supported Codex context events now use their documented context response;
+  Claude's supported response shape is preserved, with context output only for
+  its documented events. Complete Codex and Claude
+  hook strings follow local character/byte budgets, with versioned preparation
+  and local-emission receipts that store metadata rather than context text.
+  Copilot's existing response shape is preserved without a new provider-limit
+  claim.
+
 ### Changed
 
 - Separated provider quota provenance from local task outcomes and yield
@@ -20,6 +32,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Hook receipts now record configured inactive and unsupported events. Capped or
+  failed context releases its session reservation, and memory-use counts update
+  only after a complete local stdout write. Receipts retain up to 128 validated
+  components and explicitly diagnose any incomplete inventory.
+- Oversized receipt rows now leave a coalesced metadata-only storage-availability
+  marker instead of leaving the spool empty without a diagnostic; configured
+  byte limits remain enforced.
 - Launch budgets now count each reserved attempt once across pending and resolved
   lifecycle records, retain verified history across controller key rotations, and
   include spend proven by exact workflow ancestry.

@@ -118,7 +118,7 @@ class MemoryRecallTests(unittest.TestCase):
                     self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
 
             response = json.loads(stdout.getvalue())
-            context = response["systemMessage"]
+            context = response["hookSpecificOutput"]["additionalContext"]
             self.assertIn(_UNTRUSTED_HEADER, context)
             self.assertIn('"title":"Build note"', context)
             self.assertIn('"summary":"Memory: remember the checked local build command"', context)

@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,9 +24,13 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 from agentflow.events import EventEnvelope, EventSpool, normalize_event, record_event_safely
-from agentflow.memory import RecallPlan, find_first
+from agentflow.memory import RecallItem, RecallPlan, find_first
 from agentflow.project_config import DEFAULT_MEMORY
 from agentflow.search import KnowledgeIndex
+
+
+DELIVERY_COMPONENT_LIMIT = 128
+RECEIPT_STORAGE_SCHEMA = "agentflow.memory-receipt-storage@1"
 
 
 def _now() -> dt.datetime:
@@ -168,15 +173,21 @@ class ReceiptSpool:
         before = len(rows)
         cutoff = _now() - dt.timedelta(days=self.retention_days)
         kept: list[dict[str, Any]] = []
+        timestamps: dict[int, dt.datetime] = {}
         for row in rows:
             stamp = row.get("timestamp")
             try:
                 parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 parsed = _now()
+            timestamps[id(row)] = parsed
             if parsed >= cutoff:
                 kept.append(row)
-        rows[:] = kept[-self.max_events:]
+        kept.sort(key=lambda row: timestamps[id(row)])
+        diagnostics = [row for row in kept if row.get("schema") == RECEIPT_STORAGE_SCHEMA]
+        receipts = [row for row in kept if row.get("schema") != RECEIPT_STORAGE_SCHEMA]
+        retained_ids = {id(row) for row in (*receipts[-self.max_events:], *diagnostics[-1:])}
+        rows[:] = [row for row in kept if id(row) in retained_ids]
         while rows:
             encoded = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in rows)
             if len(encoded) <= self.max_bytes:
@@ -201,9 +212,24 @@ class ReceiptSpool:
                 pass
 
     def append(self, value: Mapping[str, Any]) -> None:
+        row = dict(value)
+        encoded_row = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         with _Lock(self.lock_path):
             rows = self._read_unlocked()
-            rows.append(dict(value))
+            if len(encoded_row) > self.max_bytes:
+                # Reject an individually oversized receipt before size pruning
+                # can discard useful history. Coalesce this bounded marker so
+                # repeated prepared/emitted attempts do not grow the spool.
+                rows = [item for item in rows if item.get("schema") != RECEIPT_STORAGE_SCHEMA]
+                rows.append({
+                    "schema": RECEIPT_STORAGE_SCHEMA,
+                    "timestamp": _iso(),
+                    "status": "unavailable",
+                    "reason": "receipt_exceeds_cap",
+                    "privacy": "metadata-only",
+                })
+            else:
+                rows.append(row)
             self._prune(rows)
             self._write_unlocked(rows)
 
@@ -216,7 +242,10 @@ class ReceiptSpool:
 
     def count(self) -> int:
         with _Lock(self.lock_path):
-            return len(self._read_unlocked())
+            return sum(
+                row.get("schema") != RECEIPT_STORAGE_SCHEMA
+                for row in self._read_unlocked()
+            )
 
 
 class MemoryRuntime:
@@ -249,21 +278,166 @@ class MemoryRuntime:
     def enabled(self) -> bool:
         return bool(self.settings.get("enabled", False))
 
-    def _record_receipt(self, event: EventEnvelope, plan: RecallPlan) -> None:
-        if not plan.items:
-            return
-        self.receipts.append({
-                "schema": "agentflow.memory-receipt@1",
-                "timestamp": _iso(),
-                "session_id": event.session_id,
-                "event_id": event.event_id,
-                "items": len(plan.items),
-                "characters": len(plan.text),
-                "source_digests": [item.source_digest for item in plan.items],
-                "privacy": "metadata-only",
-            })
+    def record_delivery(self, value: Mapping[str, Any]) -> None:
+        """Append bounded metadata about local preparation or hook output."""
+        stages = {"prepared", "emitted", "omitted", "failed"}
+        reasons = {
+            "", "unsupported_event", "event_has_no_documented_context_field",
+            "mandatory_context_exceeds_cap", "serialization_failed", "output_write_failed",
+            "recall_disabled", "recall_not_requested", "recall_unavailable",
+        }
+        recall_states = {"disabled", "empty", "selected", "not_requested", "unavailable"}
+        providers = {"codex", "claude", "copilot"}
+        allowed_events = {
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+            "PostToolUseFailure", "PreCompact", "Stop", "PostModelSwitch",
+            "sessionStart", "userPromptSubmitted", "preToolUse", "postToolUse",
+            "postToolUseFailure", "preCompact", "agentStop",
+        }
+        stage_value = value.get("stage")
+        provider_value = value.get("provider")
+        stage = stage_value if isinstance(stage_value, str) and stage_value in stages else "failed"
+        provider = provider_value if isinstance(provider_value, str) and provider_value in providers else "unknown"
+        raw_event = value.get("event")
+        event = raw_event if isinstance(raw_event, str) and raw_event in allowed_events else "unknown"
+        reason_value = value.get("reason")
+        reason = reason_value if isinstance(reason_value, str) and reason_value in reasons else "unknown"
+        recall_status = value.get("recall_status")
+        if not isinstance(recall_status, str) or recall_status not in recall_states:
+            recall_status = "unavailable"
 
-    def recall(self, event: EventEnvelope, payload: Mapping[str, Any]) -> RecallPlan | None:
+        def safe_count_from(count: Any, maximum: int = 1_000_000_000) -> int:
+            return count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= maximum else 0
+
+        def safe_count(name: str, maximum: int = 1_000_000_000) -> int:
+            return safe_count_from(value.get(name), maximum)
+
+        component_input_counts: dict[str, int] = {}
+        component_diagnostics: dict[str, str] = {}
+
+        def safe_components(name: str, *, omissions: bool = False) -> list[dict[str, Any]]:
+            entries = value.get(name)
+            if name not in value:
+                component_input_counts[name] = 0
+                component_diagnostics[name] = ""
+                return []
+            if not isinstance(entries, list):
+                component_input_counts[name] = 0
+                component_diagnostics[name] = f"{name}_invalid_container"
+                return []
+            component_input_counts[name] = min(len(entries), 1_000_000_000)
+            result: list[dict[str, Any]] = []
+            invalid_entries = False
+            for entry in entries[:DELIVERY_COMPONENT_LIMIT]:
+                if not isinstance(entry, Mapping):
+                    invalid_entries = True
+                    continue
+                component_id = entry.get("id")
+                kind = entry.get("kind")
+                digest = entry.get("digest")
+                if not isinstance(component_id, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", component_id):
+                    invalid_entries = True
+                    continue
+                if not isinstance(kind, str) or not re.fullmatch(r"[a-z0-9_]{1,32}", kind):
+                    invalid_entries = True
+                    continue
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    invalid_entries = True
+                    continue
+                record = {
+                    "id": component_id,
+                    "kind": kind,
+                    "digest": digest,
+                    "characters": safe_count_from(entry.get("characters")),
+                    "bytes": safe_count_from(entry.get("bytes")),
+                }
+                source_digest = entry.get("source_digest")
+                if isinstance(source_digest, str) and re.fullmatch(r"[0-9a-f]{64}", source_digest):
+                    record["source_digest"] = source_digest
+                if omissions:
+                    omission_reason = entry.get("reason")
+                    record["reason"] = (
+                        omission_reason
+                        if isinstance(omission_reason, str) and omission_reason in {
+                            "over_budget", "mandatory_overflow", "unsupported_event",
+                            "event_has_no_documented_context_field", "serialization_failed",
+                            "output_write_failed", "recall_disabled", "recall_not_requested",
+                            "recall_unavailable",
+                        }
+                        else "unknown"
+                    )
+                result.append(record)
+            diagnostics = []
+            if len(entries) > DELIVERY_COMPONENT_LIMIT:
+                diagnostics.append(f"{name}_limit_exceeded")
+            if invalid_entries:
+                diagnostics.append(f"{name}_invalid_entries")
+            component_diagnostics[name] = "_and_".join(diagnostics)
+            return result
+
+        event_envelope = value.get("event_envelope")
+        session_hash = ""
+        event_hash = ""
+        if isinstance(event_envelope, EventEnvelope):
+            session_hash = hashlib.sha256(event_envelope.session_id.encode("utf-8")).hexdigest()
+            event_hash = hashlib.sha256(event_envelope.event_id.encode("utf-8")).hexdigest()
+        cap_unit_value = value.get("cap_unit")
+        cap_unit = cap_unit_value if isinstance(cap_unit_value, str) and cap_unit_value in {"utf8_bytes", "characters"} else None
+        cap_value = value.get("cap_value")
+        if not isinstance(cap_value, int) or isinstance(cap_value, bool) or not 0 <= cap_value <= 100_000:
+            cap_value = None
+        context_sha256 = value.get("context_sha256")
+        if not isinstance(context_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", context_sha256):
+            context_sha256 = None
+        client_version = value.get("client_version")
+        if not isinstance(client_version, str) or len(client_version) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*", client_version):
+            client_version = None
+        included = safe_components("included")
+        omitted = safe_components("omitted", omissions=True)
+        included_diagnostic = component_diagnostics["included"]
+        omitted_diagnostic = component_diagnostics["omitted"]
+        inventory_diagnostic = "_and_".join(
+            value for value in (included_diagnostic, omitted_diagnostic) if value
+        )
+        component_inventory = {
+            "limit": DELIVERY_COMPONENT_LIMIT,
+            "included_input_count": component_input_counts["included"],
+            "included_recorded_count": len(included),
+            "omitted_input_count": component_input_counts["omitted"],
+            "omitted_recorded_count": len(omitted),
+            "complete": not inventory_diagnostic,
+            "diagnostic": inventory_diagnostic,
+        }
+        self.receipts.append({
+            "schema": "agentflow.memory-receipt@2",
+            "timestamp": _iso(),
+            "stage": stage,
+            "provider": provider,
+            "event": event,
+            "capability": value.get("capability") if isinstance(value.get("capability"), str) and value.get("capability") in {"documented", "unsupported", "preserved_shape"} else "unknown",
+            "serializer_version": "hook-context@1",
+            "client_version": client_version,
+            "session_id_hash": session_hash,
+            "event_id_hash": event_hash,
+            "recall_status": recall_status,
+            "selected_item_count": safe_count("selected_item_count"),
+            "retained_item_count": safe_count("retained_item_count"),
+            "omitted_item_count": safe_count("omitted_item_count"),
+            "context_characters": safe_count("context_characters"),
+            "context_bytes": safe_count("context_bytes"),
+            "context_sha256": context_sha256,
+            "cap_unit": cap_unit,
+            "cap_value": cap_value,
+            "included": included,
+            "omitted": omitted,
+            "component_inventory": component_inventory,
+            "reason": reason,
+            "privacy": "metadata-only",
+        })
+
+    def recall(
+        self, event: EventEnvelope, payload: Mapping[str, Any], *, record_usage: bool = True,
+    ) -> RecallPlan | None:
         if not self.enabled:
             return None
         if event.event == "prompt.submit" and not bool(self.settings.get("on_prompt")):
@@ -281,11 +455,36 @@ class MemoryRuntime:
                     max_age_days=float(self.settings["max_age_days"]),
                     session_id=event.session_id,
                     session_ledger_limit=int(self.settings["session_ledger_limit"]),
+                    record_usage=record_usage,
                 )
-            self._record_receipt(event, plan)
             return plan
         except Exception:  # noqa: BLE001 - hook fail-open
             return None
+
+    def finish_delivery(
+        self,
+        event: EventEnvelope | None,
+        plan: RecallPlan | None,
+        retained_items: tuple[RecallItem, ...] = (),
+    ) -> None:
+        """Commit usage for written recall and release this plan's omissions."""
+        if event is None or plan is None:
+            return
+        retained = {(item.document_id, item.source_digest) for item in retained_items}
+        try:
+            with KnowledgeIndex(self.database) as index:
+                for item in plan.items:
+                    try:
+                        if (item.document_id, item.source_digest) in retained:
+                            index.mark_used(item.document_id, injected=True)
+                        elif plan.reservation_id:
+                            index.release_injection(
+                                event.session_id, item.source_digest, plan.reservation_id,
+                            )
+                    except Exception:  # noqa: BLE001 - per-item accounting stays fail-open
+                        continue
+        except Exception:  # noqa: BLE001 - usage accounting must not break provider hooks
+            pass
 
     def maintain(self, *, force: bool = False) -> dict[str, Any]:
         """Run bounded, idempotent local maintenance under one process lock."""
@@ -339,7 +538,10 @@ class MemoryRuntime:
             _write_json(self.health_path, health)
             return health
 
-    def process(self, provider: str, payload: Mapping[str, Any], event_name: str = "") -> tuple[EventEnvelope | None, RecallPlan | None, dict[str, Any]]:
+    def process(
+        self, provider: str, payload: Mapping[str, Any], event_name: str = "", *,
+        record_usage: bool = True,
+    ) -> tuple[EventEnvelope | None, RecallPlan | None, dict[str, Any]]:
         if not self.enabled:
             return None, None, {}
         try:
@@ -357,8 +559,18 @@ class MemoryRuntime:
                         index.reset_session(event.session_id)
                 except Exception:  # noqa: BLE001 - compaction reset is fail-open
                     pass
-            plan = self.recall(event, payload)
+            recall_requested = bool(
+                (event.event != "prompt.submit" or bool(self.settings.get("on_prompt")))
+                and _query(payload, event.event, self.settings)
+            )
+            plan = self.recall(event, payload, record_usage=record_usage)
             health = self.maintain() if event.event == "session.stop" else {}
+            health["recall_status"] = (
+                "unavailable" if recall_requested and plan is None
+                else "not_requested" if not recall_requested
+                else "selected" if plan.items
+                else "empty"
+            )
             return event, plan, health
         except Exception:  # noqa: BLE001 - provider hooks are fail-open
             return None, None, {}
