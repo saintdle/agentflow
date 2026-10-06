@@ -30,6 +30,7 @@ from agentflow.search import KnowledgeIndex
 
 
 DELIVERY_COMPONENT_LIMIT = 128
+RECEIPT_STORAGE_SCHEMA = "agentflow.memory-receipt-storage@1"
 
 
 def _now() -> dt.datetime:
@@ -180,7 +181,9 @@ class ReceiptSpool:
                 parsed = _now()
             if parsed >= cutoff:
                 kept.append(row)
-        rows[:] = kept[-self.max_events:]
+        diagnostics = [row for row in kept if row.get("schema") == RECEIPT_STORAGE_SCHEMA]
+        receipts = [row for row in kept if row.get("schema") != RECEIPT_STORAGE_SCHEMA]
+        rows[:] = [*receipts[-self.max_events:], *diagnostics[-1:]]
         while rows:
             encoded = b"".join((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode() for row in rows)
             if len(encoded) <= self.max_bytes:
@@ -205,9 +208,24 @@ class ReceiptSpool:
                 pass
 
     def append(self, value: Mapping[str, Any]) -> None:
+        row = dict(value)
+        encoded_row = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         with _Lock(self.lock_path):
             rows = self._read_unlocked()
-            rows.append(dict(value))
+            if len(encoded_row) > self.max_bytes:
+                # Reject an individually oversized receipt before size pruning
+                # can discard useful history. Coalesce this bounded marker so
+                # repeated prepared/emitted attempts do not grow the spool.
+                rows = [item for item in rows if item.get("schema") != RECEIPT_STORAGE_SCHEMA]
+                rows.append({
+                    "schema": RECEIPT_STORAGE_SCHEMA,
+                    "timestamp": _iso(),
+                    "status": "unavailable",
+                    "reason": "receipt_exceeds_cap",
+                    "privacy": "metadata-only",
+                })
+            else:
+                rows.append(row)
             self._prune(rows)
             self._write_unlocked(rows)
 
@@ -220,7 +238,10 @@ class ReceiptSpool:
 
     def count(self) -> int:
         with _Lock(self.lock_path):
-            return len(self._read_unlocked())
+            return sum(
+                row.get("schema") != RECEIPT_STORAGE_SCHEMA
+                for row in self._read_unlocked()
+            )
 
 
 class MemoryRuntime:

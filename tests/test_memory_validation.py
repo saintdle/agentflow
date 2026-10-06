@@ -25,6 +25,78 @@ def _receipt_writer(path: str, start: int) -> None:
 
 
 class MemoryValidationTests(unittest.TestCase):
+    def test_hook_receipt_overflow_preserves_legacy_row_and_records_diagnostic(self) -> None:
+        for cap in (256, 512):
+            with self.subTest(cap=cap), tempfile.TemporaryDirectory() as state:
+                root = Path(state) / "repo"
+                root.mkdir()
+                config = project_config.default_data()
+                config["memory"].update(
+                    enabled=True, startup_query="blue comet", max_items=1,
+                    max_event_bytes=cap,
+                )
+                config_path = project_config.config_path(root)
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": state}, clear=False):
+                    runtime = MemoryRuntime(root, project_config.memory_settings(config))
+                    stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                    with KnowledgeIndex(runtime.database) as index:
+                        index.candidate(KnowledgeDocument(
+                            "approved", "Blue comet", "blue comet memory", "docs/source", freshness=stamp,
+                        ))
+                        index.approve(
+                            "approved", approval_by="human:test", approval_ref="review-1",
+                            approved_at=stamp,
+                        )
+                    if cap == 512:
+                        legacy = {
+                            "schema": "agentflow.memory-receipt@1",
+                            "timestamp": "2026-10-06T18:10:00Z",
+                            "session_id": "s" * 52,
+                            "event_id": "e" * 52,
+                            "items": 1,
+                            "characters": 2000,
+                            "source_digests": ["a" * 64],
+                            "privacy": "metadata-only",
+                        }
+                        legacy_bytes = (
+                            json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n"
+                        ).encode("utf-8")
+                        self.assertEqual(len(legacy_bytes), 349)
+                        runtime.receipts_path.write_bytes(legacy_bytes)
+
+                    payload = {
+                        "hook_event_name": "SessionStart", "session_id": f"small-cap-{cap}",
+                        "cwd": str(root),
+                    }
+                    with mock.patch.object(cli.beads_backend, "prime", return_value=""), \
+                         mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                         mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                        self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
+
+                    response = json.loads(stdout.getvalue())
+                    self.assertTrue(response["hookSpecificOutput"]["additionalContext"])
+                    encoded_spool = runtime.receipts_path.read_bytes()
+                    self.assertLessEqual(len(encoded_spool), cap)
+                    rows = [json.loads(line) for line in encoded_spool.splitlines()]
+                    diagnostic = next(
+                        row for row in rows
+                        if row.get("schema") == "agentflow.memory-receipt-storage@1"
+                    )
+                    self.assertEqual(sum(
+                        row.get("schema") == "agentflow.memory-receipt-storage@1" for row in rows
+                    ), 1)
+                    self.assertFalse(any(row.get("schema") == "agentflow.memory-receipt@2" for row in rows))
+                    self.assertEqual(diagnostic["status"], "unavailable")
+                    self.assertEqual(diagnostic["reason"], "receipt_exceeds_cap")
+                    if cap == 512:
+                        self.assertEqual(len(encoded_spool), cap)
+                        self.assertTrue(any(row.get("schema") == "agentflow.memory-receipt@1" for row in rows))
+                        self.assertEqual(runtime.receipts.count(), 1)
+                    else:
+                        self.assertEqual(runtime.receipts.count(), 0)
+
     def test_hook_receipt_marks_caught_requested_recall_failure_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as state:
             root = Path(state) / "repo"

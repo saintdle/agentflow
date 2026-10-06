@@ -36,6 +36,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failed context releases its session reservation, and memory-use counts update
   only after a complete local stdout write. Receipts retain up to 128 validated
   components and explicitly diagnose any incomplete inventory.
+- Oversized receipt rows now leave a coalesced metadata-only storage-availability
+  marker instead of leaving the spool empty without a diagnostic; configured
+  byte limits remain enforced.
 - Launch budgets now count each reserved attempt once across pending and resolved
   lifecycle records, retain verified history across controller key rotations, and
   include spend proven by exact workflow ancestry.

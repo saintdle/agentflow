@@ -54,6 +54,11 @@ historical records of preparation. Recall selection counters also describe
 local selection and are not provider-consumption evidence. The receipt inventory
 covers the configured limit of 100 recall items and reports an explicit
 incomplete-inventory diagnostic if the bounded 128-component limit is exceeded.
+If one complete receipt row exceeds the configured byte cap, the spool skips
+that row and coalesces a compact `agentflow.memory-receipt-storage@1`
+availability marker before normal retention. The marker is not counted as a
+hook receipt; an emitted stage can therefore coexist with an explicit warning
+that its full metadata could not be retained.
 
 ```json
 {
