@@ -324,6 +324,35 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(contract["model"], fixture.model)
             self.assertEqual(contract["effort"], fixture.effort)
 
+    def test_herdr_provider_receives_controller_state_home_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            state_home = root.parent / f"{root.name}-controller-runtime-state"
+            with mock.patch.dict(
+                os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}, clear=False,
+            ):
+                fixture = ValidLaunch(root)
+                capture: dict = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 0)
+
+                argv = capture["argv"]
+                herdr_env: dict[str, str] = {}
+                for index, argument in enumerate(argv[:-1]):
+                    if argument == "--env":
+                        key, _, value = argv[index + 1].partition("=")
+                        herdr_env[key] = value
+                self.assertEqual(herdr_env["AGENTFLOW_STATE_HOME"], str(state_home.resolve()))
+                self.assertEqual(
+                    cli.events_backend.attested_model(
+                        cli.events_backend.EventSpool(state_home / "events.jsonl"),
+                        fixture.provider, "sess-1",
+                    ),
+                    fixture.model,
+                )
+
     def test_nonsterile_launch_packages_and_tracks_claude_model_switch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.dict(

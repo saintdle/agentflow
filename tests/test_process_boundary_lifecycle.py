@@ -93,6 +93,12 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "base": f"main@{base[:12]}",
                 "acceptance": task_matrix,
                 "checks": ["process-boundary"],
+                # Controller dispatch materializes this as an external lane;
+                # provide the same explicit context/profile/budget a manual
+                # external from-bead handoff requires.
+                "context": ["README.md"],
+                "tool_profile": "shell-write",
+                "budget": ["time: 2 minutes", "retry: one bounded retry", "stop: report a blocker"],
             })
             second_task = _issue_from_create(
                 root, "Deterministic provider task two", "--description", "run the provider subprocess twice",
@@ -107,6 +113,9 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "base": f"main@{base[:12]}",
                 "acceptance": second_matrix,
                 "checks": ["process-boundary"],
+                "context": ["README.md"],
+                "tool_profile": "shell-write",
+                "budget": ["time: 2 minutes", "retry: one bounded retry", "stop: report a blocker"],
             })
 
             bin_dir = root / "bin"
@@ -129,6 +138,8 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "        pass\n"
                 "    if not pane: time.sleep(0.05)\n"
                 "if not pane: raise SystemExit('Herdr pane was not discoverable')\n"
+                "hook = {'hook_event_name': 'SessionStart', 'session_id': 'provider-process-session', 'cwd': os.getcwd(), 'model': 'gpt-5.6-luna'}\n"
+                "subprocess.run([sys.executable, '-m', 'agentflow.cli', 'hook', '--provider', 'codex', '--event', 'SessionStart'], input=json.dumps(hook), text=True, check=True, capture_output=True)\n"
                 "subprocess.run(['herdr', 'pane', 'report-agent-session', pane, '--source', 'process-boundary', '--agent', 'codex', '--agent-session-id', 'provider-process-session'], check=True)\n"
                 "contract_path = Path(os.environ['AGENTFLOW_RESULT_CONTRACT'])\n"
                 "result_path = Path(os.environ['AGENTFLOW_RESULT_FILE'])\n"
@@ -159,6 +170,12 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "import json, os, subprocess, sys\n"
                 "args = sys.argv[1:]\n"
                 "agent = args[2] if len(args) > 2 and args[:2] == ['agent', 'start'] else 'process-boundary-agent'\n"
+                "if args[:2] == ['integration', 'status']:\n"
+                "    print('codex: current (test)')\n"
+                "    sys.exit(0)\n"
+                "if args[:2] == ['status', 'server']:\n"
+                "    print('status: running')\n"
+                "    sys.exit(0)\n"
                 "if args[:2] == ['agent', 'start']:\n"
                 "    child_env = dict(os.environ)\n"
                 "    i = 3\n"

@@ -189,6 +189,13 @@ instructions and custom hooks, and keeps runtime state out of version control.
 The default Beads setup is local/stealth. Choose tracked or shared-server state
 only when that collaboration model is intentional.
 
+Agentflow's `usage yield` command keeps its existing task-class summary. Its
+opt-in `--evaluation` view compares explicitly paired baseline/treatment cases
+within the same evaluation, task class, provider, model, and effort. It reports
+missing, invalid, unmatched, and duplicate observations without imputing data
+or claiming that a workflow caused an outcome. See the [workflow guide](docs/WORKFLOW.md#paired-usage-pilots)
+for a small pilot example.
+
 Continue with the executable [first workflow tutorial](docs/FIRST_WORKFLOW.md)
 to create and approve a root/task graph, run the controller, handle a halt, and
 record completion evidence. See the [provider compatibility matrix](docs/PROVIDERS.md)

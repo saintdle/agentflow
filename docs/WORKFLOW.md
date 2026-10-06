@@ -229,3 +229,40 @@ Record commands, revisions, test results, and links that substantiate the goal.
 Do not store prompts, reasoning traces, credentials, provider logs, or account
 data as durable coordination state. Metadata-only audit and history facilities
 do not make private material safe to publish.
+
+## Paired usage pilots
+
+The existing `agentflow usage yield` report remains grouped by explicit task
+class. Add `--evaluation` to compare paired baseline and treatment observations
+for a small pilot. Choose representative cases first, assign one stable
+evaluation ID and case ID to each pair, and keep task class, provider, model,
+and effort the same within the pair. Change only the workflow condition being
+evaluated. Repeat the pairs across the selected cases before drawing a
+conclusion.
+
+Record only observations you actually have. Omit unknown numeric values instead
+of entering zero; omit `--accepted-result` when nobody assessed the result.
+Accepted results, completion, elapsed time, retries, and other task metrics are
+local observations. A source such as `/usage` labels provider quota provenance;
+it does not make task outcomes or timing provider-authoritative.
+
+The values below are illustrative command syntax. Replace them with measured
+values and record an acceptance result only after an explicit assessment.
+
+```sh
+agentflow usage record codex --model gpt-6-sol --effort high \
+  --task-class implementation --evaluation-id pilot-1 --variant baseline \
+  --case-id case-01 --rework-rounds 1 --elapsed-seconds 95 \
+  --outcome completed --accepted-result accepted --source manual
+agentflow usage record codex --model gpt-6-sol --effort high \
+  --task-class implementation --evaluation-id pilot-1 --variant treatment \
+  --case-id case-01 --rework-rounds 0 --elapsed-seconds 80 \
+  --outcome completed --accepted-result accepted --source manual
+agentflow usage yield --evaluation --json
+```
+
+The report compares only unique matching case IDs inside the same evaluation
+identity, task class, provider, model, and effort. Duplicate and unmatched
+cases remain visible; missing and invalid metrics are reported separately.
+Recording and comparison make no model calls and do not establish causal model
+efficacy. Provider quota sources remain separate from these local observations.

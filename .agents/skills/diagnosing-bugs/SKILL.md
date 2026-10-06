@@ -5,6 +5,8 @@ description: Diagnose reproducible defects, failing tests, regressions, flaky be
 
 # Diagnose Bugs
 
+When the repository provides an `AGENTS.md`, apply its shared coding discipline: inspect affected code, callers, tests, and shared utilities before changing code; keep authorized fixes complete and focused; and state material assumptions. Ask only questions that could change scope, correctness, or authority.
+
 ## Establish authority and context
 
 1. Determine whether the request authorizes diagnosis only or diagnosis plus a fix. Do not edit product code for a diagnosis-only request.

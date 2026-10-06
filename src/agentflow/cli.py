@@ -35,6 +35,7 @@ from agentflow import controller as controller_backend
 from agentflow import config_commands as config_commands_backend
 from agentflow import context_budget as context_budget_backend
 from agentflow import execution as execution_backend
+from agentflow import execution_limits as execution_limits_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
@@ -846,10 +847,16 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
         "delegation_depth": int(launch.get("delegation_depth") or 0),
         "fork_context": str(launch.get("fork_context") or ""),
         "sterile": launch.get("sterile") is True or str(launch.get("outbound_context") or "") == "restricted",
+        "execution_limits": launch.get(
+            "execution_limits", agentflow.get("execution_limits") if isinstance(agentflow, Mapping) else None,
+        ),
     }
 
 
-def _materialize_launch_handoff(cwd: Path, task_id: str, provider: str, *, role: str) -> Path:
+def _materialize_launch_handoff(
+    cwd: Path, task_id: str, provider: str, *, role: str,
+    execution_limits: Mapping[str, Any] | None = None,
+) -> Path:
     """Materialize the real, full from-bead handoff contract for a launch.
 
     AFREL-030: every provider spawn must be gated by the SAME exact
@@ -868,6 +875,8 @@ def _materialize_launch_handoff(cwd: Path, task_id: str, provider: str, *, role:
         tool_profile="", output_boundary="", require_tool=[], require_skill=[],
         allow_delegation=False, return_type="", max_ai_credits=None, base="", branch="",
         context=[], constraint=[], check=[], budget=[], out=str(output),
+        deadline_seconds=(execution_limits or {}).get("deadline_seconds"),
+        max_retries=(execution_limits or {}).get("max_retries"),
     )
     # handoff_from_bead prints its own diagnostics; the controller's JSON
     # output must be the only thing on stdout, so capture rather than let
@@ -1243,6 +1252,7 @@ def _dispatch_via_herdr(
         if not all(launch_meta.get(field) for field in ("provider", "model", "effort", "role")):
             return {"state": "blocked", "session_id": ""}
         try:
+            execution_limits = execution_limits_backend.parse_limits(launch_meta.get("execution_limits"))
             # Projects created before execution policy was introduced may not
             # have an Agentflow config at all (the lifecycle also supports
             # ephemeral test and gitless roots).  Absence gets the safe
@@ -1252,6 +1262,13 @@ def _dispatch_via_herdr(
             launch_policy = _controller_execution_policy(
                 cwd, root, workflow_root, root_issue=root_issue
             )
+            if execution_limits is not None:
+                launch_policy = dataclasses.replace(
+                    launch_policy,
+                    max_attempts_per_task=execution_limits_backend.effective_attempt_limit(
+                        launch_policy.max_attempts_per_task, execution_limits,
+                    ),
+                )
             try:
                 current_state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
             except (OSError, ValueError) as exc:
@@ -1306,6 +1323,7 @@ def _dispatch_via_herdr(
         try:
             handoff_path = _materialize_launch_handoff(
                 cwd, task_id, launch_meta["provider"], role=launch_meta["role"],
+                execution_limits=(execution_limits.to_dict() if execution_limits else None),
             )
             execution_root = root
             if launch_meta.get("sterile"):
@@ -1370,6 +1388,7 @@ def _dispatch_via_herdr(
             actor=lease.controller,
             execution_root=str(execution_root) if execution_root != root else "",
             selective_model=bool(launch_meta.get("selective_model")),
+            execution_limits=execution_limits.to_dict() if execution_limits else None,
             _authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
         # herdr_launch prints its own diagnostics; the controller's JSON
@@ -3126,6 +3145,168 @@ def _verify_authority_mac(
     )
 
 
+def _execution_limit_ledger_path(
+    root: Path, workflow_root: str, *, require_external: bool = True,
+) -> Path:
+    credential_path = _resume_key_path(argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file="",
+    ))
+    path = credential_path.with_name("execution-limits.json")
+    if require_external:
+        _require_external_accounting_storage(path, str(root.resolve()))
+    return path
+
+
+def _execution_ledger_key(root: Path, workflow_root: str, task_id: str) -> str:
+    value = json.dumps([str(root.resolve()), workflow_root, task_id], separators=(",", ":"))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def _execution_limit_ledger_transaction(path: Path):
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(lock_path.parent, 0o700)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                value = {"schema": "agentflow.execution-limit-ledger@1", "entries": {}}
+            if not isinstance(value, dict) or value.get("schema") != "agentflow.execution-limit-ledger@1":
+                raise ValueError("external execution limit ledger is malformed")
+            entries = value.setdefault("entries", {})
+            if not isinstance(entries, dict):
+                raise ValueError("external execution limit ledger entries are malformed")
+            yield value
+            _private_atomic_json(path, value)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _verify_execution_ledger_entry(
+    entry: Any, *, authority_secret: str,
+) -> Mapping[str, Any]:
+    limits = execution_limits_backend.parse_limits(
+        entry.get("execution_limits") if isinstance(entry, Mapping) else None
+    )
+    if (
+        not isinstance(entry, Mapping) or limits is None
+        or not _verify_authority_mac(authority_secret, entry, domain="execution-limit-ledger-v1")
+        or isinstance(entry.get("attempt"), bool) or not isinstance(entry.get("attempt"), int)
+        or int(entry.get("attempt") or 0) < 1
+        or isinstance(entry.get("max_attempts"), bool) or not isinstance(entry.get("max_attempts"), int)
+        or int(entry.get("max_attempts") or 0) < 1
+        or not isinstance(entry.get("deadline_epoch"), (int, float))
+    ):
+        raise ValueError("external execution limit ledger entry is invalid")
+    return entry
+
+
+def _read_any_execution_ledger_entry(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> Mapping[str, Any] | None:
+    path = _execution_limit_ledger_path(root, workflow_root, require_external=False)
+    if path.exists():
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError:
+            pass
+        else:
+            raise ValueError("existing execution limit ledger is inside the worker workspace")
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    if not isinstance(ledger, Mapping) or ledger.get("schema") != "agentflow.execution-limit-ledger@1":
+        raise ValueError("external execution limit ledger is malformed")
+    entries = ledger.get("entries")
+    if not isinstance(entries, Mapping):
+        raise ValueError("external execution limit ledger entries are malformed")
+    entry = entries.get(_execution_ledger_key(root, workflow_root, task_id))
+    return _verify_execution_ledger_entry(entry, authority_secret=authority_secret) if entry is not None else None
+
+
+def _reserve_execution_attempt(
+    root: Path, workflow_root: str, task_id: str, *,
+    limits: execution_limits_backend.ExecutionLimits,
+    policy_max_attempts: int, authority_secret: str,
+) -> Mapping[str, Any]:
+    path = _execution_limit_ledger_path(root, workflow_root)
+    key = _execution_ledger_key(root, workflow_root, task_id)
+    requested_max = execution_limits_backend.effective_attempt_limit(policy_max_attempts, limits)
+    error = ""
+    with _execution_limit_ledger_transaction(path) as ledger:
+        old = ledger["entries"].get(key)
+        allowed_attempts = requested_max
+        if old is None:
+            deadline_epoch = time.time() + limits.deadline_seconds
+            attempt = 0
+            max_attempts = requested_max
+        else:
+            old = _verify_execution_ledger_entry(old, authority_secret=authority_secret)
+            if old.get("execution_limits") != limits.to_dict():
+                raise ValueError("structured execution limits changed across relaunch")
+            deadline_epoch = float(old["deadline_epoch"])
+            attempt = int(old["attempt"])
+            max_attempts = int(old["max_attempts"])
+            allowed_attempts = min(max_attempts, requested_max)
+            if old.get("status") == "expired":
+                error = "task execution deadline expired; further launches are blocked"
+        if time.time() >= deadline_epoch or (isinstance(old, Mapping) and old.get("status") == "expired"):
+            error = "task execution deadline expired; further launches are blocked"
+            status = "expired"
+        else:
+            status = "active"
+        if not error and attempt >= allowed_attempts:
+            error = "maximum structured task launches are exhausted within the execution policy cap"
+        if error:
+            row = {
+                "execution_limits": limits.to_dict(), "deadline_epoch": deadline_epoch,
+                "attempt": attempt, "max_attempts": max_attempts, "status": status,
+            }
+        else:
+            attempt += 1
+            row = {
+                "execution_limits": limits.to_dict(), "deadline_epoch": deadline_epoch,
+                "attempt": attempt, "max_attempts": max_attempts, "status": "active",
+            }
+        row["authority_hmac"] = _authority_mac(
+            authority_secret, row, domain="execution-limit-ledger-v1",
+        )
+        ledger["entries"][key] = row
+    if error:
+        raise ValueError(error)
+    return row
+
+
+def _verify_execution_snapshot_against_ledger(
+    root: Path, workflow_root: str, task_id: str, snapshot: Mapping[str, Any], *,
+    authority_secret: str,
+) -> Mapping[str, Any] | None:
+    if snapshot.get("execution_limits") is None:
+        if _read_any_execution_ledger_entry(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        ) is not None:
+            raise ValueError("legacy execution snapshot cannot remove limits from the protected ledger")
+        return None
+    limits = execution_limits_backend.parse_limits(snapshot.get("execution_limits"))
+    assert limits is not None
+    entry = _read_any_execution_ledger_entry(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    )
+    if (
+        entry is None or entry.get("execution_limits") != limits.to_dict()
+        or entry.get("deadline_epoch") != snapshot.get("deadline_epoch")
+        or entry.get("attempt") != snapshot.get("attempt")
+        or entry.get("max_attempts") != snapshot.get("max_attempts")
+    ):
+        raise ValueError("signed execution limits do not match the protected monotonic ledger")
+    return entry
+
+
 def _mint_return_channel(
     root: Path,
     workflow_root: str,
@@ -3145,6 +3326,10 @@ def _mint_return_channel(
     lease_epoch: int = 0,
     continuity_id: str = "",
     authority_secret: str = "",
+    execution_limits: execution_limits_backend.ExecutionLimits | None = None,
+    deadline_epoch: float | None = None,
+    attempt: int = 1,
+    max_attempts: int | None = None,
 ) -> dict[str, Any]:
     """Create a signed per-launch contract without persisting its signing key."""
     launch_dir = _runtime_launch_dir(root, workflow_root, launch_id)
@@ -3189,6 +3374,13 @@ def _mint_return_channel(
         "submission_file": str(submission_path),
         "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
     }
+    if execution_limits is not None:
+        contract.update({
+            "execution_limits": execution_limits.to_dict(),
+            "deadline_epoch": deadline_epoch,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        })
     contract["authority_key_id"] = hashlib.sha256(
         authority_secret.encode("utf-8")
     ).hexdigest()[:24]
@@ -4043,6 +4235,16 @@ def herdr_launch(args: argparse.Namespace) -> int:
         if typed_handoff.manifest.get("provider") != provider:
             raise ValueError("handoff provider does not match launch route")
         _require_supported_launch_isolation(typed_handoff, transport="Herdr")
+        try:
+            execution_limits = execution_limits_backend.parse_limits(
+                typed_handoff.manifest.get("execution_limits")
+            )
+        except execution_limits_backend.ExecutionLimitError as exc:
+            raise ValueError(f"invalid structured execution limits: {exc}") from exc
+        policy_attempt_cap = (
+            _controller_execution_policy(root, root, workflow_root).max_attempts_per_task
+            if execution_limits is not None else None
+        )
 
         root_preflight_report: dict[str, Any] = {}
         claude_model_switch_version_verified = False
@@ -4233,6 +4435,33 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 ) or _acceptance_ids_from_handoff(typed_handoff)
                 if not acceptance_ids:
                     raise ValueError("authenticated handoff has no acceptance criteria")
+                # Do not consume protected retry allowance for a launch that
+                # cannot reserve its Herdr task slot. The controller fence is
+                # already held, and the Herdr transaction is rechecked below
+                # before the reservation is committed.
+                with _herdr_transaction(state_path) as state:
+                    existing = state.get("sessions", {}).get(task_id)
+                    if isinstance(existing, dict) and existing.get("status") != "failed":
+                        raise herdr_backend.HerdrError(
+                            f"collision: task {task_id!r} has an active or completed Herdr binding"
+                        )
+                prior_limit_entry = _read_any_execution_ledger_entry(
+                    root, workflow_root, task_id, authority_secret=authority_secret,
+                )
+                limit_entry: Mapping[str, Any] | None = None
+                if execution_limits is not None:
+                    assert policy_attempt_cap is not None
+                    limit_entry = _reserve_execution_attempt(
+                        root, workflow_root, task_id,
+                        limits=execution_limits,
+                        policy_max_attempts=policy_attempt_cap,
+                        authority_secret=authority_secret,
+                    )
+                    attempt = int(limit_entry["attempt"])
+                elif prior_limit_entry is not None:
+                    raise ValueError(
+                        "structured execution limits cannot be removed from a task with protected launch history"
+                    )
                 return_channel = _mint_return_channel(
                     root, workflow_root, task_id=task_id,
                     actor=str(identity.get("actor") or actor),
@@ -4243,6 +4472,10 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     state_path=state_path, controller_id=lease.controller,
                     lease_epoch=lease.epoch, continuity_id=lease.continuity_id,
                     authority_secret=authority_secret,
+                    execution_limits=execution_limits,
+                    deadline_epoch=float(limit_entry["deadline_epoch"]) if limit_entry else None,
+                    attempt=attempt,
+                    max_attempts=int(limit_entry["max_attempts"]) if limit_entry else None,
                 )
                 with _herdr_transaction(state_path) as state:
                     sessions = state.setdefault("sessions", {})
@@ -4252,10 +4485,17 @@ def herdr_launch(args: argparse.Namespace) -> int:
                             raise herdr_backend.HerdrError(
                                 f"collision: task {task_id!r} has an active or completed Herdr binding"
                             )
-                        attempt = execution_backend.attempt_count(existing) + 1
+                        if limit_entry is None:
+                            # Legacy handoffs have no protected retry ledger;
+                            # preserve their historical session-derived count.
+                            attempt = execution_backend.attempt_count(existing) + 1
                         attempts = list(existing.get("attempts") or [])
                     else:
                         attempts = []
+                    if limit_entry is not None and isinstance(existing, dict):
+                        # The external ledger is the retry highwater. Session
+                        # files may be rolled back independently by the worker.
+                        attempts = list(existing.get("attempts") or [])
                     reservation = {
                         "root": str(root), "workflow_root": workflow_root,
                         "task_id": task_id,
@@ -4297,6 +4537,16 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         "status": "launching", "result": None, "binding": None,
                         "attempt": attempt, "attempts": attempts,
                     }
+                    if limit_entry is not None:
+                        reservation.update({
+                            "execution_limits": execution_limits.to_dict(),
+                            "deadline_epoch": float(limit_entry["deadline_epoch"]),
+                            "max_attempts": int(limit_entry["max_attempts"]),
+                            "consumed_attempts": attempt,
+                            "execution_limit_capabilities": execution_limits_backend.capability_status(
+                                execution_limits, enforced=True,
+                            ),
+                        })
                     sessions[task_id] = reservation
         except controller_backend.FencedLease as exc:
             raise ValueError(f"launch authority revalidation failed before reservation: {exc}") from exc
@@ -4341,6 +4591,19 @@ def herdr_launch(args: argparse.Namespace) -> int:
                                 "Claude Herdr argv primary model does not match the approved route"
                             )
                         provider_tail.extend(["--fallback-model", primary_model])
+                    if limit_entry is not None:
+                        # The provider argv remains byte-for-byte after the
+                        # supervisor separator, preserving model selection and
+                        # native attestation hooks. Herdr owns the wrapper PTY;
+                        # the supervisor transfers foreground control to the
+                        # provider process group and bounds it by the original
+                        # absolute task deadline.
+                        provider_tail = [
+                            sys.executable,
+                            str(Path(execution_limits_backend.__file__).resolve()),
+                            "--deadline-epoch", str(limit_entry["deadline_epoch"]),
+                            "--", *provider_tail,
+                        ]
                     safe_env = [
                         f"AGENTFLOW_HANDOFF_PATH={typed_handoff.path}",
                         f"AGENTFLOW_RESULT_CONTRACT={return_channel['contract_path']}",
@@ -4348,6 +4611,12 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         f"AGENTFLOW_SUBMISSION_FILE={return_channel['submission_path']}",
                         f"AGENTFLOW_HERDR_AGENT_NAME={agent_name}",
                         f"AGENTFLOW_TASK_ID={task_id}",
+                        # Herdr's daemon can outlive this controller and keep
+                        # an older AGENTFLOW_STATE_HOME in its environment.
+                        # Pin the managed provider and its lifecycle hooks to
+                        # the state root this controller actually uses so
+                        # model evidence lands in the spool we verify.
+                        f"AGENTFLOW_STATE_HOME={_state_dir().expanduser().resolve()}",
                     ]
                     launch_env: list[str] = []
                     # Fix #2: the installed Herdr API is `herdr agent start
@@ -4591,6 +4860,14 @@ def _verify_return_contract_binding(
         raise ValueError("workspace root does not match the launch reservation")
     if str(binding.get("task_id") or "") != task_id:
         raise ValueError("task identity does not match the launch reservation")
+    if "execution_limits" in binding:
+        if (
+            record.get("execution_limits") != binding.get("execution_limits")
+            or record.get("deadline_epoch") != binding.get("deadline_epoch")
+            or int(record.get("attempt") or 0) != int(binding.get("attempt") or 0)
+            or int(record.get("max_attempts") or 0) != int(binding.get("max_attempts") or 0)
+        ):
+            raise ValueError("durable execution limit snapshot does not match the signed launch contract")
     acceptance_ids = binding.get("acceptance_ids")
     approved_waivers = binding.get("approved_waivers")
     if not isinstance(acceptance_ids, list) or not all(isinstance(value, str) and value for value in acceptance_ids):
@@ -4763,6 +5040,13 @@ def herdr_result(args: argparse.Namespace) -> int:
                 contract, contract_path, task_id, initial_record,
                 root=root, authority_secret=signing_secret,
             )
+            _verify_execution_snapshot_against_ledger(
+                root, str(binding.get("workflow_root") or ""), task_id, binding,
+                authority_secret=signing_secret,
+            )
+            deadline_epoch = binding.get("deadline_epoch")
+            if deadline_epoch is not None and time.time() >= float(deadline_epoch):
+                raise ValueError("task execution deadline expired; late results cannot be ingested")
             raw_result_path = Path(str(binding.get("result_path") or "")).expanduser()
             raw_capability_path = Path(
                 str(getattr(args, "_capability_file", "") or "")
@@ -4845,6 +5129,12 @@ def herdr_result(args: argparse.Namespace) -> int:
                     )
                     if current_contract != contract:
                         raise ValueError("return contract changed during result ingestion")
+                    _verify_execution_snapshot_against_ledger(
+                        root, workflow_root, task_id, binding,
+                        authority_secret=signing_secret,
+                    )
+                    if binding.get("deadline_epoch") is not None and time.time() >= float(binding["deadline_epoch"]):
+                        raise ValueError("task execution deadline expired; late results cannot be ingested")
                     if str(channel.get("capability_sha256") or "") != hashlib.sha256(capability.encode("utf-8")).hexdigest():
                         raise ValueError("return capability is invalid")
                     for field, expected in (
@@ -4904,6 +5194,7 @@ def herdr_result(args: argparse.Namespace) -> int:
                     record["status"] = outcome
                     channel["state"] = "consumed"
                     channel["consumed_at"] = _now()
+                    channel["consumed_at_epoch"] = time.time()
                     channel["result_sha256"] = hashlib.sha256(
                         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     ).hexdigest()
@@ -6305,14 +6596,38 @@ def usage_record(args: argparse.Namespace) -> int:
     remaining = legacy_remaining if legacy_remaining is not None else remaining_after
     findings = getattr(args, "findings", None)
     accepted_findings = getattr(args, "accepted_findings", None)
-    if getattr(args, "retries", 0) < 0:
-        print("--retries cannot be negative.", file=sys.stderr)
+    elapsed_seconds = getattr(args, "elapsed_seconds", None)
+    for field in ("remaining", "remaining_before", "remaining_after", "credits_used", "elapsed_seconds"):
+        value = getattr(args, field, None)
+        if value is not None:
+            try:
+                finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                print(f"--{field.replace('_', '-')} must be a finite number.", file=sys.stderr)
+                return 2
+    if elapsed_seconds is not None and elapsed_seconds < 0:
+        print("--elapsed-seconds must be a finite non-negative number.", file=sys.stderr)
+        return 2
+    retries = getattr(args, "retries", None)
+    evaluation_identity = any(getattr(args, field, "") for field in ("evaluation_id", "variant", "case_id"))
+    if retries is None and not evaluation_identity:
+        retries = 0  # Preserve the legacy record default; evaluation omissions stay unknown.
+    for field in ("retries", "rework_rounds", "unrequested_changes", "human_interventions"):
+        value = getattr(args, field, None)
+        if value is not None and value < 0:
+            print(f"--{field.replace('_', '-')} cannot be negative.", file=sys.stderr)
+            return 2
+    accepted_result = getattr(args, "accepted_result", "")
+    if accepted_result not in {"", "accepted", "rejected"}:
+        print("--accepted-result must be accepted or rejected.", file=sys.stderr)
         return 2
     if findings is not None and accepted_findings is not None and accepted_findings > findings:
         print("--accepted-findings cannot exceed --findings.", file=sys.stderr)
         return 2
     try:
-        for field in ("auth_mode", "plan", "model", "effort", "project", "task", "role", "window", "reset_at", "outcome", "source", "note"):
+        for field in ("auth_mode", "plan", "model", "effort", "project", "task", "role", "task_class", "evaluation_id", "variant", "case_id", "window", "reset_at", "outcome", "source", "note"):
             value = getattr(args, field, "")
             if value:
                 privacy_backend.require_safe_text(value, field, limit=1_000)
@@ -6333,19 +6648,26 @@ def usage_record(args: argparse.Namespace) -> int:
         "task": getattr(args, "task", ""),
         "role": getattr(args, "role", ""),
         "task_class": getattr(args, "task_class", ""),
+        "evaluation_id": getattr(args, "evaluation_id", ""),
+        "variant": getattr(args, "variant", ""),
+        "case_id": getattr(args, "case_id", ""),
         "remaining_percent": remaining,
         "remaining_before_percent": getattr(args, "remaining_before", None),
         "remaining_after_percent": remaining_after,
         "credits_used": getattr(args, "credits_used", None),
         "window": args.window,
         "reset_at": args.reset_at,
-        "elapsed_seconds": getattr(args, "elapsed_seconds", None),
-        "retries": getattr(args, "retries", 0),
+        "elapsed_seconds": elapsed_seconds,
+        "retries": retries,
         "checks": getattr(args, "check", []),
         "files": getattr(args, "files", None),
         "bytes": getattr(args, "bytes", None),
         "findings": findings,
         "accepted_findings": accepted_findings,
+        "accepted_result": accepted_result,
+        "rework_rounds": getattr(args, "rework_rounds", None),
+        "unrequested_changes": getattr(args, "unrequested_changes", None),
+        "human_interventions": getattr(args, "human_interventions", None),
         "outcome": getattr(args, "outcome", ""),
         "source": args.source,
         "measurement_authority": usage_backend.measurement_authority(args.source),
@@ -6510,18 +6832,42 @@ def config_hooks_merge(args: argparse.Namespace) -> int:
 
 def usage_yield(args: argparse.Namespace) -> int:
     try:
-        value = _read_json_value(args.file) if args.file else _read_json_value(str(_state_dir() / "usage.jsonl"))
+        value = _read_json_value(args.file) if args.file else _read_jsonl(_state_dir() / "usage.jsonl")
     except (OSError, json.JSONDecodeError) as exc:
-        if args.file:
-            print(f"usage yield: {exc}", file=sys.stderr)
-            return 2
-        value = _read_jsonl(_state_dir() / "usage.jsonl")
+        print(f"usage yield: {exc}", file=sys.stderr)
+        return 2
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         print("usage yield: input must be a JSON list of usage records", file=sys.stderr)
         return 2
+    if getattr(args, "evaluation", False):
+        result = {"evaluation": usage_backend.evaluation_report(value)}
+        print(json.dumps(result, indent=2, sort_keys=True) if args.json else _format_usage_evaluation(result["evaluation"]))
+        return 0
     result = usage_backend.report(value)
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else "\n".join(f"{item['task_class']}: success={item['success_yield']:.1%} evidence={item['evidence_yield'] if item['evidence_yield'] is not None else 'n/a'} ({item['measurement']})" for item in result["task_classes"]) or "No comparable task-class records.")
     return 0
+
+
+def _format_usage_evaluation(value: Mapping[str, Any]) -> str:
+    lines = [f"Evaluation records: {value['records']}"]
+    for cohort in value["cohorts"]:
+        lines.append("/".join((cohort["evaluation_id"], cohort["task_class"], cohort["provider"], cohort["model"], cohort["effort"])))
+        for variant, summary in cohort["variants"].items():
+            lines.append(f"  {variant}: attempts={summary['attempts']} completed={summary['completed']} usage={summary['usage_measurement_authority']}; outcomes/metrics=local observations")
+        for comparison in cohort["comparisons"]:
+            lines.append(f"  baseline vs treatment: matched={comparison['matched_cases']} unmatched={comparison['unmatched_cases']} ambiguous-cases={comparison['ambiguous_duplicate_cases']} ambiguous-records={comparison['ambiguous_duplicate_records']}")
+            accepted = comparison["accepted_results"]
+            lines.append(f"    accepted results: baseline={accepted['counts']['baseline']} treatment={accepted['counts']['treatment']} complete={accepted['complete_pairs']} missing={accepted['missing_pairs']} accepted-count-delta={accepted['accepted_count_delta']} acceptance-rate-delta={accepted['acceptance_rate_delta'] if accepted['acceptance_rate_delta'] is not None else 'n/a'}")
+            for metric, delta in comparison["metric_deltas"].items():
+                metric_value = delta["mean_treatment_minus_baseline"]
+                shown = "n/a" if metric_value is None else f"{metric_value:g}"
+                lines.append(f"    {metric} (local): treatment-baseline={shown} n={delta['n']} missing={delta['missing']} invalid={delta['invalid']}")
+    if value["excluded"]:
+        lines.append(f"Excluded records: {json.dumps(value['excluded'], sort_keys=True)}")
+    if not value["cohorts"]:
+        lines.append("No comparable evaluation cohorts.")
+    lines.append(value["note"])
+    return "\n".join(lines)
 
 
 def usage_optimize(args: argparse.Namespace) -> int:
@@ -7485,6 +7831,16 @@ def handoff_create(args: argparse.Namespace) -> int:
     output_boundary = getattr(args, "output_boundary", "") or str(task_cwd)
     allow_delegation = getattr(args, "allow_delegation", False)
     max_ai_credits = getattr(args, "max_ai_credits", None)
+    limit_deadline = getattr(args, "deadline_seconds", None)
+    limit_retries = getattr(args, "max_retries", None)
+    try:
+        execution_limits = execution_limits_backend.parse_limits(
+            None if limit_deadline is None and limit_retries is None
+            else {"deadline_seconds": limit_deadline, "max_retries": limit_retries}
+        )
+    except execution_limits_backend.ExecutionLimitError as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 2
     return_type = getattr(args, "return_type", "result")
     artifact_kind = getattr(args, "artifact_kind", "")
     writer_model = getattr(args, "writer_model", "")
@@ -7624,6 +7980,8 @@ Task class: {task_class}
 Role: {role}
 Artifact kind: {artifact_kind or 'not classified'}
 Writer model: {writer_model or 'resolved at launch'}
+Structured limits: {json.dumps(execution_limits.to_dict(), sort_keys=True) if execution_limits else 'legacy/unset (deadline advisory; retries unavailable)'}
+When present, `max_retries` counts additional Agentflow task launches and is capped by the workflow's attempt policy and graph launch budget; it does not count internal provider/model/tool loops. Provider spend limits are unavailable, and detached descendants are outside the process-group deadline.
 Delegation: {'allowed' if allow_delegation else 'disabled'}
 Tool profile: {tool_profile}
 Issue: {args.issue or 'none'}
@@ -7731,6 +8089,7 @@ Do not wait while consuming allowance. In an external session, the user may atta
         "constraints": args.constraint,
         "checks": args.check,
         "budget": budgets,
+        "execution_limits": execution_limits.to_dict() if execution_limits else None,
         "max_ai_credits": max_ai_credits,
         "required_tools": required_tools,
         "required_skills": required_skills,
@@ -7822,6 +8181,24 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
     constraints = args.constraint or _string_list(stored.get("constraints"))
     checks = args.check or _string_list(stored.get("checks"))
     budgets = args.budget or _string_list(stored.get("budget"))
+    stored_launch = stored.get("launch") if isinstance(stored.get("launch"), Mapping) else {}
+    stored_limits = stored_launch.get("execution_limits", stored.get("execution_limits"))
+    deadline_override = getattr(args, "deadline_seconds", None)
+    retries_override = getattr(args, "max_retries", None)
+    if deadline_override is not None or retries_override is not None:
+        merged_limits = dict(stored_limits or {}) if isinstance(stored_limits, Mapping) else {}
+        if deadline_override is not None:
+            merged_limits["deadline_seconds"] = deadline_override
+        if retries_override is not None:
+            merged_limits["max_retries"] = retries_override
+        limit_value: Any = merged_limits
+    else:
+        limit_value = stored_limits
+    try:
+        execution_limits = execution_limits_backend.parse_limits(limit_value)
+    except execution_limits_backend.ExecutionLimitError as exc:
+        print(f"Cannot materialize execution limits: {exc}", file=sys.stderr)
+        return 2
     done_when = _string_list(issue.get("acceptance_criteria"))
     if not done_when:
         done_when = _string_list(stored.get("done_when"))
@@ -7864,6 +8241,8 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
             if args.max_ai_credits is not None
             else stored.get("max_ai_credits")
         ),
+        deadline_seconds=execution_limits.deadline_seconds if execution_limits else None,
+        max_retries=execution_limits.max_retries if execution_limits else None,
         acceptance_matrix=acceptance_path,
         base=base,
         dependency=_string_list(stored.get("dependencies")),
@@ -7913,6 +8292,7 @@ def handoff_from_bead(args: argparse.Namespace) -> int:
             "max_ai_credits",
             "required_tools",
             "required_skills",
+            "execution_limits",
         )
     }
     durable_contract["materialized_at"] = _now()
@@ -7949,6 +8329,12 @@ def handoff_preflight(args: argparse.Namespace) -> int:
 
     provider = str(manifest.get("provider") or "")
     lane = str(manifest.get("lane") or "")
+    try:
+        handoff_limits = execution_limits_backend.parse_limits(manifest.get("execution_limits"))
+    except execution_limits_backend.ExecutionLimitError as exc:
+        handoff_limits = None
+        errors.append(f"invalid structured execution limits: {exc}")
+    limit_capabilities = execution_limits_backend.capability_status(handoff_limits)
     root = (
         Path(args.cwd).expanduser().resolve()
         if args.cwd
@@ -8117,6 +8503,8 @@ def handoff_preflight(args: argparse.Namespace) -> int:
             "required_skills": [skill["name"] for skill in resolved_skills],
             "required_tools": [str(tool) for tool in required_tools if isinstance(tool, str)],
             "acceptance_matrix": acceptance_value,
+            "execution_limits": handoff_limits.to_dict() if handoff_limits else None,
+            "execution_limit_capabilities": limit_capabilities,
             "errors": [],
         }
         report_sha256 = hashlib.sha256(
@@ -8176,6 +8564,7 @@ def handoff_preflight(args: argparse.Namespace) -> int:
     print(f"context: {context_files} files / {context_bytes} bytes")
     print(f"skills: {len(resolved_skills)} resolved")
     print(f"budget: {'; '.join(str(value) for value in budgets) if budgets else 'missing'}")
+    print(f"execution-limits: {json.dumps(limit_capabilities, sort_keys=True)}")
     for skill in resolved_skills:
         print(
             f"ok: skill={skill['name']} entrypoint={_safe_cwd(skill['entrypoint'])} "
@@ -10291,6 +10680,9 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--task", default="")
     record_parser.add_argument("--role", default="")
     record_parser.add_argument("--task-class", choices=TASK_CLASSES, default="")
+    record_parser.add_argument("--evaluation-id", default="", help="Shared ID for a paired evaluation run")
+    record_parser.add_argument("--variant", choices=("baseline", "treatment"), default="")
+    record_parser.add_argument("--case-id", default="", help="Stable task case identifier used to pair variants")
     record_parser.add_argument("--remaining", type=float)
     record_parser.add_argument("--remaining-before", type=float)
     record_parser.add_argument("--remaining-after", type=float)
@@ -10298,18 +10690,23 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--window", default="")
     record_parser.add_argument("--reset-at", default="")
     record_parser.add_argument("--elapsed-seconds", type=float)
-    record_parser.add_argument("--retries", type=int, default=0)
+    record_parser.add_argument("--retries", type=int, help="Observed retry count; omitted evaluation values remain unknown")
     record_parser.add_argument("--check", action="append", default=[])
     record_parser.add_argument("--files", type=int)
     record_parser.add_argument("--bytes", type=int)
     record_parser.add_argument("--findings", type=int)
     record_parser.add_argument("--accepted-findings", type=int)
+    record_parser.add_argument("--accepted-result", choices=("accepted", "rejected"), default="", help="Observed acceptance of this task result; omitted values remain unknown")
+    record_parser.add_argument("--rework-rounds", type=int, help="Observed correction or rework rounds")
+    record_parser.add_argument("--unrequested-changes", type=int, help="Observed changes outside the requested scope")
+    record_parser.add_argument("--human-interventions", type=int, help="Observed human interventions during the run")
     record_parser.add_argument("--outcome", default="")
     record_parser.add_argument("--source", default="manual")
     record_parser.add_argument("--note", default="")
     record_parser.set_defaults(func=usage_record)
     yield_parser = usage_sub.add_parser("yield", help="Compare accepted-result yield within identical task classes")
     yield_parser.add_argument("--file", default="", help="JSON list, or omit to use local usage records")
+    yield_parser.add_argument("--evaluation", action="store_true", help="Report paired cohorts within matching evaluation identities")
     yield_parser.add_argument("--json", action="store_true")
     yield_parser.set_defaults(func=usage_yield)
     optimize_parser = usage_sub.add_parser(
@@ -10430,6 +10827,8 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--allow-delegation", action="store_true")
     create_parser.add_argument("--return-type", choices=("result", "review"), default="result")
     create_parser.add_argument("--max-ai-credits", type=int)
+    create_parser.add_argument("--deadline-seconds", type=int)
+    create_parser.add_argument("--max-retries", type=int)
     create_parser.add_argument("--acceptance-matrix", default="")
     create_parser.add_argument("--isolation-profile", choices=("none", "hardened"), default="none")
     create_parser.add_argument("--require-asset", action="append", default=[])
@@ -10467,6 +10866,8 @@ def build_parser() -> argparse.ArgumentParser:
     from_bead_parser.add_argument("--allow-delegation", action="store_true")
     from_bead_parser.add_argument("--return-type", choices=("result", "review"), default="")
     from_bead_parser.add_argument("--max-ai-credits", type=int)
+    from_bead_parser.add_argument("--deadline-seconds", type=int)
+    from_bead_parser.add_argument("--max-retries", type=int)
     from_bead_parser.add_argument("--base", default="")
     from_bead_parser.add_argument("--branch", default="")
     from_bead_parser.add_argument("--context", action="append", default=[])

@@ -46,6 +46,12 @@
 
 ## Safety and quality
 
+- Before editing, inspect the affected code, its callers, relevant tests, and shared utilities.
+- Make the smallest complete implementation. Add abstractions, dependencies, or configuration only when the change justifies them.
+- Keep changes focused, preserve unrelated work, and remove only orphans created by the change.
+- Follow established conventions. If a consequential conflict requires a different choice, explain it.
+- State material assumptions. Ask only questions whose answers would change scope, correctness, or authority.
+- For behavior changes, use a check that detects the requested missing or broken behavior before the fix and passes afterward; scale the check to the risk. Report checks that were skipped, unavailable, or waived.
 - Never expose credentials or copy provider session transcripts into handoffs.
 - Treat provider-reported dashboards and usage commands as authoritative; label local cost figures as estimates.
 - Record task class, model, effort, allowance or credits, elapsed time, retries, input size, findings, accepted findings, checks, and outcome when available.
