@@ -108,6 +108,34 @@ class PackagingConfigTests(unittest.TestCase):
             self.assertIn(".agentflow/config.local.json", ignored)
             self.assertIn(".agentflow/managed-skill-links.json", ignored)
 
+    def test_project_init_and_provider_profiles_deliver_shared_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
+
+            template = Path(__file__).resolve().parents[1] / "templates/project"
+            generated_agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertEqual(generated_agents, (template / "AGENTS.md").read_text(encoding="utf-8"))
+            self.assertEqual(
+                generated_agents,
+                resources.item("templates", "project", "AGENTS.md").read_text(encoding="utf-8"),
+            )
+            self.assertEqual((root / "CLAUDE.md").read_text(encoding="utf-8"), "@AGENTS.md\n")
+            self.assertIn(
+                "AGENTS.md",
+                (root / ".github/copilot-instructions.md").read_text(encoding="utf-8"),
+            )
+
+        shared_policy_reference = "AGENTS.md for shared coding discipline"
+        for provider in ("codex", "claude", "copilot"):
+            profiles = resources.names("agents", provider)
+            self.assertEqual(len(profiles), 5)
+            for name in profiles:
+                profile = resources.item("agents", provider, name).read_text(encoding="utf-8")
+                with self.subTest(provider=provider, profile=name):
+                    self.assertIn(shared_policy_reference, profile)
+
     def test_local_layer_validates_and_overrides_shared_by_skill_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

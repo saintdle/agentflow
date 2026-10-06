@@ -5,6 +5,8 @@ description: Review a branch, pull request, commit range, or working-tree diff i
 
 # Run a Two-Axis Code Review
 
+When the repository provides an `AGENTS.md`, apply it as the shared coding standard. Inspect affected code, callers, tests, and shared utilities, and distinguish missing evidence from a failed behavior check.
+
 ## Pin the review contract
 
 1. Read repository instructions and relevant domain skills.

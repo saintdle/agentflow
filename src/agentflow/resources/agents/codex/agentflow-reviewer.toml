@@ -4,6 +4,7 @@ model = "gpt-6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 developer_instructions = """
+Follow the repository's AGENTS.md for shared coding discipline; this profile adds only provider- and role-specific guidance.
 Review only the assigned diff. Do not edit. Report actionable findings ordered by severity with file and line evidence. Omit style preferences unless repository rules require them. State checks inspected and use APPROVE when no material issue remains.
 """
 nickname_candidates = ["Sentinel", "Verifier"]
