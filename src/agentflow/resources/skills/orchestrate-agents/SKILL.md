@@ -79,10 +79,13 @@ globally merely because a bead is ready.
 A provider used only as the controller or independent reviewer still counts as participating; do not invent implementation work merely to use every provider. Resolve the base SHA, exact scopes, evidence sources, and numeric provider budgets before launching workers. If a provider has no enforceable session cap, give it a time box, maximum retry count, and stop condition in the assignment.
 
 If an external assignment uses structured Agentflow execution limits, provide
-both `--deadline-seconds` and `--max-retries`. The positive deadline is fixed
-on first launch and shared across resume; retries count additional Agentflow
-launches and can only tighten the graph's existing attempt and global-launch
-budgets. The protected ledger preserves that first deadline across retries.
+both `--deadline-seconds` and `--max-retries`. For a Beads task, persist them in
+`metadata.agentflow.launch.execution_limits` (or the compatible
+`metadata.agentflow.execution_limits` fallback); direct handoffs use the same
+two CLI flags. The positive deadline is fixed on first launch and shared across
+resume; retries count additional Agentflow launches and can only tighten the
+graph's existing attempt and global-launch budgets. The protected ledger
+preserves that first deadline across retries.
 Deadline enforcement covers only the supervised provider process group on
 supported systems; detached descendants can outlive it. Older handoffs without
 `execution_limits` remain advisory/unavailable, and these fields do not enforce
