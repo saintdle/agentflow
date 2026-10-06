@@ -189,55 +189,72 @@ def find_first(
     items: list[RecallItem] = []
     rendered: list[str] = []
     seen_digests: set[str] = set()
+    deferred_claims: list[str] = []
     # The fixed safety header is part of the same strict prompt budget as the
     # quoted records. If it cannot fit, return no recall rather than a partial
     # guardrail or a context containing data without its framing.
     used = len(_UNTRUSTED_HEADER) + 1
     if used > max_chars:
         return RecallPlan(query, (), "", max_chars, max_items)
-    for candidate in candidates:
-        result = index.fetch_approved(candidate.document_id, min_authority=min_authority, scopes=selected_scope, scope_id=scope_id, max_age_days=max_age_days, now=instant)
-        if result is None:
-            continue
-        if result.source_digest in seen_digests:
-            continue
-        # Keep room for the record separator and permit a shortened summary
-        # when escaped JSON or a long source reference consumes the budget.
-        item = RecallItem(result.document_id, result.title, result.summary[:max_summary_chars], result.source, result.source_digest, result.scope, result.scope_id, result.authority, result.provenance)
-        line = _render(item)
-        separator = 1 if rendered else 0
-        remaining = max_chars - used - separator
-        if remaining <= 0:
-            break
-        if len(line) > remaining:
-            # Find the longest summary that fits after JSON escaping while
-            # preserving identity and provenance fields in full.
-            low, high = 0, len(item.summary)
-            best: RecallItem | None = None
-            best_line = ""
-            while low <= high:
-                middle = (low + high) // 2
-                candidate_item = dataclasses.replace(item, summary=item.summary[:middle])
-                candidate_line = _render(candidate_item)
-                if len(candidate_line) <= remaining:
-                    best, best_line = candidate_item, candidate_line
-                    low = middle + 1
-                else:
-                    high = middle - 1
-            if best is None:
+    try:
+        for candidate in candidates:
+            result = index.fetch_approved(candidate.document_id, min_authority=min_authority, scopes=selected_scope, scope_id=scope_id, max_age_days=max_age_days, now=instant)
+            if result is None:
+                continue
+            if result.source_digest in seen_digests:
+                continue
+            # Keep room for the record separator and permit a shortened summary
+            # when escaped JSON or a long source reference consumes the budget.
+            item = RecallItem(result.document_id, result.title, result.summary[:max_summary_chars], result.source, result.source_digest, result.scope, result.scope_id, result.authority, result.provenance)
+            line = _render(item)
+            separator = 1 if rendered else 0
+            remaining = max_chars - used - separator
+            if remaining <= 0:
                 break
-            item, line = best, best_line
-        if session_id and not index.claim_injection(
-            session_id, item.source_digest, item.document_id,
-            limit=session_ledger_limit, reservation_id=reservation_id,
-        ):
-            continue
-        rendered.append(line)
-        items.append(item)
-        seen_digests.add(item.source_digest)
-        used += separator + len(line)
-        if len(items) >= max_items:
-            break
+            if len(line) > remaining:
+                # Find the longest summary that fits after JSON escaping while
+                # preserving identity and provenance fields in full.
+                low, high = 0, len(item.summary)
+                best: RecallItem | None = None
+                best_line = ""
+                while low <= high:
+                    middle = (low + high) // 2
+                    candidate_item = dataclasses.replace(item, summary=item.summary[:middle])
+                    candidate_line = _render(candidate_item)
+                    if len(candidate_line) <= remaining:
+                        best, best_line = candidate_item, candidate_line
+                        low = middle + 1
+                    else:
+                        high = middle - 1
+                if best is None:
+                    break
+                item, line = best, best_line
+            if session_id:
+                claimed = index.claim_injection(
+                    session_id, item.source_digest, item.document_id,
+                    limit=session_ledger_limit, reservation_id=reservation_id,
+                )
+                if not claimed:
+                    continue
+                if not record_usage and reservation_id:
+                    deferred_claims.append(item.source_digest)
+            rendered.append(line)
+            items.append(item)
+            seen_digests.add(item.source_digest)
+            used += separator + len(line)
+            if len(items) >= max_items:
+                break
+    except Exception:
+        # A later fetch or atomic claim can fail after earlier claims were
+        # acquired. Release only this deferred plan's nonce so the hook may
+        # retry without touching committed/direct-recall claims.
+        if not record_usage and session_id and reservation_id:
+            for source_digest in deferred_claims:
+                try:
+                    index.release_injection(session_id, source_digest, reservation_id)
+                except Exception:
+                    continue
+        raise
     # Direct recall callers retain the historical accounting behavior. Hook
     # callers may defer this update until the assembled context was written.
     if record_usage:

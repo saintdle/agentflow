@@ -7155,6 +7155,7 @@ def hook(args: argparse.Namespace) -> int:
     runtime = None
     runtime_event = None
     plan = None
+    runtime_status: dict[str, Any] = {}
     try:
         workflow_workspace = _repository_root(hook_cwd)
         config_path = project_config_backend.config_path(workflow_workspace)
@@ -7166,7 +7167,9 @@ def hook(args: argparse.Namespace) -> int:
         runtime = memory_runtime_backend.MemoryRuntime(
             workflow_workspace, project_config_backend.memory_settings(config)
         )
-        runtime_event, plan, _ = runtime.process(args.provider, payload, event, record_usage=False)
+        runtime_event, plan, runtime_status = runtime.process(
+            args.provider, payload, event, record_usage=False,
+        )
     except Exception:  # noqa: BLE001 - provider hooks must fail open
         runtime = None
         runtime_event = None
@@ -7176,7 +7179,11 @@ def hook(args: argparse.Namespace) -> int:
         inactive = context_delivery_backend.plan_context(args.provider, event)
         if inactive.get("status") == "unsupported_event":
             reason = inactive.get("reason") or "unsupported_event"
-        elif runtime is None or (runtime.enabled and runtime_event is None):
+        elif runtime is None or (
+            runtime.enabled and (
+                runtime_event is None or runtime_status.get("recall_status") == "unavailable"
+            )
+        ):
             reason = "recall_unavailable"
         elif not runtime.enabled:
             reason = "recall_disabled"
@@ -7191,7 +7198,9 @@ def hook(args: argparse.Namespace) -> int:
                     "client_version": payload.get("client_version"),
                     "event_envelope": runtime_event or event_envelope,
                     "recall_status": (
-                        "unavailable" if runtime.enabled and runtime_event is None else
+                        "unavailable" if runtime.enabled and (
+                            runtime_event is None or runtime_status.get("recall_status") == "unavailable"
+                        ) else
                         "disabled" if not runtime.enabled else "not_requested"
                     ),
                     "selected_item_count": 0,
@@ -7223,7 +7232,8 @@ def hook(args: argparse.Namespace) -> int:
     recall_status = (
         "unavailable" if runtime is None
         else "disabled" if not runtime.enabled
-        else "not_requested" if plan is None
+        else "unavailable" if runtime_event is None
+        else runtime_status.get("recall_status", "not_requested") if plan is None
         else "selected" if plan.items
         else "empty"
     )

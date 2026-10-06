@@ -534,8 +534,18 @@ class MemoryRuntime:
                         index.reset_session(event.session_id)
                 except Exception:  # noqa: BLE001 - compaction reset is fail-open
                     pass
+            recall_requested = bool(
+                (event.event != "prompt.submit" or bool(self.settings.get("on_prompt")))
+                and _query(payload, event.event, self.settings)
+            )
             plan = self.recall(event, payload, record_usage=record_usage)
             health = self.maintain() if event.event == "session.stop" else {}
+            health["recall_status"] = (
+                "unavailable" if recall_requested and plan is None
+                else "not_requested" if not recall_requested
+                else "selected" if plan.items
+                else "empty"
+            )
             return event, plan, health
         except Exception:  # noqa: BLE001 - provider hooks are fail-open
             return None, None, {}

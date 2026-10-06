@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import argparse
+import io
 import json
 import multiprocessing
 import os
@@ -9,10 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agentflow import cli, project_config
 from agentflow.events import normalize_event
 from agentflow.memory_runtime import MemoryRuntime, ReceiptSpool, state_home
 from agentflow.project_config import DEFAULT_MEMORY
-from agentflow.search import KnowledgeDocument, KnowledgeIndex
+from agentflow.search import KnowledgeDocument, KnowledgeIndex, SearchError
 
 
 def _receipt_writer(path: str, start: int) -> None:
@@ -22,6 +25,114 @@ def _receipt_writer(path: str, start: int) -> None:
 
 
 class MemoryValidationTests(unittest.TestCase):
+    def test_hook_receipt_marks_caught_requested_recall_failure_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            root = Path(state) / "repo"
+            root.mkdir()
+            config = project_config.default_data()
+            config["memory"].update(enabled=True, startup_query="blue comet", max_items=2)
+            config_path = project_config.config_path(root)
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": state}, clear=False):
+                runtime = MemoryRuntime(root, project_config.memory_settings(config))
+                stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                with KnowledgeIndex(runtime.database) as index:
+                    for number in range(2):
+                        document_id = f"doc-{number}"
+                        index.candidate(KnowledgeDocument(
+                            document_id, f"Blue comet {number}", f"blue comet memory {number}",
+                            f"docs/{number}.md", freshness=stamp,
+                        ))
+                        index.approve(
+                            document_id, approval_by="human:test", approval_ref=f"review-{number}",
+                            approved_at=stamp,
+                        )
+                original_claim = KnowledgeIndex.claim_injection
+                claim_count = 0
+
+                def fail_second_claim(index, *args, **kwargs):
+                    nonlocal claim_count
+                    claim_count += 1
+                    if claim_count == 2:
+                        raise SearchError("synthetic second-claim failure")
+                    return original_claim(index, *args, **kwargs)
+
+                payload = {
+                    "hook_event_name": "SessionStart", "session_id": "hook-failure",
+                    "cwd": str(root),
+                }
+                with mock.patch.object(KnowledgeIndex, "claim_injection", fail_second_claim), \
+                     mock.patch.object(cli.beads_backend, "prime", return_value=""), \
+                     mock.patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                     mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
+
+                rows = [json.loads(line) for line in runtime.receipts_path.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(rows[-1]["recall_status"], "unavailable")
+                self.assertEqual(rows[-1]["stage"], "emitted")
+
+    def test_partial_deferred_claim_failure_releases_plan_and_allows_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            root = Path(state) / "repo"
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": state}, clear=False):
+                settings = dict(DEFAULT_MEMORY, enabled=True, startup_query="blue comet", max_items=2)
+                runtime = MemoryRuntime(root, settings)
+                stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                with KnowledgeIndex(runtime.database) as index:
+                    for number in range(2):
+                        document_id = f"doc-{number}"
+                        index.candidate(KnowledgeDocument(
+                            document_id, f"Blue comet {number}", f"blue comet memory {number}",
+                            f"docs/{number}.md", freshness=stamp,
+                        ))
+                        index.approve(
+                            document_id, approval_by="human:test", approval_ref=f"review-{number}",
+                            approved_at=stamp,
+                        )
+
+                original_claim = KnowledgeIndex.claim_injection
+                claim_count = 0
+
+                def fail_second_claim(index, *args, **kwargs):
+                    nonlocal claim_count
+                    claim_count += 1
+                    if claim_count == 2:
+                        raise SearchError("synthetic second-claim failure")
+                    return original_claim(index, *args, **kwargs)
+
+                with mock.patch.object(KnowledgeIndex, "claim_injection", fail_second_claim):
+                    event, failed_plan, failed_status = runtime.process(
+                        "codex", {"event": "SessionStart", "session_id": "retry-session"},
+                        "SessionStart", record_usage=False,
+                    )
+
+                self.assertIsNotNone(event)
+                self.assertIsNone(failed_plan)
+                with KnowledgeIndex(runtime.database) as index:
+                    held = index.connection.execute(
+                        "SELECT COUNT(*) FROM session_injections WHERE session_id = ?",
+                        (event.session_id,),
+                    ).fetchone()[0]
+                self.assertEqual(held, 0)
+                self.assertEqual(failed_status.get("recall_status"), "unavailable")
+
+                retry_event, retry_plan, retry_status = runtime.process(
+                    "codex", {"event": "SessionStart", "session_id": "retry-session"},
+                    "SessionStart", record_usage=False,
+                )
+                self.assertIsNotNone(retry_event)
+                self.assertIsNotNone(retry_plan)
+                self.assertEqual(retry_plan.item_count, 2)
+                self.assertEqual(retry_status.get("recall_status"), "selected")
+                runtime.finish_delivery(retry_event, retry_plan, retry_plan.items)
+                with KnowledgeIndex(runtime.database) as index:
+                    claims = index.connection.execute(
+                        "SELECT COUNT(*) FROM session_injections WHERE session_id = ?",
+                        (retry_event.session_id,),
+                    ).fetchone()[0]
+                self.assertEqual(claims, 2)
+
     def test_native_prompt_shapes_are_transient_and_recall_for_each_provider(self) -> None:
         fixtures = (
             ("claude", {"hook_event_name": "UserPromptSubmit", "session_id": "claude", "prompt": "blue comet"}),
