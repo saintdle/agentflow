@@ -150,13 +150,11 @@ class CodexDiagnosticsTests(unittest.TestCase):
 
 
 class CodexPermissionAndTurnTests(unittest.TestCase):
-    def test_only_shell_readonly_is_supported(self) -> None:
-        policy = app_server.permission_for_profile(
-            "shell-readonly", cwd="/workspace", output_boundary=".",
-        )
-        self.assertEqual(policy, {
-            "sandbox": "read-only", "network_access": False, "approval_policy": "never",
-        })
+    def test_shell_readonly_fails_closed_without_verified_named_profile(self) -> None:
+        with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+            app_server.permission_for_profile(
+                "shell-readonly", cwd="/workspace", output_boundary=".",
+            )
         for profile in ("shell-write", "no-shell", "provider-default"):
             with self.assertRaises(app_server.CodexAppServerError):
                 app_server.permission_for_profile(profile, cwd="/workspace", output_boundary=".")
@@ -165,92 +163,134 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
                 "shell-readonly", cwd="/workspace", output_boundary=".", sterile=True,
             )
 
-    def test_typed_start_pins_model_cwd_skills_permissions_and_disables_subdelegation(self) -> None:
-        captured: dict[str, object] = {}
+    def test_turn_start_is_blocked_before_sdk_client_or_spend(self) -> None:
+        with mock.patch.object(app_server, "_sdk_modules") as sdk:
+            with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+                app_server.start_background_turn(
+                    cwd="/workspace", model="gpt-6-luna", effort="medium", instruction="exact",
+                    skills=[], tool_profile="shell-readonly", output_boundary=".", sterile=False,
+                    output_schema={"type": "object"}, on_thread=lambda _value: None,
+                    on_turn=lambda _value: None, on_complete=lambda _observation, _text: None,
+                )
+        sdk.assert_not_called()
 
-        class FieldParams:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-        class FakeThread:
-            def __init__(self, _client, thread_id):
-                captured["thread_id"] = thread_id
-
-            def turn(self, inputs, **kwargs):
-                captured["inputs"] = inputs
-                captured["turn"] = kwargs
-                return SimpleNamespace(id="turn-1", stream=lambda: iter(()))
-
-        api = SimpleNamespace(
-            Sandbox=SimpleNamespace(read_only="read-only"),
-            ApprovalMode=SimpleNamespace(deny_all="deny_all"),
-            Thread=FakeThread,
-        )
-        module_values = {
-            "api": api, "ThreadStartParams": FieldParams,
-            "AskForApproval": FieldParams,
-            "AskForApprovalValue": SimpleNamespace(never="never"),
-            "ReasoningEffort": lambda value: value,
-            "SkillInput": lambda **kwargs: ("skill", kwargs),
-            "TextInput": lambda **kwargs: ("text", kwargs),
-        }
-
-        class Client:
-            def __init__(self, _config):
-                captured["client_config"] = getattr(_config, "kwargs", _config)
-
-            def start(self):
-                pass
-
-            def initialize(self):
-                pass
-
-            def thread_start(self, params):
-                captured["thread_start"] = params.kwargs
-                return SimpleNamespace(thread=SimpleNamespace(
-                    id="thread-1", model="gpt-6-luna", cwd="/workspace",
-                ))
-
-            def close(self):
-                pass
-
-        callbacks: list[str] = []
-        with mock.patch.object(
+    def test_direct_supervisor_start_cannot_bypass_permission_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             app_server, "_sdk_modules",
-            return_value=(module_values, SimpleNamespace(__version__=app_server.SUPPORTED_SDK_VERSION), Client, lambda **kwargs: kwargs),
-        ), mock.patch.object(app_server, "_bounded_call", side_effect=lambda _client, function: function()):
-            thread_id, turn_id = app_server.start_background_turn(
-                cwd="/workspace", model="gpt-6-luna", effort="medium", instruction="exact",
-                skills=[("skill-a", "/skills/skill-a/SKILL.md")],
-                tool_profile="shell-readonly", output_boundary=".", sterile=False,
-                output_schema={"type": "object"}, on_thread=lambda value: callbacks.append("thread:" + value),
-                on_turn=lambda value: callbacks.append("turn:" + value),
-                on_complete=lambda _observation, _text: None,
+        ) as sdk:
+            with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+                app_server.start_supervised_turn(
+                    runtime_dir=Path(temporary) / "runtime", request_id="launch",
+                    cwd=temporary, model="gpt-6-luna", effort="medium", instruction="exact",
+                    skills=[], skill_manifest={"required_skills": [], "resolved_skills": []},
+                    tool_profile="shell-readonly", output_boundary=".",
+                    output_schema={"type": "object"}, timeout_seconds=30,
+                    on_thread=lambda _value: None, on_turn=lambda _value: None,
+                )
+        sdk.assert_not_called()
+
+    def test_skill_package_is_revalidated_after_thread_ack_before_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            skill = root / ".agents/skills/domain-skill/SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("---\nname: domain-skill\ndescription: Pinned.\n---\n", encoding="utf-8")
+            with mock.patch.object(cli, "_repository_root", return_value=root):
+                pin = cli._skill_pin(skill, root)
+                manifest = {
+                    "required_skills": ["domain-skill"],
+                    "resolved_skills": [{
+                        "name": "domain-skill", "provider": "codex",
+                        "entrypoint": str(skill), **pin,
+                    }],
+                }
+                pinned_inputs = cli._codex_skill_inputs(root, manifest)
+                captured: dict[str, object] = {"turn_called": False}
+
+                class FieldParams:
+                    def __init__(self, **kwargs):
+                        self.kwargs = kwargs
+
+                class FakeThread:
+                    def __init__(self, _client, _thread_id):
+                        pass
+
+                    def turn(self, *_args, **_kwargs):
+                        captured["turn_called"] = True
+                        return SimpleNamespace(id="turn-1", stream=lambda: iter(()))
+
+                class Client:
+                    def __init__(self, _config):
+                        pass
+
+                    def start(self):
+                        pass
+
+                    def initialize(self):
+                        pass
+
+                    def thread_start(self, _params):
+                        return SimpleNamespace(thread=SimpleNamespace(
+                            id="thread-1", model="gpt-6-luna", cwd=str(root),
+                        ))
+
+                    def close(self):
+                        pass
+
+                modules = {
+                    "api": SimpleNamespace(
+                        Thread=FakeThread, Sandbox=SimpleNamespace(read_only="read-only"),
+                        ApprovalMode=SimpleNamespace(deny_all="deny_all"),
+                    ),
+                    "ThreadStartParams": FieldParams, "AskForApproval": FieldParams,
+                    "AskForApprovalValue": SimpleNamespace(never="never"),
+                    "ReasoningEffort": lambda value: value,
+                    "SkillInput": lambda **kwargs: kwargs,
+                    "TextInput": lambda **kwargs: kwargs,
+                }
+
+                def mutate_after_thread(_thread_id):
+                    skill.write_text("---\nname: domain-skill\ndescription: Changed.\n---\n", encoding="utf-8")
+
+                with mock.patch.object(app_server, "permission_for_profile", return_value={}), \
+                     mock.patch.object(app_server, "_sdk_modules", return_value=(modules, SimpleNamespace(__version__=app_server.SUPPORTED_SDK_VERSION), Client, lambda **kwargs: kwargs)), \
+                     mock.patch.object(app_server, "_bounded_call", side_effect=lambda _client, function: function()):
+                    with self.assertRaisesRegex(ValueError, "changed after preflight"):
+                        app_server.start_background_turn(
+                            cwd=str(root), model="gpt-6-luna", effort="medium", instruction="exact",
+                            skills=pinned_inputs, tool_profile="shell-readonly", output_boundary=".", sterile=False,
+                            output_schema={"type": "object"}, on_thread=mutate_after_thread,
+                            on_turn=lambda _value: None, on_complete=lambda _observation, _text: None,
+                            skill_validator=lambda: cli._codex_skill_inputs(root, manifest),
+                        )
+                self.assertFalse(captured["turn_called"])
+
+    def test_thread_ack_rechecks_live_claim_before_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ValidLaunch(
+                Path(temporary).resolve(), provider="codex", model="gpt-6-luna",
             )
-        self.assertEqual((thread_id, turn_id), ("thread-1", "turn-1"))
-        self.assertEqual(callbacks, ["thread:thread-1", "turn:turn-1"])
-        start = captured["thread_start"]
-        self.assertEqual(start["model"], "gpt-6-luna")
-        self.assertEqual(start["cwd"], "/workspace")
-        self.assertEqual(start["sandbox"], "read-only")
-        self.assertEqual(start["approval_policy"].kwargs["root"], "never")
-        self.assertEqual(captured["client_config"]["cwd"], "/workspace")
-        self.assertIn("mcp_servers={}", captured["client_config"]["config_overrides"])
-        self.assertIn("plugins={}", captured["client_config"]["config_overrides"])
-        self.assertIn('web_search="disabled"', captured["client_config"]["config_overrides"])
-        self.assertEqual(start["config"]["mcp_servers"], {})
-        self.assertEqual(start["config"]["plugins"], {})
-        self.assertEqual(start["config"]["apps"], {})
-        self.assertEqual(start["config"]["web_search"], "disabled")
-        self.assertEqual(start["config"]["sandbox_mode"], "read-only")
-        self.assertFalse(start["config"]["features"]["multi_agent"])
-        self.assertFalse(start["config"]["features"]["web_search"])
-        turn = captured["turn"]
-        self.assertEqual(turn["model"], "gpt-6-luna")
-        self.assertEqual(turn["cwd"], "/workspace")
-        self.assertEqual(turn["sandbox"], "read-only")
-        self.assertEqual(turn["approval_mode"], "deny_all")
-        self.assertIn(("skill", {"name": "skill-a", "path": "/skills/skill-a/SKILL.md"}), captured["inputs"])
+            fixture.task_issue["metadata"]["agentflow"]["tool_profile"] = "shell-readonly"
+            fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
+            turn_starts: list[str] = []
+
+            def mutate_claim_then_ack(**kwargs):
+                fixture.task_issue["metadata"]["agentflow"]["claim_token"] = "changed-claim-token-012345678901234567890123"
+                kwargs["on_thread"]("thread-stale")
+                turn_starts.append("turn-started")
+                kwargs["on_turn"]("turn-stale")
+                return "thread-stale", "turn-stale"
+
+            args = fixture.launch_args(transport="app-server")
+            with fixture.beads_patches(), \
+                 mock.patch.object(app_server, "permission_for_profile", return_value={}), \
+                 mock.patch.object(cli.codex_app_server_backend, "start_supervised_turn", side_effect=mutate_claim_then_ack):
+                self.assertEqual(cli.herdr_launch(args), 2)
+            self.assertEqual(turn_starts, [])
+            self.assertNotEqual(
+                fixture.task_issue["metadata"]["agentflow"]["claim_token"],
+                fixture.claim_token,
+            )
 
     def test_stream_deadline_records_interrupted_without_blocking_controller(self) -> None:
         closed = threading.Event()
@@ -321,6 +361,8 @@ class CodexControllerBridgeTests(unittest.TestCase):
             args = fixture.launch_args(transport="app-server")
             with fixture.beads_patches(), mock.patch.object(
                 cli.codex_app_server_backend, "start_supervised_turn", side_effect=fake_sdk_worker,
+            ), mock.patch.object(
+                app_server, "permission_for_profile", return_value={},
             ), mock.patch.object(
                 app_server, "_sdk_modules",
                 return_value=({}, SimpleNamespace(__version__=app_server.SUPPORTED_SDK_VERSION), object, lambda **kwargs: kwargs),

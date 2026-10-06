@@ -268,12 +268,22 @@ def _safe_window(window: Any) -> dict[str, int | None] | None:
 def permission_for_profile(
     tool_profile: str, *, cwd: str, output_boundary: str, sterile: bool = False,
 ) -> dict[str, Any]:
-    """Map only explicitly approved handoff profiles to bounded Codex policy."""
+    """Fail closed until named-profile enforcement is provable through the pinned SDK.
+
+    The current SDK exposes only legacy sandbox fields on thread start and does
+    not return active-permission-profile provenance. Passing those fields would
+    silently select the older sandbox implementation, so no app-server worker
+    may be started until a supported typed profile route and enforcement check
+    are available.
+    """
     if sterile:
         raise CodexAppServerError("Codex App Server cannot preserve the sterile outbound boundary")
-    if tool_profile == "shell-readonly":
-        return {"sandbox": "read-only", "network_access": False, "approval_policy": "never"}
-    raise CodexAppServerError(f"Codex App Server does not support tool profile {tool_profile!r}")
+    if tool_profile != "shell-readonly":
+        raise CodexAppServerError(f"Codex App Server does not support tool profile {tool_profile!r}")
+    raise CodexAppServerError(
+        "Codex App Server launch blocked: pinned SDK cannot yet prove the named read-only "
+        "permission profile without falling back to legacy sandbox settings"
+    )
 
 
 def _turn_text(turn: Any) -> str:
@@ -396,6 +406,7 @@ def start_background_turn(
     sterile: bool, output_schema: Mapping[str, Any],
     on_thread: Callable[[str], None], on_turn: Callable[[str], None],
     on_complete: Callable[[TurnObservation, str], None],
+    skill_validator: Callable[[], None] | None = None,
     client_factory: Callable[[Any], Any] | None = None,
     timeout_seconds: int = DEFAULT_WORKER_TIMEOUT_SECONDS,
 ) -> tuple[str, str]:
@@ -456,6 +467,12 @@ def start_background_turn(
         if observed_model != model or os.path.realpath(observed_cwd) != os.path.realpath(cwd):
             raise CodexAppServerError("Codex App Server thread configuration mismatched the approved route")
         on_thread(thread_id)
+        if skill_validator is not None:
+            # The supervisor waits for the controller to recheck live claim
+            # authority and persist the thread identity before acknowledging.
+            # Revalidate the exact preflight package pins after that boundary
+            # and immediately before the SDK can submit them to a turn.
+            skill_validator()
         sdk_thread = modules["api"].Thread(client, thread_id)
         inputs = [modules["SkillInput"](name=name, path=path) for name, path in skills]
         inputs.append(modules["TextInput"](text=instruction))
@@ -591,6 +608,21 @@ def _supervised_worker(request_path: Path) -> int:
         )
         finished.set()
 
+    def validate_skill_packages() -> None:
+        manifest = request.get("skill_manifest")
+        if not isinstance(manifest, dict):
+            raise CodexAppServerError("Codex worker is missing its verified skill pins")
+        try:
+            # Reuse Agentflow's full transitive package hashing and registration
+            # checks; do not replace these with an entrypoint-only digest here.
+            from agentflow.cli import _codex_skill_inputs
+
+            verified = _codex_skill_inputs(Path(request["cwd"]), manifest)
+        except (ImportError, OSError, ValueError) as exc:
+            raise CodexAppServerError("Codex worker skill package changed before turn submission") from exc
+        if verified != [tuple(item) for item in request["skills"]]:
+            raise CodexAppServerError("Codex worker skill package identity changed before turn submission")
+
     try:
         thread_id, _turn_id = start_background_turn(
             cwd=request["cwd"], model=request["model"], effort=request["effort"],
@@ -598,6 +630,7 @@ def _supervised_worker(request_path: Path) -> int:
             tool_profile=request["tool_profile"], output_boundary=request["output_boundary"],
             sterile=False, output_schema=request["output_schema"], on_thread=on_thread,
             on_turn=on_turn, on_complete=on_complete,
+            skill_validator=validate_skill_packages,
             timeout_seconds=request["timeout_seconds"],
         )
         # on_turn has persisted the ID before this wait can begin.
@@ -619,6 +652,7 @@ def _supervised_worker(request_path: Path) -> int:
 def start_supervised_turn(
     *, runtime_dir: Path, request_id: str, cwd: str, model: str, effort: str,
     instruction: str, skills: list[tuple[str, str]], tool_profile: str,
+    skill_manifest: Mapping[str, Any],
     output_boundary: str, output_schema: Mapping[str, Any], timeout_seconds: int,
     sterile: bool = False,
     on_thread: Callable[[str], None], on_turn: Callable[[str], None],
@@ -656,6 +690,7 @@ def start_supervised_turn(
         "request_id": request_id, "cwd": str(Path(cwd).resolve()), "model": model,
         "effort": effort, "instruction": instruction,
         "skills": [[name, path] for name, path in skills],
+        "skill_manifest": dict(skill_manifest),
         "tool_profile": tool_profile, "output_boundary": output_boundary,
         "output_schema": dict(output_schema), "timeout_seconds": timeout_seconds,
     }

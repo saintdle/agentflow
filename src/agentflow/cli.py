@@ -4572,6 +4572,24 @@ def _start_codex_app_server_launch(
         skills = _codex_skill_inputs(cwd, typed_handoff.manifest)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
+    # Only the existing full-package pin fields needed by the supervisor's
+    # last-moment revalidation cross the process boundary. No capability,
+    # result contract, or skill content is included in this validation input.
+    skill_manifest = {
+        "required_skills": list(typed_handoff.manifest.get("required_skills", [])),
+        "resolved_skills": [
+            {
+                field: item[field]
+                for field in (
+                    "name", "provider", "entrypoint", "sha256",
+                    "entrypoint_sha256", "package_count",
+                )
+                if field in item
+            }
+            for item in typed_handoff.manifest.get("resolved_skills", [])
+            if isinstance(item, Mapping)
+        ],
+    }
     contract = return_channel.get("contract")
     if not isinstance(contract, Mapping):
         raise ValueError("Codex App Server return contract is unavailable")
@@ -4600,6 +4618,14 @@ def _start_codex_app_server_launch(
             current_lease = fence_context.__enter__()
             if current_lease.continuity_id != continuity_id:
                 raise controller_backend.FencedLease("Codex launch continuity changed")
+            # The Beads claim may change after the initial launch check but
+            # before the helper returns its thread ID. Re-read exact task,
+            # actor, ancestry, and claim token while the root fence is held;
+            # the helper cannot submit a turn until this callback succeeds.
+            _verify_launch_authority(
+                root, task_id, str(getattr(args, "claim", "") or ""), lease_id,
+                workflow_root=workflow_root, beads_cwd=root, actor=actor,
+            )
         elif fence_context is None:
             raise ValueError("Codex thread identity was not fenced")
         with _herdr_transaction(state_path) as state:
@@ -4701,6 +4727,7 @@ def _start_codex_app_server_launch(
                          "Agentflow acceptance result. Do not write or submit result files; "
                          "the controller collects and validates your final response."),
             skills=skills,
+            skill_manifest=skill_manifest,
             tool_profile=str(typed_handoff.manifest.get("tool_profile") or ""),
             output_boundary=str(typed_handoff.manifest.get("output_boundary") or ""),
             sterile=False, output_schema=_codex_result_schema(acceptance_ids),
