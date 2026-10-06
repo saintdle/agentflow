@@ -92,9 +92,6 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
                 "base": f"main@{base[:12]}",
                 "acceptance": task_matrix,
-                "context": ["README.md"],
-                "tool_profile": "shell-write",
-                "budget": ["10 minutes; one retry; stop on blocker"],
                 "checks": ["process-boundary"],
                 # Controller dispatch materializes this as an external lane;
                 # provide the same explicit context/profile/budget a manual
@@ -115,9 +112,6 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
                 "base": f"main@{base[:12]}",
                 "acceptance": second_matrix,
-                "context": ["README.md"],
-                "tool_profile": "shell-write",
-                "budget": ["10 minutes; one retry; stop on blocker"],
                 "checks": ["process-boundary"],
                 "context": ["README.md"],
                 "tool_profile": "shell-write",
