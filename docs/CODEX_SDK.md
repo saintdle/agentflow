@@ -30,6 +30,21 @@ replace the full config file. Existing configurations continue to use Herdr:
 }
 ```
 
+This transport-only setting remains valid. An optional
+`codex.worker_timeout_seconds` integer sets the App Server worker timeout; it
+defaults to `1800` seconds and accepts values from `1` through `86400`. For a
+brief, bounded trial, use `180` seconds. Merge the optional field into the same
+existing `codex` object rather than replacing project configuration:
+
+```json
+{
+  "codex": {
+    "transport": "app-server",
+    "worker_timeout_seconds": 180
+  }
+}
+```
+
 Use `"herdr"` to explicitly retain the existing transport. The setting selects
 the transport only for leased root-controller tasks whose persisted provider
 is `codex`; Claude and Copilot tasks continue to use their existing Herdr
