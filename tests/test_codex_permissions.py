@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 from pathlib import Path
 import shlex
@@ -8,6 +9,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import traceback
+from types import SimpleNamespace
 import unittest
 
 try:
@@ -92,6 +96,113 @@ def _parse_probe_results(stdout: str) -> dict[str, str]:
     if result != _EXPECTED_PROBE_RESULTS:
         raise ValueError("probe did not establish every required allow/deny outcome")
     return result
+
+
+class _OptionalProbeSdkUnavailable(Exception):
+    pass
+
+
+class _ProbeSdkImportError(RuntimeError):
+    pass
+
+
+class _ProbeCallError(RuntimeError):
+    pass
+
+
+def _load_probe_sdk(importer=None):
+    importer = importer or importlib.import_module
+    try:
+        sdk = importer("openai_codex")
+    except ModuleNotFoundError as exc:
+        if exc.name == "openai_codex":
+            raise _OptionalProbeSdkUnavailable("optional Codex SDK is not installed") from None
+        raise _ProbeSdkImportError("installed Codex SDK has a missing dependency") from None
+    except Exception:
+        raise _ProbeSdkImportError("optional Codex SDK could not be imported") from None
+
+    try:
+        client_module = importer("openai_codex.client")
+        generated = importer("openai_codex.generated.v2_all")
+        return (
+            sdk,
+            client_module.CodexClient,
+            client_module.CodexConfig,
+            generated.CommandExecParams,
+            generated.CommandExecResponse,
+        )
+    except Exception:
+        raise _ProbeSdkImportError("installed Codex SDK is incomplete or incompatible") from None
+
+
+def _close_probe_client_bounded(client, timeout_seconds: float) -> None:
+    failures = []
+
+    def close():
+        try:
+            client.close()
+        except BaseException as exc:  # Never surface SDK exception text.
+            failures.append(exc)
+
+    worker = threading.Thread(target=close, name="codex-probe-close", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise _ProbeCallError("Codex client cleanup exceeded its deadline")
+    if failures:
+        raise _ProbeCallError("Codex client cleanup failed") from None
+
+
+def _bounded_sdk_call(
+    client,
+    operation: str,
+    call,
+    timeout_seconds: float,
+    *,
+    cleanup_timeout_seconds: float = 2,
+    settle_timeout_seconds: float = 1,
+):
+    safe_operation = operation if operation in {"start", "initialize", "command/exec"} else "SDK call"
+    result = []
+    failures = []
+
+    def invoke():
+        try:
+            result.append(call())
+        except BaseException as exc:  # Keep provider/config exception text out of logs.
+            failures.append(exc)
+
+    worker = threading.Thread(target=invoke, name="codex-permission-probe", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    timed_out = worker.is_alive()
+
+    if timed_out or failures:
+        cleanup_error = None
+        try:
+            _close_probe_client_bounded(client, cleanup_timeout_seconds)
+        except _ProbeCallError as exc:
+            cleanup_error = str(exc)
+        if timed_out:
+            worker.join(settle_timeout_seconds)
+            if cleanup_error:
+                raise _ProbeCallError(
+                    f"Codex {safe_operation} timed out; {cleanup_error}"
+                ) from None
+            if worker.is_alive():
+                raise _ProbeCallError(
+                    f"Codex {safe_operation} timed out and did not stop after client close"
+                ) from None
+            raise _ProbeCallError(f"Codex {safe_operation} exceeded its deadline") from None
+        if cleanup_error:
+            raise _ProbeCallError(
+                f"Codex {safe_operation} failed; {cleanup_error}"
+            ) from None
+        raise _ProbeCallError(f"Codex {safe_operation} failed") from None
+
+    if len(result) != 1:
+        raise _ProbeCallError(f"Codex {safe_operation} returned no result")
+    return result[0]
 
 
 class ReadonlyPermissionConfigTests(unittest.TestCase):
@@ -234,6 +345,119 @@ class ReadonlyPermissionConfigTests(unittest.TestCase):
                     )
 
 
+class ProbeBoundaryTests(unittest.TestCase):
+    def test_only_absent_top_level_sdk_is_optional(self) -> None:
+        def missing_package(_name):
+            raise ModuleNotFoundError("synthetic absent package", name="openai_codex")
+
+        with self.assertRaises(_OptionalProbeSdkUnavailable):
+            _load_probe_sdk(missing_package)
+
+        def broken_generated_module(name):
+            if name == "openai_codex":
+                return SimpleNamespace(__version__="0.160.1")
+            if name == "openai_codex.client":
+                return SimpleNamespace(CodexClient=object, CodexConfig=object)
+            raise ModuleNotFoundError(
+                "synthetic private path /tmp/private/controller-state", name=name,
+            )
+
+        with self.assertRaises(_ProbeSdkImportError) as raised:
+            _load_probe_sdk(broken_generated_module)
+        self.assertNotIn("private", str(raised.exception))
+        self.assertNotIn("controller-state", "".join(traceback.format_exception(raised.exception)))
+
+        def incompatible_package(_name):
+            raise ImportError("synthetic secret token /private/auth/config")
+
+        with self.assertRaises(_ProbeSdkImportError) as raised:
+            _load_probe_sdk(incompatible_package)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertNotIn("/private/auth", "".join(traceback.format_exception(raised.exception)))
+
+    def test_bounded_call_failure_closes_and_redacts_provider_exception(self) -> None:
+        class FakeClient:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient()
+        private_detail = "/private/controller-state/fake-token"
+
+        def fail_with_private_detail():
+            raise RuntimeError(f"failed to read {private_detail}")
+
+        with self.assertRaises(_ProbeCallError) as raised:
+            _bounded_sdk_call(client, "command/exec", fail_with_private_detail, 1)
+        self.assertTrue(client.closed)
+        formatted = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn(private_detail, formatted)
+        self.assertIn("Codex command/exec failed", str(raised.exception))
+
+    def test_bounded_call_timeout_closes_client_and_never_returns_success(self) -> None:
+        class FakeClient:
+            def __init__(self):
+                self.closed = False
+                self.release_operation = threading.Event()
+                self.operation_finished = threading.Event()
+
+            def close(self):
+                self.closed = True
+                self.release_operation.set()
+
+        client = FakeClient()
+
+        def blocked_operation():
+            client.release_operation.wait(2)
+            client.operation_finished.set()
+            return "must not be returned as success"
+
+        with self.assertRaises(_ProbeCallError) as raised:
+            _bounded_sdk_call(
+                client,
+                "initialize",
+                blocked_operation,
+                0.02,
+                cleanup_timeout_seconds=0.2,
+                settle_timeout_seconds=0.2,
+            )
+        self.assertTrue(client.closed)
+        self.assertTrue(client.operation_finished.is_set())
+        self.assertIn("exceeded its deadline", str(raised.exception))
+
+    def test_bounded_call_cleanup_timeout_is_bounded_and_redacted(self) -> None:
+        class FakeClient:
+            def __init__(self):
+                self.release_close = threading.Event()
+                self.release_operation = threading.Event()
+
+            def close(self):
+                self.release_close.wait(2)
+                raise RuntimeError("synthetic secret /private/codex/home/fake-token")
+
+        client = FakeClient()
+        started = time.monotonic()
+        try:
+            with self.assertRaises(_ProbeCallError) as raised:
+                _bounded_sdk_call(
+                    client,
+                    "command/exec",
+                    lambda: client.release_operation.wait(2),
+                    0.02,
+                    cleanup_timeout_seconds=0.02,
+                    settle_timeout_seconds=0.02,
+                )
+        finally:
+            client.release_close.set()
+            client.release_operation.set()
+        self.assertLess(time.monotonic() - started, 1)
+        formatted = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn("synthetic secret", formatted)
+        self.assertNotIn("fake-token", formatted)
+        self.assertIn("client cleanup exceeded its deadline", str(raised.exception))
+
+
 @unittest.skipUnless(
     os.environ.get("AGENTFLOW_CODEX_PERMISSION_PROBE") == "1",
     "set AGENTFLOW_CODEX_PERMISSION_PROBE=1 to run bounded local Codex isolation probe",
@@ -241,36 +465,19 @@ class ReadonlyPermissionConfigTests(unittest.TestCase):
 class CodexReadonlyShellIsolationProbe(unittest.TestCase):
     """Direct command/exec canary only; this does not exercise model tools."""
 
-    def _bounded_sdk_call(self, client, operation, call, timeout_seconds):
-        result = []
-        failure = []
-
-        def invoke():
-            try:
-                result.append(call())
-            except BaseException as exc:  # Keep provider output/errors out of test logs.
-                failure.append(exc)
-
-        worker = threading.Thread(target=invoke, name="codex-permission-probe", daemon=True)
-        worker.start()
-        worker.join(timeout_seconds)
-        if worker.is_alive():
-            client.close()
-            worker.join(2)
-            self.fail(f"Codex {operation} exceeded its bounded probe deadline")
-        if failure:
-            self.fail(f"Codex {operation} failed ({type(failure[0]).__name__})")
-        if len(result) != 1:
-            self.fail(f"Codex {operation} returned no result")
-        return result[0]
-
     def test_typed_app_server_command_exec_enforces_synthetic_profile(self) -> None:
         try:
-            import openai_codex
-            from openai_codex.client import CodexClient, CodexConfig
-            from openai_codex.generated.v2_all import CommandExecParams, CommandExecResponse
-        except ImportError as exc:
-            self.skipTest(f"optional Codex SDK unavailable: {type(exc).__name__}")
+            (
+                openai_codex,
+                CodexClient,
+                CodexConfig,
+                CommandExecParams,
+                CommandExecResponse,
+            ) = _load_probe_sdk()
+        except _OptionalProbeSdkUnavailable as exc:
+            self.skipTest(str(exc))
+        except _ProbeSdkImportError as exc:
+            self.fail(str(exc))
         from agentflow.codex_app_server import SUPPORTED_SDK_VERSION
 
         self.assertEqual(openai_codex.__version__, SUPPORTED_SDK_VERSION)
@@ -318,15 +525,15 @@ class CodexReadonlyShellIsolationProbe(unittest.TestCase):
             child_env["CODEX_HOME"] = str(codex_home)
             client = CodexClient(CodexConfig(cwd=str(workspace), env=child_env))
             try:
-                self._bounded_sdk_call(client, "start", client.start, 8)
-                self._bounded_sdk_call(client, "initialize", client.initialize, 12)
+                _bounded_sdk_call(client, "start", client.start, 8)
+                _bounded_sdk_call(client, "initialize", client.initialize, 10)
                 params = CommandExecParams(
                     command=["/bin/sh", "-c", script],
                     cwd=str(workspace),
                     timeout_ms=10_000,
                     output_bytes_cap=2048,
                 )
-                response = self._bounded_sdk_call(
+                response = _bounded_sdk_call(
                     client,
                     "command/exec",
                     lambda: client.request(
@@ -334,7 +541,7 @@ class CodexReadonlyShellIsolationProbe(unittest.TestCase):
                         params.model_dump(by_alias=True, exclude_none=True),
                         response_model=CommandExecResponse,
                     ),
-                    12,
+                    10,
                 )
                 self.assertEqual(response.exit_code, 0, "direct shell canary process failed")
                 try:
@@ -349,7 +556,7 @@ class CodexReadonlyShellIsolationProbe(unittest.TestCase):
                 self.assertFalse((workspace / "write-probe.txt").exists())
                 self.assertEqual(_parse_probe_results(json.dumps(results)), _EXPECTED_PROBE_RESULTS)
             finally:
-                client.close()
+                _close_probe_client_bounded(client, 3)
 
 
 if __name__ == "__main__":
