@@ -118,24 +118,32 @@ environment default, or provider-side setting broaden those limits. If the
 approved route cannot be honored, stop and report the blocker; do not substitute
 another model, effort, workspace, transport, permission, or skill set.
 
-The planned result path has the model return a structured final response; it
-must not write to Agentflow's result inbox or receive its authenticated result
-capability. A controller-owned collector will submit the response through the
-existing authenticated result and acceptance path. Until that path is
-implemented and verified, an SDK response is not an accepted result. Provider
-output, thread state, and process completion are not acceptance: the result
-must pass the normal contract, evidence, and acceptance checks. A failed,
-interrupted, timed-out, or ambiguous SDK run is never success and is not
-authorization to retry or launch elsewhere.
+The model returns a structured final response; it cannot write to Agentflow's
+result inbox or receive its authenticated result capability. A detached local
+helper persists the response separately. The controller-owned collector reads
+that output, validates it against the signed return contract, and submits it
+through the existing authenticated result path. Normal ingestion and
+acceptance checks still decide whether the task passed. Provider output,
+thread state, and process completion are not acceptance. A failed, interrupted,
+timed-out, or ambiguous SDK run is never success and does not authorize a retry
+or another transport.
 
 Agentflow workflow resume and Codex thread resume are separate operations.
 Workflow resume reattaches to the existing approved root and reconciles its
-durable tasks and results; it does not imply continuing a provider thread.
-For an App Server worker, recovery reattaches to the exact persisted Codex
-thread and turn; it never starts a duplicate turn. If the required identity is
-missing or the outcome is ambiguous or interrupted, stop for operator
-reconciliation. Do not create a replacement workflow to recover a disconnected
-session.
+durable tasks and results; it does not imply restarting a provider turn. The
+App Server launch uses a detached supervised helper that can keep its SDK
+connection and exact thread/turn alive when the controller process exits. A
+same-owner controller resume checks the persisted helper state and can observe
+or collect that same turn; it does not issue a new `thread/start` or
+`turn/start`. This is not recovery from a dead helper or lost App Server: if
+helper liveness, thread/turn identity, or turn outcome is missing or ambiguous,
+Agentflow stops for operator reconciliation and does not retry. Do not create a
+replacement workflow to recover a disconnected session.
+
+The automated helper-process fixture uses a fake worker to exercise durable
+helper output and controller-side collection; it does not run the Codex SDK or
+prove a real provider turn. A real SDK trial remains a separately approved,
+potentially billable action.
 
 ## Observability limits
 
