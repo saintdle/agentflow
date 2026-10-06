@@ -27,6 +27,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Documented read-only Codex SDK diagnostics and the experimental App Server
   worker prototype, which remains blocked before inference pending supported
   same-user isolation; Herdr remains the default transport.
+- Added standalone strict TOML generation/validation and an opt-in,
+  no-thread/no-turn Codex permission-profile shell probe for synthetic paths;
+  this is not wired into worker admission and does not prove model-tool
+  isolation.
 
 ### Changed
 

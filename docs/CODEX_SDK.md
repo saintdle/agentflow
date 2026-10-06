@@ -9,6 +9,32 @@ read-only sandbox alone does not isolate same-user controller authority and
 result-return capabilities. Do not attempt to bypass the guard; use the
 existing Herdr route for worker execution.
 
+## Permission-profile probe status
+
+The repository includes a standalone generator and validator for a synthetic
+Codex named-permission profile, plus an opt-in, no-thread/no-turn App Server
+`command/exec` canary. It checks a known fixture read against fake controller
+token/lease files inside the workspace, fake authority files outside it, a
+symlink alias, and write attempts. Its profile denies filesystem root and
+network access, grants minimal and workspace reads, explicitly denies
+`.agentflow` controller state and the external authority directory, and sets
+approval policy to `never`. Run the direct canary only in a disposable local
+environment with the pinned optional SDK installed:
+
+```sh
+PYTHONPATH=src AGENTFLOW_CODEX_PERMISSION_PROBE=1 \
+  python -m unittest discover -s tests -p 'test_codex_permissions.py'
+```
+
+The deterministic profile tests run without the optional SDK. A passing direct
+canary is narrow evidence about that SDK runtime's `command/exec` behavior for
+the synthetic paths only. It does not establish the active profile of a model
+thread/turn, constrain inherited MCP or other external tools, or prove
+same-user isolation for production workers. The helper is not connected to
+worker admission; the existing pre-inference hard guard remains unchanged.
+Treat unsupported or ambiguous canary results as a failed proof, not as
+permission to enable App Server workers.
+
 ## Install and configure
 
 Install the optional `codex` extra (`openai-codex==0.160.1`) only when you
