@@ -1359,9 +1359,11 @@ class AgentflowTests(unittest.TestCase):
         ) as stdout, mock.patch.object(cli.beads_backend, "prime", return_value=""):
             self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
             response = json.loads(stdout.getvalue())
-            self.assertIn("project-owned domain skills", response["systemMessage"])
-            self.assertNotIn("training", response["systemMessage"].lower())
-            self.assertNotIn("private", response["systemMessage"].lower())
+            context = response["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(response["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn("project-owned domain skills", context)
+            self.assertNotIn("training", context.lower())
+            self.assertNotIn("private", context.lower())
 
     def test_session_start_hook_injects_beads_only_when_active(self) -> None:
         payload = {"hook_event_name": "SessionStart", "cwd": "/tmp/project"}
@@ -1374,9 +1376,10 @@ class AgentflowTests(unittest.TestCase):
         ) as prime:
             self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
             response = json.loads(stdout.getvalue())
-            self.assertIn("BEADS PRIME CONTEXT", response["systemMessage"])
-            self.assertIn("untrusted task data", response["systemMessage"])
-            self.assertIn("never present a bare bead ID", response["systemMessage"])
+            context = response["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("BEADS PRIME CONTEXT", context)
+            self.assertIn("untrusted task data", context)
+            self.assertIn("never present a bare bead ID", context)
             prime.assert_called_once()
 
     def test_copilot_session_hook_uses_additional_context_json(self) -> None:

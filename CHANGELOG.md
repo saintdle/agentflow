@@ -12,6 +12,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   IDs, provider/model/effort boundaries, accepted-result deltas, observed task
   metrics, and visible missing, invalid, unmatched, or duplicate data.
 
+- Codex history manifests now retain request-level usage metadata. Context audits
+  distinguish maximum request input from aggregate totals and the explicitly
+  labeled legacy input-plus-output pressure proxy; missing or ambiguous values
+  remain unknown.
+- Supported Codex context events now use their documented context response;
+  Claude's supported response shape is preserved, with context output only for
+  its documented events. Complete Codex and Claude
+  hook strings follow local character/byte budgets, with versioned preparation
+  and local-emission receipts that store metadata rather than context text.
+  Copilot's existing response shape is preserved without a new provider-limit
+  claim.
+
 ### Changed
 
 - Separated provider quota provenance from local task outcomes and yield

@@ -780,7 +780,7 @@ def add_comment(cwd: Path, issue_id: str, text: str) -> None:
         )
 
 
-def prime(cwd: Path, *, maximum_characters: int = 12_000) -> str:
+def prime(cwd: Path, *, maximum_characters: int = 12_000, truncate: bool = True) -> str:
     workspace_data = workspace(cwd)
     if workspace_data is None:
         return ""
@@ -797,4 +797,4 @@ def prime(cwd: Path, *, maximum_characters: int = 12_000) -> str:
             f"`BEADS_DIR={shlex.quote(beads_dir)} bd <command>`; do not create Git "
             f"state.\n\n{text}"
         )
-    return text[:maximum_characters]
+    return text[:maximum_characters] if truncate else text

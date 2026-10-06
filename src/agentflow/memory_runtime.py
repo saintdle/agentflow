@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -249,19 +250,120 @@ class MemoryRuntime:
     def enabled(self) -> bool:
         return bool(self.settings.get("enabled", False))
 
-    def _record_receipt(self, event: EventEnvelope, plan: RecallPlan) -> None:
-        if not plan.items:
-            return
+    def record_delivery(self, value: Mapping[str, Any]) -> None:
+        """Append bounded metadata about local preparation or hook output."""
+        stages = {"prepared", "emitted", "omitted", "failed"}
+        reasons = {
+            "", "unsupported_event", "event_has_no_documented_context_field",
+            "mandatory_context_exceeds_cap", "serialization_failed", "output_write_failed",
+        }
+        recall_states = {"disabled", "empty", "selected", "not_requested", "unavailable"}
+        providers = {"codex", "claude", "copilot"}
+        allowed_events = {
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+            "PostToolUseFailure", "PreCompact", "Stop", "PostModelSwitch",
+            "sessionStart", "userPromptSubmitted", "preToolUse", "postToolUse",
+            "postToolUseFailure", "preCompact", "agentStop",
+        }
+        stage_value = value.get("stage")
+        provider_value = value.get("provider")
+        stage = stage_value if isinstance(stage_value, str) and stage_value in stages else "failed"
+        provider = provider_value if isinstance(provider_value, str) and provider_value in providers else "unknown"
+        raw_event = value.get("event")
+        event = raw_event if isinstance(raw_event, str) and raw_event in allowed_events else "unknown"
+        reason_value = value.get("reason")
+        reason = reason_value if isinstance(reason_value, str) and reason_value in reasons else "unknown"
+        recall_status = value.get("recall_status")
+        if not isinstance(recall_status, str) or recall_status not in recall_states:
+            recall_status = "unavailable"
+
+        def safe_count_from(count: Any, maximum: int = 1_000_000_000) -> int:
+            return count if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= maximum else 0
+
+        def safe_count(name: str, maximum: int = 1_000_000_000) -> int:
+            return safe_count_from(value.get(name), maximum)
+
+        def safe_components(name: str, *, omissions: bool = False) -> list[dict[str, Any]]:
+            entries = value.get(name)
+            if not isinstance(entries, list):
+                return []
+            result: list[dict[str, Any]] = []
+            for entry in entries[:32]:
+                if not isinstance(entry, Mapping):
+                    continue
+                component_id = entry.get("id")
+                kind = entry.get("kind")
+                digest = entry.get("digest")
+                if not isinstance(component_id, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", component_id):
+                    continue
+                if not isinstance(kind, str) or not re.fullmatch(r"[a-z0-9_]{1,32}", kind):
+                    continue
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    continue
+                record = {
+                    "id": component_id,
+                    "kind": kind,
+                    "digest": digest,
+                    "characters": safe_count_from(entry.get("characters")),
+                    "bytes": safe_count_from(entry.get("bytes")),
+                }
+                source_digest = entry.get("source_digest")
+                if isinstance(source_digest, str) and re.fullmatch(r"[0-9a-f]{64}", source_digest):
+                    record["source_digest"] = source_digest
+                if omissions:
+                    omission_reason = entry.get("reason")
+                    record["reason"] = (
+                        omission_reason
+                        if isinstance(omission_reason, str) and omission_reason in {"over_budget", "mandatory_overflow"}
+                        else "unknown"
+                    )
+                result.append(record)
+            return result
+
+        event_envelope = value.get("event_envelope")
+        session_hash = ""
+        event_hash = ""
+        if isinstance(event_envelope, EventEnvelope):
+            session_hash = hashlib.sha256(event_envelope.session_id.encode("utf-8")).hexdigest()
+            event_hash = hashlib.sha256(event_envelope.event_id.encode("utf-8")).hexdigest()
+        cap_unit_value = value.get("cap_unit")
+        cap_unit = cap_unit_value if isinstance(cap_unit_value, str) and cap_unit_value in {"utf8_bytes", "characters"} else None
+        cap_value = value.get("cap_value")
+        if not isinstance(cap_value, int) or isinstance(cap_value, bool) or not 0 <= cap_value <= 100_000:
+            cap_value = None
+        context_sha256 = value.get("context_sha256")
+        if not isinstance(context_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", context_sha256):
+            context_sha256 = None
+        client_version = value.get("client_version")
+        if not isinstance(client_version, str) or len(client_version) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:-]*", client_version):
+            client_version = None
+        included = safe_components("included")
+        omitted = safe_components("omitted", omissions=True)
         self.receipts.append({
-                "schema": "agentflow.memory-receipt@1",
-                "timestamp": _iso(),
-                "session_id": event.session_id,
-                "event_id": event.event_id,
-                "items": len(plan.items),
-                "characters": len(plan.text),
-                "source_digests": [item.source_digest for item in plan.items],
-                "privacy": "metadata-only",
-            })
+            "schema": "agentflow.memory-receipt@2",
+            "timestamp": _iso(),
+            "stage": stage,
+            "provider": provider,
+            "event": event,
+            "capability": value.get("capability") if isinstance(value.get("capability"), str) and value.get("capability") in {"documented", "unsupported", "preserved_shape"} else "unknown",
+            "serializer_version": "hook-context@1",
+            "client_version": client_version,
+            "session_id_hash": session_hash,
+            "event_id_hash": event_hash,
+            "recall_status": recall_status,
+            "selected_item_count": safe_count("selected_item_count"),
+            "retained_item_count": safe_count("retained_item_count"),
+            "omitted_item_count": safe_count("omitted_item_count"),
+            "context_characters": safe_count("context_characters"),
+            "context_bytes": safe_count("context_bytes"),
+            "context_sha256": context_sha256,
+            "cap_unit": cap_unit,
+            "cap_value": cap_value,
+            "included": included,
+            "omitted": omitted,
+            "reason": reason,
+            "privacy": "metadata-only",
+        })
 
     def recall(self, event: EventEnvelope, payload: Mapping[str, Any]) -> RecallPlan | None:
         if not self.enabled:
@@ -282,7 +384,6 @@ class MemoryRuntime:
                     session_id=event.session_id,
                     session_ledger_limit=int(self.settings["session_ledger_limit"]),
                 )
-            self._record_receipt(event, plan)
             return plan
         except Exception:  # noqa: BLE001 - hook fail-open
             return None

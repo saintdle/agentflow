@@ -39,6 +39,16 @@ explicit compaction/session reset is the only reset policy. `Stop` maintenance
 is model-free, idempotent, lock-protected, rate-limited, retryable, and reports
 durable health through `agentflow doctor` or `agentflow memory status`.
 
+The local receipt spool uses `agentflow.memory-receipt@2` for hook context
+delivery. It records separate prepared and emitted stages, bounded component
+hashes and sizes, source digests, omission reasons, and whether recall was
+disabled, empty, selected, or not requested. Emitted means the complete JSON
+response was serialized and written to hook stdout; it does not establish that
+the provider accepted it or included it in model input. Receipts contain no
+prompt, recalled summary, source path, or prime text. Older `@1` receipts remain
+historical records of preparation. Recall selection counters also describe
+local selection and are not provider-consumption evidence.
+
 ```json
 {
   "schema": "agentflow.project@1",
