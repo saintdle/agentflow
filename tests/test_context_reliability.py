@@ -197,6 +197,64 @@ class ContextAuditTests(unittest.TestCase):
         self.assertEqual(report["execution"]["expensive_execution_children"], 1)
         self.assertEqual(report["execution"]["tasks_over_attempt_budget"], 0)
 
+    def test_attempt_accounting_rejects_conflicting_explicit_launch_ids(self) -> None:
+        conflicts = {
+            "same-number-different-ids": {
+                "attempts": [
+                    {"attempt": 1, "launch_id": "launch-one", "status": "identity_pending"},
+                    {"attempt": 1, "launch_id": "launch-two", "status": "launched",
+                     "resolved_from": "identity_pending"},
+                ],
+            },
+            "numberless-different-ids": {
+                "attempts": [
+                    {"launch_id": "launch-one", "status": "identity_pending"},
+                    {"launch_id": "launch-two", "status": "launched",
+                     "resolved_from": "identity_pending"},
+                ],
+            },
+            "reservation-conflicts-with-history": {
+                "attempt": 1, "launch_id": "launch-two",
+                "attempts": [
+                    {"attempt": 1, "launch_id": "launch-one", "status": "identity_pending"},
+                    {"attempt": 1, "launch_id": "launch-two", "status": "launched",
+                     "resolved_from": "identity_pending"},
+                ],
+            },
+            "record-conflicts-with-binding": {
+                "attempt": 1, "launch_id": "launch-one",
+                "binding": {"launch_id": "launch-two"}, "attempts": [],
+            },
+            "one-id-two-attempt-numbers": {
+                "attempts": [
+                    {"attempt": 1, "launch_id": "launch-one", "status": "failed"},
+                    {"attempt": 2, "launch_id": "launch-one", "status": "failed"},
+                ],
+            },
+        }
+        for name, record in conflicts.items():
+            with self.subTest(name=name), self.assertRaises(execution.AccountingIndeterminate):
+                execution.attempt_count(record)
+
+        report = context_budget.add_execution_attempts(
+            context_budget.audit([], days=30),
+            {"task-1": conflicts["same-number-different-ids"]},
+            policy=execution.ExecutionPolicy(max_attempts_per_task=2),
+        )
+        self.assertIsNone(report["execution"]["recorded_attempts"])
+        self.assertTrue(report["execution"]["accounting_indeterminate"])
+        self.assertIn(
+            "execution-accounting-indeterminate",
+            {finding["id"] for finding in report["findings"]},
+        )
+
+    def test_numbered_history_preserves_attempt_highwater(self) -> None:
+        history_only = {
+            "attempts": [{"attempt": 3, "launch_id": "launch-three", "status": "failed"}],
+        }
+        self.assertEqual(execution.attempt_count(history_only), 3)
+        self.assertEqual(execution.summarize_attempts([history_only])[0], 3)
+
     def test_corrupt_attempt_history_is_an_actionable_audit_finding(self) -> None:
         report = context_budget.add_execution_attempts(
             context_budget.audit([], days=30),

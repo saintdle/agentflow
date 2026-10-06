@@ -1263,7 +1263,10 @@ def _dispatch_via_herdr(
             )
             total_attempts, active_workers, expensive_children = execution_backend.summarize_attempts(session_values)
             existing = current_state.get("sessions", {}).get(task_id)
-            task_attempt = int(existing.get("attempt") or 0) + 1 if isinstance(existing, Mapping) else 1
+            task_attempt = (
+                execution_backend.attempt_count(existing) + 1
+                if isinstance(existing, Mapping) else 1
+            )
             descendants = beads_backend.root_descendants(cwd, workflow_root)
             planned_tasks = sum(bool(_launch_task_metadata(item)) for item in descendants)
             admission = execution_backend.evaluate_launch(
@@ -4249,7 +4252,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                             raise herdr_backend.HerdrError(
                                 f"collision: task {task_id!r} has an active or completed Herdr binding"
                             )
-                        attempt = int(existing.get("attempt") or 1) + 1
+                        attempt = execution_backend.attempt_count(existing) + 1
                         attempts = list(existing.get("attempts") or [])
                     else:
                         attempts = []

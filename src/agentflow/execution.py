@@ -229,12 +229,12 @@ def summarize_attempts(sessions: Iterable[Mapping[str, Any]]) -> tuple[int, int,
 
 
 def attempt_count(record: Mapping[str, Any]) -> int:
-    """Count distinct reserved launches, collapsing events from one launch.
+    """Count launches while enforcing immutable attempt and launch identities.
 
-    New events carry a launch ID. Older history often carries only the task
-    attempt number, while very old anonymous rows remain conservatively
-    additive. The record-level attempt preserves an empty reservation and
-    histories whose lifecycle row was not yet appended.
+    ID-less legacy pending observations can join their resolution. Explicit
+    launch IDs may only join the same ID, and numbered history must map each
+    attempt number and launch ID one-to-one. Anonymous legacy rows remain
+    conservatively additive; numbered history also preserves its highwater.
     """
 
     raw_attempt = record.get("attempt")
@@ -253,20 +253,24 @@ def attempt_count(record: Mapping[str, Any]) -> int:
     binding_launch = record_binding.get("launch_id") if isinstance(record_binding, Mapping) else None
     if binding_launch not in (None, "") and not isinstance(binding_launch, str):
         raise _accounting_indeterminate("provider binding launch ID is malformed")
+    record_launch = str(record_launch or "")
+    binding_launch = str(binding_launch or "")
+    if record_launch and binding_launch and record_launch != binding_launch:
+        raise _accounting_indeterminate(
+            "current reservation launch ID conflicts with provider binding"
+        )
+    reserved_launch = record_launch or binding_launch
 
     raw_events = record.get("attempts")
     if raw_events is None:
-        return record_attempt
+        raw_events = []
     if not isinstance(raw_events, list):
         raise _accounting_indeterminate("launch attempt history is not a list")
 
-    groups: set[tuple[str, str | int]] = set()
-    launch_groups: dict[str, tuple[str, str | int]] = {}
-    attempt_groups: dict[int, tuple[str, str | int]] = {}
-    pending_groups: list[tuple[str, str | int]] = []
-    pending_attempt_groups: dict[int, tuple[str, str | int]] = {}
-    anonymous_index = 0
-
+    normalized_events: list[tuple[Mapping[str, Any], str | None, int | None]] = []
+    id_for_attempt: dict[int, str] = {}
+    attempt_for_id: dict[str, int] = {}
+    highwater = record_attempt
     for event in raw_events:
         if not isinstance(event, Mapping):
             raise _accounting_indeterminate("launch attempt history contains a malformed event")
@@ -279,49 +283,116 @@ def attempt_count(record: Mapping[str, Any]) -> int:
         elif not isinstance(event_attempt, int) or isinstance(event_attempt, bool) or event_attempt < 1:
             raise _accounting_indeterminate("launch attempt event has a malformed attempt number")
 
-        if launch_id:
-            group = launch_groups.get(launch_id)
-            if group is None:
-                pending_alias = (
-                    pending_attempt_groups.get(event_attempt)
-                    if event_attempt is not None
-                    else (pending_groups[-1] if pending_groups else None)
+        launch_id = str(launch_id or "") or None
+        normalized_events.append((event, launch_id, event_attempt))
+        if event_attempt is not None:
+            highwater = max(highwater, event_attempt)
+        if launch_id and event_attempt is not None:
+            previous_id = id_for_attempt.get(event_attempt)
+            previous_attempt = attempt_for_id.get(launch_id)
+            if previous_id is not None and previous_id != launch_id:
+                raise _accounting_indeterminate(
+                    f"attempt {event_attempt} is bound to conflicting launch IDs"
                 )
-                if event.get("resolved_from") == "identity_pending" and pending_alias is not None:
-                    group = pending_alias
-                else:
-                    group = ("launch", launch_id)
-                launch_groups[launch_id] = group
-            if event_attempt is not None:
-                attempt_groups.setdefault(event_attempt, group)
+            if previous_attempt is not None and previous_attempt != event_attempt:
+                raise _accounting_indeterminate(
+                    f"launch ID {launch_id!r} is bound to conflicting attempt numbers"
+                )
+            id_for_attempt[event_attempt] = launch_id
+            attempt_for_id[launch_id] = event_attempt
+
+    if reserved_launch and record_attempt:
+        previous_id = id_for_attempt.get(record_attempt)
+        previous_attempt = attempt_for_id.get(reserved_launch)
+        if previous_id is not None and previous_id != reserved_launch:
+            raise _accounting_indeterminate(
+                f"current reservation conflicts with the launch ID for attempt {record_attempt}"
+            )
+        if previous_attempt is not None and previous_attempt != record_attempt:
+            raise _accounting_indeterminate(
+                f"current reservation launch ID {reserved_launch!r} conflicts with history"
+            )
+        id_for_attempt[record_attempt] = reserved_launch
+        attempt_for_id[reserved_launch] = record_attempt
+
+    groups: set[tuple[str, str | int]] = set()
+    launch_groups: dict[str, tuple[str, str | int]] = {}
+    attempt_groups: dict[int, tuple[str, str | int]] = {}
+    # Each pending entry records its normalized group and any explicit ID or
+    # attempt so a resolution cannot merge two distinct launch identities.
+    pending_events: list[tuple[tuple[str, str | int], str | None, int | None]] = []
+    anonymous_index = 0
+
+    for event, launch_id, event_attempt in normalized_events:
+        status = str(event.get("status") or "")
+        is_resolution = event.get("resolved_from") == "identity_pending"
+        pending_index: int | None = None
+        if is_resolution and pending_events:
+            if event_attempt is None:
+                pending_index = len(pending_events) - 1
+            else:
+                pending_index = next(
+                    (index for index in range(len(pending_events) - 1, -1, -1)
+                     if pending_events[index][2] == event_attempt),
+                    None,
+                )
+
+        alias_group: tuple[str, str | int] | None = None
+        if pending_index is not None:
+            pending_group, pending_launch_id, _pending_attempt = pending_events[pending_index]
+            if pending_launch_id and launch_id != pending_launch_id:
+                detail = (
+                    "omits" if launch_id is None
+                    else f"conflicts with {launch_id!r}"
+                )
+                raise _accounting_indeterminate(
+                    f"identity-pending resolution {detail} its explicit launch ID {pending_launch_id!r}"
+                )
+            # Only an ID-less pending row may acquire an ID during resolution;
+            # an explicit ID can never be replaced by another ID.
+            alias_group = pending_group
+            pending_events.pop(pending_index)
+        elif is_resolution and launch_id is None and event_attempt in id_for_attempt:
+            raise _accounting_indeterminate(
+                "identity-pending resolution omits an explicit launch ID from its attempt"
+            )
+
+        if launch_id:
+            group = alias_group or launch_groups.get(launch_id) or ("launch", launch_id)
+            launch_groups[launch_id] = group
+        elif alias_group is not None:
+            group = alias_group
         elif event_attempt is not None and event_attempt in attempt_groups:
+            if id_for_attempt.get(event_attempt) and status != "identity_pending":
+                raise _accounting_indeterminate(
+                    f"attempt {event_attempt} has an ID-less non-pending event alongside an explicit launch ID"
+                )
             group = attempt_groups[event_attempt]
         elif event_attempt is not None:
             group = ("attempt", event_attempt)
-            attempt_groups[event_attempt] = group
-        elif event.get("resolved_from") == "identity_pending" and pending_groups:
-            group = pending_groups.pop()
         else:
             anonymous_index += 1
             group = ("anonymous", anonymous_index)
 
+        if event_attempt is not None:
+            attempt_groups.setdefault(event_attempt, group)
         groups.add(group)
-        status = str(event.get("status") or "")
         if status == "identity_pending":
-            pending_groups.append(group)
-            if event_attempt is not None:
-                pending_attempt_groups[event_attempt] = group
-        elif event.get("resolved_from") == "identity_pending":
-            # A resolution may have an ID while its pending observation did
-            # not. Pair it with that prior observation instead of billing a
-            # second launch.
-            if group in pending_groups:
-                pending_groups.remove(group)
-            if event_attempt is not None and pending_attempt_groups.get(event_attempt) == group:
-                pending_attempt_groups.pop(event_attempt, None)
+            pending_events.append((group, launch_id, event_attempt))
 
-    has_reserved_launch = bool(record_launch or binding_launch)
-    return max(record_attempt, len(groups), int(has_reserved_launch))
+    if reserved_launch:
+        reserved_group = launch_groups.get(reserved_launch)
+        if reserved_group is None and record_attempt:
+            # A numbered legacy pending row may be upgraded by the current
+            # reservation identity for that exact attempt.
+            reserved_group = attempt_groups.get(record_attempt)
+            if reserved_group is not None:
+                launch_groups[reserved_launch] = reserved_group
+        if reserved_group is None:
+            reserved_group = ("launch", reserved_launch)
+        groups.add(reserved_group)
+
+    return max(highwater, len(groups))
 
 
 def _accounting_indeterminate(message: str) -> AccountingIndeterminate:
