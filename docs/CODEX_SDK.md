@@ -1,12 +1,13 @@
 # Optional Codex SDK integration
 
-The Codex SDK lane is experimental and opt-in, and currently supports only
-bounded, read-only Codex tasks. The existing Herdr-backed provider transport
-remains the default; installing the optional integration does not change
-existing workflows, profiles, or transport selection. Unsupported task
-permissions are rejected before inference. An SDK request that may have
-started but whose outcome is unclear must be reconciled before another launch;
-Agentflow does not automatically fall back to Herdr or another model.
+The optional Codex SDK diagnostics are read-only. The App Server worker
+transport is an experimental prototype and is currently blocked before
+inference for configured worker tasks. Herdr remains the default; installing
+the optional extra or selecting `app-server` does not override this guard or
+make worker execution available or alter existing defaults and profiles. A
+read-only sandbox alone does not isolate same-user controller authority and
+result-return capabilities. Do not attempt to bypass the guard; use the
+existing Herdr route for worker execution.
 
 ## Install and configure
 
@@ -32,9 +33,10 @@ replace the full config file. Existing configurations continue to use Herdr:
 
 This transport-only setting remains valid. An optional
 `codex.worker_timeout_seconds` integer sets the App Server worker timeout; it
-defaults to `1800` seconds and accepts values from `1` through `86400`. For a
-brief, bounded trial, use `180` seconds. Merge the optional field into the same
-existing `codex` object rather than replacing project configuration:
+defaults to `1800` seconds and accepts values from `1` through `86400`. The
+`180`-second value below is a test timeout only; configuring it does not enable
+or authorize a worker turn. Merge the optional field into the same existing
+`codex` object rather than replacing project configuration:
 
 ```json
 {
@@ -49,10 +51,10 @@ Use `"herdr"` to explicitly retain the existing transport. The setting selects
 the transport only for leased root-controller tasks whose persisted provider
 is `codex`; Claude and Copilot tasks continue to use their existing Herdr
 routes. An explicit App Server task route for a non-Codex provider is rejected.
-The App Server adapter is driven only by the leased root controller; it is not
-a standalone unauthenticated worker-run command. Review the resolved
-configuration and run local diagnostics before launching work. Do not copy
-provider credentials into project configuration.
+The App Server adapter is controller-owned, not a standalone worker command;
+selecting it does not bypass the pre-inference guard. Review the resolved
+config and run diagnostics; do not copy provider credentials into project
+configuration.
 
 The SDK uses its own pinned Codex runtime, not necessarily the globally
 installed `codex` executable, and the user's existing ChatGPT/Codex
@@ -75,17 +77,17 @@ evidence of available capacity. Diagnostic values and catalogue entries do not
 establish model entitlement or guaranteed capacity. See the official [Codex SDK guide](https://learn.chatgpt.com/docs/codex-sdk)
 and [App Server protocol](https://learn.chatgpt.com/docs/app-server).
 
-Before any workflow that can start a paid worker turn, obtain the user's
-explicit consent for that workflow and its exact model, effort, workspace,
-allowed skills, and launch budget. A read-only diagnostic is not that consent.
-The supported task must explicitly use `shell-readonly` with
-`Sandbox.read_only` and approval policy `never` on the thread and turn. The
-handoff's existing `tool_profile` selects `shell-readonly`; this is not a new
-Beads metadata field. `never` disables approval prompts inside the read-only
-sandbox; it does not grant write permission. The adapter rejects
-`shell-write`, `no-shell`, `provider-default`, and sterile or restricted-outbound
-tasks before inference. It does not support SDK subdelegation. Do not relax
-these limits to make a task eligible.
+If a future release enables App Server worker execution, each task will still
+require explicit approval of its exact model, effort, workspace, allowed
+skills, and launch budget. The prototype supports only the existing
+`shell-readonly` handoff profile and pins the SDK thread and turn to
+`Sandbox.read_only` and approval policy `never`. These restrictions are
+necessary but not sufficient to establish isolation from same-user controller
+authority, so the current hard guard rejects App Server worker tasks before
+inference. `shell-write`, `no-shell`, `provider-default`, and sterile or
+restricted-outbound tasks are also rejected; SDK subdelegation is disabled.
+Do not weaken the guard or permissions to make a task eligible. Diagnostics do
+not start a worker and are not workflow consent.
 
 For example, a chat can check readiness without starting work:
 
@@ -95,17 +97,18 @@ an inference or worker, change authentication, or modify configuration. Report
 only the supported/redacted diagnostic fields and any unavailable checks.
 ```
 
-The next prompt is planning-only. To approve execution after reviewing the
+The next prompt is planning-only; App Server worker execution remains blocked.
+For worker execution, select the existing Herdr transport. After reviewing the
 persisted contract, use [the chat workflow's approval and run step](CHAT_WORKFLOWS.md#3-approve-and-run-one-persistent-controller).
 That approval authorizes the persistent controller to continue within the
 root's saved limits; it does not require approval for each wave.
 
 ```text
-For Agentflow workflow [workflow-id], plan a bounded read-only Codex task only.
-Inspect the exact model, effort, workspace, allowed skills, and launch budget;
-require `shell-readonly`, `Sandbox.read_only`, and approval policy `never` for
-the thread and turn. Do not start a worker until I explicitly approve this
-workflow and those limits. Do not change the transport or substitute a model.
+For Agentflow workflow [workflow-id], plan a bounded read-only Codex task using
+the existing Herdr transport; App Server worker tasks are currently blocked.
+Inspect the exact model, effort, workspace, allowed skills, and launch budget.
+Do not start a worker until I explicitly approve this workflow and those
+limits. Do not substitute another model or provider.
 ```
 
 ## Keep the workflow contract authoritative
@@ -118,27 +121,26 @@ environment default, or provider-side setting broaden those limits. If the
 approved route cannot be honored, stop and report the blocker; do not substitute
 another model, effort, workspace, transport, permission, or skill set.
 
-The model returns a structured final response; it cannot write to Agentflow's
-result inbox or receive its authenticated result capability. A detached local
-helper persists the response separately. The controller-owned collector reads
-that output, validates it against the signed return contract, and submits it
-through the existing authenticated result path. Normal ingestion and
-acceptance checks still decide whether the task passed. Provider output,
-thread state, and process completion are not acceptance. A failed, interrupted,
-timed-out, or ambiguous SDK run is never success and does not authorize a retry
-or another transport.
+The guarded prototype returns a structured response through a detached local
+helper. The model/helper does not receive the authenticated result capability;
+the controller-owned collector validates helper output against the signed
+return contract before submitting through the existing result path. This
+prototype path remains behind the pre-inference guard. If enabled in a future
+version, normal ingestion and acceptance checks would still decide whether the
+task passed; provider output, thread state, or process completion alone is not
+acceptance.
 
 Agentflow workflow resume and Codex thread resume are separate operations.
 Workflow resume reattaches to the existing approved root and reconciles its
 durable tasks and results; it does not imply restarting a provider turn. The
-App Server launch uses a detached supervised helper that can keep its SDK
-connection and exact thread/turn alive when the controller process exits. A
-same-owner controller resume checks the persisted helper state and can observe
-or collect that same turn; it does not issue a new `thread/start` or
-`turn/start`. This is not recovery from a dead helper or lost App Server: if
-helper liveness, thread/turn identity, or turn outcome is missing or ambiguous,
-Agentflow stops for operator reconciliation and does not retry. Do not create a
-replacement workflow to recover a disconnected session.
+guarded prototype uses a detached supervised helper designed to keep its SDK
+connection and exact thread/turn alive when the controller exits. If this
+worker path is enabled in a future version, same-owner controller resume can
+inspect persisted helper state and observe or collect that same turn; it does
+not issue a new `thread/start` or `turn/start`. This is not recovery from a dead
+helper or lost App Server: if helper liveness, thread/turn identity, or turn
+outcome is missing or ambiguous, Agentflow stops for operator reconciliation
+and does not retry.
 
 The automated helper-process fixture uses a fake worker to exercise durable
 helper output and controller-side collection; it does not run the Codex SDK or

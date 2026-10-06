@@ -24,8 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Copilot's existing response shape is preserved without a new provider-limit
   claim.
 
-- Documented the experimental, opt-in Codex SDK integration and its diagnostic,
-  consent, workflow-authority, and session-observability boundaries.
+- Documented read-only Codex SDK diagnostics and the experimental App Server
+  worker prototype, which remains blocked before inference pending supported
+  same-user isolation; Herdr remains the default transport.
 
 ### Changed
 

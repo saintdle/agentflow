@@ -58,8 +58,9 @@ own skills and instructions remain authoritative.
 See [Conditional prose quality](docs/PROSE_QUALITY.md) for controller-driven
 blog, documentation, and Instruqt examples.
 
-The experimental, opt-in [Codex SDK integration](docs/CODEX_SDK.md) documents
-its setup boundary, diagnostics, consent requirements, and observability limits.
+The optional [Codex SDK diagnostics and App Server prototype](docs/CODEX_SDK.md)
+are experimental. Diagnostics are read-only; App Server worker tasks are
+currently blocked before inference, and Herdr remains the default transport.
 
 ## How the components fit together
 
