@@ -5567,6 +5567,29 @@ class HandoffPreflightAssetAndIsolationGateTests(unittest.TestCase):
 class ControllerParallelDispatchTests(unittest.TestCase):
     """The root scheduler admits a bounded launch wave before polling results."""
 
+    def test_accounting_key_lookup_rejects_workspace_local_state_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            local_state_home = workspace / ".agentflow/controller-state"
+            local_state_home.mkdir(parents=True)
+            linked_state_home = base / "state-home-link"
+            linked_state_home.symlink_to(local_state_home, target_is_directory=True)
+
+            for state_home in (local_state_home, linked_state_home):
+                with self.subTest(state_home=state_home.name), mock.patch.dict(
+                    os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}
+                ):
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError,
+                        "outside the worker workspace",
+                    ):
+                        cli._accounting_authority_secret(
+                            workspace, "wf-root", continuity_id="old-incarnation",
+                            authority_key_id="a" * 24,
+                        )
+
     def test_dispatch_accounts_signed_sessions_by_workflow_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp).resolve()
@@ -5595,11 +5618,11 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     ),
                     lease,
                 )
-                return lease, credentials["authority_secret"]
+                return controller, lease, credentials["authority_secret"]
 
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
-                lease_a, secret_a = make_lease(root_a)
-                lease_b, secret_b = make_lease(root_b)
+                controller_a, lease_a, secret_a = make_lease(root_a)
+                _controller_b, lease_b, secret_b = make_lease(root_b)
                 handoff = cli.provider_argv_backend.ConfinedHandoff(
                     path=fixture.root / ".agentflow/tmp/handoffs/synthetic.md",
                     manifest={
@@ -5637,6 +5660,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                         "return_channel": {
                             "state": "consumed",
                             "contract_path": str(minted["contract_path"]),
+                            "capability_file": str(minted["capability_path"]),
                             "contract_sha256": minted["contract_sha256"],
                             "contract_binding": minted["contract"],
                             "acceptance_ids": ["R1"], "approved_waivers": [],
@@ -5647,6 +5671,40 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     "task-a-one": signed_record(root_a, lease_a, secret_a, "task-a-one", ["a-1"]),
                     "task-a-two": signed_record(root_a, lease_a, secret_a, "task-a-two", ["a-2"]),
                 }
+                # A normal release/reacquire starts a new continuity and
+                # signing key. Historical snapshots must remain verifiable
+                # for accounting without making the old key live authority.
+                controller_a.release(lease_a)
+                renewed_lease_a = controller_a.acquire()
+                _, renewed_credentials_a = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=root_a,
+                        resume_key_file="",
+                    ),
+                    renewed_lease_a,
+                )
+                self.assertNotEqual(secret_a, renewed_credentials_a["authority_secret"])
+                archive_path = cli._accounting_key_archive_path(
+                    cli._resume_key_path(argparse.Namespace(
+                        root=str(fixture.root), workflow_root=root_a,
+                        resume_key_file="",
+                    )),
+                    lease_a.continuity_id,
+                )
+                self.assertEqual(archive_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    cli._accounting_authority_secret(
+                        fixture.root, root_a,
+                        continuity_id=lease_a.continuity_id,
+                        authority_key_id=cli._credential_key_id(secret_a),
+                    ),
+                    secret_a,
+                )
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._authority_secret(
+                        fixture.root, root_a, continuity_id=lease_a.continuity_id,
+                    )
+
                 state_path = fixture.root / ".agentflow/herdr/sessions.json"
                 cli._private_atomic_json(state_path, {
                     "schema": "agentflow.herdr", "version": 1,
@@ -5660,8 +5718,12 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     max_parallel_workers=2, max_attempts_per_task=2,
                     launch_budget_multiplier=1, max_expensive_execution_children=0,
                 )
-                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
-                                       fixture.root_issue if issue_id == root_b else task), \
+                bead_issues = {root_b: fixture.root_issue, str(task["id"]): task}
+
+                def get_issue(_cwd, issue_id):
+                    return bead_issues.get(issue_id, task)
+
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
                      mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task, previous]), \
                      mock.patch.object(cli.beads_backend, "add_comment"), \
                      mock.patch.object(cli, "_controller_execution_policy", return_value=policy), \
@@ -5675,6 +5737,46 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     admitted = dispatch(task)
                     self.assertEqual(admitted["state"], "running", admitted)
                     launch.assert_called_once()
+
+                    # The archived key can authenticate the old snapshot for
+                    # accounting only. Result ingestion still requires the
+                    # current controller incarnation and rejects old output.
+                    stale_result_record = json.loads(json.dumps(old_root_records["task-a-one"]))
+                    stale_result_record["return_channel"]["state"] = "issued"
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": {"task-a-one": stale_result_record},
+                    })
+                    stale_result_path = Path(
+                        stale_result_record["return_channel"]["contract_binding"]["result_path"]
+                    )
+                    stale_result_path.write_text(json.dumps({
+                        "outcome": "completed",
+                        "acceptance_results": [{
+                            "acceptance_id": "R1", "status": "passed",
+                            "evidence": "synthetic stale result", "source": "provider",
+                        }],
+                    }), encoding="utf-8")
+                    stale_channel = stale_result_record["return_channel"]
+                    stale_args = argparse.Namespace(
+                        root=str(fixture.root), contract=stale_channel["contract_path"],
+                        file=str(stale_result_path), json=True,
+                        _controller_ingest=True,
+                        _capability_file=stale_channel["capability_file"],
+                        _authority_secret=secret_a,
+                    )
+                    stale_payloads: list[dict] = []
+                    with fixture.beads_patches(), mock.patch.object(
+                        cli, "_json_or_status",
+                        side_effect=lambda payload, **_kwargs: stale_payloads.append(payload),
+                    ):
+                        self.assertEqual(cli.herdr_result(stale_args), 2)
+                    self.assertIn("superseded controller incarnation", stale_payloads[-1]["error"])
+
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": old_root_records,
+                    })
 
                     own_root_at_cap = dict(old_root_records)
                     own_root_at_cap["task-b-prior"] = signed_record(
@@ -5718,9 +5820,35 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     })
                     unknown_result = dispatch(task)
 
+                    legacy_task = {
+                        "id": "legacy-task", "parent": "phase",
+                        "status": "closed", "metadata": {},
+                    }
+                    bead_issues.update({
+                        "legacy-task": legacy_task,
+                        "phase": {"id": "phase", "parent": root_b},
+                    })
+                    # The unsigned field names a valid intermediate ancestor.
+                    # Exact ancestry still proves this spend belongs beneath
+                    # root B, so the retained root cap must include it.
+                    cli._private_atomic_json(state_path, {
+                        "schema": "agentflow.herdr", "version": 1,
+                        "sessions": {
+                            "legacy-task": {
+                                "root": str(fixture.root),
+                                "workflow_root": "phase",
+                                "task_id": "legacy-task", "attempt": 2,
+                                "attempts": [], "status": "completed",
+                                "model": "claude-sonnet-5", "role": "coding",
+                            },
+                        },
+                    })
+                    legacy_at_cap = dispatch(task)
+
             self.assertTrue(corrupt_result.get("accounting_indeterminate"), corrupt_result)
             self.assertTrue(tampered_result.get("accounting_indeterminate"), tampered_result)
             self.assertTrue(unknown_result.get("accounting_indeterminate"), unknown_result)
+            self.assertEqual(legacy_at_cap["state"], "blocked", legacy_at_cap)
             launch.assert_called_once()
 
     def test_codex_trust_prompt_pauses_parallel_controller_without_relaunch(self) -> None:
@@ -6240,7 +6368,8 @@ class ControllerParallelDispatchTests(unittest.TestCase):
 
     def test_two_authenticated_results_are_dispositioned_out_of_launch_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
             first = dict(fixture.task_issue)
             second = json.loads(json.dumps(fixture.task_issue))
             second.update(id="task-2", title="Second bounded task")
@@ -6366,7 +6495,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                 poll_interval=0.01, deadline=12.0,
             )
             payloads: list[dict] = []
-            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")}), \
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
                  mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
                  mock.patch.object(cli.beads_backend, "root_descendants", side_effect=root_descendants), \
                  mock.patch.object(cli.beads_backend, "claim_ready", side_effect=claim_ready), \

@@ -162,12 +162,30 @@ class ContextAuditTests(unittest.TestCase):
             "attempts": [{"attempt": 1, "launch_id": "launch-ambiguous", "status": "ambiguous"}],
             "status": "launching",
         }
+        mixed_version_pending = {
+            "attempt": 1,
+            "attempts": [
+                {"attempt": 1, "status": "identity_pending"},
+                {"attempt": 1, "launch_id": "launch-one", "status": "launched",
+                 "resolved_from": "identity_pending"},
+            ],
+        }
+        legacy_pending_resolution = {
+            "attempt": 1,
+            "attempts": [
+                {"attempt": 1, "status": "identity_pending"},
+                {"attempt": 1, "status": "launched",
+                 "resolved_from": "identity_pending"},
+            ],
+        }
 
         self.assertEqual(execution.summarize_attempts([pending]), (1, 1, 1))
         self.assertEqual(execution.summarize_attempts([retry])[0], 2)
         self.assertEqual(execution.summarize_attempts([reservation])[0], 1)
         self.assertEqual(execution.summarize_attempts([failed_start])[0], 1)
         self.assertEqual(execution.summarize_attempts([ambiguous])[0], 1)
+        self.assertEqual(execution.summarize_attempts([mixed_version_pending])[0], 1)
+        self.assertEqual(execution.summarize_attempts([legacy_pending_resolution])[0], 1)
         self.assertEqual(execution.summarize_attempts([{"attempts": [{}, {}, {}]}])[0], 3)
 
         report = context_budget.add_execution_attempts(

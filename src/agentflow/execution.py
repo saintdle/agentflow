@@ -264,6 +264,7 @@ def attempt_count(record: Mapping[str, Any]) -> int:
     launch_groups: dict[str, tuple[str, str | int]] = {}
     attempt_groups: dict[int, tuple[str, str | int]] = {}
     pending_groups: list[tuple[str, str | int]] = []
+    pending_attempt_groups: dict[int, tuple[str, str | int]] = {}
     anonymous_index = 0
 
     for event in raw_events:
@@ -279,7 +280,18 @@ def attempt_count(record: Mapping[str, Any]) -> int:
             raise _accounting_indeterminate("launch attempt event has a malformed attempt number")
 
         if launch_id:
-            group = launch_groups.setdefault(launch_id, ("launch", launch_id))
+            group = launch_groups.get(launch_id)
+            if group is None:
+                pending_alias = (
+                    pending_attempt_groups.get(event_attempt)
+                    if event_attempt is not None
+                    else (pending_groups[-1] if pending_groups else None)
+                )
+                if event.get("resolved_from") == "identity_pending" and pending_alias is not None:
+                    group = pending_alias
+                else:
+                    group = ("launch", launch_id)
+                launch_groups[launch_id] = group
             if event_attempt is not None:
                 attempt_groups.setdefault(event_attempt, group)
         elif event_attempt is not None and event_attempt in attempt_groups:
@@ -297,12 +309,16 @@ def attempt_count(record: Mapping[str, Any]) -> int:
         status = str(event.get("status") or "")
         if status == "identity_pending":
             pending_groups.append(group)
+            if event_attempt is not None:
+                pending_attempt_groups[event_attempt] = group
         elif event.get("resolved_from") == "identity_pending":
             # A resolution may have an ID while its pending observation did
             # not. Pair it with that prior observation instead of billing a
             # second launch.
             if group in pending_groups:
                 pending_groups.remove(group)
+            if event_attempt is not None and pending_attempt_groups.get(event_attempt) == group:
+                pending_attempt_groups.pop(event_attempt, None)
 
     has_reserved_launch = bool(record_launch or binding_launch)
     return max(record_attempt, len(groups), int(has_reserved_launch))

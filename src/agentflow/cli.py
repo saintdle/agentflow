@@ -399,6 +399,164 @@ def _write_resume_key(
     })
 
 
+def _accounting_key_archive_path(canonical_path: Path, continuity_id: str) -> Path:
+    """Return a controller-derived archive path for one incarnation key."""
+    continuity_hash = hashlib.sha256(continuity_id.encode("utf-8")).hexdigest()
+    return canonical_path.parent / "accounting-verification" / f"{continuity_hash}.json"
+
+
+def _credential_key_id(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:24]
+
+
+def _require_external_accounting_storage(path: Path, workspace_root: str) -> None:
+    """Refuse accounting key material stored inside a worker-writable tree."""
+    try:
+        workspace = Path(workspace_root).expanduser().resolve()
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(workspace)
+    except ValueError:
+        return
+    except (OSError, RuntimeError) as exc:
+        raise controller_backend.ControllerError(
+            "canonical accounting credential storage cannot be resolved safely"
+        ) from exc
+    raise controller_backend.ControllerError(
+        "accounting verification material must be stored outside the worker workspace"
+    )
+
+
+def _archive_accounting_authority_key(
+    canonical_path: Path,
+    credentials: Mapping[str, str],
+    *,
+    workspace_root: str,
+    workflow_root: str,
+) -> None:
+    """Retain a prior canonical key only for immutable accounting snapshots."""
+    _require_external_accounting_storage(canonical_path, workspace_root)
+    secret = str(credentials.get("authority_secret") or "")
+    continuity_id = str(credentials.get("continuity_id") or "")
+    if (
+        not secret
+        or not continuity_id
+        or credentials.get("workspace_root") != workspace_root
+        or credentials.get("workflow_root") != workflow_root
+    ):
+        return
+    key_id = _credential_key_id(secret)
+    archive_path = _accounting_key_archive_path(canonical_path, continuity_id)
+    if archive_path.parent.is_symlink():
+        raise controller_backend.ControllerError(
+            "protected accounting verification directory must not be a symlink"
+        )
+    if archive_path.exists() or archive_path.is_symlink():
+        archived = _read_accounting_authority_archive(
+            archive_path, workspace_root=workspace_root,
+            workflow_root=workflow_root, continuity_id=continuity_id,
+            authority_key_id=key_id,
+        )
+        if not hmac.compare_digest(archived, secret):
+            raise controller_backend.ControllerError(
+                "protected accounting verification archive conflicts with the prior controller key"
+            )
+        return
+    _private_atomic_json(archive_path, {
+        "schema": "agentflow.accounting_verification_key",
+        "version": 1,
+        "authority_secret": secret,
+        "authority_key_id": key_id,
+        "continuity_id": continuity_id,
+        "workspace_root": workspace_root,
+        "workflow_root": workflow_root,
+    })
+
+
+def _read_accounting_authority_archive(
+    path: Path,
+    *,
+    workspace_root: str,
+    workflow_root: str,
+    continuity_id: str,
+    authority_key_id: str,
+) -> str:
+    """Load a protected accounting-only key after validating every binding."""
+    if not re.fullmatch(r"[0-9a-f]{24}", authority_key_id):
+        raise controller_backend.ControllerError("signed accounting authority key ID is malformed")
+    if path.is_symlink() or not path.is_file() or path.parent.is_symlink():
+        raise controller_backend.ControllerError("protected accounting verification key is unavailable")
+    try:
+        if os.name == "posix":
+            file_mode = path.stat().st_mode & 0o777
+            directory_mode = path.parent.stat().st_mode & 0o777
+            if file_mode & 0o077 or directory_mode & 0o077:
+                raise controller_backend.ControllerError(
+                    "protected accounting verification key permissions are too broad"
+                )
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise controller_backend.ControllerError(
+            "protected accounting verification key cannot be read"
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise controller_backend.ControllerError("protected accounting verification key is malformed")
+    secret = str(value.get("authority_secret") or "")
+    stored_key_id = str(value.get("authority_key_id") or "")
+    if (
+        value.get("schema") != "agentflow.accounting_verification_key"
+        or value.get("version") != 1
+        or value.get("workspace_root") != workspace_root
+        or value.get("workflow_root") != workflow_root
+        or value.get("continuity_id") != continuity_id
+        or not secret
+        or not re.fullmatch(r"[0-9a-f]{24}", stored_key_id)
+        or not hmac.compare_digest(stored_key_id, authority_key_id)
+        or not hmac.compare_digest(_credential_key_id(secret), stored_key_id)
+    ):
+        raise controller_backend.ControllerError(
+            "protected accounting verification key does not match the signed snapshot"
+        )
+    return secret
+
+
+def _accounting_authority_secret(
+    root: Path,
+    workflow_root: str,
+    *,
+    continuity_id: str,
+    authority_key_id: str,
+) -> str:
+    """Verify snapshot MACs using current or archived accounting-only material."""
+    if not re.fullmatch(r"[0-9a-f]{24}", authority_key_id):
+        raise controller_backend.ControllerError("signed accounting authority key ID is malformed")
+    canonical_args = argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file=""
+    )
+    canonical_path = _resume_key_path(canonical_args)
+    _require_external_accounting_storage(canonical_path, str(root.resolve()))
+    credentials = (
+        {} if canonical_path.is_symlink()
+        else _read_controller_credentials(canonical_path)
+    )
+    if (
+        credentials.get("workspace_root") == str(root.resolve())
+        and credentials.get("workflow_root") == workflow_root
+        and credentials.get("continuity_id") == continuity_id
+        and credentials.get("authority_secret")
+    ):
+        current_secret = credentials["authority_secret"]
+        current_key_id = _credential_key_id(current_secret)
+        if hmac.compare_digest(current_key_id, authority_key_id):
+            return current_secret
+
+    archive_path = _accounting_key_archive_path(canonical_path, continuity_id)
+    return _read_accounting_authority_archive(
+        archive_path,
+        workspace_root=str(root.resolve()), workflow_root=workflow_root,
+        continuity_id=continuity_id, authority_key_id=authority_key_id,
+    )
+
+
 def _controller_credentials(
     args: argparse.Namespace,
     lease: controller_backend.Lease,
@@ -424,6 +582,23 @@ def _controller_credentials(
         )
     root = _root_arg(args)
     workflow_root = str(getattr(args, "workflow_root", "") or "")
+    canonical_args = argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file=""
+    )
+    canonical_path = _resume_key_path(canonical_args)
+    canonical_credentials = (
+        {} if canonical_path.is_symlink()
+        else _read_controller_credentials(canonical_path)
+    )
+    prior_canonical_secret = str(canonical_credentials.get("authority_secret") or "")
+    if prior_canonical_secret and (
+        canonical_credentials.get("continuity_id") != lease.continuity_id
+        or not hmac.compare_digest(prior_canonical_secret, authority_secret)
+    ):
+        _archive_accounting_authority_key(
+            canonical_path, canonical_credentials,
+            workspace_root=str(root.resolve()), workflow_root=workflow_root,
+        )
     _write_resume_key(
         path,
         resume_secret,
@@ -432,10 +607,6 @@ def _controller_credentials(
         workspace_root=str(root),
         workflow_root=workflow_root,
     )
-    canonical_args = argparse.Namespace(
-        root=str(root), workflow_root=workflow_root, resume_key_file=""
-    )
-    canonical_path = _resume_key_path(canonical_args)
     if canonical_path != path:
         # Result/waiver verification never follows a worker-controlled path.
         # Keep a canonical authority-only copy outside the workspace even
@@ -987,8 +1158,9 @@ def _workflow_session_records(
                     f"task {task_id!r} signed snapshot lacks workflow or controller identity"
                 )
             try:
-                authority_secret = _authority_secret(
+                authority_secret = _accounting_authority_secret(
                     root, signed_root, continuity_id=continuity_id,
+                    authority_key_id=str(binding.get("authority_key_id") or ""),
                 )
                 _verify_return_contract_binding(
                     binding, Path(contract_path_value), task_id, record,
@@ -1041,14 +1213,10 @@ def _workflow_session_records(
 
         ancestry = _history_task_ancestry(cwd, task_id)
         recorded_root = str(record.get("workflow_root") or "")
-        if recorded_root:
-            if recorded_root not in ancestry:
-                raise _accounting_indeterminate(
-                    f"legacy task {task_id!r} workflow root is not proven by its Beads ancestry"
-                )
-            if recorded_root == workflow_root:
-                selected.append(record)
-            continue
+        if recorded_root and recorded_root not in ancestry:
+            raise _accounting_indeterminate(
+                f"legacy task {task_id!r} workflow root is not proven by its Beads ancestry"
+            )
         if workflow_root in ancestry:
             selected.append(record)
     return selected

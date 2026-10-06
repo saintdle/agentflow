@@ -6,6 +6,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Launch budgets now count each reserved attempt once across pending and resolved
+  lifecycle records, retain verified history across controller key rotations, and
+  include spend proven by exact workflow ancestry.
+
 ## [0.0.8] - 2026-10-05
 
 ### Added
