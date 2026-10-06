@@ -35,6 +35,7 @@ from agentflow import controller as controller_backend
 from agentflow import config_commands as config_commands_backend
 from agentflow import context_budget as context_budget_backend
 from agentflow import context_delivery as context_delivery_backend
+from agentflow import codex_app_server as codex_app_server_backend
 from agentflow import execution as execution_backend
 from agentflow import execution_limits as execution_limits_backend
 from agentflow import guidance as guidance_backend
@@ -844,6 +845,7 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
         "model": str(launch.get("model") or ""),
         "effort": str(launch.get("effort") or ""),
         "role": str(launch.get("role") or ""),
+        "transport": str(launch.get("transport") or ""),
         "selective_model": launch.get("selective_model") is True,
         "delegation_depth": int(launch.get("delegation_depth") or 0),
         "fork_context": str(launch.get("fork_context") or ""),
@@ -855,7 +857,7 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _materialize_launch_handoff(
-    cwd: Path, task_id: str, provider: str, *, role: str,
+    cwd: Path, task_id: str, provider: str, *, role: str, transport: str = "herdr",
     execution_limits: Mapping[str, Any] | None = None,
 ) -> Path:
     """Materialize the real, full from-bead handoff contract for a launch.
@@ -886,7 +888,9 @@ def _materialize_launch_handoff(
         exit_code = handoff_from_bead(handoff_args)
     if exit_code != 0:
         raise ValueError(f"cannot materialize the from-bead handoff contract for task {task_id!r}")
-    preflight_args = argparse.Namespace(file=str(output), cwd=str(cwd), require_matrix=True)
+    preflight_args = argparse.Namespace(
+        file=str(output), cwd=str(cwd), require_matrix=True, transport=transport,
+    )
     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
         preflight_exit_code = handoff_preflight(preflight_args)
     if preflight_exit_code != 0:
@@ -993,6 +997,7 @@ def _run_actual_root_preflight(
     handoff: provider_argv_backend.ConfinedHandoff,
     selective_model: bool = False,
     execution_root: Path | None = None,
+    provider_transport: str = "herdr",
 ) -> tuple[dict[str, Any], str]:
     """Run the public root preflight against the materialized launch inputs."""
     manifest = handoff.manifest
@@ -1031,8 +1036,11 @@ def _run_actual_root_preflight(
         boundary=str(boundary), matrix=list(acceptance_ids),
         tool=list(required_tools), provider=provider, role=role, model=model, effort=effort,
         policy_version="", workflow_root=workflow_root, task=task_id, actor=actor,
-        session_id=session_name, lease=lease, claim=claim, handoff=str(handoff.path),
-        herdr_session=session_name, herdr_protocol="agentflow.herdr@1", duplicate_session=[],
+        session_id=session_name if provider_transport == "herdr" else "",
+        lease=lease, claim=claim, handoff=str(handoff.path),
+        herdr_session=session_name if provider_transport == "herdr" else "",
+        herdr_protocol="agentflow.herdr@1" if provider_transport == "herdr" else "",
+        provider_transport=provider_transport,
         external=False, authenticated_confinement=True, json=True,
         selective_model=selective_model,
     )
@@ -1252,6 +1260,11 @@ def _dispatch_via_herdr(
         launch_meta = _launch_task_metadata(issue)
         if not all(launch_meta.get(field) for field in ("provider", "model", "effort", "role")):
             return {"state": "blocked", "session_id": ""}
+        requested_transport = str(launch_meta.get("transport") or "")
+        if requested_transport and requested_transport not in {"herdr", "app-server"}:
+            return {"state": "blocked", "session_id": ""}
+        if requested_transport == "app-server" and launch_meta["provider"] != "codex":
+            return {"state": "blocked", "session_id": ""}
         try:
             execution_limits = execution_limits_backend.parse_limits(launch_meta.get("execution_limits"))
             # Projects created before execution policy was introduced may not
@@ -1260,6 +1273,11 @@ def _dispatch_via_herdr(
             # packaged defaults; an existing malformed config still fails
             # closed instead of being silently ignored.
             root_issue = beads_backend.get_issue(cwd, workflow_root)
+            project_config = project_config_backend.load(cwd)
+            configured_transport = project_config_backend.codex_transport(project_config)
+            transport = requested_transport or (
+                configured_transport if launch_meta["provider"] == "codex" else "herdr"
+            )
             launch_policy = _controller_execution_policy(
                 cwd, root, workflow_root, root_issue=root_issue
             )
@@ -1325,8 +1343,11 @@ def _dispatch_via_herdr(
             handoff_path = _materialize_launch_handoff(
                 cwd, task_id, launch_meta["provider"], role=launch_meta["role"],
                 execution_limits=(execution_limits.to_dict() if execution_limits else None),
+                transport=transport,
             )
             execution_root = root
+            if transport == "app-server" and launch_meta.get("sterile"):
+                return {"state": "blocked", "session_id": ""}
             if launch_meta.get("sterile"):
                 sterile_root = _state_dir() / "sterile" / f"{_slug(task_id)}-{uuid.uuid4()}"
                 handoff_path = _package_handoff_sterile(handoff_path, sterile_root)
@@ -1366,6 +1387,7 @@ def _dispatch_via_herdr(
                 role=launch_meta["role"], model=launch_meta["model"], effort=launch_meta["effort"],
                 selective_model=bool(launch_meta.get("selective_model")),
                 handoff=handoff, execution_root=execution_root,
+                provider_transport=transport,
             )
         except ValueError:
             return {"state": "blocked", "session_id": ""}
@@ -1390,6 +1412,7 @@ def _dispatch_via_herdr(
             execution_root=str(execution_root) if execution_root != root else "",
             selective_model=bool(launch_meta.get("selective_model")),
             execution_limits=execution_limits.to_dict() if execution_limits else None,
+            transport=transport,
             _authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
         # herdr_launch prints its own diagnostics; the controller's JSON
@@ -1492,6 +1515,30 @@ def _controller_step_serial(
         in_flight_issue = beads_backend.get_issue(cwd, in_flight_task)
         in_flight_terminal = str(in_flight_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
         in_flight_record = _herdr_session_record(root, in_flight_task) or {}
+        if in_flight_record.get("provider_transport") == "app-server":
+            lifecycle = in_flight_record.get("codex_app_server")
+            lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+            identity = lifecycle.get("identity")
+            identity = identity if isinstance(identity, Mapping) else {}
+            local_state = codex_app_server_backend.local_turn_state(
+                str(identity.get("thread_id") or ""), str(identity.get("turn_id") or ""),
+            )
+            terminal_status = str(lifecycle.get("status") or "")
+            unsafe_status = terminal_status in {"failed", "interrupted", "server_lost", "ambiguous"}
+            if lifecycle.get("rerouted") is True or unsafe_status:
+                reason = (
+                    "USER_ACTION_REQUIRED: Codex App Server turn ended without an accepted result "
+                    "(or reported a route change); inspect the persisted thread/turn and do not retry"
+                )
+                result = controller.halt("blocked", reason, lease=lease)
+                return _payload(result, "USER_ACTION_REQUIRED"), True
+            if local_state is None:
+                reason = (
+                    "USER_ACTION_REQUIRED: the persisted Codex App Server turn has no live local "
+                    "watcher; inspect its exact thread/turn before any recovery, never start a duplicate turn"
+                )
+                result = controller.halt("blocked", reason, lease=lease)
+                return _payload(result, "USER_ACTION_REQUIRED"), True
         if in_flight_terminal and not in_flight_record:
             result = controller.halt(
                 "blocked",
@@ -1867,6 +1914,39 @@ def _controller_step_parallel(
     for entry in list(active):
         task_id = entry["task"]
         session_record = _herdr_session_record(root, task_id) or {}
+        if session_record.get("provider_transport") == "app-server":
+            lifecycle = session_record.get("codex_app_server")
+            lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+            identity = lifecycle.get("identity")
+            identity = identity if isinstance(identity, Mapping) else {}
+            local_state = codex_app_server_backend.local_turn_state(
+                str(identity.get("thread_id") or ""), str(identity.get("turn_id") or ""),
+            )
+            status = str(lifecycle.get("status") or "")
+            if lifecycle.get("rerouted") is True or status in {
+                "failed", "interrupted", "server_lost", "ambiguous",
+            }:
+                reason = (
+                    f"USER_ACTION_REQUIRED: Codex App Server task {task_id} did not produce an "
+                    "accepted result; inspect the persisted thread/turn and do not retry"
+                )
+                note_failure(task_id, reason, provider_terminal=True)
+                launch_attention_required = {
+                    "code": "codex_app_server_recovery_required", "task_id": task_id,
+                    "message": reason,
+                }
+                continue
+            if local_state is None:
+                reason = (
+                    f"USER_ACTION_REQUIRED: Codex App Server task {task_id} has no live local "
+                    "watcher after reattach; inspect the exact thread/turn, never start a duplicate turn"
+                )
+                note_failure(task_id, reason)
+                launch_attention_required = {
+                    "code": "codex_app_server_recovery_required", "task_id": task_id,
+                    "message": reason,
+                }
+                continue
         recovery = launch_recovery_backend.reduce_incomplete_launch(
             entry["state"], session_record, task_id=task_id,
         )
@@ -2868,7 +2948,10 @@ def preflight_root(args: argparse.Namespace) -> int:
         tools = tuple(getattr(args, "tool", []) or getattr(args, "tools", []) or [])
         snapshot = preflight_backend.take_snapshot(root, tools=tools)
         model = getattr(args, "model", "") or " "
-        session_id = getattr(args, "session_id", "") or " "
+        provider_transport = getattr(args, "provider_transport", getattr(args, "transport", "herdr"))
+        session_id = getattr(args, "session_id", "")
+        if provider_transport == "herdr" and not session_id:
+            session_id = " "
         workspace_kind = getattr(args, "workspace_kind", "") or (
             "git" if _is_git_repository(authority_root) else "directory"
         )
@@ -2896,6 +2979,7 @@ def preflight_root(args: argparse.Namespace) -> int:
             duplicate_sessions=tuple(getattr(args, "duplicate_session", []) or []),
             herdr_session=getattr(args, "herdr_session", ""),
             herdr_protocol=getattr(args, "herdr_protocol", ""),
+            provider_transport=provider_transport,
             external=bool(getattr(args, "external", False)),
             authenticated_confinement=bool(getattr(args, "authenticated_confinement", False)),
             selective_model=bool(getattr(args, "selective_model", False)),
@@ -4178,6 +4262,264 @@ def _require_herdr_provider_integration(herdr: str, provider: str) -> None:
                          "and install it with `herdr integration install codex` before launching")
 
 
+def _codex_result_schema(acceptance_ids: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "type": "object", "additionalProperties": False,
+        "required": ["outcome", "acceptance_results"],
+        "properties": {
+            "outcome": {"type": "string", "enum": ["completed"]},
+            "acceptance_results": {
+                "type": "array", "minItems": len(acceptance_ids),
+                "maxItems": len(acceptance_ids),
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["acceptance_id", "status", "evidence"],
+                    "properties": {
+                        "acceptance_id": {"type": "string", "enum": list(acceptance_ids)},
+                        "status": {"type": "string", "enum": ["passed"]},
+                        "evidence": {"type": "string", "minLength": 1},
+                        "source": {"type": "string"},
+                    },
+                },
+            },
+            "evidence": {"type": "array", "items": {"type": "object"}},
+        },
+    }
+
+
+def _codex_skill_inputs(root: Path, manifest: Mapping[str, Any]) -> list[tuple[str, str]]:
+    required = tuple(str(value) for value in manifest.get("required_skills", []) if isinstance(value, str))
+    resolved = manifest.get("resolved_skills")
+    if not isinstance(resolved, list) or len(resolved) != len(required):
+        raise ValueError("Codex App Server requires the exact preflight-pinned skill set")
+    inputs: list[tuple[str, str]] = []
+    for item in resolved:
+        if not isinstance(item, Mapping):
+            raise ValueError("Codex skill preflight pin is malformed")
+        name = str(item.get("name") or "")
+        if name not in required or item.get("provider") != "codex":
+            raise ValueError("Codex skill preflight pin does not match the requested skill")
+        path = Path(str(item.get("entrypoint") or "")).expanduser()
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("pinned Codex skill entrypoint is unavailable")
+        try:
+            pin, _ = _required_skill_pin("codex", root, name, path)
+        except (OSError, ValueError) as exc:
+            raise ValueError("pinned Codex skill package could not be revalidated") from exc
+        for field in ("sha256", "entrypoint_sha256", "package_count"):
+            if pin.get(field) != item.get(field):
+                raise ValueError("pinned Codex skill package changed after preflight")
+        inputs.append((name, str(path.resolve())))
+    return inputs
+
+
+def _start_codex_app_server_launch(
+    args: argparse.Namespace, *, root: Path, workflow_root: str, task_id: str,
+    actor: str, claim_id: str, lease_id: str, lease_epoch: int,
+    continuity_id: str, cwd: Path, model: str, effort: str, role: str,
+    launch_id: str, attempt: int,
+    typed_handoff: provider_argv_backend.ConfinedHandoff,
+    acceptance_ids: tuple[str, ...], return_channel: Mapping[str, Any],
+    state_path: Path, authority_secret: str,
+) -> int:
+    """Start one read-only Codex turn and collect its result inside the controller."""
+    try:
+        skills = _codex_skill_inputs(cwd, typed_handoff.manifest)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    contract = return_channel.get("contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("Codex App Server return contract is unavailable")
+    contract_path = Path(str(return_channel.get("contract_path") or ""))
+    result_path = Path(str(return_channel.get("result_path") or ""))
+    submission_path = Path(str(return_channel.get("submission_path") or ""))
+    session_id = ""
+    fence_context: Any = None
+    identity_base = {
+        "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": claim_id, "lease_epoch": lease_epoch,
+        "lease_continuity_id": continuity_id,
+        "lease_token_sha256": hashlib.sha256(lease_id.encode("utf-8")).hexdigest(),
+        "cwd": str(cwd.resolve()), "model": model, "effort": effort,
+        "sdk_version": codex_app_server_backend.SUPPORTED_SDK_VERSION,
+        "model_evidence": "codex-app-server-protocol-cooperative",
+    }
+
+    def save_identity(field: str, value: str) -> None:
+        nonlocal fence_context
+        if field == "thread_id":
+            # Keep the root lease fence held from persisted thread identity
+            # through the turn/start response; a takeover cannot race spend.
+            fence_context = _controller_fence(root, workflow_root, lease_id)
+            current_lease = fence_context.__enter__()
+            if current_lease.continuity_id != continuity_id:
+                raise controller_backend.FencedLease("Codex launch continuity changed")
+        elif fence_context is None:
+            raise ValueError("Codex thread identity was not fenced")
+        with _herdr_transaction(state_path) as state:
+            record = state.get("sessions", {}).get(task_id)
+            if not isinstance(record, dict) or record.get("launch_id") != launch_id:
+                raise ValueError("Codex launch reservation was replaced")
+            current = record.setdefault("codex_app_server", {})
+            current["identity"] = {**identity_base, field: value, **(
+                {"thread_id": current.get("identity", {}).get("thread_id")}
+                if field == "turn_id" and isinstance(current.get("identity"), Mapping) else {}
+            )}
+            current["status"] = "thread_created" if field == "thread_id" else "running"
+
+    def collect_result(observation: codex_app_server_backend.TurnObservation, output: str) -> None:
+        parsed: dict[str, Any] | None = None
+        final_observation = observation
+        if observation.status == "completed" and not observation.rerouted:
+            try:
+                candidate = json.loads(output)
+                if (
+                    isinstance(candidate, dict)
+                    and set(candidate).issubset({"outcome", "acceptance_results", "evidence"})
+                    and candidate.get("outcome") == "completed"
+                    and isinstance(candidate.get("acceptance_results"), list)
+                    and isinstance(candidate.get("evidence", []), list)
+                ):
+                    parsed = candidate
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
+            if parsed is None:
+                final_observation = codex_app_server_backend.TurnObservation(
+                    "failed", reason_code="structured_result_invalid",
+                )
+        try:
+            with _return_controller_fence(
+                root, workflow_root, str(contract.get("controller_id") or ""), continuity_id,
+            ):
+                with _herdr_transaction(state_path) as state:
+                    record = state.get("sessions", {}).get(task_id)
+                    channel = record.get("return_channel") if isinstance(record, Mapping) else None
+                    if (
+                        not isinstance(record, dict) or record.get("launch_id") != launch_id
+                        or not isinstance(channel, Mapping) or channel.get("state") != "issued"
+                    ):
+                        return
+                    _verify_return_contract_binding(
+                        contract, contract_path, task_id, record,
+                        root=root, authority_secret=authority_secret,
+                    )
+                    lifecycle = record.get("codex_app_server")
+                    persisted = lifecycle.get("identity") if isinstance(lifecycle, Mapping) else None
+                    if not isinstance(persisted, Mapping):
+                        return
+                    thread_id = str(persisted.get("thread_id") or "")
+                    turn_id = str(persisted.get("turn_id") or "")
+                    if not thread_id or not turn_id:
+                        return
+                    record["codex_app_server"] = {
+                        **dict(lifecycle), "status": final_observation.status,
+                        "rerouted": final_observation.rerouted,
+                        "reason_code": final_observation.reason_code,
+                        "thread_id": thread_id, "turn_id": turn_id,
+                        "model": model, "effort": effort,
+                        "sdk_version": codex_app_server_backend.SUPPORTED_SDK_VERSION,
+                        "model_evidence": "codex-app-server-protocol-cooperative",
+                        "observed_at": _now(),
+                    }
+                    if final_observation.status != "completed" or parsed is None:
+                        record["status"] = "failed"
+                        return
+                    result = dict(parsed)
+                    result["evidence"] = result.get("evidence", [])
+                    result["session_id"] = f"codex-app-server:{thread_id}:{turn_id}"
+                    _private_atomic_json(result_path, result)
+                    _private_atomic_json(submission_path, {
+                        "schema": "agentflow.result-submission@1",
+                        "contract_sha256": _file_sha256(contract_path),
+                        "result_sha256": _file_sha256(result_path),
+                        "submitted_at": _now(),
+                    })
+                    record["status"] = "completed"
+        except Exception:
+            # Do not leak raw SDK or provider output. Without the controller
+            # result marker, the task cannot pass acceptance.
+            return
+
+    try:
+        _verify_launch_authority(
+            root, task_id, str(getattr(args, "claim", "") or ""), lease_id,
+            workflow_root=workflow_root, beads_cwd=root, actor=actor,
+        )
+        thread_id, turn_id = codex_app_server_backend.start_background_turn(
+            cwd=str(cwd.resolve()), model=model, effort=effort,
+            instruction=(typed_handoff.instruction + "\n\nReturn only the exact structured "
+                         "Agentflow acceptance result. Do not write or submit result files; "
+                         "the controller collects and validates your final response."),
+            skills=skills,
+            tool_profile=str(typed_handoff.manifest.get("tool_profile") or ""),
+            output_boundary=str(typed_handoff.manifest.get("output_boundary") or ""),
+            sterile=False, output_schema=_codex_result_schema(acceptance_ids),
+            on_thread=lambda value: save_identity("thread_id", value),
+            on_turn=lambda value: save_identity("turn_id", value),
+            on_complete=collect_result,
+        )
+    except Exception as exc:
+        if fence_context is not None:
+            try:
+                fence_context.__exit__(None, None, None)
+            except Exception:
+                pass
+            fence_context = None
+        with _herdr_transaction(state_path) as state:
+            record = state.get("sessions", {}).get(task_id)
+            if isinstance(record, dict) and record.get("launch_id") == launch_id:
+                lifecycle = record.setdefault("codex_app_server", {})
+                ambiguous = bool(lifecycle.get("identity", {}).get("thread_id"))
+                lifecycle["status"] = "ambiguous" if ambiguous else "failed"
+                lifecycle["reason_code"] = "startup_ambiguous" if ambiguous else "startup_failed"
+                record["status"] = "ambiguous" if ambiguous else "failed"
+                record["launch_outcome"] = "ambiguous" if ambiguous else "failed"
+        failed_status = "ambiguous" if locals().get("ambiguous", False) else "failed"
+        payload = {
+            "operation": "launch", "ok": False,
+            "status": failed_status,
+            "error": {"code": "codex_app_server_start_failed"},
+        }
+        _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CODEX APP SERVER LAUNCH")
+        return 2
+    finally:
+        if fence_context is not None:
+            try:
+                fence_context.__exit__(None, None, None)
+            except Exception:
+                pass
+    session_id = f"codex-app-server:{thread_id}:{turn_id}"
+    binding = {
+        "root": str(root.resolve()), "task_id": task_id,
+        "claim_id": claim_id, "lease_id": lease_id, "launch_id": launch_id,
+        "provider": "codex", "session_id": session_id,
+        "thread_id": thread_id, "turn_id": turn_id,
+        "created_at": _now(), "launched_at": _now(),
+    }
+    with _controller_fence(root, workflow_root, lease_id) as current_lease:
+        if current_lease.continuity_id != continuity_id:
+            raise controller_backend.FencedLease("Codex launch continuity changed before binding")
+        with _herdr_transaction(state_path) as state:
+            record = state.get("sessions", {}).get(task_id)
+            if not isinstance(record, dict) or record.get("launch_id") != launch_id:
+                raise ValueError("Codex launch reservation was replaced before binding")
+            record["provider_transport"] = "app-server"
+            record["binding"] = binding
+            record["status"] = "launched"
+            record.setdefault("attempts", []).append({
+                "attempt": attempt, "launch_id": launch_id,
+                "workflow_root": workflow_root, "status": "launched",
+                "transport": "app-server",
+            })
+    _json_or_status(
+        {"operation": "launch", "ok": True, "root": str(root), "task_id": task_id,
+         "provider": "codex", "transport": "app-server", "model": model,
+         "effort": effort, "status": "launched", "binding": binding},
+        as_json=bool(getattr(args, "json", False)), title="CODEX APP SERVER LAUNCH",
+    )
+    return 0
+
+
 def herdr_launch(args: argparse.Namespace) -> int:
     root = _root_arg(args)
     execution_root = root
@@ -4186,6 +4528,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
     try:
         policy = model_policy_backend.load_policy(_resolve_model_policy(args, root))
         provider = getattr(args, "provider", "")
+        transport = str(getattr(args, "transport", "herdr") or "herdr")
+        if transport not in {"herdr", "app-server"}:
+            raise ValueError("transport must be herdr or app-server")
+        if transport == "app-server" and provider != "codex":
+            raise ValueError("app-server transport is supported only for Codex")
         role = getattr(args, "role", "")
         model = getattr(args, "model", "")
         effort = getattr(args, "effort", "")
@@ -4235,7 +4582,20 @@ def herdr_launch(args: argparse.Namespace) -> int:
         )
         if typed_handoff.manifest.get("provider") != provider:
             raise ValueError("handoff provider does not match launch route")
-        _require_supported_launch_isolation(typed_handoff, transport="Herdr")
+        if transport == "app-server":
+            if typed_handoff.manifest.get("sterile") is True or str(
+                typed_handoff.manifest.get("outbound_context") or ""
+            ) == "restricted" or execution_root != root:
+                raise ValueError("Codex App Server cannot preserve the sterile outbound boundary")
+            codex_app_server_backend.permission_for_profile(
+                str(typed_handoff.manifest.get("tool_profile") or ""),
+                cwd=str(execution_root),
+                output_boundary=str(typed_handoff.manifest.get("output_boundary") or ""),
+                sterile=False,
+            )
+        _require_supported_launch_isolation(
+            typed_handoff, transport="Codex App Server" if transport == "app-server" else "Herdr",
+        )
         try:
             execution_limits = execution_limits_backend.parse_limits(
                 typed_handoff.manifest.get("execution_limits")
@@ -4267,7 +4627,9 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 expected_manifest_sha256=typed_handoff.manifest_sha256,
                 expected_preflight_sha256=typed_handoff.preflight_sha256,
             )
-            _require_supported_launch_isolation(typed_handoff, transport="Herdr")
+            _require_supported_launch_isolation(
+                typed_handoff, transport="Codex App Server" if transport == "app-server" else "Herdr"
+            )
             if provider == "claude":
                 # Model matching for a persistent Claude session depends on
                 # local observations of both native lifecycle events. Recheck
@@ -4293,6 +4655,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 provider=provider, role=role, model=model, effort=effort,
                 selective_model=selective_model,
                 handoff=typed_handoff, execution_root=execution_root,
+                provider_transport=transport,
             )
             expected_digest = str(getattr(args, "root_preflight_sha256", "") or "")
             if current_digest != expected_digest:
@@ -4323,7 +4686,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 "live Herdr launch is controller-owned; start or resume the "
                 "workflow root controller instead"
             )
-        herdr = _provider_command("herdr")
+        herdr = "" if transport == "app-server" else _provider_command("herdr")
         if herdr:
             _require_herdr_provider_integration(herdr, provider)
             _ensure_herdr_server(herdr)
@@ -4551,6 +4914,17 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     sessions[task_id] = reservation
         except controller_backend.FencedLease as exc:
             raise ValueError(f"launch authority revalidation failed before reservation: {exc}") from exc
+
+        if transport == "app-server":
+            return _start_codex_app_server_launch(
+                args, root=root, workflow_root=workflow_root, task_id=task_id,
+                actor=actor, claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                lease_epoch=lease.epoch, continuity_id=lease.continuity_id,
+                cwd=execution_root, model=model, effort=effort, role=role,
+                launch_id=launch_id, attempt=attempt, typed_handoff=typed_handoff,
+                acceptance_ids=acceptance_ids, return_channel=return_channel,
+                state_path=state_path, authority_secret=authority_secret,
+            )
 
         resolved_provider = _provider_command(provider)
         if not herdr:
@@ -5164,9 +5538,56 @@ def herdr_result(args: argparse.Namespace) -> int:
                     session_id = str(binding_data.get("session_id") or "")
                     if not session_id:
                         raise ValueError("provider session identity is unavailable")
-                    _require_attested_model(
-                        provider, session_id, str(contract.get("model") or "")
-                    )
+                    app_server_evidence = record.get("codex_app_server")
+                    if record.get("provider_transport") == "app-server":
+                        if not isinstance(app_server_evidence, Mapping):
+                            raise ValueError("Codex App Server model evidence is unavailable")
+                        app_server_identity = app_server_evidence.get("identity")
+                        if not isinstance(app_server_identity, Mapping):
+                            raise ValueError("Codex App Server persisted turn identity is unavailable")
+                        if str(record.get("claim_token_sha256") or "") != str(
+                            contract.get("claim_token_sha256") or ""
+                        ):
+                            raise ValueError("Codex App Server exact claim changed after launch")
+                        try:
+                            recovered_identity = codex_app_server_backend.bind_recovered_identity(
+                                app_server_identity,
+                                launch_snapshot={
+                                    "workspace_root": str(contract.get("workspace_root") or ""),
+                                    "workflow_root": workflow_root,
+                                    "task_id": task_id,
+                                    "claim_id": str(record.get("claim_id") or ""),
+                                    "lease_epoch": contract.get("lease_epoch"),
+                                    "continuity_id": continuity_id,
+                                    "lease_id": lease_id,
+                                    "cwd": str(Path(str(record.get("execution_root") or root)).resolve()),
+                                    "model": str(contract.get("model") or ""),
+                                    "effort": str(contract.get("effort") or ""),
+                                },
+                                current_continuity_id=current_lease.continuity_id,
+                            )
+                        except (codex_app_server_backend.CodexAppServerError, TypeError, ValueError) as exc:
+                            raise ValueError("Codex App Server persisted launch identity is stale") from exc
+                        if (
+                            app_server_evidence.get("status") != "completed"
+                            or app_server_evidence.get("rerouted") is not False
+                            or app_server_evidence.get("model") != contract.get("model")
+                            or app_server_evidence.get("effort") != contract.get("effort")
+                            or app_server_evidence.get("sdk_version") != codex_app_server_backend.SUPPORTED_SDK_VERSION
+                            or app_server_evidence.get("model_evidence") != "codex-app-server-protocol-cooperative"
+                            or recovered_identity.thread_id != str(app_server_evidence.get("thread_id") or "")
+                            or recovered_identity.turn_id != str(app_server_evidence.get("turn_id") or "")
+                            or session_id != (
+                                "codex-app-server:"
+                                + str(app_server_evidence.get("thread_id") or "")
+                                + ":" + str(app_server_evidence.get("turn_id") or "")
+                            )
+                        ):
+                            raise ValueError("Codex App Server model/turn evidence does not match the signed route")
+                    else:
+                        _require_attested_model(
+                            provider, session_id, str(contract.get("model") or "")
+                        )
                     supplied_session = str(raw.get("session_id") or session_id)
                     if not hmac.compare_digest(supplied_session, session_id):
                         raise ValueError("provider session identity mismatch")
@@ -6943,6 +7364,40 @@ def usage_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def codex_diagnostics(args: argparse.Namespace) -> int:
+    """Read-only Codex SDK account, support, quota, and token diagnostics."""
+    report = codex_app_server_backend.diagnostics_report()
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print("CODEX SDK DIAGNOSTICS " + ("OK" if report.get("ok") else "UNAVAILABLE"))
+        print(f"SDK version: {report.get('sdk_version') or 'unavailable'}")
+        print(f"Runtime version: {report.get('runtime_version') or 'unavailable'}")
+        print(f"Authentication: {report.get('authentication_type') or 'unknown'}")
+        print(f"Authenticated: {'yes' if report.get('authenticated') else 'no'}")
+        support = report.get("support") if isinstance(report.get("support"), Mapping) else {}
+        print("Support: " + ", ".join(f"{key}={value}" for key, value in sorted(support.items())))
+        quota = report.get("quota")
+        if isinstance(quota, Mapping):
+            for bucket in ("primary", "secondary"):
+                values = quota.get(bucket)
+                if isinstance(values, Mapping):
+                    numeric = [f"{key}={value}" for key, value in values.items() if value is not None]
+                    if numeric:
+                        print(f"{bucket.title()} quota: " + ", ".join(numeric))
+        tokens = report.get("tokens")
+        if isinstance(tokens, Mapping):
+            numeric = [f"{key}={value}" for key, value in tokens.items() if value is not None]
+            if numeric:
+                print("Tokens: " + ", ".join(numeric))
+    return 0 if report.get("ok") else 2
+
+
+def codex_config(args: argparse.Namespace) -> int:
+    """Inspect read-only Codex SDK health without inferring model entitlement."""
+    return codex_diagnostics(args)
+
+
 def context_audit(args: argparse.Namespace) -> int:
     """Audit sanitized provider metadata; never open raw session content."""
 
@@ -8513,7 +8968,15 @@ def handoff_preflight(args: argparse.Namespace) -> int:
         errors.append(f"handoff is not readable: {path}")
     if not root.is_dir():
         errors.append(f"target cwd is not a directory: {root}")
-    if provider not in PROVIDERS or not _provider_command(provider):
+    selected_transport = str(getattr(args, "transport", "herdr") or "herdr")
+    if selected_transport not in {"herdr", "app-server"}:
+        errors.append("transport must be herdr or app-server")
+    if selected_transport == "app-server" and provider != "codex":
+        errors.append("app-server transport is supported only for Codex")
+    if provider not in PROVIDERS or (
+        not _provider_command(provider)
+        and not (provider == "codex" and selected_transport == "app-server")
+    ):
         errors.append(f"provider CLI is unavailable: {provider or 'missing'}")
     else:
         checks.append(f"provider={provider}")
@@ -10304,6 +10767,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    codex_parser = sub.add_parser("codex", help="Read-only Codex SDK diagnostics")
+    codex_sub = codex_parser.add_subparsers(dest="codex_command", required=True)
+    codex_diagnostics_parser = codex_sub.add_parser(
+        "diagnostics", help="Inspect SDK/authentication support, quota, and token counts"
+    )
+    codex_diagnostics_parser.add_argument("--json", action="store_true")
+    codex_diagnostics_parser.set_defaults(func=codex_config)
+
     controller_parser = sub.add_parser(
         "controller", help="Lease, resume, inspect, and stop one persistent workflow root"
     )
@@ -10438,6 +10909,10 @@ def build_parser() -> argparse.ArgumentParser:
     root_preflight_parser.add_argument("--handoff", default="")
     root_preflight_parser.add_argument("--herdr-session", default="")
     root_preflight_parser.add_argument("--herdr-protocol", default="")
+    root_preflight_parser.add_argument(
+        "--transport", choices=("herdr", "app-server"), default="herdr",
+        help="typed provider transport; app-server is Codex-only and does not claim Herdr identity",
+    )
     root_preflight_parser.add_argument("--duplicate-session", action="append", default=[])
     root_preflight_parser.add_argument("--external", action="store_true")
     root_preflight_parser.add_argument("--authenticated-confinement", action="store_true")
@@ -10456,6 +10931,10 @@ def build_parser() -> argparse.ArgumentParser:
     herdr_launch_parser.add_argument("--workflow-root", default="", help="exact Beads root ID; Beads becomes the claim authority")
     herdr_launch_parser.add_argument("--actor", default="", help="expected Beads assignee for the exact task")
     herdr_launch_parser.add_argument("--provider", choices=PROVIDERS, required=True)
+    herdr_launch_parser.add_argument(
+        "--transport", choices=("herdr", "app-server"), default="herdr",
+        help="app-server is Codex-only and supports only the shell-readonly profile",
+    )
     herdr_launch_parser.add_argument("--role", required=True)
     herdr_launch_parser.add_argument("--model", required=True)
     herdr_launch_parser.add_argument("--effort", required=True)
@@ -11017,6 +11496,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser = handoff_sub.add_parser("preflight")
     preflight_parser.add_argument("file")
     preflight_parser.add_argument("--cwd", default="")
+    preflight_parser.add_argument("--transport", choices=("herdr", "app-server"), default="herdr")
     preflight_parser.add_argument("--require-matrix", action="store_true")
     preflight_parser.set_defaults(func=handoff_preflight)
     package_parser = handoff_sub.add_parser(

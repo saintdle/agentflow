@@ -30,8 +30,10 @@ class ProviderCapability:
     native_subagents: CapabilityState
     direct_cli: CapabilityState
     persistent_herdr: CapabilityState
+    persistent_app_server: CapabilityState = CapabilityState.DISABLED
     herdr_minimum_version: str | None = None
     herdr_note: str = ""
+    app_server_note: str = ""
 
     def lane_state(self, lane: str) -> CapabilityState:
         """Return one named lane's state; reject unknown lanes fail-closed."""
@@ -42,6 +44,7 @@ class ProviderCapability:
             "native": "native_subagents",
             "direct-cli": "direct_cli",
             "persistent-herdr": "persistent_herdr",
+            "persistent-app-server": "persistent_app_server",
         }
         field = field_by_lane.get(lane)
         if field is None:
@@ -56,7 +59,14 @@ _CAPABILITIES = (
         native_subagents=CapabilityState.SUPPORTED,
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.SUPPORTED,
+        persistent_app_server=CapabilityState.CONDITIONAL,
         herdr_note="Install and verify the Codex Herdr integration before dispatch.",
+        app_server_note=(
+            "Optional openai-codex 0.160.1 extra; only shell-readonly handoffs, pinned to "
+            "read-only sandbox and never approval with network and native subdelegation off. "
+            "Thread/model evidence is cooperative local protocol provenance, not attestation. "
+            "Herdr remains the default; sterile/restricted launches are unsupported."
+        ),
     ),
     ProviderCapability(
         provider="claude",
@@ -64,6 +74,7 @@ _CAPABILITIES = (
         native_subagents=CapabilityState.SUPPORTED,
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.CONDITIONAL,
+        persistent_app_server=CapabilityState.DISABLED,
         herdr_minimum_version="2.1.251",
         herdr_note=(
             "Requires Claude Code 2.1.251+, controlled SessionStart and "
@@ -76,6 +87,7 @@ _CAPABILITIES = (
         native_subagents=CapabilityState.SUPPORTED,
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.DISABLED,
+        persistent_app_server=CapabilityState.DISABLED,
         herdr_note=(
             "Persistent worker launch fails closed because Agentflow cannot "
             "attest Copilot's resolved model from a protected source."

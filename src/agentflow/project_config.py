@@ -34,6 +34,7 @@ DEFAULT_EXECUTION = {
     "launch_budget_multiplier": 2,
     "max_expensive_execution_children": 0,
 }
+DEFAULT_CODEX = {"transport": "herdr"}
 DEFAULT_GUIDANCE = {
     "strategic_compaction": False,
     "verification": False,
@@ -70,6 +71,7 @@ def default_data() -> dict[str, Any]:
         "model_policy": ".agentflow/models-v2.json",
         "prose": {"editor": dict(DEFAULT_PROSE_EDITOR)},
         "execution": dict(DEFAULT_EXECUTION),
+        "codex": dict(DEFAULT_CODEX),
         "guidance": dict(DEFAULT_GUIDANCE),
         "memory": dict(DEFAULT_MEMORY),
         "skills": [],
@@ -116,7 +118,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Keep the public schema limited to values consumed by runtime code.
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
-    allowed = {"schema", "version", "model_policy", "prose", "execution", "guidance", "memory", "skills"}
+    allowed = {"schema", "version", "model_policy", "prose", "execution", "codex", "guidance", "memory", "skills"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
@@ -181,6 +183,12 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
                 value = execution.get(field)
                 if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
                     errors.append(f"execution.{field} must be an integer of at least {minimum}")
+    if "codex" in data:
+        codex = data.get("codex")
+        if not isinstance(codex, dict) or set(codex) != {"transport"}:
+            errors.append("codex must contain exactly a transport field")
+        elif codex.get("transport") not in {"herdr", "app-server"}:
+            errors.append("codex.transport must be 'herdr' or 'app-server'")
     if "guidance" in data:
         guidance = data.get("guidance")
         if not isinstance(guidance, dict) or set(guidance) != set(DEFAULT_GUIDANCE):
@@ -294,6 +302,8 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
         result["prose"] = local["prose"]
     if "execution" in local:
         result["execution"] = local["execution"]
+    if "codex" in local:
+        result["codex"] = local["codex"]
     if "guidance" in local:
         result["guidance"] = local["guidance"]
     if "memory" in local:
@@ -325,6 +335,14 @@ def prose_editor(data: dict[str, Any]) -> dict[str, Any] | None:
 def execution_settings(data: dict[str, Any]) -> dict[str, Any]:
     value = data.get("execution")
     return dict(value) if isinstance(value, dict) else dict(DEFAULT_EXECUTION)
+
+
+def codex_transport(data: dict[str, Any]) -> str:
+    """Return the Codex worker transport, keeping legacy projects on Herdr."""
+    value = data.get("codex")
+    if not isinstance(value, dict):
+        return str(DEFAULT_CODEX["transport"])
+    return str(value.get("transport") or DEFAULT_CODEX["transport"])
 
 
 def guidance_settings(data: dict[str, Any]) -> dict[str, Any]:

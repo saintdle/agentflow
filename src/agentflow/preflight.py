@@ -80,6 +80,7 @@ class LaunchSpec:
     duplicate_sessions: tuple[str, ...] = ()
     herdr_session: str = ""
     herdr_protocol: str = ""
+    provider_transport: str = "herdr"
     external: bool = False
     authenticated_confinement: bool = False
     selective_model: bool = False
@@ -96,7 +97,11 @@ class LaunchSpec:
             raise PreflightError("boundary must not be empty")
         if not self.model:
             raise PreflightError("model must not be empty")
-        if not self.session_id:
+        if self.provider_transport not in {"herdr", "app-server"}:
+            raise PreflightError("provider_transport must be 'herdr' or 'app-server'")
+        if self.provider_transport == "app-server" and self.provider != "codex":
+            raise PreflightError("app-server transport is supported only for Codex")
+        if not self.session_id and self.provider_transport != "app-server":
             raise PreflightError("session_id must not be empty")
 
 
@@ -298,7 +303,7 @@ def _filesystem_findings(spec: LaunchSpec, snapshot: RootSnapshot) -> list[Prefl
         ))
 
     # session
-    if not spec.session_id.strip():
+    if not spec.session_id.strip() and spec.provider_transport != "app-server":
         findings.append(PreflightFinding(
             "session-empty", BLOCKER, "session",
             "session_id is empty",
@@ -432,29 +437,36 @@ def check_launch(spec: LaunchSpec, snapshot: RootSnapshot, *, policy: Any = None
             "duplicate active sessions: " + ", ".join(sorted(spec.duplicate_sessions)),
             "Keep one provider session per exact task and claim.",
         ))
-    if spec.herdr_session and not spec.session_id:
+    if spec.provider_transport == "herdr":
+        if spec.herdr_session and not spec.session_id:
+            findings.append(PreflightFinding(
+                "herdr-session-mismatch", BLOCKER, "herdr",
+                "Herdr session binding has no provider session identity",
+                "Persist and bind the named Herdr session to the provider session.",
+            ))
+        if spec.herdr_protocol and spec.herdr_protocol not in {"agentflow.herdr@1", "1"}:
+            findings.append(PreflightFinding(
+                "herdr-protocol-invalid", BLOCKER, "herdr",
+                f"unsupported Herdr protocol {spec.herdr_protocol!r}",
+                "Use the versioned agentflow.herdr@1 protocol.",
+            ))
+        if not spec.herdr_protocol:
+            findings.append(PreflightFinding(
+                "herdr-protocol-missing", BLOCKER, "herdr",
+                "authenticated launch requires the versioned Herdr protocol",
+                "Provide herdr-protocol agentflow.herdr@1.",
+            ))
+        if not spec.herdr_session:
+            findings.append(PreflightFinding(
+                "herdr-binding-missing", BLOCKER, "herdr",
+                "authenticated launch has no named Herdr session binding",
+                "Bind the provider launch to a named Herdr session before launching.",
+            ))
+    elif spec.herdr_session or spec.herdr_protocol:
         findings.append(PreflightFinding(
-            "herdr-session-mismatch", BLOCKER, "herdr",
-            "Herdr session binding has no provider session identity",
-            "Persist and bind the named Herdr session to the provider session.",
-        ))
-    if spec.herdr_protocol and spec.herdr_protocol not in {"agentflow.herdr@1", "1"}:
-        findings.append(PreflightFinding(
-            "herdr-protocol-invalid", BLOCKER, "herdr",
-            f"unsupported Herdr protocol {spec.herdr_protocol!r}",
-            "Use the versioned agentflow.herdr@1 protocol.",
-        ))
-    if not spec.herdr_protocol:
-        findings.append(PreflightFinding(
-            "herdr-protocol-missing", BLOCKER, "herdr",
-            "authenticated launch requires the versioned Herdr protocol",
-            "Provide herdr-protocol agentflow.herdr@1.",
-        ))
-    if not spec.herdr_session:
-        findings.append(PreflightFinding(
-            "herdr-binding-missing", BLOCKER, "herdr",
-            "authenticated launch has no named Herdr session binding",
-            "Bind the provider launch to a named Herdr session before launching.",
+            "herdr-identity-for-other-transport", BLOCKER, "transport",
+            "app-server preflight must not claim Herdr pane or protocol evidence",
+            "Use the typed app-server transport fields and persist its SDK thread identity after launch.",
         ))
     if spec.external and not spec.authenticated_confinement:
         findings.append(PreflightFinding(
