@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
 
+import agentflow
 from agentflow import migration
 
 
@@ -42,7 +44,9 @@ class LegacyMigrationTests(unittest.TestCase):
 
         new_command = root / "isolated/bin/agentflow"
         new_command.parent.mkdir(parents=True)
-        new_command.write_text("#!/bin/sh\nprintf 'agentflow 0.0.8\\n'\n", encoding="utf-8")
+        new_command.write_text(
+            f"#!/bin/sh\nprintf 'agentflow {agentflow.__version__}\\n'\n", encoding="utf-8"
+        )
         new_command.chmod(0o755)
         return home, legacy, state, new_command
 
@@ -171,7 +175,10 @@ class LegacyMigrationTests(unittest.TestCase):
             root = Path(temporary)
             home, legacy, state, new_command = self.fixture(root)
             new_command.write_text("#!/bin/sh\nprintf 'not-agentflow 9.9.9\\n'\n", encoding="utf-8")
-            with self.assertRaisesRegex(migration.MigrationError, "running Agentflow 0.0.8"):
+            with self.assertRaisesRegex(
+                migration.MigrationError,
+                f"running Agentflow {re.escape(agentflow.__version__)}",
+            ):
                 migration.apply(
                     legacy,
                     home=home,
