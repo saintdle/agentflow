@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -474,6 +474,35 @@ class CodexPreflightTests(unittest.TestCase):
                 result = preflight._child_diagnostic(env)
             self.assertEqual(result["failure_kind"], "deadline")
             self.assertIsNone(result["failure_category"])
+
+    def test_lazy_module_class_lookup_is_inert_and_fails_safe(self):
+        lookups = []
+
+        class LazyErrorsModule(ModuleType):
+            def __getattr__(self, name):
+                lookups.append(name)
+                raise RuntimeError("private lazy-module detail")
+
+        class OpaqueCustomError(Exception):
+            def __str__(self):
+                raise AssertionError("exception text must not be inspected")
+
+        failure = OpaqueCustomError("private exception text")
+        failure.__cause__ = RuntimeError("private cause")
+        failure.__context__ = ValueError("private context")
+        lazy_errors = LazyErrorsModule("openai_codex.errors")
+
+        def fail_once():
+            raise failure
+
+        with mock.patch.dict(sys.modules, {"openai_codex.errors": lazy_errors}), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(preflight.RPCFailure) as raised:
+                preflight._bounded_call(None, fail_once, 0.5, "initialize")
+
+        self.assertEqual(raised.exception.category, "unknown")
+        self.assertEqual(lookups, [])
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_rpc_deadline_is_distinct_from_immediate_exception(self):
         with tempfile.TemporaryDirectory() as temporary:

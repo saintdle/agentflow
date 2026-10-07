@@ -497,8 +497,14 @@ def _exception_category(exc: BaseException) -> str:
         module = sys.modules.get(module_name)
         if module is None:
             continue
+        try:
+            module_namespace = module.__dict__
+        except BaseException:
+            return "unknown"
+        if type(module_namespace) is not dict:
+            return "unknown"
         for class_name, category in known_classes:
-            known_type = getattr(module, class_name, None)
+            known_type = dict.get(module_namespace, class_name)
             if type(known_type) is type and exception_type is known_type:
                 return category
     return "unknown"
