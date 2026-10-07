@@ -4606,6 +4606,12 @@ def herdr_launch(args: argparse.Namespace) -> int:
                             "--", *provider_tail,
                         ]
                     safe_env = [
+                        # Herdr's daemon can outlive this controller and keep
+                        # Python bootstrap paths from an older Agentflow
+                        # installation. Let each managed interpreter resolve
+                        # the package from its own approved installation.
+                        "PYTHONPATH=",
+                        "PYTHONHOME=",
                         f"AGENTFLOW_HANDOFF_PATH={typed_handoff.path}",
                         f"AGENTFLOW_RESULT_CONTRACT={return_channel['contract_path']}",
                         f"AGENTFLOW_RESULT_FILE={return_channel['result_path']}",

@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import site
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import unittest
@@ -55,6 +58,67 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             test_root = Path(temporary).resolve()
             root = test_root / "workspace"
+            private_python_root = test_root / "private-python"
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--system-site-packages", str(private_python_root)],
+                capture_output=True, text=True, check=True,
+            )
+            private_python = private_python_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            private_site = Path(sysconfig.get_path(
+                "purelib", vars={"base": str(private_python_root), "platbase": str(private_python_root)},
+            ))
+            private_site.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(ROOT / "src/agentflow", private_site / "agentflow")
+            dependency_sites = [
+                str(Path(path).resolve()) for path in site.getsitepackages()
+                if Path(path).is_dir()
+            ]
+            (private_site / "agentflow-process-test-dependencies.pth").write_text(
+                "\n".join(dependency_sites) + "\n", encoding="utf-8",
+            )
+            private_env = {**os.environ, "PYTHONPATH": "", "PYTHONHOME": ""}
+            installed_probe = subprocess.run(
+                [str(private_python), "-c", "from agentflow import cli; print(cli.__file__)"],
+                env=private_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(installed_probe.returncode, 0, installed_probe.stderr)
+            expected_cli = str((private_site / "agentflow/cli.py").resolve())
+            self.assertEqual(installed_probe.stdout.strip(), expected_cli)
+            supervisor_probe = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "src/agentflow/execution_limits.py"),
+                    "--deadline-epoch", str(time.time() + 10), "--",
+                    str(private_python), "-c", "print('supervisor-started')",
+                ],
+                env=private_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(supervisor_probe.returncode, 0, supervisor_probe.stderr)
+            self.assertIn("supervisor-started", supervisor_probe.stdout)
+
+            # Model an already-running Herdr daemon independently of the
+            # controller's environment. Its stale Python path shadows the
+            # private Agentflow install, and its stale home prevents bootstrap.
+            daemon_pythonpath = test_root / "old-agentflow-src"
+            old_agentflow = daemon_pythonpath / "agentflow"
+            old_agentflow.mkdir(parents=True)
+            old_cli = old_agentflow / "cli.py"
+            old_cli.write_text("STALE_AGENTFLOW = True\n", encoding="utf-8")
+            (old_agentflow / "__init__.py").write_text("from . import cli\n", encoding="utf-8")
+            daemon_pythonhome = test_root / "old-python-home"
+            stale_import_env = {**private_env, "PYTHONPATH": str(daemon_pythonpath)}
+            stale_probe = subprocess.run(
+                [str(private_python), "-c", "from agentflow import cli; print(cli.__file__)"],
+                env=stale_import_env, capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(stale_probe.returncode, 0, stale_probe.stderr)
+            self.assertEqual(stale_probe.stdout.strip(), str(old_cli))
+            stale_bootstrap = subprocess.run(
+                [str(private_python), "-c", "print('interpreter started')"],
+                env={**private_env, "PYTHONHOME": str(daemon_pythonhome)},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(stale_bootstrap.returncode, 0)
+
             subprocess.run(["git", "init", "-b", "main", str(root)], capture_output=True, check=True)
             subprocess.run(["git", "-C", str(root), "config", "user.email", "process@example.test"], check=True)
             subprocess.run(["git", "-C", str(root), "config", "user.name", "Process Test"], check=True)
@@ -89,7 +153,10 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             task_matrix = dict(matrix)
             task_matrix["task_id"] = task_id
             beads.update_agentflow_metadata(root, task_id, {
-                "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
+                "launch": {
+                    "provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding",
+                    "execution_limits": {"deadline_seconds": 90, "max_retries": 0},
+                },
                 "base": f"main@{base[:12]}",
                 "acceptance": task_matrix,
                 "checks": ["process-boundary"],
@@ -109,7 +176,10 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             second_matrix = dict(matrix)
             second_matrix["task_id"] = second_task_id
             beads.update_agentflow_metadata(root, second_task_id, {
-                "launch": {"provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding"},
+                "launch": {
+                    "provider": "codex", "model": "gpt-5.6-luna", "effort": "medium", "role": "coding",
+                    "execution_limits": {"deadline_seconds": 90, "max_retries": 0},
+                },
                 "base": f"main@{base[:12]}",
                 "acceptance": second_matrix,
                 "checks": ["process-boundary"],
@@ -122,11 +192,16 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             bin_dir.mkdir()
             provider = bin_dir / "codex"
             provider.write_text(
-                "#!/usr/bin/env python3\n"
+                f"#!{private_python}\n"
                 "import json, os, subprocess, sys, time\n"
                 "from pathlib import Path\n"
+                "from agentflow import cli as imported_cli\n"
                 "root = Path(os.environ['AGENTFLOW_HANDOFF_PATH']).parents[3]\n"
                 "agent = os.environ['AGENTFLOW_HERDR_AGENT_NAME']\n"
+                "task_id = os.environ['AGENTFLOW_TASK_ID']\n"
+                "snapshot = root / '.process-boundary-snapshots' / task_id; snapshot.mkdir(parents=True, exist_ok=True)\n"
+                "runtime = {'python': sys.executable, 'agentflow_cli': str(Path(imported_cli.__file__).resolve()), 'pythonpath': os.environ.get('PYTHONPATH'), 'pythonhome': os.environ.get('PYTHONHOME'), 'path': os.environ.get('PATH'), 'state_home': os.environ.get('AGENTFLOW_STATE_HOME'), 'handoff_exists': Path(os.environ['AGENTFLOW_HANDOFF_PATH']).is_file(), 'contract_exists': Path(os.environ['AGENTFLOW_RESULT_CONTRACT']).is_file(), 'argv': sys.argv}\n"
+                "(snapshot / 'runtime').write_text(json.dumps(runtime))\n"
                 "pane = ''\n"
                 "deadline = time.time() + 10\n"
                 "while time.time() < deadline and not pane:\n"
@@ -139,13 +214,13 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "    if not pane: time.sleep(0.05)\n"
                 "if not pane: raise SystemExit('Herdr pane was not discoverable')\n"
                 "hook = {'hook_event_name': 'SessionStart', 'session_id': 'provider-process-session', 'cwd': os.getcwd(), 'model': 'gpt-5.6-luna'}\n"
-                "subprocess.run([sys.executable, '-m', 'agentflow.cli', 'hook', '--provider', 'codex', '--event', 'SessionStart'], input=json.dumps(hook), text=True, check=True, capture_output=True)\n"
+                "hook_result = subprocess.run([sys.executable, '-m', 'agentflow.cli', 'hook', '--provider', 'codex', '--event', 'SessionStart'], input=json.dumps(hook), text=True, check=False, capture_output=True)\n"
+                "if hook_result.returncode: raise SystemExit(hook_result.stdout + hook_result.stderr)\n"
+                "(snapshot / 'hook').write_text(hook_result.stdout)\n"
                 "subprocess.run(['herdr', 'pane', 'report-agent-session', pane, '--source', 'process-boundary', '--agent', 'codex', '--agent-session-id', 'provider-process-session'], check=True)\n"
                 "contract_path = Path(os.environ['AGENTFLOW_RESULT_CONTRACT'])\n"
                 "result_path = Path(os.environ['AGENTFLOW_RESULT_FILE'])\n"
                 "contract = json.loads(contract_path.read_text())\n"
-                "task_id = os.environ['AGENTFLOW_TASK_ID']\n"
-                "snapshot = root / '.process-boundary-snapshots' / task_id; snapshot.mkdir(parents=True, exist_ok=True)\n"
                 "result_body = json.dumps({'outcome': 'completed', 'acceptance_results': [{'acceptance_id': item, 'status': 'passed', 'evidence': 'real provider process', 'source': 'provider-process'} for item in contract['acceptance_ids']]})\n"
                 "(snapshot / 'contract').write_bytes(contract_path.read_bytes())\n"
                 "(snapshot / 'result').write_text(result_body)\n"
@@ -156,8 +231,11 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             )
             provider.chmod(0o700)
             environment = dict(os.environ)
-            environment["PATH"] = f"{bin_dir}{os.pathsep}{environment.get('PATH', '')}"
+            environment["PATH"] = f"{private_python.parent}{os.pathsep}{bin_dir}{os.pathsep}{environment.get('PATH', '')}"
             environment["PYTHONPATH"] = f"{ROOT / 'src'}{os.pathsep}{environment.get('PYTHONPATH', '')}"
+            environment.pop("PYTHONHOME", None)
+            state_home = test_root / "controller-state"
+            environment["AGENTFLOW_STATE_HOME"] = str(state_home)
 
             # Herdr-compatible deterministic fallback: installed Herdr needs
             # a persistent interactive server and provider-specific session
@@ -168,6 +246,7 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             fake_herdr.write_text(
                 "#!/usr/bin/env python3\n"
                 "import json, os, subprocess, sys\n"
+                "from pathlib import Path\n"
                 "args = sys.argv[1:]\n"
                 "agent = args[2] if len(args) > 2 and args[:2] == ['agent', 'start'] else 'process-boundary-agent'\n"
                 "if args[:2] == ['integration', 'status']:\n"
@@ -178,12 +257,28 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 "    sys.exit(0)\n"
                 "if args[:2] == ['agent', 'start']:\n"
                 "    child_env = dict(os.environ)\n"
+                f"    child_env['PYTHONPATH'] = {str(daemon_pythonpath)!r}\n"
+                f"    child_env['PYTHONHOME'] = {str(daemon_pythonhome)!r}\n"
                 "    i = 3\n"
                 "    while i < len(args) and args[i] != '--':\n"
                 "        if args[i] == '--env':\n"
                 "            key, _, value = args[i + 1].partition('='); child_env[key] = value; i += 2\n"
                 "        else: i += 1\n"
-                "    subprocess.Popen(args[i + 1:], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
+                "    handoff_path = child_env.get('AGENTFLOW_HANDOFF_PATH', '')\n"
+                "    if handoff_path:\n"
+                "        root = Path(handoff_path).parents[3]\n"
+                "        snapshot = root / '.process-boundary-snapshots' / child_env['AGENTFLOW_TASK_ID']; snapshot.mkdir(parents=True, exist_ok=True)\n"
+                "        (snapshot / 'agent-start-argv').write_text(json.dumps(args))\n"
+                "        (snapshot / 'effective-python-env').write_text(json.dumps({key: child_env.get(key) for key in ('PYTHONPATH', 'PYTHONHOME', 'PATH')}))\n"
+                "        child_stderr = (snapshot / 'child-stderr').open('w')\n"
+                "    else:\n"
+                "        child_stderr = subprocess.DEVNULL\n"
+                "    child = subprocess.Popen(args[i + 1:], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=child_stderr, start_new_session=True)\n"
+                "    if handoff_path: child_stderr.close()\n"
+                "    if handoff_path:\n"
+                "        try: child_returncode = child.wait(timeout=0.25)\n"
+                "        except subprocess.TimeoutExpired: child_returncode = None\n"
+                "        (snapshot / 'child-returncode').write_text(str(child_returncode))\n"
                 "    agent_data = {'pane_id': 'deterministic-pane', 'agent': 'codex', 'agent_session': {'source': 'process-boundary', 'agent': 'codex', 'kind': 'id', 'value': 'provider-process-session'}}\n"
                 "    print(json.dumps({'id': 'cli:agent:start', 'result': {'type': 'agent_started', 'agent': agent_data}}))\n"
                 "    sys.exit(0)\n"
@@ -229,6 +324,40 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 f"controller state={first_payload['result']['state']}; Herdr state exists={herdr_state_exists}",
             )
 
+            first_sessions = json.loads(
+                (root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"),
+            )["sessions"]
+            self.assertEqual(len(first_sessions), 1, first_sessions)
+            first_started_task_id = next(iter(first_sessions))
+            self.assertIn(first_started_task_id, {task_id, second_task_id})
+            first_snapshot = root / ".process-boundary-snapshots" / first_started_task_id
+            first_runtime_path = first_snapshot / "runtime"
+            child_deadline = time.monotonic() + 8
+            while time.monotonic() < child_deadline and not first_runtime_path.is_file():
+                time.sleep(0.05)
+            effective_python_env = (
+                (first_snapshot / "effective-python-env").read_text(encoding="utf-8")
+                if (first_snapshot / "effective-python-env").exists() else "missing"
+            )
+            supervisor_argv = (
+                (first_snapshot / "agent-start-argv").read_text(encoding="utf-8")
+                if (first_snapshot / "agent-start-argv").exists() else "missing"
+            )
+            child_stderr = (
+                (first_snapshot / "child-stderr").read_text(encoding="utf-8")[-500:]
+                if (first_snapshot / "child-stderr").exists() else "missing"
+            )
+            child_returncode = (
+                (first_snapshot / "child-returncode").read_text(encoding="utf-8")
+                if (first_snapshot / "child-returncode").exists() else "missing"
+            )
+            self.assertTrue(
+                first_runtime_path.is_file(),
+                "hostile daemon Python environment prevented the actual managed child from importing Agentflow; "
+                f"started task={first_started_task_id}, env={effective_python_env}, "
+                f"supervisor argv={supervisor_argv}, return code={child_returncode}, stderr={child_stderr}",
+            )
+
             # The first controller process is deliberately treated as crashed
             # after dispatch. A new process consumes the provider's result,
             # disposes the real Bead, and reaches GOAL_COMPLETE.
@@ -245,6 +374,44 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             second_record = state["sessions"][second_task_id]
             self.assertEqual(second_record["return_channel"]["state"], "consumed")
             self.assertEqual(second_record["result"]["acceptance_results"][0]["acceptance_id"], "R1")
+
+            for task, session in ((task_id, record), (second_task_id, second_record)):
+                snapshot = root / ".process-boundary-snapshots" / task
+                runtime = json.loads((snapshot / "runtime").read_text(encoding="utf-8"))
+                self.assertEqual(runtime["python"], str(private_python))
+                self.assertEqual(runtime["agentflow_cli"], expected_cli)
+                self.assertEqual(runtime["pythonpath"], "")
+                self.assertEqual(runtime["pythonhome"], "")
+                self.assertIn(str(private_python.parent), runtime["path"])
+                self.assertEqual(runtime["state_home"], str(state_home.resolve()))
+                self.assertTrue(runtime["handoff_exists"])
+                self.assertTrue(runtime["contract_exists"])
+                self.assertEqual(runtime["argv"][runtime["argv"].index("--model") + 1], "gpt-5.6-luna")
+                self.assertEqual(session["execution_limits"], {"deadline_seconds": 90, "max_retries": 0})
+                self.assertEqual(session["attempt"], 1)
+                self.assertEqual(session["max_attempts"], 1)
+                self.assertEqual(
+                    session["execution_limit_capabilities"]["deadline"],
+                    "process_group_enforced_for_confined_provider_argv",
+                )
+                start_argv = json.loads((snapshot / "agent-start-argv").read_text(encoding="utf-8"))
+                provider_tail = start_argv[start_argv.index("--") + 1:]
+                self.assertEqual(Path(provider_tail[1]).resolve(), (ROOT / "src/agentflow/execution_limits.py").resolve())
+                deadline_index = provider_tail.index("--deadline-epoch")
+                self.assertEqual(float(provider_tail[deadline_index + 1]), session["deadline_epoch"])
+                self.assertEqual(provider_tail[deadline_index + 2], "--")
+                hook = json.loads((snapshot / "hook").read_text(encoding="utf-8"))
+                context = hook["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("load project-owned domain skills", context)
+                receipt_paths = list((state_home / "memory").rglob("injections.jsonl"))
+                self.assertEqual(len(receipt_paths), 1)
+                receipts = [json.loads(line) for line in receipt_paths[0].read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(receipts[-1]["schema"], "agentflow.memory-receipt@2")
+                self.assertEqual(receipts[-1]["serializer_version"], "hook-context@1")
+                self.assertEqual(
+                    receipts[-1]["context_sha256"],
+                    hashlib.sha256(context.encode()).hexdigest(),
+                )
 
             # A separate OS process taking over the reusable controller name
             # gets a new incarnation identity; it cannot inherit the prior

@@ -32,6 +32,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Managed Herdr launches now clear inherited Python import and home overrides so
+  providers and lifecycle commands use their installed Agentflow package.
 - Hook receipts now record configured inactive and unsupported events. Capped or
   failed context releases its session reservation, and memory-use counts update
   only after a complete local stdout write. Receipts retain up to 128 validated
