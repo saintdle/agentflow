@@ -45,6 +45,7 @@ class AgentLedDocumentationTests(unittest.TestCase):
     def test_pull_request_ci_runs_bounded_real_pinned_beads_smoke(self) -> None:
         ci = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         integration = (REPOSITORY / ".github/workflows/integration.yml").read_text(encoding="utf-8")
+        build_main = (REPOSITORY / ".github/workflows/build-main.yml").read_text(encoding="utf-8")
         smoke = (REPOSITORY / "scripts/ci/integration_beads.sh").read_text(encoding="utf-8")
 
         self.assertRegex(ci, r"(?m)^  pull_request:\s*$")
@@ -56,6 +57,8 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertIn('GOFLAGS: "-tags=gms_pure_go"', ci)
         self.assertIn('go-version: "1.26.2"', ci)
         self.assertIn("go install github.com/steveyegge/beads/cmd/bd@v1.1.0", ci)
+        self.assertIn("--expected-version 0.0.9", ci)
+        self.assertIn("--expected-version 0.0.9", build_main)
         self.assertIn("scripts/ci/integration_beads.sh", ci)
         self.assertIn('schedule:', integration)
         self.assertIn('workflow_dispatch:', integration)
@@ -76,7 +79,7 @@ class AgentLedDocumentationTests(unittest.TestCase):
         for required in (
             "uv tool install --reinstall",
             "pipx install --force",
-            "@v0.0.8",
+            "@v0.0.9",
             "Herdr is required",
             "Agent mode",
             "terminal access",

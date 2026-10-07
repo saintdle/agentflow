@@ -8,9 +8,14 @@ switches. Initialization places the shared project file at
 machine-local layer for absolute skill paths or a local model-policy override;
 local values override same-name shared values. Runtime state, credentials,
 claims, logs, temporary handoffs, and provider sessions must remain ignored.
-The optional `memory` section is disabled by default; schema-v1 files without
-it remain valid. See [governed memory](MEMORY.md) for the metadata-only hook,
-scope, budget, and retention contract.
+`agentflow init` enables metadata-only memory in a newly created shared
+configuration, for both Git and gitless workspaces, while keeping `on_prompt`
+false. Pass `--no-memory` to create that config with memory disabled. This is
+an init-only default: uninitialized workspaces and schema-v1 files without a
+`memory` section retain the disabled runtime fallback, and init does not
+rewrite existing shared settings or local overrides. See
+[governed memory](MEMORY.md) for the hook, scope, budget, and retention
+contract.
 
 ## Principles
 
@@ -50,7 +55,7 @@ An initialized project starts with a schema-versioned configuration like this:
     "max_children_per_parent": 12
   },
   "memory": {
-    "enabled": false,
+    "enabled": true,
     "on_prompt": false,
     "capture_failures": true,
     "max_items": 5,

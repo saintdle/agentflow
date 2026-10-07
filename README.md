@@ -20,7 +20,7 @@ unrelated projects.
 > permissions, diffs, and backups as though untrusted automation may fail.
 
 > [!IMPORTANT]
-> Agentflow `0.0.8` is a public preview. Its commands, configuration schema,
+> Agentflow `0.0.9` is a public preview. Its commands, configuration schema,
 > and compatibility guarantees may change before `1.0`.
 
 ## What it provides
@@ -38,6 +38,8 @@ unrelated projects.
 - Seven bundled generic workflow skills and five provider-role profiles for
   each supported coding-agent provider.
 - Project initialization that preserves existing agent instructions and hooks.
+- Metadata-only memory enabled in newly initialized projects, with prompt
+  recall off by default and legacy/uninitialized config fallback disabled.
 - Config-driven discovery and installation of your own skills.
 - Optional observable external-agent sessions through Herdr.
 - Authenticated result channels for every controller-launched external worker,
@@ -135,9 +137,9 @@ For manual installation, continue below.
 The cleanest installation uses an isolated Python tool environment:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.8"
+uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.9"
 # or
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.8"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.9"
 ```
 
 The source repository is public, so direct GitHub installs do not require an
@@ -145,7 +147,7 @@ authenticated checkout. If your network blocks GitHub, install from a downloaded
 release wheel:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.8-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.9-py3-none-any.whl
 ```
 
 Verify the installation and prerequisites without exposing credentials:
@@ -190,6 +192,10 @@ agentflow init . --beads
 
 Initialization creates only missing workflow files, preserves existing agent
 instructions and custom hooks, and keeps runtime state out of version control.
+For a newly created project configuration, memory is enabled in metadata-only
+mode and prompt recall stays off; pass `--no-memory` to keep a new project
+config disabled. Existing and legacy config values are not changed. See
+[governed memory](docs/MEMORY.md).
 The default Beads setup is local/stealth. Choose tracked or shared-server state
 only when that collaboration model is intentional.
 
@@ -275,12 +281,12 @@ locations, and team-safe setup patterns.
 | Platform | Core CLI | Hardened isolation |
 | --- | --- | --- |
 | macOS | Supported | Available through `sandbox-exec`; probes fail closed |
-| Linux | Supported | Not available in `0.0.8`; requests fail closed |
-| Windows | Not supported in `0.0.8` | Not available |
+| Linux | Supported | Not available in `0.0.9`; requests fail closed |
+| Windows | Not supported in `0.0.9` | Not available |
 
 Core coordination can run on macOS and Linux. Hardened isolation is a distinct,
 macOS-only security control; ordinary execution on Linux is not equivalent
-confinement. In `0.0.8`, `agentflow isolation launch` provides synchronous
+confinement. In `0.0.9`, `agentflow isolation launch` provides synchronous
 hardened execution. Direct handoff and persistent Herdr/controller launches
 reject hardened profiles rather than treating a successful probe as confinement.
 
@@ -304,7 +310,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Project status and releases
 
-`0.0.8` is intended for development/testing and feedback. Pull requests run validation
+`0.0.9` is intended for development/testing and feedback. Pull requests run validation
 and package-build checks. Merges to `main` build the CLI distribution artifacts;
 tagged releases are the versioned distribution boundary. See
 [the changelog](CHANGELOG.md) and [release process](CONTRIBUTING.md#releases).

@@ -2536,6 +2536,117 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(gitignore.read_text(encoding="utf-8"), first_gitignore)
             self.assertEqual(first_gitignore.count(cli.GITIGNORE_BEGIN), 1)
 
+    def test_init_enables_metadata_memory_for_new_git_and_gitless_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            git_root = Path(temp) / "git-project"
+            git_root.mkdir()
+            subprocess.run(
+                ["git", "init", "-q", str(git_root)], check=True,
+                capture_output=True, text=True,
+            )
+            gitless_root = Path(temp) / "gitless-project"
+            gitless_root.mkdir()
+
+            for target in (git_root, gitless_root):
+                # An uninitialized workspace stays safely disabled at runtime;
+                # only `init` opts its newly created config in.
+                self.assertFalse(
+                    cli.project_config_backend.load_for_dispatch(target)["memory"]["enabled"]
+                )
+                with self.subTest(workspace="git" if (target / ".git").exists() else "gitless"), \
+                     mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(cli.main(["init", str(target)]), 0)
+                config_path = target / ".agentflow/config.json"
+                config_bytes = config_path.read_bytes()
+                data = json.loads(config_bytes)
+                self.assertTrue(data["memory"]["enabled"])
+                self.assertFalse(data["memory"]["on_prompt"])
+                # Re-running init must not rewrite a user's chosen value.
+                with mock.patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(cli.main(["init", str(target)]), 0)
+                self.assertEqual(config_path.read_bytes(), config_bytes)
+
+    def test_init_no_memory_opt_out_applies_only_to_new_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "new-project"
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.main(["init", str(root), "--no-memory"]), 0)
+            data = json.loads((root / ".agentflow/config.json").read_text(encoding="utf-8"))
+            self.assertFalse(data["memory"]["enabled"])
+            self.assertFalse(data["memory"]["on_prompt"])
+            path = root / ".agentflow/config.json"
+            opted_out_bytes = path.read_bytes()
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.main(["init", str(root), "--no-memory"]), 0)
+            self.assertEqual(path.read_bytes(), opted_out_bytes)
+
+            # Init remains non-overwriting even when the opt-out flag is repeated.
+            data["memory"]["enabled"] = True
+            chosen_bytes = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
+            path.write_bytes(chosen_bytes)
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.main(["init", str(root), "--no-memory"]), 0)
+            self.assertEqual(path.read_bytes(), chosen_bytes)
+
+    def test_init_preserves_existing_memory_settings_and_legacy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            for enabled in (False, True):
+                with self.subTest(enabled=enabled):
+                    root = Path(temp) / f"existing-{enabled}"
+                    root.mkdir()
+                    config = cli.project_config_backend.default_data()
+                    config["memory"]["enabled"] = enabled
+                    cli.project_config_backend.write_layer(root, config, local=False)
+                    path = root / ".agentflow/config.json"
+                    before = path.read_bytes()
+                    with mock.patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(cli.main(["init", str(root)]), 0)
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertEqual(
+                        cli.project_config_backend.load(root)["memory"]["enabled"], enabled
+                    )
+
+            # A valid schema-v1 config that predates memory is not silently
+            # upgraded or activated by init.
+            legacy_root = Path(temp) / "legacy-project"
+            legacy_root.mkdir()
+            legacy = cli.project_config_backend.default_data()
+            legacy.pop("memory")
+            legacy_bytes = (json.dumps(legacy, indent=2, sort_keys=True) + "\n").encode()
+            legacy_path = legacy_root / ".agentflow/config.json"
+            legacy_path.parent.mkdir(parents=True)
+            legacy_path.write_bytes(legacy_bytes)
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                self.assertEqual(cli.main(["init", str(legacy_root)]), 0)
+            self.assertEqual(legacy_path.read_bytes(), legacy_bytes)
+            loaded = cli.project_config_backend.load(legacy_root)
+            self.assertNotIn("memory", json.loads(legacy_path.read_text(encoding="utf-8")))
+            self.assertFalse(cli.project_config_backend.memory_settings(loaded)["enabled"])
+
+    def test_init_preserves_local_memory_override_while_seeding_shared_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            for enabled in (False, True):
+                with self.subTest(local_enabled=enabled):
+                    root = Path(temp) / f"local-{enabled}"
+                    root.mkdir()
+                    local = cli.project_config_backend.default_local_data()
+                    local["memory"] = dict(cli.project_config_backend.DEFAULT_MEMORY)
+                    local["memory"]["enabled"] = enabled
+                    cli.project_config_backend.write_layer(root, local, local=True)
+                    local_path = root / ".agentflow/config.local.json"
+                    local_bytes = local_path.read_bytes()
+                    with mock.patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(cli.main(["init", str(root)]), 0)
+                    shared = json.loads((root / ".agentflow/config.json").read_text(encoding="utf-8"))
+                    self.assertTrue(shared["memory"]["enabled"])
+                    self.assertEqual(local_path.read_bytes(), local_bytes)
+                    self.assertEqual(
+                        cli.project_config_backend.load(root)["memory"]["enabled"], enabled
+                    )
+                    with mock.patch("sys.stdout", new_callable=io.StringIO):
+                        self.assertEqual(cli.main(["init", str(root)]), 0)
+                    self.assertEqual(local_path.read_bytes(), local_bytes)
+
     def test_init_refuses_malformed_gitignore_block(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp)

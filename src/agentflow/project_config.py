@@ -41,6 +41,9 @@ DEFAULT_GUIDANCE = {
     "context_pressure_percent": 75,
     "max_children_per_parent": 12,
 }
+# Keep the runtime fallback off for uninitialized workspaces and schema-v1
+# configs that predate memory. `agentflow init` seeds a new config from the
+# project template, whose init-only default is enabled separately.
 DEFAULT_MEMORY = {
     "enabled": False,
     "on_prompt": False,

@@ -1,5 +1,16 @@
 # Agent Instructions
 
+## Project memory defaults
+
+`agentflow init` enables metadata-only memory in a newly created project
+configuration for Git and gitless workspaces; `on_prompt` remains false.
+`agentflow init --no-memory` creates a new configuration with memory disabled.
+Initialization never rewrites an existing shared configuration. Schema-v1
+configurations without a `memory` section and uninitialized workspaces retain
+the disabled runtime fallback. An existing local memory value continues to
+override the shared value, including `false`. Use `agentflow config memory
+enable` or `disable` for an intentional change to an existing configuration.
+
 - Before editing, inspect the affected code, its callers, relevant tests, and shared utilities.
 - Make the smallest complete implementation. Add abstractions, dependencies, or configuration only when the change justifies them.
 - Keep changes focused, preserve unrelated work, and remove only orphans created by the change.

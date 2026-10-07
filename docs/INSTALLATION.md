@@ -33,13 +33,13 @@ reports missing optional integrations without reading their credential stores.
 Install a tagged release with `uv`:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.8"
+uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.9"
 ```
 
 Or with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.8"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.9"
 ```
 
 For a local checkout:
@@ -55,7 +55,7 @@ authenticated checkout. A release wheel built by GitHub Actions can also be
 installed without a source checkout:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.8-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.9-py3-none-any.whl
 ```
 
 ## Verify
@@ -107,18 +107,22 @@ agentflow beads status .
 Review every proposed hook and generated instruction file before enabling it in
 a sensitive repository. Re-running initialization is idempotent for files
 managed by Agentflow. Existing custom files are preserved for manual merging.
+A newly created project config enables metadata-only memory while keeping
+`on_prompt` false; pass `--no-memory` to create it disabled. Legacy schema-v1
+configs without a `memory` section stay valid and disabled, and an existing
+local override remains effective.
 
 ## Upgrade
 
 Choose an explicit tag from the [GitHub releases](https://github.com/saintdle/agentflow/releases)
-page, then reinstall from that tag. The commands below show the current `v0.0.8`
+page, then reinstall from that tag. The commands below show the current `v0.0.9`
 tag; replace it with the exact reviewed release you intend to install. Plain
 `uv tool upgrade saintdle-agentflow` or `pipx upgrade saintdle-agentflow` does
 not specify a new tag; use the install command with the selected tag to advance.
 
 ```sh
-uv tool install --reinstall "git+https://github.com/saintdle/agentflow.git@v0.0.8"
-# or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.8"
+uv tool install --reinstall "git+https://github.com/saintdle/agentflow.git@v0.0.9"
+# or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.9"
 agentflow --version
 agentflow install --dry-run
 # Review each proposed refresh; edited/unknown assets remain untouched.

@@ -33,7 +33,11 @@ indexes are unrelated projects and must not be installed.
    checkout, and return the rollback ID after applying.
 6. Initialize a target workspace only when the user asked to configure that
    workspace. `agentflow init <path> --beads` is non-overwriting, but inspect
-   its result and repository status. Do not silently change Beads from local
+   its result and repository status. A newly created project config enables
+   metadata-only memory by default while keeping prompt recall (`on_prompt`)
+   off; use `--no-memory` only when the user intends a new config to stay
+   disabled. Existing shared settings, legacy configs without `memory`, and
+   local overrides are preserved. Do not silently change Beads from local
    state to a tracked or shared-server mode.
 7. Discover repository-local instructions and domain skills. Register external
    or machine-specific skills in ignored local configuration; use shareable

@@ -1,13 +1,18 @@
 # Optional governed memory
 
-Agentflow memory is disabled by default. Existing `agentflow.project@1`
-configuration remains valid when the `memory` section is absent; `agentflow
-config show` supplies the disabled defaults. Enable it explicitly in the
-shared configuration, or use the local layer for an intentional machine
-override. The toggle writes the complete strict default memory object before
-changing only `enabled`; it validates both layers and refuses unknown fields
-or implicit schema migration. If a local `memory` object shadows shared
-settings, a shared toggle is refused with guidance to use `--local`.
+`agentflow init` enables metadata-only memory when it creates a new project
+configuration, for both Git and gitless workspaces. Prompt recall remains off
+because `on_prompt` defaults to `false`. Pass `agentflow init --no-memory` to
+create a new configuration with memory disabled. This default applies only at
+initialization: an uninitialized workspace and existing schema-v1 config with
+no `memory` section still use the disabled runtime fallback. Re-running init
+does not change an existing shared value or local override, including an
+explicit `enabled: false`. `agentflow config show` supplies disabled defaults
+for legacy configs that omit the section. The memory toggle writes the complete
+strict default memory object before changing only `enabled`; it validates both
+layers and refuses unknown fields or implicit schema migration. If a local
+`memory` object shadows shared settings, a shared toggle is refused with
+guidance to use `--local`.
 
 ```sh
 agentflow config memory enable --root . --dry-run
