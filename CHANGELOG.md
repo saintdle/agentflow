@@ -24,12 +24,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Copilot's existing response shape is preserved without a new provider-limit
   claim.
 
+- Documented read-only Codex SDK diagnostics and the experimental App Server
+  worker prototype, which remains blocked before inference pending supported
+  same-user isolation; Herdr remains the default transport.
+- Added standalone strict TOML generation/validation and an opt-in,
+  no-thread/no-turn Codex permission-profile shell probe for synthetic paths;
+  this is not wired into worker admission and does not prove model-tool
+  isolation.
+- Added a source-only fake-client Codex worker trial rehearsal and focused
+  deterministic tests for pre-turn profile evidence, durable attempt budgets,
+  ambiguous outcomes, and simulated controller restart. This does not load the
+  SDK, enable worker admission, or establish live model-worker isolation or
+  restart behavior.
+- Added an explicit-run, source-only Codex no-inference preflight diagnostic
+  with a strict child environment, file-only disposable auth home, typed
+  pre-turn profile gate, durable two-attempt limit, and sanitized output.
+  Missing auth and unknown tool/instruction surfaces halt; no worker or
+  inference path is enabled.
+
 ### Changed
 
 - Separated provider quota provenance from local task outcomes and yield
   measurements. `agentflow usage yield` now reads its default single-record
   JSONL history correctly while preserving the task-class report.
-
 ### Fixed
 
 - Managed Herdr launches now clear inherited Python import and home overrides so
@@ -41,6 +58,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Oversized receipt rows now leave a coalesced metadata-only storage-availability
   marker instead of leaving the spool empty without a diagnostic; configured
   byte limits remain enforced.
+- No-inference preflight diagnostics now distinguish an immediate bounded-call
+  exception from an elapsed deadline and emit only a fixed RPC phase, failure
+  kind, and allowlisted exception-family category. Unknown types are redacted to
+  `unknown`; the underlying SDK failure cause remains unverified without
+  runtime evidence.
+- The internal preflight child route now validates the opt-in marker and exact
+  private synthetic layout before SDK loading; its token is not a same-user
+  authentication mechanism.
 - Launch budgets now count each reserved attempt once across pending and resolved
   lifecycle records, retain verified history across controller key rotations, and
   include spend proven by exact workflow ancestry.

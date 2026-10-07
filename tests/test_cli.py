@@ -3686,6 +3686,50 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["return_channel"]["state"], "issued")
 
+    def test_codex_app_server_guard_returns_durable_task_block_without_starting_worker(self) -> None:
+        """A permission guard is a typed launch failure, not a controller crash."""
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(
+                Path(temp).resolve(), provider="codex", model="gpt-6-luna", seed_lease=False,
+            )
+            fixture.task_issue["metadata"]["agentflow"]["launch"]["transport"] = "app-server"
+            fixture.task_issue["metadata"]["agentflow"]["tool_profile"] = "shell-readonly"
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            spawned: list[object] = []
+            real_popen = subprocess.Popen
+
+            def record_popen(command, *argv, **kwargs):
+                spawned.append(command)
+                return real_popen(command, *argv, **kwargs)
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.codex_app_server_backend, "_sdk_modules", side_effect=AssertionError("SDK must not initialize")) as sdk, \
+                 mock.patch.object(subprocess, "Popen", side_effect=record_popen):
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertTrue(payload["ok"], payload)
+            self.assertEqual(payload["stop_reason"], "TASK_BLOCKED")
+            self.assertEqual(payload["result"]["state"], "blocked")
+            controller, _ = cli._controller_instance(args)
+            self.assertEqual(controller._load_checkpoint()["state"], "blocked")
+            sdk.assert_not_called()
+            self.assertFalse(any(
+                (
+                    Path(str(command[0])).name.lower() in {"codex", "codex.exe"}
+                    or "app-server" in {str(argument).lower() for argument in command[1:]}
+                )
+                for command in spawned if isinstance(command, (list, tuple)) and command
+            ), spawned)
+            sessions_path = fixture.root / ".agentflow/herdr/sessions.json"
+            if sessions_path.exists():
+                sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
+                self.assertNotIn("task-1", sessions.get("sessions", {}))
+
     def test_supervisor_restart_keeps_lease_and_does_not_relaunch_live_herdr_task(self) -> None:
         """A separate-terminal restart uses the protected proof to keep the
         exact lease and reconciles the durable Herdr session instead of

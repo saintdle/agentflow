@@ -62,6 +62,31 @@ class ConfigCommandTests(unittest.TestCase):
         self.assertIs(enable.func, cli.memory_toggle)
         self.assertIs(hooks.func, cli.config_hooks_merge)
 
+    def test_dispatch_defaults_only_when_both_config_layers_are_absent(self) -> None:
+        loaded = project_config.load_for_dispatch(self.root)
+        self.assertEqual(project_config.codex_transport(loaded), "herdr")
+        self.assertEqual(project_config.codex_worker_timeout_seconds(loaded), 1800)
+        bad = project_config.config_path(self.root)
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("{ malformed", encoding="utf-8")
+        with self.assertRaises(project_config.ConfigError):
+            project_config.load_for_dispatch(self.root)
+
+    def test_codex_worker_timeout_is_bounded_and_local_layer_merges_transport(self) -> None:
+        shared = project_config.default_data()
+        shared["codex"] = {"transport": "app-server", "worker_timeout_seconds": 900}
+        _write_config(self.root, shared)
+        local = project_config.default_local_data()
+        local["codex"] = {"worker_timeout_seconds": 180}
+        _write_config(self.root, local, local=True)
+        effective = project_config.load(self.root)
+        self.assertEqual(project_config.codex_transport(effective), "app-server")
+        self.assertEqual(project_config.codex_worker_timeout_seconds(effective), 180)
+        for invalid in (0, 86401, True, 1.5, "180"):
+            candidate = project_config.default_data()
+            candidate["codex"]["worker_timeout_seconds"] = invalid
+            self.assertTrue(project_config.validate(candidate, self.root))
+
     def test_memory_document_json_example_is_complete_and_schema_valid(self) -> None:
         documentation = Path(__file__).resolve().parents[1] / "docs/MEMORY.md"
         text = documentation.read_text(encoding="utf-8")
