@@ -35,6 +35,96 @@ worker admission; the existing pre-inference hard guard remains unchanged.
 Treat unsupported or ambiguous canary results as a failed proof, not as
 permission to enable App Server workers.
 
+## Stage-0 fake-only rehearsal
+
+A separate source-only harness rehearses request accounting, the pre-turn
+profile-proof gate, ambiguous outcomes, and same-owner restart using fixed
+synthetic data and an in-process fake client. It is not part of the installed
+CLI or worker admission. It has no SDK/runtime
+imports, transport selection, live mode, or arbitrary client injection. Its
+profile events, helper/server state, and result consumption are simulated and
+cannot establish real model-worker isolation or SDK restart behavior, or
+advance any live trial gate.
+
+Run only the fixed fake simulation and its focused tests:
+
+```sh
+python3 scripts/trials/codex_model_worker_trial.py
+python3 -m unittest tests.test_codex_model_worker_trial
+```
+
+The simulation persists only its synthetic state in a temporary directory.
+Tests additionally use the production controller lease and turn-identity
+recovery APIs with fake identifiers; they do not start an SDK process, thread,
+turn, or inference. The ledger reserves each fake `thread/start` and
+`turn/start` attempt before its fake call, caps persisted turn starts at two
+and no-inference profile attempts at two, and stops after stale identity,
+replay, dead-helper/server, ambiguous outcome, unknown/unattributable usage,
+or the cumulative reported-usage threshold. Catalogue entries and legacy
+sandbox metadata are not accepted as active-profile evidence. The fixed
+synthetic outbound inventory and sanitized result are hash-checked and
+bounded.
+
+Reported local timing and token thresholds are stop-rule metadata, not hard
+provider guarantees. Cancellation is best-effort; output-size checks happen
+after generation; no hard model-token or currency ceiling is proven. The fake
+rehearsal does not enforce a provider spend cap and must not be presented as
+evidence that time, byte, cancellation, or usage limits constrain a live SDK
+call. Future live stages have no runnable command here: each remains blocked
+pending separately approved admission work and evidence, and the existing
+pre-inference worker guard must remain unchanged.
+
+## No-inference SDK preflight diagnostic
+
+`scripts/trials/codex_preflight_no_inference.py` is a separate source-only
+diagnostic, not a worker entry point or an admission switch. Its default
+invocation and `--help` do not create files or start a process; `--run` is
+required, along with a new private `--trial-dir`. The directory holds only a
+synthetic fixture, a generated permission-profile config, isolated home/cache
+directories, a separate Codex auth home, and a private two-attempt ledger.
+Do not point it at a project checkout or the normal Codex home.
+
+The opt-in child process receives a strict environment allowlist and lazily
+loads only the pinned SDK. It forces file-backed auth in its separate Codex
+home and reads account state without refreshing tokens. Missing or unsupported
+authentication blocks before `thread/start`. If a user separately signs into
+that disposable home, the diagnostic may create at most one thread per
+attempt, then requires a typed active-permission-profile notification before
+its bounded wait expires. It never starts a turn, runs a command, logs in, logs
+out, or changes global settings. It makes no fallback to the normal home.
+The hidden child route also rechecks the exact allowlisted environment,
+canonical disposable paths, private directories, reserved attempt, synthetic
+fixture, and generated profile before loading the SDK. Its mode marker and
+one-shot stdin token are invocation controls, not authentication or same-user
+attestation; the checks reject accidental/path-confused entry but do not create
+a same-user security boundary.
+The normal auth-home boundary is compared with the POSIX account-home path
+metadata; credential files in that home are not opened. Environments whose
+effective `HOME` does not match the account metadata fail closed.
+
+Even a matching profile notification is not a pass: the pinned SDK does not
+provide complete proof of all tools and instruction surfaces. Unknown or
+uncontrolled inventory remains blocked. Attempts are durably reserved before
+the child starts; ambiguous timeouts are not retried, and the directory allows
+at most two explicit attempts. Output is a bounded, sanitized status record.
+Bounded-call failures report a fixed RPC phase and `exception` or `deadline`
+kind. The nullable `failure_category` is populated only for an observed
+immediate exception in result schema `agentflow.codex_preflight_result.v2`; it
+is one of a small allowlist of built-in, already-loaded
+pinned-SDK, or already-loaded Pydantic exception families, with unrecognized
+types reduced to `unknown`. Deadlines and non-exception halts have a null
+category. Exception class names, messages, arguments, causes, contexts,
+tracebacks, and server data are never serialized. A family category identifies
+only the observed exception type boundary; it does not establish the underlying
+SDK cause, which remains unverified without separately authorized runtime
+evidence.
+Source review of the pinned SDK confirms the existing typed `initialize()` call
+sequence is compatible with its client API. It does not identify the cause of
+the previously observed initialize failure or substitute for live verification.
+Do not interpret this diagnostic as model-tool isolation evidence, approval for
+inference, or authorization to weaken the App Server worker guard. No SDK
+runtime result is included in the source-only fake tests.
+
 ## Install and configure
 
 Install the optional `codex` extra (`openai-codex==0.160.1`) only when you
