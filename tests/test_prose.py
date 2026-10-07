@@ -109,6 +109,8 @@ agentflow doctor
         )
         configs = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
         self.assertEqual(configs[0], configs[1])
+        self.assertTrue(configs[0]["memory"]["enabled"])
+        self.assertFalse(configs[0]["memory"]["on_prompt"])
         self.assertEqual(configs[0]["prose"]["editor"], {
             "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
         })

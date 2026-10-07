@@ -6226,7 +6226,10 @@ def _resource_status(parts: tuple[str, ...], destination: Path) -> str:
         return "unreadable"
 
 
-def _copy_resource(parts: tuple[str, ...], destination: Path, *, refresh: bool = False) -> str:
+def _copy_resource(
+    parts: tuple[str, ...], destination: Path, *, refresh: bool = False,
+    initial_bytes: bytes | None = None,
+) -> str:
     existed = destination.exists() or destination.is_symlink()
     if existed:
         if destination.is_file() and _resource_status(parts, destination) == "installed":
@@ -6241,7 +6244,12 @@ def _copy_resource(parts: tuple[str, ...], destination: Path, *, refresh: bool =
         backup = _refresh_backup_path(destination)
         destination.rename(backup)
     try:
-        destination.write_bytes(packaged_resources.item(*parts).read_bytes())
+        content = (
+            initial_bytes
+            if not existed and initial_bytes is not None
+            else packaged_resources.item(*parts).read_bytes()
+        )
+        destination.write_bytes(content)
     except Exception:
         if backup is not None:
             if destination.exists():
@@ -10669,11 +10677,27 @@ def init_project(args: argparse.Namespace) -> int:
         (("templates", "project", "claude-settings.json"), target / ".claude/settings.json"),
         (("templates", "project", "copilot-hooks.json"), target / ".github/hooks/agentflow.json"),
         (("templates", "project", "copilot-instructions.md"), target / ".github/copilot-instructions.md"),
-        (("templates", "project", "agentflow.json"), target / ".agentflow/config.json"),
-        (("policies", "models-v2.json"), target / ".agentflow/models-v2.json"),
     )
     for resource_parts, destination in mappings:
         print(f"{_copy_resource(resource_parts, destination):<8} {destination}")
+
+    config_parts = ("templates", "project", "agentflow.json")
+    initial_config_bytes = None
+    if getattr(args, "no_memory", False):
+        config = json.loads(packaged_resources.item(*config_parts).read_text(encoding="utf-8"))
+        memory = config.get("memory") if isinstance(config, dict) else None
+        if not isinstance(memory, dict):
+            raise ValueError("bundled project config has no memory object")
+        memory["enabled"] = False
+        initial_config_bytes = (json.dumps(config, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    config_destination = target / ".agentflow/config.json"
+    print(
+        f"{_copy_resource(config_parts, config_destination, initial_bytes=initial_config_bytes):<8} "
+        f"{config_destination}"
+    )
+    policy_destination = target / ".agentflow/models-v2.json"
+    policy_parts = ("policies", "models-v2.json")
+    print(f"{_copy_resource(policy_parts, policy_destination):<8} {policy_destination}")
     print(
         "Existing workflow files were preserved. Agentflow uses one user-level Codex hook; custom project hooks are untouched."
     )
@@ -11478,6 +11502,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = sub.add_parser("init", help="Add non-overwriting workflow adapters to a project")
     init_parser.add_argument("path", nargs="?", default=".")
     init_parser.add_argument("--beads", action="store_true", help="Also initialize local durable coordination")
+    init_parser.add_argument(
+        "--no-memory", action="store_true",
+        help="Create a new project config with metadata-only memory disabled (default: enabled)",
+    )
     init_parser.add_argument(
         "--beads-mode",
         choices=("embedded", "shared-server"),

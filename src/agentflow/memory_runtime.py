@@ -1,4 +1,4 @@
-"""Opt-in, metadata-only provider memory wiring.
+"""Configuration-controlled, metadata-only provider memory wiring.
 
 The runtime is deliberately model-free.  Hooks normalize one bounded event,
 optionally perform governed find-then-fetch recall, and leave a durable health

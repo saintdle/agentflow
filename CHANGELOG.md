@@ -6,7 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-10-07
+
 ### Added
+
+- New project configurations created by `agentflow init` now enable
+  metadata-only memory by default while keeping prompt recall off. The
+  `--no-memory` option opts out for a newly created config; legacy and
+  uninitialized runtime defaults remain disabled, and existing values are
+  preserved.
 
 - Added opt-in paired baseline/treatment usage evaluation with explicit case
   IDs, provider/model/effort boundaries, accepted-result deltas, observed task
@@ -289,7 +297,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/saintdle/agentflow/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/saintdle/agentflow/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/saintdle/agentflow/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/saintdle/agentflow/compare/v0.0.5...v0.0.6

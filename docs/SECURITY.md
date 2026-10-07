@@ -156,7 +156,7 @@ depends on enforcement rather than launch discipline.
 
 ## Hardened isolation
 
-Hardened subprocess isolation in `0.0.8` is available only on macOS through
+Hardened subprocess isolation in `0.0.9` is available only on macOS through
 `/usr/bin/sandbox-exec`. Process execution, writes, and network access are
 deny-by-default. Reads use a different boundary: the profile permits blanket
 system reads so interpreters and toolchains can start, denies protected home
@@ -181,11 +181,11 @@ model, effort, and policy. External handoffs require the controller-owned Herdr
 path. Neither path is the synchronous isolation path: a handoff declaring
 `isolation_profile: hardened` is rejected rather than launched unconfined.
 Authenticated Herdr/controller launch also rejects hardened handoffs in
-`0.0.8`, because a probe cannot confine the later persistent provider session.
+`0.0.9`, because a probe cannot confine the later persistent provider session.
 Use `agentflow isolation launch` for synchronous hardened commands;
 persistent-session confinement is not currently provided.
 
-Linux can run the core CLI but has no equivalent hardened isolation in `0.0.8`.
+Linux can run the core CLI but has no equivalent hardened isolation in `0.0.9`.
 Running a command in a shell, virtual environment, worktree, or terminal
 multiplexer is not an isolation boundary.
 
