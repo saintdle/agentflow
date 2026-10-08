@@ -15,6 +15,11 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib  # type: ignore[no-redef]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts/trials/codex_preflight_no_inference.py"
@@ -421,6 +426,41 @@ class CodexPreflightTests(unittest.TestCase):
         self.assertFalse(called & forbidden)
         self.assertEqual(sum(1 for n in ast.walk(tree) if isinstance(n, ast.Call)
                              and isinstance(n.func, ast.Attribute) and n.func.attr == "thread_start"), 1)
+
+    def test_generated_permission_profile_uses_structure_preserving_overrides(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trial"
+            workspace, _authority, _env, _config_hash, _fixture_hash = preflight._prepare_trial(root, 1)
+            paths = {name: root / name for name in ("home", "codex_home", "config", "cache", "tmp", "authority")}
+            protected_path = root / 'protected path.with:colon "quotes"'
+            protected_path.mkdir(mode=0o700)
+            paths["home"] = protected_path
+            config_text = preflight._render_profile_config(workspace, paths).decode("utf-8")
+
+        parsed_config = tomllib.loads(config_text)
+        overrides = preflight._toml_overrides(config_text)
+        override_keys = [assignment.partition("=")[0] for assignment in overrides]
+        reconstructed = {}
+        for assignment in overrides:
+            key, separator, _value = assignment.partition("=")
+            self.assertTrue(separator)
+            self.assertNotIn(".", key)
+            parsed_assignment = tomllib.loads(assignment)
+            self.assertTrue(len(parsed_assignment) == 1 and key in parsed_assignment)
+            reconstructed.update(parsed_assignment)
+
+        profile = parsed_config["permissions"][preflight.PROFILE]
+        filesystem = profile["filesystem"]
+        workspace_rules = filesystem[":workspace_roots"]
+        self.assertTrue(set(override_keys) == set(parsed_config))
+        self.assertTrue(len(overrides) == len(parsed_config))
+        self.assertTrue(reconstructed == parsed_config)
+        self.assertTrue(filesystem[":root"] == "deny")
+        self.assertTrue(filesystem[":minimal"] == "read")
+        self.assertTrue(workspace_rules == {
+            ".": "read", ".agentflow": "deny", ".agentflow/controller-state": "deny",
+        })
+        self.assertTrue(filesystem.get(str(protected_path.resolve())) == "deny")
 
     def test_missing_auth_halts_before_thread_start_and_never_refreshes(self):
         with tempfile.TemporaryDirectory() as temporary:

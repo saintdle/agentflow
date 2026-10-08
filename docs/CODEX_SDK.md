@@ -92,6 +92,9 @@ that disposable home, the diagnostic may create at most one thread per
 attempt, then requires a typed active-permission-profile notification before
 its bounded wait expires. It never starts a turn, runs a command, logs in, logs
 out, or changes global settings. It makes no fallback to the normal home.
+The generated named permission profile is passed as a top-level TOML inline
+table override, preserving quoted filesystem and workspace-rule keys through
+the CLI parser.
 The hidden child route also rechecks the exact allowlisted environment,
 canonical disposable paths, private directories, reserved attempt, synthetic
 fixture, and generated profile before loading the SDK. Its mode marker and

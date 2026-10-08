@@ -454,16 +454,18 @@ def _toml_overrides(config_text: str) -> tuple[str, ...]:
     def key_text(key: str) -> str:
         return key if key.replace("_", "a").replace("-", "a").isalnum() else json.dumps(key)
 
-    def walk(value: Any, prefix: tuple[str, ...] = ()) -> None:
-        for key, item in value.items():
-            parts = (*prefix, key_text(str(key)))
-            if isinstance(item, dict):
-                walk(item, parts)
-            else:
-                encoded = json.dumps(item) if isinstance(item, str) else str(item).lower() if isinstance(item, bool) else str(item)
-                values.append(".".join(parts) + "=" + encoded)
+    def value_text(value: Any) -> str:
+        if isinstance(value, dict):
+            entries = (f"{key_text(str(key))}={value_text(item)}" for key, item in value.items())
+            return "{" + ",".join(entries) + "}"
+        if isinstance(value, str):
+            return json.dumps(value)
+        if isinstance(value, bool):
+            return str(value).lower()
+        raise Halt("trial_layout_invalid")
 
-    walk(tree)
+    for key, value in tree.items():
+        values.append(f"{key_text(str(key))}={value_text(value)}")
     return tuple(values)
 
 
