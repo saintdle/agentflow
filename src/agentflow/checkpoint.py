@@ -26,6 +26,7 @@ TEXT_FIELDS = (
     "next_action",
     "blocker",
     "last_check",
+    "pending_continuation_task",
     "remaining_risk",
     "session_hash",
 )

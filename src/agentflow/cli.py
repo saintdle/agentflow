@@ -1710,6 +1710,14 @@ def _controller_step_serial(
     # claim_ready() would never surface it again and it would sit
     # undiscoverable. Adopt it instead of claiming something new.
     descendants = beads_backend.root_descendants(cwd, workflow_root)
+    selection_checkpoint = controller._load_checkpoint()
+    pending_target = str(selection_checkpoint.get("pending_continuation_task") or "")
+    requested_target = str(getattr(args, "_continuation_task", "") or "")
+    if pending_target and requested_target and pending_target != requested_target:
+        raise controller_backend.ControllerError(
+            "continuation target differs from the durable pending task"
+        )
+    continuation_task = pending_target or requested_target
     orphaned = [
         item for item in descendants
         if str(item.get("status") or "").lower() == "in_progress"
@@ -1720,19 +1728,24 @@ def _controller_step_serial(
         )
     ]
     if orphaned:
-        if getattr(args, "_continuation_task", ""):
+        if continuation_task and (
+            len(orphaned) != 1 or str(orphaned[0].get("id") or "") != continuation_task
+        ):
             raise controller_backend.ControllerError(
-                "workflow acquired other in-progress work after continuation validation"
+                "workflow has in-progress work other than the durable continuation target"
+            )
+        if continuation_task:
+            beads_backend.verify_task_ancestry_and_ownership(
+                cwd, orphaned[0], task=continuation_task,
+                root=workflow_root, actor=lease.controller,
             )
         claimed = orphaned[0]
-    elif getattr(args, "_continuation_task", ""):
-        continuation_task = str(args._continuation_task)
+    elif continuation_task:
         exact = beads_backend.claim_issue_exact(
             cwd, task=continuation_task, root=workflow_root,
             actor=lease.controller, persist=False,
         )
         claimed = exact.issue
-        args._continuation_task = ""
     else:
         claimed = beads_backend.claim_ready(cwd, parent=workflow_root, labels=[], actor=lease.controller)
     stop_reason = ""
@@ -1804,6 +1817,8 @@ def _controller_step_serial(
         result = controller.resume(
             [selected], dispatch=_dispatch_via_herdr(args, root, cwd, workflow_root, lease), lease=lease,
         )
+        if continuation_task:
+            args._continuation_task = ""
         action_required: dict[str, str] | None = None
         if result.dispatched:
             controller.record_session_event(
@@ -2175,6 +2190,14 @@ def _controller_step_parallel(
         not draining and not attention_required and len(active) < policy.max_parallel_workers
         and not continuation_dispatched
     ):
+        selection_checkpoint = controller._load_checkpoint()
+        pending_target = str(selection_checkpoint.get("pending_continuation_task") or "")
+        requested_target = str(getattr(args, "_continuation_task", "") or "")
+        if pending_target and requested_target and pending_target != requested_target:
+            raise controller_backend.ControllerError(
+                "continuation target differs from the durable pending task"
+            )
+        continuation_task = pending_target or requested_target
         descendants = beads_backend.root_descendants(cwd, workflow_root)
         active_ids = {item["task"] for item in active}
         orphaned = [
@@ -2188,18 +2211,26 @@ def _controller_step_parallel(
             )
         ]
         if orphaned:
-            if getattr(args, "_continuation_task", ""):
+            if continuation_task and (
+                len(orphaned) != 1 or str(orphaned[0].get("id") or "") != continuation_task
+            ):
                 raise controller_backend.ControllerError(
-                    "workflow acquired other in-progress work after continuation validation"
+                    "workflow has in-progress work other than the durable continuation target"
+                )
+            if continuation_task:
+                beads_backend.verify_task_ancestry_and_ownership(
+                    cwd, orphaned[0], task=continuation_task,
+                    root=workflow_root, actor=lease.controller,
                 )
             claimed = orphaned[0]
-        elif getattr(args, "_continuation_task", ""):
+            if continuation_task:
+                continuation_dispatched = True
+        elif continuation_task:
             exact = beads_backend.claim_issue_exact(
-                cwd, task=str(args._continuation_task), root=workflow_root,
+                cwd, task=continuation_task, root=workflow_root,
                 actor=lease.controller, persist=False,
             )
             claimed = exact.issue
-            args._continuation_task = ""
             continuation_dispatched = True
         else:
             claimed = beads_backend.claim_ready(
@@ -2281,6 +2312,8 @@ def _controller_step_parallel(
         })
         # This atomic reservation precedes all handoff/preflight/provider work.
         controller.reserve_active_task(selected, lease=lease)
+        if continuation_task:
+            args._continuation_task = ""
         dispatched = _dispatch_via_herdr(args, root, cwd, workflow_root, lease)(selected)
         session_id = str(dispatched.get("session_id") or "")
         dispatch_state = str(dispatched.get("state") or "")
@@ -2511,12 +2544,12 @@ def _verify_cancelled_preidentity_continuation(
         )
     document = controller._load_checkpoint()
     record = _herdr_session_record(root, cancelled_task)
-    reason = f"USER_ACTION_REQUIRED: task {cancelled_task} provider identity never resolved within "
+    retired_check = f"cancelled expired preidentity launch {record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
     if (
         checkpoint_backend.admission_phase(document) != "terminal"
         or checkpoint_backend.resume_state(document) != "blocked"
         or document.get("terminal") is not True
-        or not str(document.get("terminal_reason") or "").startswith(reason)
+        or document.get("last_check") != retired_check
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
         or str(document.get("task") or "") != controller.root
@@ -2729,19 +2762,27 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
                 if (
                     dormant.root != str(root) or dormant.controller != controller.controller
                     or dormant.continuity_id != contract.get("continuity_id")
-                    or not dormant.verify_resume_proof(proof)
                     or dormant.epoch != int(state.get("epoch", -1))
                     or dormant.epoch < int(contract.get("lease_epoch", -1))
                 ):
                     raise controller_backend.LeaseConflict("released lease does not match the protected launch")
-                lease = controller.acquire(resume_proof=proof)
-                _, credentials = _controller_credentials(args, lease, key_path=key_path)
+                lease = controller.recover_released_incarnation(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
+                )
+                credentials = _read_controller_credentials(key_path)
             else:
                 lease = controller.recover_released_incarnation(
                     workflow_root=workflow_root, contract=contract,
                     authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
                 )
-                _, credentials = _controller_credentials(args, lease, key_path=key_path)
+                credentials = _read_controller_credentials(key_path)
 
             snapshot = _preidentity_recovery_snapshot(
                 controller, root, workflow_root, task_id, launch_id, pane_id,
@@ -2907,6 +2948,15 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                             "explicit controller continuation requires the protected credential "
                             "and exact resumable workflow incarnation"
                         )
+                    if continue_cancelled_task:
+                        # Candidate validation is read-only and must precede
+                        # acquire(), which rotates the fencing epoch. A bad
+                        # choice therefore leaves the signed halt retryable.
+                        _verify_cancelled_preidentity_continuation(
+                            root, workflow_root, continue_cancelled_task,
+                            continue_ready_task, controller, previous,
+                            authority_secret=credentials["authority_secret"],
+                        )
                 lease = controller.acquire(
                     takeover=bool(getattr(args, "takeover", False)),
                     resume_proof=resume_proof,
@@ -2920,10 +2970,6 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                 controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
             if continue_cancelled_task:
                 ready_task = continue_ready_task
-                _verify_cancelled_preidentity_continuation(
-                    root, workflow_root, continue_cancelled_task, ready_task,
-                    controller, lease, authority_secret=credentials["authority_secret"],
-                )
                 controller.acknowledge_cancelled_preidentity_halt(
                     workflow_root, continue_cancelled_task, ready_task, lease=lease,
                 )
@@ -3883,11 +3929,25 @@ def _preidentity_recovery_snapshot(
         and not document.get("active_tasks")
         and document.get("last_check") == f"cancelled expired preidentity launch {launch_id} for {task_id}"
     )
+    retained_draining = (
+        checkpoint_backend.admission_phase(document) == "draining"
+        and checkpoint_backend.resume_state(document) == "draining"
+        and document.get("terminal") is False
+        and str(document.get("task") or "") == controller.root
+        and not document.get("actor") and not document.get("claim_id")
+        and not document.get("session_id")
+        and len(rows) == 1 and rows[0].get("task") == task_id
+        and rows[0].get("state") == "identity_pending"
+        and not rows[0].get("session_id")
+    )
+    terminal_halt = (
+        checkpoint_backend.admission_phase(document) == "terminal"
+        and checkpoint_backend.resume_state(document) == "blocked"
+        and document.get("terminal") is True
+        and str(document.get("terminal_reason") or "").startswith(expected_reason)
+    )
     if (
-        checkpoint_backend.admission_phase(document) != "terminal"
-        or checkpoint_backend.resume_state(document) != "blocked"
-        or document.get("terminal") is not True
-        or not str(document.get("terminal_reason") or "").startswith(expected_reason)
+        not (terminal_halt or retained_draining or already_retired)
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
         or not (

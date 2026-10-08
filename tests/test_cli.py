@@ -3077,6 +3077,279 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(lease.continuity_id, contract["continuity_id"])
                 self.assertEqual(lease.epoch, contract["lease_epoch"] + 1)
 
+    def test_legacy_recovery_retries_after_credential_write_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, _ledger, baseline = _expired_preidentity_fixture(base)
+                controller.release(fixture.lease)
+                released = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                released.pop("dormant_lease", None)
+                cli._private_atomic_json(controller.state_path, released)
+                args = self._args(fixture)
+                checkpoint_epoch = controller._load_checkpoint()["epoch"]
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential crash")):
+                    first, _ = self._run_recovery(fixture, args)
+                self.assertEqual(first["error"], "credential crash")
+                self.assertEqual(json.loads(controller.state_path.read_text())["epoch"], checkpoint_epoch)
+                self.assertEqual(controller._load_checkpoint()["epoch"], checkpoint_epoch)
+
+                second, _ = self._run_recovery(fixture, args)
+                self.assertTrue(second["ok"], second)
+                state = json.loads(controller.state_path.read_text())
+                self.assertEqual(state["epoch"], checkpoint_epoch + 1)
+                self.assertNotIn("recovery_reattach", state)
+                record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "cancelled_preidentity")
+                self.assertEqual(record["attempts"], baseline["attempts"])
+                entry = json.loads(_ledger.read_text())["entries"][
+                    cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id)
+                ]
+                self.assertEqual(entry["deadline_epoch"], contract["deadline_epoch"])
+                self.assertEqual(entry["attempt"], 1)
+
+    def test_dormant_recovery_finishes_signed_pending_credential_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, _ledger, _baseline = _expired_preidentity_fixture(base)
+                controller.release(fixture.lease)
+                args = self._args(fixture)
+                checkpoint_epoch = controller._load_checkpoint()["epoch"]
+                writer = cli._controller_credentials
+
+                def write_then_crash(*writer_args, **writer_kwargs):
+                    writer(*writer_args, **writer_kwargs)
+                    raise OSError("crash after protected credential commit")
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_crash):
+                    first, _ = self._run_recovery(fixture, args)
+                self.assertEqual(first["error"], "crash after protected credential commit")
+                staged = json.loads(controller.state_path.read_text())
+                self.assertEqual(staged["epoch"], checkpoint_epoch)
+                self.assertIsNone(staged.get("lease"))
+                self.assertIn("recovery_reattach", staged)
+                self.assertEqual(controller._load_checkpoint()["epoch"], checkpoint_epoch)
+
+                second, _ = self._run_recovery(fixture, args)
+                self.assertTrue(second["ok"], second)
+                current = json.loads(controller.state_path.read_text())
+                self.assertEqual(current["epoch"], checkpoint_epoch + 1)
+                self.assertNotIn("recovery_reattach", current)
+                self.assertEqual(
+                    cli.controller_backend.Lease.from_dict(current["lease"]).continuity_id,
+                    contract["continuity_id"],
+                )
+
+    def test_recovery_accepts_exact_retained_draining_identity_pending_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline = _expired_preidentity_fixture(base)
+                document = controller._load_checkpoint()
+                document.update({
+                    "state": "draining", "status": "draining", "terminal": False,
+                    "terminal_reason": (
+                        "USER_ACTION_REQUIRED: prior no-ready halt; failed sibling; "
+                        f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within"
+                    )[:500],
+                })
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+                result, pane_probe = self._run_recovery(fixture, self._args(fixture))
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(pane_probe.call_count, 2)
+                checkpoint = controller._load_checkpoint()
+                self.assertTrue(checkpoint["terminal"])
+                self.assertEqual(checkpoint["state"], "blocked")
+                self.assertTrue(checkpoint["terminal_reason"].startswith("USER_ACTION_REQUIRED: prior no-ready halt"))
+                self.assertEqual(checkpoint["active_tasks"], [])
+
+    def test_retained_draining_recovery_rejects_mismatched_or_multiple_active_rows(self) -> None:
+        for shape in ("wrong-task", "sibling"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, _contract, _ledger, baseline = _expired_preidentity_fixture(base)
+                    document = controller._load_checkpoint()
+                    rows = [dict(row) for row in document["active_tasks"]]
+                    if shape == "wrong-task":
+                        rows[0]["task"] = "foreign-task"
+                    else:
+                        rows.append({**rows[0], "task": "sibling-task"})
+                    document.update({
+                        "state": "draining", "status": "draining", "terminal": False,
+                        "terminal_reason": "accumulated and truncated halt history",
+                        "active_tasks": rows,
+                    })
+                    cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+                    result, pane_probe = self._run_recovery(fixture, self._args(fixture))
+                    self.assertFalse(result["ok"], result)
+                    self.assertEqual(pane_probe.call_count, 0)
+                    record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                    self.assertEqual(record["status"], "identity_pending")
+                    self.assertEqual(controller._load_checkpoint()["state"], "draining")
+
+
+class ControllerPendingContinuationTests(unittest.TestCase):
+    def test_invalid_ready_choice_is_rejected_before_epoch_rotation_and_can_be_corrected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args = _controller_args(
+                    workspace, workflow_root="wf",
+                    continue_after_cancelled_preidentity="old",
+                    continue_task="bad-ready-task",
+                )
+                controller, _root = cli._controller_instance(args)
+                lease = controller.acquire()
+                cli._controller_credentials(args, lease)
+                controller.halt(
+                    "blocked",
+                    "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                    lease=lease,
+                )
+                halted = controller._load_checkpoint()
+                halted["last_check"] = "cancelled expired preidentity launch old-launch for old"
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, halted)
+                initial_epoch = json.loads(controller.state_path.read_text())["epoch"]
+                verified: list[str] = []
+
+                def verify(_root, _workflow, _cancelled, ready, *_rest, **_kwargs):
+                    verified.append(ready)
+                    if ready == "bad-ready-task":
+                        raise ValueError("ready task is invalid")
+                    return ready
+
+                def one_step(step_args, current, root, current_lease, *, operation):
+                    result = current.resume([], lease=current_lease)
+                    return ({
+                        "operation": operation, "ok": True, "root": str(root),
+                        "result": result.to_dict(),
+                    }, True)
+
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"}), \
+                     mock.patch.object(cli, "_verify_cancelled_preidentity_continuation", side_effect=verify), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                    first = _run_controller_json(cli.controller_resume, args)
+                    self.assertEqual(first["error"], "ready task is invalid")
+                    after_invalid = json.loads(controller.state_path.read_text())
+                    self.assertEqual(after_invalid["epoch"], initial_epoch)
+                    self.assertEqual(controller._load_checkpoint()["epoch"], initial_epoch)
+                    self.assertEqual(controller._load_checkpoint()["pending_continuation_task"], "")
+
+                    args.continue_task = "ready-good-task"
+                    second = _run_controller_json(cli.controller_resume, args)
+                    self.assertTrue(second["ok"], second)
+                    self.assertEqual(verified, ["bad-ready-task", "ready-good-task"])
+                    current_state = json.loads(controller.state_path.read_text())
+                    self.assertEqual(current_state["epoch"], initial_epoch + 1)
+                    self.assertEqual(controller._load_checkpoint()["pending_continuation_task"], "ready-good-task")
+
+    def _exercise_retry(self, *, parallel: bool, claim_landed: bool = False) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            controller = cli.controller_backend.RootController(
+                str(workspace), "controller",
+                state_path=base / "protected/controller.json",
+                checkpoint_path=base / "protected/checkpoint.json",
+            )
+            lease = controller.acquire()
+            controller.halt(
+                "blocked",
+                "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                lease=lease,
+            )
+            halted = controller._load_checkpoint()
+            halted["last_check"] = "cancelled expired preidentity launch old-launch for old"
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, halted)
+            controller.acknowledge_cancelled_preidentity_halt(
+                "wf", "old", "target", lease=lease,
+            )
+            issue = {
+                "id": "target", "status": "open", "assignee": "",
+                "metadata": {"agentflow": {}}, "labels": [],
+            }
+            claim = cli.beads_backend.ExactClaim(
+                cli.beads_backend.ClaimIdentity("wf", "target", "controller", "claim-target"),
+                issue,
+            )
+            args = argparse.Namespace(
+                workflow_root="wf", _authority_secret="test-authority",
+                _continuation_task="target",
+            )
+            policy = cli.execution_backend.ExecutionPolicy(max_parallel_workers=2)
+            step = cli._controller_step_parallel if parallel else cli._controller_step_serial
+            kwargs = {"operation": "resume"}
+            if parallel:
+                kwargs["policy"] = policy
+            exact_calls: list[str] = []
+            orphaned_rows: list[dict[str, Any]] = []
+
+            def exact_claim(_cwd, *, task, **_kwargs):
+                exact_calls.append(task)
+                if len(exact_calls) == 1:
+                    if claim_landed:
+                        orphaned_rows.append({
+                            **issue, "status": "in_progress", "assignee": "controller",
+                        })
+                    raise cli.beads_backend.BeadsError("injected exact claim failure")
+                return claim
+
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"},
+                ))
+                stack.enter_context(mock.patch.object(
+                    cli.beads_backend, "root_descendants", side_effect=lambda *_args: list(orphaned_rows),
+                ))
+                stack.enter_context(mock.patch.object(cli.beads_backend, "claim_issue_exact", side_effect=exact_claim))
+                ready = stack.enter_context(mock.patch.object(cli.beads_backend, "claim_ready"))
+                stack.enter_context(mock.patch.object(cli.beads_backend, "update_agentflow_metadata"))
+                stack.enter_context(mock.patch.object(cli, "_persist_claim_identity"))
+                stack.enter_context(mock.patch.object(cli, "_authenticated_cancelled_preidentity", return_value=False))
+                stack.enter_context(mock.patch.object(cli, "_dispatch_via_herdr", return_value=lambda _selected: {
+                    "state": "running", "session_id": "session-target",
+                }))
+                stack.enter_context(mock.patch.object(
+                    cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None,
+                ))
+                with self.assertRaisesRegex(cli.beads_backend.BeadsError, "injected exact claim failure"):
+                    step(args, controller, workspace, lease, **kwargs)
+                self.assertEqual(controller._load_checkpoint()["pending_continuation_task"], "target")
+                # A new CLI process has no in-memory target. The durable
+                # checkpoint forces the same exact claim path on retry.
+                restarted_args = argparse.Namespace(
+                    workflow_root="wf", _authority_secret="test-authority", _continuation_task="",
+                )
+                result, _stop = step(restarted_args, controller, workspace, lease, **kwargs)
+                if not parallel:
+                    self.assertEqual(result["result"]["task"], "target")
+                self.assertEqual(exact_calls, ["target"] if claim_landed else ["target", "target"])
+                ready.assert_not_called()
+                checkpoint = controller._load_checkpoint()
+                self.assertEqual(checkpoint["pending_continuation_task"], "")
+                if parallel:
+                    self.assertEqual([row["task"] for row in checkpoint["active_tasks"]], ["target"])
+                else:
+                    self.assertEqual(checkpoint["task"], "target")
+
+    def test_serial_resume_retries_only_durable_exact_continuation_after_claim_failure(self) -> None:
+        self._exercise_retry(parallel=False)
+
+    def test_parallel_resume_retries_only_durable_exact_continuation_after_claim_failure(self) -> None:
+        self._exercise_retry(parallel=True)
+
+    def test_serial_resume_adopts_only_durable_target_after_claim_committed_before_crash(self) -> None:
+        self._exercise_retry(parallel=False, claim_landed=True)
+
+    def test_parallel_resume_adopts_only_durable_target_after_claim_committed_before_crash(self) -> None:
+        self._exercise_retry(parallel=True, claim_landed=True)
+
 
 class ControllerResumeCredentialTests(unittest.TestCase):
     """AFREL-023: the resume secret gets a protected automatic handoff and
@@ -6312,11 +6585,22 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     "task-a-one": signed_record(root_a, lease_a, secret_a, "task-a-one", ["a-1"]),
                     "task-a-two": signed_record(root_a, lease_a, secret_a, "task-a-two", ["a-2"]),
                 }
-                # A normal release/reacquire starts a new continuity and
-                # signing key. Historical snapshots must remain verifiable
-                # for accounting without making the old key live authority.
+                # Authenticated reattach preserves this incarnation. An
+                # explicit takeover then starts a fresh one; old snapshots
+                # remain verifiable for accounting without live authority.
                 controller_a.release(lease_a)
-                renewed_lease_a = controller_a.acquire()
+                reattached_lease_a = controller_a.acquire(resume_proof=lease_a.resume_secret)
+                _, reattached_credentials_a = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=root_a,
+                        resume_key_file="",
+                    ),
+                    reattached_lease_a,
+                )
+                self.assertEqual(reattached_lease_a.continuity_id, lease_a.continuity_id)
+                self.assertEqual(secret_a, reattached_credentials_a["authority_secret"])
+                controller_a.release(reattached_lease_a)
+                renewed_lease_a = controller_a.acquire(takeover=True)
                 _, renewed_credentials_a = cli._controller_credentials(
                     argparse.Namespace(
                         root=str(fixture.root), workflow_root=root_a,
