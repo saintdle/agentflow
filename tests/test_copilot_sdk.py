@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -17,7 +19,7 @@ from agentflow import copilot_sdk
 
 
 class CopilotSDKOptionalTests(unittest.TestCase):
-    def test_import_is_lazy_and_sdk_and_runtime_versions_are_exact(self) -> None:
+    def test_import_is_lazy_and_release_and_build_versions_are_distinct(self) -> None:
         with mock.patch.object(copilot_sdk.importlib.metadata, "version") as version:
             importlib.reload(copilot_sdk)
             version.assert_not_called()
@@ -27,7 +29,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         copilot.CopilotClient = object
         copilot.RuntimeConnection = object
         version_module = types.ModuleType("copilot._cli_version")
-        version_module.CLI_VERSION = copilot_sdk.SUPPORTED_RUNTIME_VERSION
+        version_module.CLI_VERSION = copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION
         rpc_module = types.ModuleType("copilot.rpc")
         rpc_module.PermissionDecisionReject = reject
         with (
@@ -43,16 +45,102 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         ):
             self.assertEqual(copilot_sdk._sdk_components()[2], reject)
 
+        version_module.CLI_VERSION = copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION
         with (
             mock.patch.dict(sys.modules, {
                 "copilot": copilot,
                 "copilot._cli_version": version_module,
                 "copilot.rpc": rpc_module,
             }),
-            mock.patch.object(copilot_sdk.importlib.metadata, "version", return_value="1.0.16"),
+            mock.patch.object(
+                copilot_sdk.importlib.metadata, "version",
+                return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
+            ),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
             copilot_sdk._sdk_components()
+
+        version_module.CLI_VERSION = copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION
+        with (
+            mock.patch.dict(sys.modules, {
+                "copilot": copilot,
+                "copilot._cli_version": version_module,
+                "copilot.rpc": rpc_module,
+            }),
+            mock.patch.object(
+                copilot_sdk.importlib.metadata, "version", return_value="1.0.16"
+            ),
+            self.assertRaises(copilot_sdk.CopilotSDKError),
+        ):
+            copilot_sdk._sdk_components()
+
+    def test_installed_pinned_sdk_imports_offline_when_private_env_is_supplied(self) -> None:
+        raw_env = os.environ.get("AGENTFLOW_COPILOT_SDK_ENV")
+        if not raw_env:
+            self.skipTest("set AGENTFLOW_COPILOT_SDK_ENV to an installed private SDK environment")
+        sdk_env = Path(raw_env).resolve(strict=True)
+        python = sdk_env / "bin" / "python"
+        if not python.is_file():
+            python = sdk_env / "Scripts" / "python.exe"
+        self.assertTrue(python.is_file(), "private SDK environment has no Python executable")
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        script = (
+            "import importlib.metadata; "
+            "from copilot._cli_version import CLI_VERSION; "
+            "from agentflow.copilot_sdk import _sdk_components; "
+            "client_type, _, _ = _sdk_components(); "
+            "assert callable(getattr(client_type, 'get_status', None)); "
+            "print(importlib.metadata.version('github-copilot-sdk') + ':' + CLI_VERSION + ':status.get')"
+        )
+        env = {
+            "PATH": os.defpath,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(source_root),
+        }
+        result = subprocess.run(
+            [str(python), "-c", script],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-1200:])
+        self.assertEqual(result.stdout.strip(), "1.0.17:1.0.93:status.get")
+
+    def test_connected_runtime_build_must_match_exact_build_pin(self) -> None:
+        class Client:
+            def __init__(self, version: str):
+                self.version = version
+                self.status_calls = 0
+
+            async def get_status(self):
+                self.status_calls += 1
+                return SimpleNamespace(version=self.version)
+
+        supported = Client(copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+        # Run the asynchronous status check without starting a client or runtime.
+        async def check_supported() -> str:
+            return await copilot_sdk.CopilotProofRun._verify_runtime_build(
+                supported, asyncio.get_running_loop().time() + 1
+            )
+
+        actual = asyncio.run(check_supported())
+        self.assertEqual(actual, copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+        self.assertEqual(supported.status_calls, 1)
+
+        for unsupported_version in (copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION, "1.0.93-3"):
+            unsupported = Client(unsupported_version)
+
+            async def check_unsupported() -> None:
+                await copilot_sdk.CopilotProofRun._verify_runtime_build(
+                    unsupported, asyncio.get_running_loop().time() + 1
+                )
+
+            with self.subTest(runtime_build_version=unsupported_version):
+                with self.assertRaises(copilot_sdk.CopilotSDKError):
+                    asyncio.run(check_unsupported())
+            self.assertEqual(unsupported.status_calls, 1)
 
     def test_proof_client_is_managed_empty_mode_and_does_not_cache_token(self) -> None:
         class RuntimeConnection:
@@ -134,6 +222,9 @@ class CopilotSDKOptionalTests(unittest.TestCase):
 
             async def start(self):
                 return None
+
+            async def get_status(self):
+                return SimpleNamespace(version=copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
 
             async def create_session(self, **kwargs):
                 self.session_config = kwargs
@@ -237,7 +328,7 @@ class CopilotUsageCollectorTests(unittest.TestCase):
             def on(self, _handler):
                 return lambda: None
 
-        collector.attach(Session())
+        collector.attach(Session(), runtime_build_version=copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
         collector.record_tool_inventory([])
         collector.begin_request()
 
@@ -279,6 +370,14 @@ class CopilotUsageCollectorTests(unittest.TestCase):
         self.assertEqual(report.calls[0]["call_sequence"], 1)
         self.assertEqual(report.ledger[0]["identity"]["launch_id"], "launch-1")
         self.assertEqual(report.ledger[0]["session_scope"], report.session_scope)
+        self.assertEqual(
+            report.ledger[0]["sdk_cli_release_version"],
+            copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION,
+        )
+        self.assertEqual(
+            report.ledger[0]["runtime_build_version"],
+            copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION,
+        )
         encoded = json.dumps(report.to_dict())
         self.assertNotIn("private-session-id", encoded)
         self.assertNotIn("call-1", encoded)

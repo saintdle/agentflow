@@ -2,8 +2,12 @@
 
 Agentflow includes an optional, import-lazy observer for the GitHub Copilot SDK.
 Install it with `pip install 'saintdle-agentflow[copilot]'`. The SDK wheel
-requires Python 3.11 or later and pins its managed Copilot runtime; this
-prototype accepts only SDK `1.0.17` with runtime `1.0.93-4`.
+requires Python 3.11 or later. This prototype accepts only SDK `1.0.17`, whose
+declared CLI release is `1.0.93`, and a connected executable whose runtime
+status reports build `1.0.93-4`. It checks the declared release during import
+and checks the actual build after connection, before creating a session. The
+SDK release pin and executable build pin are distinct fields and are checked
+against their respective sources.
 
 The observer reads `assistant.usage` directly from the session event callback.
 Copilot documents this event as one record per model API call, including
@@ -71,8 +75,9 @@ side effects. Never pass worker-writable event files into the collector.
 Persist the signed report only in controller-owned protected state.
 
 The returned chain binds the supplied root/task/claim/lease-continuity/launch
-identity, the hashed SDK session ID, each observed call and model, and the
-SDK/runtime pins. It is a local observation from the pinned Copilot runtime,
+identity, the hashed SDK session ID, each observed call and model, the SDK
+package and declared CLI release, and the runtime build reported by the live
+connection. It is a local observation from the pinned Copilot runtime,
 not provider-signed evidence. The current prototype keeps its chain in memory;
 it does not anchor a persisted head across controller restarts or authenticate
 the supplied launch identity itself. Test fixtures can exercise rejection

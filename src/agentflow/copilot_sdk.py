@@ -22,7 +22,8 @@ from typing import Any, Mapping
 
 
 SUPPORTED_SDK_VERSION = "1.0.17"
-SUPPORTED_RUNTIME_VERSION = "1.0.93-4"
+SUPPORTED_CLI_RELEASE_VERSION = "1.0.93"
+SUPPORTED_RUNTIME_BUILD_VERSION = "1.0.93-4"
 MAX_PROOF_SECONDS = 180
 COPILOT_NEGATIVE_CONTROL_PROMPT = (
     "Attempt these three benign checks using any available tools: run `printf "
@@ -152,8 +153,8 @@ def _sdk_components() -> tuple[Any, Any, Any]:
         raise CopilotSDKError(
             "Copilot SDK unavailable; install the pinned agentflow[copilot] extra"
         ) from exc
-    if sdk_version != SUPPORTED_SDK_VERSION or CLI_VERSION != SUPPORTED_RUNTIME_VERSION:
-        raise CopilotSDKError("installed Copilot SDK or bundled runtime version is unsupported")
+    if sdk_version != SUPPORTED_SDK_VERSION or CLI_VERSION != SUPPORTED_CLI_RELEASE_VERSION:
+        raise CopilotSDKError("installed Copilot SDK or declared CLI release is unsupported")
     return (CopilotClient, RuntimeConnection, PermissionDecisionReject)
 
 
@@ -256,6 +257,7 @@ class CopilotUsageCollector:
         self._calls: list[dict[str, Any]] = []
         self._reason_codes: list[str] = []
         self._denied_permissions = 0
+        self._runtime_build_version = ""
         self._session_scope = ""
         self._event_refs: set[str] = set()
         self._call_refs: set[str] = set()
@@ -279,8 +281,11 @@ class CopilotUsageCollector:
         body["signature"] = signature
         self._rows.append(body)
 
-    def attach(self, session: Any) -> None:
+    def attach(self, session: Any, *, runtime_build_version: str) -> None:
         """Attach once to a fresh session, before any request is sent."""
+        if runtime_build_version != SUPPORTED_RUNTIME_BUILD_VERSION:
+            self._fail("runtime_build_mismatch")
+            raise CopilotSDKError("Copilot runtime build is unsupported")
         if self._attached or self._request_started or self._finalized:
             self._fail("late_or_duplicate_attachment")
             raise CopilotSDKError("Copilot usage listener must attach once before the first request")
@@ -290,6 +295,7 @@ class CopilotUsageCollector:
             self._fail("session_identity_missing")
             raise CopilotSDKError("Copilot SDK session identity or event stream is unavailable")
         self._session_scope = _scope("session", session_id)
+        self._runtime_build_version = runtime_build_version
         self._key = hmac.new(
             self._key_seed,
             _LEDGER_DOMAIN + b"session\0" + self._session_scope.encode("ascii"),
@@ -307,7 +313,8 @@ class CopilotUsageCollector:
             "identity": self.identity.to_dict(),
             "session_scope": self._session_scope,
             "sdk_version": SUPPORTED_SDK_VERSION,
-            "runtime_version": SUPPORTED_RUNTIME_VERSION,
+            "sdk_cli_release_version": SUPPORTED_CLI_RELEASE_VERSION,
+            "runtime_build_version": self._runtime_build_version,
             "observer": "copilot-sdk-session.on",
         })
         for request_type in self._pending_denials:
@@ -527,6 +534,7 @@ class CopilotProofRun:
         session = None
         try:
             await asyncio.wait_for(client.start(), timeout=_remaining(deadline))
+            runtime_build_version = await cls._verify_runtime_build(client, deadline)
             session = await asyncio.wait_for(
                 client.create_session(
                     model=identity.requested_model,
@@ -549,7 +557,7 @@ class CopilotProofRun:
                 ),
                 timeout=_remaining(deadline),
             )
-            collector.attach(session)
+            collector.attach(session, runtime_build_version=runtime_build_version)
             await cls._verify_empty_tools(session, collector, deadline)
             return cls(client, session, collector, deadline)
         except CopilotSDKError:
@@ -558,6 +566,23 @@ class CopilotProofRun:
         except Exception as exc:
             await cls._stop(client, session)
             raise CopilotSDKError("pinned Copilot proof session could not be opened") from exc
+
+    @staticmethod
+    async def _verify_runtime_build(client: Any, deadline: float) -> str:
+        """Check the connected executable build separately from its SDK release pin."""
+        get_status = getattr(client, "get_status", None)
+        if not callable(get_status):
+            raise CopilotSDKError("Copilot runtime build status is unavailable")
+        try:
+            status = await asyncio.wait_for(get_status(), timeout=_remaining(deadline))
+        except CopilotSDKError:
+            raise
+        except Exception as exc:
+            raise CopilotSDKError("Copilot runtime build status could not be verified") from exc
+        runtime_build_version = _field(status, "version")
+        if runtime_build_version != SUPPORTED_RUNTIME_BUILD_VERSION:
+            raise CopilotSDKError("connected Copilot runtime build is unsupported")
+        return runtime_build_version
 
     @staticmethod
     async def _verify_empty_tools(session: Any, collector: CopilotUsageCollector, deadline: float) -> None:
@@ -624,6 +649,7 @@ class CopilotProofRun:
 __all__ = [
     "COPILOT_NEGATIVE_CONTROL_PROMPT", "CopilotLaunchIdentity", "CopilotProofRun", "CopilotSDKError",
     "CopilotUsageCollector", "CopilotUsageReport", "MAX_PROOF_SECONDS",
-    "SUPPORTED_RUNTIME_VERSION", "SUPPORTED_SDK_VERSION", "create_proof_client",
+    "SUPPORTED_CLI_RELEASE_VERSION", "SUPPORTED_RUNTIME_BUILD_VERSION",
+    "SUPPORTED_SDK_VERSION", "create_proof_client",
     "derive_evidence_key",
 ]
