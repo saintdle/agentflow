@@ -706,6 +706,14 @@ def _reject_custom_controller_state_path(args: argparse.Namespace) -> None:
         )
 
 
+def _reject_custom_retirement_checkpoint(args: argparse.Namespace) -> None:
+    """Keep retirement and its continuation bound to the canonical checkpoint."""
+    if str(getattr(args, "checkpoint_path", "") or ""):
+        raise ValueError(
+            "preidentity retirement and continuation require the canonical namespaced controller checkpoint"
+        )
+
+
 def _root_acceptance_passed(issue: Mapping[str, Any], *, beads_cwd: Path | None = None) -> bool:
     """GOAL_COMPLETE requires the canonical acceptance matrix, not root status.
 
@@ -2536,6 +2544,7 @@ def _verify_cancelled_preidentity_continuation(
     lease: controller_backend.Lease,
     *,
     authority_secret: str,
+    allow_staged_selection: bool = False,
 ) -> str:
     """Prove a signed retired launch and one distinct, currently ready child."""
     if not cancelled_task or not ready_task or ready_task == cancelled_task:
@@ -2558,7 +2567,22 @@ def _verify_cancelled_preidentity_continuation(
         f"cancelled {marker_reason} preidentity launch "
         f"{record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
     )
+    selected_check = (
+        f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+        f"ready descendant {ready_task} after {cancelled_task}"
+    )
+    staged_selection = bool(
+        allow_staged_selection
+        and checkpoint_backend.resume_state(document) == "advancing"
+        and checkpoint_backend.admission_phase(document) == "controller"
+        and document.get("terminal") is False
+        and document.get("pending_continuation_task") == ready_task
+        and document.get("last_check") == selected_check
+        and document.get("epoch") == lease.epoch
+        and document.get("lease_token") == lease.token
+    )
     if (
+        not staged_selection and (
         checkpoint_backend.admission_phase(document) != "terminal"
         or checkpoint_backend.resume_state(document) != "blocked"
         or document.get("terminal") is not True
@@ -2569,6 +2593,15 @@ def _verify_cancelled_preidentity_continuation(
         or document.get("active_tasks")
         or document.get("actor") or document.get("claim_id") or document.get("session_id")
         or document.get("last_check") != retired_check
+        )
+    ) or (
+        staged_selection and (
+            str(document.get("root") or "") != str(root)
+            or str(document.get("controller") or "") != controller.controller
+            or str(document.get("task") or "") != controller.root
+            or document.get("active_tasks")
+            or document.get("actor") or document.get("claim_id") or document.get("session_id")
+        )
     ):
         raise controller_backend.ControllerError(
             "checkpoint is not the exact safely retired preidentity halt"
@@ -2700,6 +2733,7 @@ def _controller_preidentity_retirement(
     )
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_retirement_checkpoint(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
         workflow_root = raw_workflow_root.strip()
         task_id = str(getattr(args, "task", "") or "")
@@ -2872,6 +2906,10 @@ def _controller_preidentity_retirement(
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
+        if operation == "resume" and str(
+            getattr(args, "continue_after_cancelled_preidentity", "") or ""
+        ):
+            _reject_custom_retirement_checkpoint(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
         workflow_root = raw_workflow_root.strip()
         if not workflow_root:
@@ -2981,30 +3019,90 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     if (
                         previous is None or previous.root != str(root)
                         or previous.controller != controller.controller
-                        or not previous.verify_resume_proof(resume_proof)
                         or credentials.get("workspace_root") != str(root.resolve())
                         or credentials.get("workflow_root") != workflow_root
                         or credentials.get("continuity_id") != previous.continuity_id
                         or not credentials.get("authority_secret")
-                        or (continue_cancelled_task and int(state.get("epoch", -1)) != int(checkpoint_epoch or -2))
                     ):
                         raise controller_backend.LeaseConflict(
                             "explicit controller continuation requires the protected credential "
                             "and exact resumable workflow incarnation"
                         )
                     if continue_cancelled_task:
-                        # Candidate validation is read-only and must precede
-                        # acquire(), which rotates the fencing epoch. A bad
-                        # choice therefore leaves the signed halt retryable.
+                        stored_proof = str(credentials.get("resume_secret") or "")
+                        if not stored_proof or not hmac.compare_digest(
+                            resume_proof.encode("utf-8"), stored_proof.encode("utf-8"),
+                        ):
+                            raise controller_backend.LeaseConflict(
+                                "explicit controller continuation requires its exact canonical protected credential"
+                            )
+                        continuation_intent = controller.pending_explicit_continuation(
+                            workflow_root=workflow_root,
+                            cancelled_task=continue_cancelled_task,
+                            ready_task=continue_ready_task,
+                            authority_secret=credentials["authority_secret"],
+                            resume_proof=resume_proof,
+                        )
+                        state_epoch = int(state.get("epoch", -1))
+                        checkpoint_epoch_value = int(checkpoint_epoch or -1)
+                        continuation_already_selected = False
+                        if continuation_intent is not None:
+                            previous_epoch = int(continuation_intent.get("previous_epoch", -1))
+                            candidate_epoch = int(continuation_intent.get("epoch", -1))
+                            if (
+                                state_epoch not in {previous_epoch, candidate_epoch}
+                                or checkpoint_epoch_value not in {previous_epoch, candidate_epoch}
+                                or (state_epoch == previous_epoch and checkpoint_epoch_value != previous_epoch)
+                            ):
+                                raise controller_backend.LeaseConflict(
+                                    "staged continuation state and checkpoint epochs do not match"
+                                )
+                            continuation_already_selected = checkpoint_epoch_value == candidate_epoch
+                        elif (
+                            state_epoch != checkpoint_epoch_value
+                            or not previous.verify_resume_proof(resume_proof)
+                        ):
+                            raise controller_backend.LeaseConflict(
+                                "explicit controller continuation requires its exact current protected credential"
+                            )
+                        # Verify the chosen task before rotating credentials.
+                        # A retry after the signed target checkpoint is already
+                        # durable may finish the staged transaction without
+                        # selecting or dispatching a different task.
                         _verify_cancelled_preidentity_continuation(
                             root, workflow_root, continue_cancelled_task,
                             continue_ready_task, controller, previous,
                             authority_secret=credentials["authority_secret"],
+                            allow_staged_selection=continuation_already_selected,
                         )
-                lease = controller.acquire(
-                    takeover=bool(getattr(args, "takeover", False)),
-                    resume_proof=resume_proof,
-                )
+                        if continuation_already_selected:
+                            lease = controller.authorize(resume_proof)
+                        else:
+                            lease = controller.reattach_for_explicit_continuation(
+                                workflow_root=workflow_root,
+                                cancelled_task=continue_cancelled_task,
+                                ready_task=continue_ready_task,
+                                checkpoint_epoch=checkpoint_epoch_value,
+                                authority_secret=credentials["authority_secret"],
+                                resume_proof=resume_proof,
+                                persist_credentials=lambda candidate: _controller_credentials(
+                                    args, candidate, key_path=key_path,
+                                ),
+                            )
+                    else:
+                        if not previous.verify_resume_proof(resume_proof):
+                            raise controller_backend.LeaseConflict(
+                                "explicit no-ready acknowledgement requires its current protected credential"
+                            )
+                        lease = controller.acquire(
+                            takeover=bool(getattr(args, "takeover", False)),
+                            resume_proof=resume_proof,
+                        )
+                else:
+                    lease = controller.acquire(
+                        takeover=bool(getattr(args, "takeover", False)),
+                        resume_proof=resume_proof,
+                    )
             _, credentials = _controller_credentials(args, lease, key_path=key_path)
             # Internal-only: never serialized into a handoff, command argv,
             # Herdr state, environment variable, checkpoint, or payload.
@@ -3014,8 +3112,16 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                 controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
             if continue_cancelled_task:
                 ready_task = continue_ready_task
-                controller.acknowledge_cancelled_preidentity_halt(
-                    workflow_root, continue_cancelled_task, ready_task, lease=lease,
+                if not continuation_already_selected:
+                    controller.acknowledge_cancelled_preidentity_halt(
+                        workflow_root, continue_cancelled_task, ready_task, lease=lease,
+                    )
+                controller.clear_explicit_continuation(
+                    workflow_root=workflow_root,
+                    cancelled_task=continue_cancelled_task,
+                    ready_task=ready_task,
+                    authority_secret=credentials["authority_secret"],
+                    lease=lease,
                 )
                 args._continuation_task = ready_task
             _bind_current_controller_sessions(root, workflow_root, lease)

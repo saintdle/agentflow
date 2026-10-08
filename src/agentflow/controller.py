@@ -684,6 +684,299 @@ class RootController:
             self._lease = lease
             return lease
 
+    def pending_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Mapping[str, Any] | None:
+        """Authenticate a staged exact-target continuation, if one exists."""
+        with self._locked():
+            state = _read_json(self.state_path)
+            pending = state.get("continuation_reattach")
+            if pending is None:
+                return None
+            if not isinstance(pending, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
+            payload = dict(pending)
+            supplied = str(payload.pop("authority_hmac", ""))
+            expected = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root,
+                "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task,
+                "ready_task": ready_task,
+            }
+            if (
+                any(payload.get(key) != value for key, value in expected.items())
+                or not hmac.compare_digest(
+                    supplied,
+                    _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+                )
+            ):
+                raise LeaseConflict("staged continuation does not authenticate this exact target")
+            try:
+                previous_epoch = int(payload["previous_epoch"])
+                candidate_epoch = int(payload["epoch"])
+                state_epoch = int(state.get("epoch", -1))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LeaseConflict("staged continuation epochs are malformed") from exc
+            if (
+                candidate_epoch != previous_epoch + 1
+                or state_epoch not in {previous_epoch, candidate_epoch}
+                or payload.get("continuity_id") != self._continuity_for_staged_state(state, previous_epoch, candidate_epoch)
+                or payload.get("token") != f"{self.root}/{self.controller}/{candidate_epoch}"
+            ):
+                raise LeaseConflict("staged continuation no longer matches its protected incarnation")
+            active = self._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            candidate_hash = str(payload.get("resume_secret_hash") or "")
+            candidate_proof = bool(
+                resume_proof and candidate_hash
+                and hmac.compare_digest(_hash_secret(resume_proof), candidate_hash)
+            )
+            if state_epoch == previous_epoch:
+                previous = active or dormant
+                if (
+                    previous is None or previous.epoch != previous_epoch
+                    or previous.root != self.root or previous.controller != self.controller
+                    or previous.continuity_id != payload.get("continuity_id")
+                    or (not candidate_proof and not previous.verify_resume_proof(resume_proof))
+                ):
+                    raise LeaseConflict("staged continuation requires its exact current or rotated credential")
+            else:
+                candidate = active
+                if (
+                    candidate is None or candidate.epoch != candidate_epoch
+                    or candidate.root != self.root or candidate.controller != self.controller
+                    or candidate.continuity_id != payload.get("continuity_id")
+                    or candidate.token != payload.get("token")
+                    or candidate.resume_secret_hash != candidate_hash
+                    or not candidate_proof or not candidate.verify_resume_proof(resume_proof)
+                ):
+                    raise LeaseConflict("staged continuation requires its exact committed credential")
+            return dict(pending)
+
+    def _continuity_for_staged_state(
+        self, state: Mapping[str, Any], previous_epoch: int, candidate_epoch: int,
+    ) -> str:
+        active = self._read_lease(state)
+        dormant_value = state.get("dormant_lease")
+        dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+        expected_epoch = int(state.get("epoch", -1))
+        expected = candidate_epoch if expected_epoch == candidate_epoch else previous_epoch
+        lease = active if active is not None and active.epoch == expected else dormant
+        if lease is None or lease.epoch != expected or lease.root != self.root or lease.controller != self.controller:
+            return ""
+        return lease.continuity_id
+
+    def reattach_for_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        checkpoint_epoch: int,
+        authority_secret: str,
+        resume_proof: str,
+        persist_credentials: Callable[[Lease], Any],
+    ) -> Lease:
+        """Rotate credentials under a signed, exact-target retry intent."""
+        if not all((workflow_root, cancelled_task, ready_task, authority_secret, resume_proof)):
+            raise LeaseConflict("explicit continuation reattach is missing an authenticated identity")
+        if cancelled_task == ready_task:
+            raise LeaseConflict("continuation target must differ from the cancelled task")
+        with self._locked():
+            state = _read_json(self.state_path)
+            active = self._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            if dormant_value is not None and dormant is None:
+                raise LeaseConflict("dormant controller lease is malformed")
+            pending_value = state.get("continuation_reattach")
+            pending: dict[str, Any] | None = None
+            if pending_value is not None:
+                if not isinstance(pending_value, Mapping):
+                    raise LeaseConflict("staged continuation reattach record is malformed")
+                pending = dict(pending_value)
+                supplied = str(pending.pop("authority_hmac", ""))
+                expected = {
+                    "schema": "agentflow.continuation-reattach@1",
+                    "root": self.root, "controller": self.controller,
+                    "workflow_root": workflow_root,
+                    "cancelled_task": cancelled_task, "ready_task": ready_task,
+                }
+                if (
+                    any(pending.get(key) != value for key, value in expected.items())
+                    or not hmac.compare_digest(
+                        supplied,
+                        _authority_mac(authority_secret, pending, domain="continuation-reattach-v1"),
+                    )
+                ):
+                    raise LeaseConflict("staged continuation does not authenticate this exact target")
+                if checkpoint_epoch not in {pending.get("previous_epoch"), pending.get("epoch")}:
+                    raise LeaseConflict("staged continuation checkpoint epoch changed")
+                candidate_hash = str(pending.get("resume_secret_hash") or "")
+                try:
+                    previous_epoch = int(pending["previous_epoch"])
+                    candidate_epoch = int(pending["epoch"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise LeaseConflict("staged continuation epochs are malformed") from exc
+                if candidate_epoch != previous_epoch + 1 or int(state.get("epoch", -1)) not in {
+                    previous_epoch, candidate_epoch,
+                }:
+                    raise LeaseConflict("staged continuation epochs no longer match the protected lease")
+                if (
+                    active is not None and active.epoch == candidate_epoch
+                    and active.root == self.root and active.controller == self.controller
+                    and active.continuity_id == pending.get("continuity_id")
+                    and active.token == pending.get("token")
+                    and active.resume_secret_hash == candidate_hash
+                    and int(state.get("epoch", -1)) == candidate_epoch
+                    and active.verify_resume_proof(resume_proof)
+                ):
+                    self._lease = active
+                    return active
+                if candidate_hash and hmac.compare_digest(
+                    hashlib.sha256(resume_proof.encode("utf-8")).hexdigest(), candidate_hash,
+                ):
+                    previous = active or dormant
+                    if (
+                        previous is None or previous.root != self.root
+                        or previous.controller != self.controller
+                        or previous.epoch != previous_epoch
+                        or previous.continuity_id != pending.get("continuity_id")
+                    ):
+                        raise LeaseConflict("staged continuation no longer matches its original incarnation")
+                    candidate = self._continuation_lease_from_record(pending, resume_proof)
+                    state["epoch"] = candidate.epoch
+                    state["lease"] = candidate.to_storage_dict()
+                    state.pop("dormant_lease", None)
+                    self._write_state(state)
+                    self._lease = candidate
+                    return candidate
+            previous = active or dormant
+            if (
+                previous is None or previous.root != self.root
+                or previous.controller != self.controller
+                or previous.epoch != int(state.get("epoch", -1))
+                or previous.epoch != checkpoint_epoch
+                or not previous.verify_resume_proof(resume_proof)
+                or not previous.continuity_id
+            ):
+                raise LeaseConflict("explicit continuation requires its exact current protected credential")
+            now = float(self.clock())
+            epoch = previous.epoch + 1
+            secret = secrets.token_urlsafe(32)
+            candidate = Lease(
+                self.root, self.controller, epoch, f"{self.root}/{self.controller}/{epoch}",
+                previous.acquired_at, now, self.owner_id, secret, _hash_secret(secret),
+                continuity_id=previous.continuity_id,
+            )
+            payload = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root, "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task, "ready_task": ready_task,
+                "continuity_id": previous.continuity_id,
+                "previous_epoch": previous.epoch, "epoch": epoch,
+                "token": candidate.token, "acquired_at": candidate.acquired_at,
+                "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
+                "resume_secret_hash": candidate.resume_secret_hash,
+            }
+            payload["authority_hmac"] = _authority_mac(
+                authority_secret, payload, domain="continuation-reattach-v1",
+            )
+            state["continuation_reattach"] = payload
+            self._write_state(state)
+            persist_credentials(candidate)
+            state["epoch"] = candidate.epoch
+            state["lease"] = candidate.to_storage_dict()
+            state.pop("dormant_lease", None)
+            self._write_state(state)
+            self._lease = candidate
+            return candidate
+
+    def clear_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        lease: Lease | str,
+    ) -> None:
+        """Clear a staged continuation only after its target is checkpointed."""
+        with self.fence(lease) as current:
+            state = _read_json(self.state_path)
+            pending = state.get("continuation_reattach")
+            if pending is None:
+                return
+            if not isinstance(pending, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
+            payload = dict(pending)
+            supplied = str(payload.pop("authority_hmac", ""))
+            expected = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root, "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task, "ready_task": ready_task,
+                "epoch": current.epoch, "continuity_id": current.continuity_id,
+            }
+            checkpoint = self._load_checkpoint()
+            expected_check = (
+                f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+                f"ready descendant {ready_task} after {cancelled_task}"
+            )
+            if (
+                any(payload.get(key) != value for key, value in expected.items())
+                or not hmac.compare_digest(
+                    supplied,
+                    _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+                )
+                or int(state.get("epoch", -1)) != current.epoch
+                or payload.get("previous_epoch") != current.epoch - 1
+                or payload.get("token") != current.token
+                or payload.get("resume_secret_hash") != current.resume_secret_hash
+                or checkpoint.get("root") != self.root
+                or checkpoint.get("controller") != self.controller
+                or checkpoint.get("task") != self.root
+                or checkpoint.get("phase") != "controller"
+                or checkpoint.get("state") != "advancing"
+                or checkpoint.get("terminal") is not False
+                or checkpoint.get("active_tasks")
+                or checkpoint.get("actor") or checkpoint.get("claim_id") or checkpoint.get("session_id")
+                or checkpoint.get("last_check") != expected_check
+                or checkpoint.get("pending_continuation_task") != ready_task
+                or checkpoint.get("epoch") != current.epoch
+                or checkpoint.get("lease_token") != current.token
+            ):
+                raise LeaseConflict("staged continuation cannot be cleared before its exact target is durable")
+            state.pop("continuation_reattach", None)
+            self._write_state(state)
+
+    @staticmethod
+    def _continuation_lease_from_record(value: Mapping[str, Any], resume_proof: str) -> Lease:
+        try:
+            epoch = int(value["epoch"])
+            resume_hash = str(value["resume_secret_hash"])
+            if not hmac.compare_digest(_hash_secret(resume_proof), resume_hash):
+                raise ValueError("staged credential does not match")
+            return Lease(
+                root=str(value["root"]), controller=str(value["controller"]),
+                epoch=epoch, token=str(value["token"]),
+                acquired_at=float(value["acquired_at"]), heartbeat_at=float(value["heartbeat_at"]),
+                owner_id=str(value.get("owner_id") or ""), resume_secret=resume_proof,
+                resume_secret_hash=resume_hash, continuity_id=str(value["continuity_id"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("staged continuation lease is malformed") from exc
+
     def _lease_matches(self, current: Lease, expected: Lease | str) -> bool:
         if isinstance(expected, str):
             return current.token == expected

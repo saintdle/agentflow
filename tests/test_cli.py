@@ -3103,6 +3103,33 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(resume.continue_after_cancelled_preidentity, "task")
         self.assertEqual(resume.continue_task, "child")
 
+    def test_retirement_rejects_checkpoint_override_before_any_mutation(self) -> None:
+        for legacy_scope in (False, True):
+            with self.subTest(legacy_scope=legacy_scope), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    factory = self._legacy_fixture if legacy_scope else _expired_preidentity_fixture
+                    fixture, controller, contract, _ledger_path, baseline = factory(base)
+                    fixture.contract = contract
+                    args = self._args(fixture)
+                    shadow_checkpoint = base / "shadow-checkpoint.json"
+                    args.checkpoint_path = str(shadow_checkpoint)
+                    checkpoint_before = controller.checkpoint_path.read_bytes()
+                    state_before = controller.state_path.read_bytes()
+                    herdr_before = baseline["state_path"].read_bytes()
+
+                    result, pane_probe = self._run_recovery(
+                        fixture, args, legacy_scope=legacy_scope,
+                    )
+
+                    self.assertFalse(result["ok"])
+                    self.assertIn("canonical namespaced controller checkpoint", result["error"])
+                    self.assertEqual(pane_probe.call_count, 0)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(baseline["state_path"].read_bytes(), herdr_before)
+                    self.assertFalse(shadow_checkpoint.exists())
+
     def test_superseded_legacy_retirement_preserves_unknown_budget_and_fences_late_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -3541,6 +3568,54 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
 
 
 class ControllerPendingContinuationTests(unittest.TestCase):
+    def _continuation_fixture(self, base: Path, *, ready_task: str = "ready-task"):
+        workspace = base / "workspace"
+        workspace.mkdir()
+        args = _controller_args(
+            workspace, workflow_root="wf", once=True,
+            continue_after_cancelled_preidentity="old-task",
+            continue_task=ready_task,
+        )
+        controller, _root = cli._controller_instance(args)
+        lease = controller.acquire()
+        cli._controller_credentials(args, lease)
+        controller.halt(
+            "blocked",
+            "USER_ACTION_REQUIRED: task old-task provider identity never resolved within 1800s",
+            lease=lease,
+        )
+        halted = controller._load_checkpoint()
+        halted["last_check"] = "cancelled expired preidentity launch old-launch for old-task"
+        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, halted)
+        return args, controller, lease
+
+    def _run_continuation_once(self, args):
+        def one_step(step_args, current, root, current_lease, *, operation):
+            result = current.resume([], lease=current_lease)
+            return ({
+                "operation": operation, "ok": True, "root": str(root),
+                "result": result.to_dict(),
+            }, True)
+
+        with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"}), \
+             mock.patch.object(
+                 cli, "_verify_cancelled_preidentity_continuation",
+                 return_value=args.continue_task,
+             ), \
+             mock.patch.object(cli, "_bind_current_controller_sessions"), \
+             mock.patch.object(cli, "_controller_step", side_effect=one_step):
+            return _run_controller_json(cli.controller_resume, args)
+
+    def _assert_continuation_committed(self, args, controller, ready_task):
+        state = json.loads(controller.state_path.read_text())
+        checkpoint = controller._load_checkpoint()
+        credentials = cli._read_controller_credentials(cli._resume_key_path(args))
+        lease = cli.controller_backend.Lease.from_dict(state["lease"])
+        self.assertEqual(state["epoch"], checkpoint["epoch"])
+        self.assertEqual(checkpoint["pending_continuation_task"], ready_task)
+        self.assertTrue(lease.verify_resume_proof(credentials["resume_secret"]))
+        self.assertNotIn("continuation_reattach", state)
+
     def test_invalid_ready_choice_is_rejected_before_epoch_rotation_and_can_be_corrected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -3597,6 +3672,158 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                     current_state = json.loads(controller.state_path.read_text())
                     self.assertEqual(current_state["epoch"], initial_epoch + 1)
                     self.assertEqual(controller._load_checkpoint()["pending_continuation_task"], "ready-good-task")
+
+    def test_explicit_continuation_rejects_checkpoint_override_before_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, _lease = self._continuation_fixture(base)
+                shadow_checkpoint = base / "shadow-checkpoint.json"
+                args.checkpoint_path = str(shadow_checkpoint)
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+
+                result = self._run_continuation_once(args)
+
+                self.assertFalse(result["ok"])
+                self.assertIn("canonical namespaced controller checkpoint", result["error"])
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertFalse(shadow_checkpoint.exists())
+
+    def test_explicit_continuation_retries_when_credential_write_fails_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                initial_epoch = lease.epoch
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write failed")):
+                    first = self._run_continuation_once(args)
+                self.assertEqual(first["error"], "credential write failed")
+                staged = json.loads(controller.state_path.read_text())
+                self.assertEqual(staged["epoch"], initial_epoch)
+                self.assertIn("continuation_reattach", staged)
+                self.assertEqual(controller._load_checkpoint()["epoch"], initial_epoch)
+
+                second = self._run_continuation_once(args)
+                self.assertTrue(second["ok"], second)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_staged_continuation_rejects_changed_target_and_stale_proof_without_losing_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write failed")):
+                    first = self._run_continuation_once(args)
+                self.assertEqual(first["error"], "credential write failed")
+                staged_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+
+                args.continue_task = "different-ready-task"
+                changed_target = self._run_continuation_once(args)
+                self.assertFalse(changed_target["ok"])
+                self.assertIn("exact target", changed_target["error"])
+                self.assertEqual(controller.state_path.read_bytes(), staged_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+
+                args.continue_task = "ready-task"
+                args.resume_token = "stale-proof"
+                stale_proof = self._run_continuation_once(args)
+                self.assertFalse(stale_proof["ok"])
+                self.assertIn("canonical protected credential", stale_proof["error"])
+                self.assertEqual(controller.state_path.read_bytes(), staged_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+
+                args.resume_token = ""
+                retry = self._run_continuation_once(args)
+                self.assertTrue(retry["ok"], retry)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_explicit_continuation_retries_after_credential_write_then_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                original = cli._controller_credentials
+
+                def write_then_crash(*writer_args, **writer_kwargs):
+                    original(*writer_args, **writer_kwargs)
+                    raise OSError("crash after credential write")
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_crash):
+                    first = self._run_continuation_once(args)
+                self.assertEqual(first["error"], "crash after credential write")
+                staged = json.loads(controller.state_path.read_text())
+                self.assertEqual(staged["epoch"], lease.epoch)
+                self.assertEqual(controller._load_checkpoint()["epoch"], lease.epoch)
+                self.assertNotEqual(
+                    cli._read_controller_credentials(cli._resume_key_path(args))["resume_secret"],
+                    lease.resume_secret,
+                )
+
+                second = self._run_continuation_once(args)
+                self.assertTrue(second["ok"], second)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_explicit_continuation_retries_after_lease_state_write_then_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                writer = cli.controller_backend.RootController._write_state
+                writes = 0
+
+                def write_state_then_crash(instance, state):
+                    nonlocal writes
+                    writes += 1
+                    writer(instance, state)
+                    if writes == 2:
+                        raise OSError("crash after active lease write")
+
+                with mock.patch.object(
+                    cli.controller_backend.RootController, "_write_state",
+                    new=write_state_then_crash,
+                ):
+                    first = self._run_continuation_once(args)
+                self.assertEqual(first["error"], "crash after active lease write")
+                staged = json.loads(controller.state_path.read_text())
+                self.assertEqual(staged["epoch"], lease.epoch + 1)
+                self.assertIn("continuation_reattach", staged)
+                self.assertEqual(controller._load_checkpoint()["epoch"], lease.epoch)
+
+                second = self._run_continuation_once(args)
+                self.assertTrue(second["ok"], second)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_explicit_continuation_retries_after_target_checkpoint_write_then_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                writer = cli.checkpoint_backend.write_checkpoint
+
+                def write_checkpoint_then_crash(path, document):
+                    saved = writer(path, document)
+                    if Path(path) == controller.checkpoint_path and document.get("pending_continuation_task"):
+                        raise OSError("crash after target checkpoint write")
+                    return saved
+
+                with mock.patch.object(
+                    cli.checkpoint_backend, "write_checkpoint",
+                    side_effect=write_checkpoint_then_crash,
+                ):
+                    first = self._run_continuation_once(args)
+                self.assertEqual(first["error"], "crash after target checkpoint write")
+                staged = json.loads(controller.state_path.read_text())
+                self.assertIn("continuation_reattach", staged)
+                self.assertEqual(
+                    controller._load_checkpoint()["pending_continuation_task"], "ready-task",
+                )
+
+                second = self._run_continuation_once(args)
+                self.assertTrue(second["ok"], second)
+                self._assert_continuation_committed(args, controller, "ready-task")
 
     def _exercise_retry(self, *, parallel: bool, claim_landed: bool = False) -> None:
         with tempfile.TemporaryDirectory() as temporary:
