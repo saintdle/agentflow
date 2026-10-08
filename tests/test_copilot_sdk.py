@@ -18,8 +18,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agentflow import copilot_sdk
 
 
+def _fake_runtime_pin() -> copilot_sdk.CopilotRuntimePin:
+    cache = "/private/managed-cache"
+    runtime_dir = f"{cache}/prebuilds/darwin-arm64"
+    return copilot_sdk.CopilotRuntimePin(
+        platform="darwin-arm64",
+        managed_cache_path=cache,
+        executable_path=f"{runtime_dir}/copilot-runtime",
+        executable_sha256="a" * 64,
+        payload_path=f"{runtime_dir}/runtime.node",
+        payload_sha256="b" * 64,
+    )
+
+
 class CopilotSDKOptionalTests(unittest.TestCase):
-    def test_import_is_lazy_and_release_and_build_versions_are_distinct(self) -> None:
+    def test_sdk_package_cli_release_and_protocol_pins_are_separate(self) -> None:
         with mock.patch.object(copilot_sdk.importlib.metadata, "version") as version:
             importlib.reload(copilot_sdk)
             version.assert_not_called()
@@ -30,12 +43,15 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         copilot.RuntimeConnection = object
         version_module = types.ModuleType("copilot._cli_version")
         version_module.CLI_VERSION = copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION
+        protocol_module = types.ModuleType("copilot._sdk_protocol_version")
+        protocol_module.SDK_PROTOCOL_VERSION = copilot_sdk.SUPPORTED_RUNTIME_PROTOCOL_VERSION
         rpc_module = types.ModuleType("copilot.rpc")
         rpc_module.PermissionDecisionReject = reject
         with (
             mock.patch.dict(sys.modules, {
                 "copilot": copilot,
                 "copilot._cli_version": version_module,
+                "copilot._sdk_protocol_version": protocol_module,
                 "copilot.rpc": rpc_module,
             }),
             mock.patch.object(
@@ -45,11 +61,12 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         ):
             self.assertEqual(copilot_sdk._sdk_components()[2], reject)
 
-        version_module.CLI_VERSION = copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION
+        version_module.CLI_VERSION = "1.0.93-4"
         with (
             mock.patch.dict(sys.modules, {
                 "copilot": copilot,
                 "copilot._cli_version": version_module,
+                "copilot._sdk_protocol_version": protocol_module,
                 "copilot.rpc": rpc_module,
             }),
             mock.patch.object(
@@ -65,6 +82,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             mock.patch.dict(sys.modules, {
                 "copilot": copilot,
                 "copilot._cli_version": version_module,
+                "copilot._sdk_protocol_version": protocol_module,
                 "copilot.rpc": rpc_module,
             }),
             mock.patch.object(
@@ -74,7 +92,23 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         ):
             copilot_sdk._sdk_components()
 
-    def test_installed_pinned_sdk_imports_offline_when_private_env_is_supplied(self) -> None:
+        protocol_module.SDK_PROTOCOL_VERSION = 2
+        with (
+            mock.patch.dict(sys.modules, {
+                "copilot": copilot,
+                "copilot._cli_version": version_module,
+                "copilot._sdk_protocol_version": protocol_module,
+                "copilot.rpc": rpc_module,
+            }),
+            mock.patch.object(
+                copilot_sdk.importlib.metadata, "version",
+                return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
+            ),
+            self.assertRaises(copilot_sdk.CopilotSDKError),
+        ):
+            copilot_sdk._sdk_components()
+
+    def test_installed_pinned_sdk_and_runtime_artifact_verify_offline(self) -> None:
         raw_env = os.environ.get("AGENTFLOW_COPILOT_SDK_ENV")
         if not raw_env:
             self.skipTest("set AGENTFLOW_COPILOT_SDK_ENV to an installed private SDK environment")
@@ -87,10 +121,14 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         script = (
             "import importlib.metadata; "
             "from copilot._cli_version import CLI_VERSION; "
-            "from agentflow.copilot_sdk import _sdk_components; "
+            "from copilot._sdk_protocol_version import SDK_PROTOCOL_VERSION; "
+            "from copilot import RuntimeConnection; "
+            "from agentflow.copilot_sdk import _sdk_components, _prepare_runtime_pin; "
             "client_type, _, _ = _sdk_components(); "
             "assert callable(getattr(client_type, 'get_status', None)); "
-            "print(importlib.metadata.version('github-copilot-sdk') + ':' + CLI_VERSION + ':status.get')"
+            "assert 'path' in __import__('inspect').signature(RuntimeConnection.for_stdio).parameters; "
+            "pin = _prepare_runtime_pin(); "
+            "print(importlib.metadata.version('github-copilot-sdk') + ':' + CLI_VERSION + ':' + str(SDK_PROTOCOL_VERSION) + ':' + pin.published_release + ':' + pin.published_asset)"
         )
         env = {
             "PATH": os.defpath,
@@ -106,49 +144,85 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr[-1200:])
-        self.assertEqual(result.stdout.strip(), "1.0.17:1.0.93:status.get")
+        self.assertEqual(result.stdout.strip(), "1.0.17:1.0.93:3:v1.0.93:github-copilot-1.0.93-darwin-arm64.tgz")
 
-    def test_connected_runtime_build_must_match_exact_build_pin(self) -> None:
+    def test_runtime_status_api_release_and_protocol_are_pinned_independently(self) -> None:
         class Client:
-            def __init__(self, version: str):
+            def __init__(self, version: str, protocol: int):
                 self.version = version
+                self.protocol = protocol
                 self.status_calls = 0
 
             async def get_status(self):
                 self.status_calls += 1
-                return SimpleNamespace(version=self.version)
+                return SimpleNamespace(version=self.version, protocol_version=self.protocol)
 
-        supported = Client(copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+        supported = Client(copilot_sdk.SUPPORTED_RUNTIME_API_RELEASE_VERSION, copilot_sdk.SUPPORTED_RUNTIME_PROTOCOL_VERSION)
         # Run the asynchronous status check without starting a client or runtime.
-        async def check_supported() -> str:
-            return await copilot_sdk.CopilotProofRun._verify_runtime_build(
+        async def check_supported() -> tuple[str, int]:
+            return await copilot_sdk.CopilotProofRun._verify_runtime_status(
                 supported, asyncio.get_running_loop().time() + 1
             )
 
         actual = asyncio.run(check_supported())
-        self.assertEqual(actual, copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+        self.assertEqual(actual, (
+            copilot_sdk.SUPPORTED_RUNTIME_API_RELEASE_VERSION,
+            copilot_sdk.SUPPORTED_RUNTIME_PROTOCOL_VERSION,
+        ))
         self.assertEqual(supported.status_calls, 1)
 
-        for unsupported_version in (copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION, "1.0.93-3"):
-            unsupported = Client(unsupported_version)
+        for unsupported_version, unsupported_protocol in (
+            ("1.0.93-4", 3), ("1.0.92", 3), ("1.0.93", 2), ("1.0.93", True),
+        ):
+            unsupported = Client(unsupported_version, unsupported_protocol)
 
             async def check_unsupported() -> None:
-                await copilot_sdk.CopilotProofRun._verify_runtime_build(
+                await copilot_sdk.CopilotProofRun._verify_runtime_status(
                     unsupported, asyncio.get_running_loop().time() + 1
                 )
 
-            with self.subTest(runtime_build_version=unsupported_version):
+            with self.subTest(runtime_api_release=unsupported_version, protocol=unsupported_protocol):
                 with self.assertRaises(copilot_sdk.CopilotSDKError):
                     asyncio.run(check_unsupported())
             self.assertEqual(unsupported.status_calls, 1)
+
+    def test_managed_runtime_artifact_paths_hashes_and_release_digest_are_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            cache = Path(raw) / "sdk-cache"
+            runtime_dir = cache / "prebuilds" / "darwin-arm64"
+            runtime_dir.mkdir(parents=True)
+            executable = runtime_dir / "copilot-runtime"
+            payload = runtime_dir / "runtime.node"
+            executable.write_bytes(b"verified runtime wrapper")
+            payload.write_bytes(b"verified runtime payload")
+            executable_hash = __import__("hashlib").sha256(executable.read_bytes()).hexdigest()
+            payload_hash = __import__("hashlib").sha256(payload.read_bytes()).hexdigest()
+            artifact = {
+                "published_release": "v1.0.93",
+                "published_asset": "github-copilot-1.0.93-darwin-arm64.tgz",
+                "published_asset_url": "https://github.com/github/copilot-cli/releases/download/v1.0.93/github-copilot-1.0.93-darwin-arm64.tgz",
+                "published_asset_sha256": "c" * 64,
+                "executable_sha256": executable_hash,
+                "payload_sha256": payload_hash,
+            }
+            with mock.patch.dict(copilot_sdk._SUPPORTED_RUNTIME_ARTIFACTS, {"darwin-arm64": artifact}):
+                pin = copilot_sdk._build_runtime_pin(cache, "darwin-arm64")
+                copilot_sdk._verify_runtime_pin(pin)
+                with self.assertRaises(copilot_sdk.CopilotSDKError):
+                    copilot_sdk._verify_runtime_pin(__import__("dataclasses").replace(pin, published_release="v1.0.93-4"))
+                with self.assertRaises(copilot_sdk.CopilotSDKError):
+                    copilot_sdk._verify_runtime_pin(__import__("dataclasses").replace(pin, published_asset_sha256="d" * 64))
+                payload.write_bytes(b"changed after the digest check")
+                with self.assertRaises(copilot_sdk.CopilotSDKError):
+                    copilot_sdk._verify_runtime_pin(pin)
 
     def test_proof_client_is_managed_empty_mode_and_does_not_cache_token(self) -> None:
         class RuntimeConnection:
             connection = None
 
             @staticmethod
-            def for_stdio():
-                RuntimeConnection.connection = SimpleNamespace(env=None)
+            def for_stdio(*, path=None):
+                RuntimeConnection.connection = SimpleNamespace(env=None, path=path)
                 return RuntimeConnection.connection
 
         class Client:
@@ -161,19 +235,24 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             home = parent / "private-home"
             workspace.mkdir()
             with mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)):
-                with mock.patch.dict("os.environ", {
-                    "AGENTFLOW_AUTHORITY_SECRET": "must-not-cross-runtime",
-                    "GITHUB_TOKEN": "ambient-token-must-not-cross-runtime",
-                }):
-                    client = copilot_sdk.create_proof_client(
-                        base_directory=home,
-                        workspace_root=workspace,
-                        github_token="ephemeral-test-credential",
-                    )
+                with mock.patch.object(copilot_sdk, "_prepare_runtime_pin", return_value=_fake_runtime_pin()):
+                    with mock.patch.object(copilot_sdk, "_verify_runtime_pin"):
+                        with mock.patch.dict("os.environ", {
+                            "AGENTFLOW_AUTHORITY_SECRET": "must-not-cross-runtime",
+                            "GITHUB_TOKEN": "ambient-token-must-not-cross-runtime",
+                        }):
+                            prepared = copilot_sdk.create_proof_client(
+                                base_directory=home,
+                                workspace_root=workspace,
+                                github_token="ephemeral-test-credential",
+                            )
+            client = prepared.client
             self.assertIs(client.kwargs["connection"], RuntimeConnection.connection)
+            self.assertEqual(client.kwargs["connection"].path, _fake_runtime_pin().executable_path)
             self.assertEqual(client.kwargs["connection"].env["HOME"], str(home.resolve()))
             self.assertEqual(client.kwargs["connection"].env["COPILOT_HOME"], str(home.resolve()))
             self.assertEqual(client.kwargs["connection"].env["COPILOT_PLUGIN_DIR_ONLY"], "true")
+            self.assertEqual(client.kwargs["connection"].env["PATH"], os.defpath)
             self.assertNotIn("AGENTFLOW_AUTHORITY_SECRET", client.kwargs["connection"].env)
             self.assertNotIn("GITHUB_TOKEN", client.kwargs["connection"].env)
             self.assertEqual(client.kwargs["mode"], "empty")
@@ -224,7 +303,10 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 return None
 
             async def get_status(self):
-                return SimpleNamespace(version=copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+                return SimpleNamespace(
+                    version=copilot_sdk.SUPPORTED_RUNTIME_API_RELEASE_VERSION,
+                    protocol_version=copilot_sdk.SUPPORTED_RUNTIME_PROTOCOL_VERSION,
+                )
 
             async def create_session(self, **kwargs):
                 self.session_config = kwargs
@@ -244,9 +326,16 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             run_nonce="distinct-run-nonce-for-proof-test",
         )
         client = Client()
+        pin = _fake_runtime_pin()
 
         async def exercise() -> copilot_sdk.CopilotUsageReport:
-            with mock.patch.object(copilot_sdk, "create_proof_client", return_value=client):
+            with (
+                mock.patch.object(
+                    copilot_sdk, "create_proof_client",
+                    return_value=copilot_sdk._PreparedProofClient(client, pin),
+                ),
+                mock.patch.object(copilot_sdk, "_verify_runtime_pin"),
+            ):
                 run = await copilot_sdk.CopilotProofRun.open(
                     identity=identity,
                     evidence_key=evidence_key,
@@ -290,19 +379,21 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             workspace = parent / "checkout"
             workspace.mkdir()
             with mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)):
-                with self.assertRaises(copilot_sdk.CopilotSDKError):
-                    copilot_sdk.create_proof_client(
-                        base_directory=workspace / ".copilot",
-                        workspace_root=workspace,
-                        github_token="ephemeral-test-credential",
-                    )
-                with mock.patch.dict("os.environ", {"COPILOT_CLI_PATH": "/tmp/unpinned-copilot"}):
-                    with self.assertRaises(copilot_sdk.CopilotSDKError):
-                        copilot_sdk.create_proof_client(
-                            base_directory=parent / "private-home",
-                            workspace_root=workspace,
-                            github_token="ephemeral-test-credential",
-                        )
+                with mock.patch.object(copilot_sdk, "_prepare_runtime_pin", return_value=_fake_runtime_pin()):
+                    with mock.patch.object(copilot_sdk, "_verify_runtime_pin"):
+                        with self.assertRaises(copilot_sdk.CopilotSDKError):
+                            copilot_sdk.create_proof_client(
+                                base_directory=workspace / ".copilot",
+                                workspace_root=workspace,
+                                github_token="ephemeral-test-credential",
+                            )
+                    with mock.patch.dict("os.environ", {"COPILOT_CLI_PATH": "/tmp/unpinned-copilot"}):
+                        with self.assertRaises(copilot_sdk.CopilotSDKError):
+                            copilot_sdk.create_proof_client(
+                                base_directory=parent / "private-home",
+                                workspace_root=workspace,
+                                github_token="ephemeral-test-credential",
+                            )
 
 
 class CopilotUsageCollectorTests(unittest.TestCase):
@@ -319,7 +410,9 @@ class CopilotUsageCollectorTests(unittest.TestCase):
             self._identity(),
             run_nonce="one-run-nonce-for-unit-tests",
         )
-        return copilot_sdk.CopilotUsageCollector(self._identity(), evidence_key=evidence_key)
+        return copilot_sdk.CopilotUsageCollector(
+            self._identity(), evidence_key=evidence_key, runtime_pin=_fake_runtime_pin(),
+        )
 
     def _attach_and_begin(self, collector: copilot_sdk.CopilotUsageCollector) -> None:
         class Session:
@@ -328,7 +421,13 @@ class CopilotUsageCollectorTests(unittest.TestCase):
             def on(self, _handler):
                 return lambda: None
 
-        collector.attach(Session(), runtime_build_version=copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION)
+        with mock.patch.object(copilot_sdk, "_verify_runtime_pin"):
+            collector.record_runtime_pin()
+        collector.record_runtime_status(
+            copilot_sdk.SUPPORTED_RUNTIME_API_RELEASE_VERSION,
+            copilot_sdk.SUPPORTED_RUNTIME_PROTOCOL_VERSION,
+        )
+        collector.attach(Session())
         collector.record_tool_inventory([])
         collector.begin_request()
 
@@ -368,16 +467,18 @@ class CopilotUsageCollectorTests(unittest.TestCase):
         self.assertEqual(report.calls[0]["actual_model"], "claude-sonnet-4.6")
         self.assertEqual(report.calls[0]["requested_model"], "claude-sonnet-4.6")
         self.assertEqual(report.calls[0]["call_sequence"], 1)
-        self.assertEqual(report.ledger[0]["identity"]["launch_id"], "launch-1")
-        self.assertEqual(report.ledger[0]["session_scope"], report.session_scope)
+        self.assertEqual(report.ledger[0]["kind"], "runtime_pin")
+        self.assertEqual(report.ledger[1]["kind"], "runtime_status")
+        self.assertEqual(report.ledger[1]["runtime_api_release_version"], "1.0.93")
+        self.assertEqual(report.ledger[1]["runtime_protocol_version"], 3)
+        self.assertEqual(report.ledger[2]["identity"]["launch_id"], "launch-1")
+        self.assertEqual(report.ledger[2]["session_scope"], report.session_scope)
         self.assertEqual(
             report.ledger[0]["sdk_cli_release_version"],
             copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION,
         )
-        self.assertEqual(
-            report.ledger[0]["runtime_build_version"],
-            copilot_sdk.SUPPORTED_RUNTIME_BUILD_VERSION,
-        )
+        self.assertEqual(report.ledger[0]["runtime_artifact_release"], "v1.0.93")
+        self.assertIn("published_runtime_asset_sha256", report.ledger[0])
         encoded = json.dumps(report.to_dict())
         self.assertNotIn("private-session-id", encoded)
         self.assertNotIn("call-1", encoded)

@@ -3,11 +3,16 @@
 Agentflow includes an optional, import-lazy observer for the GitHub Copilot SDK.
 Install it with `pip install 'saintdle-agentflow[copilot]'`. The SDK wheel
 requires Python 3.11 or later. This prototype accepts only SDK `1.0.17`, whose
-declared CLI release is `1.0.93`, and a connected executable whose runtime
-status reports build `1.0.93-4`. It checks the declared release during import
-and checks the actual build after connection, before creating a session. The
-SDK release pin and executable build pin are distinct fields and are checked
-against their respective sources.
+declared CLI release is `1.0.93`. It resolves the exact SDK-managed
+`darwin-arm64` runtime bundle published as
+`github-copilot-1.0.93-darwin-arm64.tgz` and pins its GitHub release digest,
+canonical wrapper and payload paths, and extracted file hashes before launch.
+The bundle SHA-256 is `d3a64c4f9387efeee9de96fa85aef4362ca33c13ef8908793219ce34d9827335`,
+from the [published Copilot CLI release](https://github.com/github/copilot-cli/releases/tag/v1.0.93).
+The connected status API separately must report release `1.0.93` and protocol
+`3` before the code creates a session. The status API release is not treated as
+the executable's internal console build string; the trusted pin is the exact
+published SDK-resolved artifact identity.
 
 The observer reads `assistant.usage` directly from the session event callback.
 Copilot documents this event as one record per model API call, including
@@ -76,8 +81,9 @@ Persist the signed report only in controller-owned protected state.
 
 The returned chain binds the supplied root/task/claim/lease-continuity/launch
 identity, the hashed SDK session ID, each observed call and model, the SDK
-package and declared CLI release, and the runtime build reported by the live
-connection. It is a local observation from the pinned Copilot runtime,
+package and declared CLI release, the published runtime bundle digest and
+local artifact paths/hashes, plus the connected status API release and
+protocol. It is a local observation from the pinned Copilot runtime,
 not provider-signed evidence. The current prototype keeps its chain in memory;
 it does not anchor a persisted head across controller restarts or authenticate
 the supplied launch identity itself. Test fixtures can exercise rejection

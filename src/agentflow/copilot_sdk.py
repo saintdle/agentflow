@@ -23,7 +23,9 @@ from typing import Any, Mapping
 
 SUPPORTED_SDK_VERSION = "1.0.17"
 SUPPORTED_CLI_RELEASE_VERSION = "1.0.93"
-SUPPORTED_RUNTIME_BUILD_VERSION = "1.0.93-4"
+SUPPORTED_RUNTIME_API_RELEASE_VERSION = "1.0.93"
+SUPPORTED_RUNTIME_PROTOCOL_VERSION = 3
+SUPPORTED_RUNTIME_ARTIFACT_RELEASE = "v1.0.93"
 MAX_PROOF_SECONDS = 180
 COPILOT_NEGATIVE_CONTROL_PROMPT = (
     "Attempt these three benign checks using any available tools: run `printf "
@@ -41,6 +43,19 @@ _RUNTIME_OVERRIDES = (
     "COPILOT_SKIP_CLI_DOWNLOAD",
     "COPILOT_SDK_DEFAULT_CONNECTION",
 )
+# This local artifact manifest is deliberately narrow. It binds the SDK-managed
+# macOS arm64 wrapper and payload to the exact published archive digest. Unknown
+# platforms or changed cache contents fail closed until pinned independently.
+_SUPPORTED_RUNTIME_ARTIFACTS = {
+    "darwin-arm64": {
+        "published_release": SUPPORTED_RUNTIME_ARTIFACT_RELEASE,
+        "published_asset": "github-copilot-1.0.93-darwin-arm64.tgz",
+        "published_asset_url": "https://github.com/github/copilot-cli/releases/download/v1.0.93/github-copilot-1.0.93-darwin-arm64.tgz",
+        "published_asset_sha256": "d3a64c4f9387efeee9de96fa85aef4362ca33c13ef8908793219ce34d9827335",
+        "executable_sha256": "46905309fc5eb6b140d425401c9422614c18b6ba1240e4e516b7619a18b364e4",
+        "payload_sha256": "9e1248dd5e71079310706b139f076851bd924a9a7d93a703d5546eac48ddbb03",
+    },
+}
 
 
 class CopilotSDKError(RuntimeError):
@@ -106,6 +121,47 @@ class CopilotUsageReport:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class CopilotRuntimePin:
+    """Exact SDK-managed runtime artifacts and their separate version identities."""
+
+    platform: str
+    managed_cache_path: str
+    executable_path: str
+    executable_sha256: str
+    payload_path: str
+    payload_sha256: str
+    published_release: str = SUPPORTED_RUNTIME_ARTIFACT_RELEASE
+    published_asset: str = "github-copilot-1.0.93-darwin-arm64.tgz"
+    published_asset_url: str = "https://github.com/github/copilot-cli/releases/download/v1.0.93/github-copilot-1.0.93-darwin-arm64.tgz"
+    published_asset_sha256: str = "d3a64c4f9387efeee9de96fa85aef4362ca33c13ef8908793219ce34d9827335"
+    sdk_version: str = SUPPORTED_SDK_VERSION
+    sdk_cli_release_version: str = SUPPORTED_CLI_RELEASE_VERSION
+
+    def ledger_fields(self) -> dict[str, Any]:
+        return {
+            "sdk_version": self.sdk_version,
+            "sdk_cli_release_version": self.sdk_cli_release_version,
+            "runtime_expected_api_release_version": SUPPORTED_RUNTIME_API_RELEASE_VERSION,
+            "runtime_expected_protocol_version": SUPPORTED_RUNTIME_PROTOCOL_VERSION,
+            "runtime_artifact_release": self.published_release,
+            "published_runtime_asset": self.published_asset,
+            "published_runtime_asset_sha256": self.published_asset_sha256,
+            "runtime_platform": self.platform,
+            "managed_cache_scope": _scope("runtime-cache-path", self.managed_cache_path),
+            "runtime_executable_path_scope": _scope("runtime-executable-path", self.executable_path),
+            "runtime_executable_sha256": self.executable_sha256,
+            "runtime_payload_path_scope": _scope("runtime-payload-path", self.payload_path),
+            "runtime_payload_sha256": self.payload_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedProofClient:
+    client: Any
+    runtime_pin: CopilotRuntimePin
+
+
 def _canonical(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
@@ -147,15 +203,91 @@ def _sdk_components() -> tuple[Any, Any, Any]:
     try:
         from copilot import CopilotClient, RuntimeConnection
         from copilot._cli_version import CLI_VERSION
+        from copilot._sdk_protocol_version import SDK_PROTOCOL_VERSION
         from copilot.rpc import PermissionDecisionReject
         sdk_version = importlib.metadata.version("github-copilot-sdk")
     except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
         raise CopilotSDKError(
             "Copilot SDK unavailable; install the pinned agentflow[copilot] extra"
         ) from exc
-    if sdk_version != SUPPORTED_SDK_VERSION or CLI_VERSION != SUPPORTED_CLI_RELEASE_VERSION:
+    if (
+        sdk_version != SUPPORTED_SDK_VERSION
+        or CLI_VERSION != SUPPORTED_CLI_RELEASE_VERSION
+        or SDK_PROTOCOL_VERSION != SUPPORTED_RUNTIME_PROTOCOL_VERSION
+    ):
         raise CopilotSDKError("installed Copilot SDK or declared CLI release is unsupported")
     return (CopilotClient, RuntimeConnection, PermissionDecisionReject)
+
+
+def _build_runtime_pin(cache_path: Path, platform: str) -> CopilotRuntimePin:
+    """Resolve only the exact locally managed runtime artifact pinned above."""
+    artifact = _SUPPORTED_RUNTIME_ARTIFACTS.get(platform)
+    if artifact is None:
+        raise CopilotSDKError("Copilot runtime platform has no exact artifact pin")
+    try:
+        cache = Path(cache_path).resolve(strict=True)
+        runtime_directory = cache / "prebuilds" / platform
+        executable = runtime_directory / "copilot-runtime"
+        payload = runtime_directory / "runtime.node"
+        for candidate in (executable, payload):
+            info = candidate.lstat()
+            if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+                raise CopilotSDKError("SDK-managed Copilot runtime artifact is not a regular file")
+            if candidate.resolve(strict=True) != candidate:
+                raise CopilotSDKError("SDK-managed Copilot runtime artifact path is not canonical")
+        executable_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+        payload_hash = hashlib.sha256(payload.read_bytes()).hexdigest()
+        if (
+            executable_hash != artifact["executable_sha256"]
+            or payload_hash != artifact["payload_sha256"]
+        ):
+            raise CopilotSDKError("SDK-managed Copilot runtime artifact hash is unsupported")
+        return CopilotRuntimePin(
+            platform=platform,
+            managed_cache_path=str(cache),
+            executable_path=str(executable),
+            executable_sha256=executable_hash,
+            payload_path=str(payload),
+            payload_sha256=payload_hash,
+            published_release=artifact["published_release"],
+            published_asset=artifact["published_asset"],
+            published_asset_url=artifact["published_asset_url"],
+            published_asset_sha256=artifact["published_asset_sha256"],
+        )
+    except CopilotSDKError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CopilotSDKError("pinned SDK-managed Copilot runtime is unavailable") from exc
+
+
+def _prepare_runtime_pin() -> CopilotRuntimePin:
+    try:
+        from copilot._cli_download import get_cache_dir, get_runtime_platform
+    except ImportError as exc:
+        raise CopilotSDKError("pinned Copilot SDK runtime resolver is unavailable") from exc
+    return _build_runtime_pin(
+        Path(get_cache_dir(SUPPORTED_CLI_RELEASE_VERSION)), get_runtime_platform(),
+    )
+
+
+def _verify_runtime_pin(pin: CopilotRuntimePin) -> None:
+    """Recheck the exact artifact bytes immediately before spawning the SDK child."""
+    artifact = _SUPPORTED_RUNTIME_ARTIFACTS.get(pin.platform)
+    if artifact is None:
+        raise CopilotSDKError("Copilot runtime platform has no exact artifact pin")
+    if (
+        pin.sdk_version != SUPPORTED_SDK_VERSION
+        or pin.sdk_cli_release_version != SUPPORTED_CLI_RELEASE_VERSION
+        or pin.published_release != artifact["published_release"]
+        or pin.published_asset != artifact["published_asset"]
+        or pin.published_asset_url != artifact["published_asset_url"]
+        or pin.published_asset_sha256 != artifact["published_asset_sha256"]
+        or Path(pin.managed_cache_path).resolve(strict=True) != Path(pin.managed_cache_path)
+    ):
+        raise CopilotSDKError("Copilot runtime pin metadata is unsupported")
+    rebuilt = _build_runtime_pin(Path(pin.managed_cache_path), pin.platform)
+    if rebuilt != pin:
+        raise CopilotSDKError("Copilot runtime artifact changed after pinning")
 
 
 def _private_empty_directory(path: Path, workspace_root: Path) -> Path:
@@ -189,7 +321,7 @@ def _private_runtime_environment(private_home: Path) -> dict[str, str]:
         "TMPDIR": str(private_home),
         "TEMP": str(private_home),
         "TMP": str(private_home),
-        "PATH": os.environ.get("PATH") or os.defpath,
+        "PATH": os.defpath,
         "COPILOT_PLUGIN_DIR_ONLY": "true",
     }
     if os.name == "nt":
@@ -209,7 +341,7 @@ def _remaining(deadline: float) -> float:
 
 def create_proof_client(
     *, base_directory: Path, workspace_root: Path, github_token: str,
-) -> Any:
+) -> _PreparedProofClient:
     """Create a managed, pinned SDK client with no ambient tools or plugins.
 
     The caller obtains ``github_token`` from an already-authorized source and
@@ -222,13 +354,15 @@ def create_proof_client(
     if configured:
         raise CopilotSDKError("Copilot proof cannot use a runtime override")
     client_type, connection_type, _reject = _sdk_components()
+    runtime_pin = _prepare_runtime_pin()
+    _verify_runtime_pin(runtime_pin)
     private_home = _private_empty_directory(Path(base_directory), Path(workspace_root))
     try:
-        connection = connection_type.for_stdio()
+        connection = connection_type.for_stdio(path=runtime_pin.executable_path)
         if not hasattr(connection, "env"):
             raise CopilotSDKError("pinned Copilot stdio connection cannot isolate its environment")
         connection.env = _private_runtime_environment(private_home)
-        return client_type(
+        client = client_type(
             connection=connection,
             mode="empty",
             base_directory=str(private_home),
@@ -238,6 +372,7 @@ def create_proof_client(
             enable_remote_sessions=False,
             builtin_plugin_directories=[],
         )
+        return _PreparedProofClient(client=client, runtime_pin=runtime_pin)
     except CopilotSDKError:
         raise
     except Exception as exc:
@@ -247,17 +382,28 @@ def create_proof_client(
 class CopilotUsageCollector:
     """Capture only pinned-runtime usage events and sign a per-run memory chain."""
 
-    def __init__(self, identity: CopilotLaunchIdentity, *, evidence_key: bytes) -> None:
+    def __init__(
+        self,
+        identity: CopilotLaunchIdentity,
+        *,
+        evidence_key: bytes,
+        runtime_pin: CopilotRuntimePin,
+    ) -> None:
         if not isinstance(evidence_key, bytes) or len(evidence_key) < 32:
             raise CopilotSDKError("collector evidence key is unavailable")
         self.identity = identity
+        self._runtime_pin = runtime_pin
         self._key_seed = evidence_key
+        self._launch_key = evidence_key
         self._key = b""
         self._rows: list[dict[str, Any]] = []
         self._calls: list[dict[str, Any]] = []
         self._reason_codes: list[str] = []
         self._denied_permissions = 0
-        self._runtime_build_version = ""
+        self._runtime_api_release_version = ""
+        self._runtime_protocol_version: int | None = None
+        self._runtime_pin_recorded = False
+        self._runtime_status_recorded = False
         self._session_scope = ""
         self._event_refs: set[str] = set()
         self._call_refs: set[str] = set()
@@ -276,16 +422,51 @@ class CopilotUsageCollector:
         body["sequence"] = len(self._rows)
         body["previous_signature"] = previous
         signature = hmac.new(
-            self._key, _LEDGER_DOMAIN + previous.encode("ascii") + b"\0" + _canonical(body), hashlib.sha256,
+            self._key or self._launch_key,
+            _LEDGER_DOMAIN + previous.encode("ascii") + b"\0" + _canonical(body),
+            hashlib.sha256,
         ).hexdigest()
         body["signature"] = signature
         self._rows.append(body)
 
-    def attach(self, session: Any, *, runtime_build_version: str) -> None:
+    def record_runtime_pin(self) -> None:
+        """Seal the selected runtime files before spawning or creating a session."""
+        if self._runtime_pin_recorded or self._attached or self._finalized:
+            self._fail("runtime_pin_recorded_late_or_twice")
+            raise CopilotSDKError("Copilot runtime pin must be sealed before startup")
+        _verify_runtime_pin(self._runtime_pin)
+        self._append({"kind": "runtime_pin", **self._runtime_pin.ledger_fields()})
+        self._runtime_pin_recorded = True
+
+    def record_runtime_status(self, api_release_version: Any, protocol_version: Any) -> None:
+        """Seal and validate the status API identity before any session exists."""
+        if not self._runtime_pin_recorded or self._runtime_status_recorded or self._attached:
+            self._fail("runtime_status_recorded_late_or_twice")
+            raise CopilotSDKError("Copilot runtime status must be checked before session creation")
+        version = api_release_version if isinstance(api_release_version, str) else ""
+        protocol = protocol_version if isinstance(protocol_version, int) and not isinstance(protocol_version, bool) else None
+        matches = (
+            version == SUPPORTED_RUNTIME_API_RELEASE_VERSION
+            and protocol == SUPPORTED_RUNTIME_PROTOCOL_VERSION
+        )
+        self._append({
+            "kind": "runtime_status",
+            "runtime_api_release_version": version,
+            "runtime_protocol_version": protocol,
+            "runtime_status_matches_pin": matches,
+        })
+        self._runtime_status_recorded = True
+        self._runtime_api_release_version = version
+        self._runtime_protocol_version = protocol
+        if not matches:
+            self._fail("runtime_status_mismatch")
+            raise CopilotSDKError("connected Copilot runtime status is unsupported")
+
+    def attach(self, session: Any) -> None:
         """Attach once to a fresh session, before any request is sent."""
-        if runtime_build_version != SUPPORTED_RUNTIME_BUILD_VERSION:
-            self._fail("runtime_build_mismatch")
-            raise CopilotSDKError("Copilot runtime build is unsupported")
+        if not self._runtime_pin_recorded or not self._runtime_status_recorded:
+            self._fail("runtime_identity_not_sealed_before_session")
+            raise CopilotSDKError("Copilot runtime identity must be sealed before session creation")
         if self._attached or self._request_started or self._finalized:
             self._fail("late_or_duplicate_attachment")
             raise CopilotSDKError("Copilot usage listener must attach once before the first request")
@@ -295,7 +476,6 @@ class CopilotUsageCollector:
             self._fail("session_identity_missing")
             raise CopilotSDKError("Copilot SDK session identity or event stream is unavailable")
         self._session_scope = _scope("session", session_id)
-        self._runtime_build_version = runtime_build_version
         self._key = hmac.new(
             self._key_seed,
             _LEDGER_DOMAIN + b"session\0" + self._session_scope.encode("ascii"),
@@ -312,9 +492,9 @@ class CopilotUsageCollector:
             "kind": "launch",
             "identity": self.identity.to_dict(),
             "session_scope": self._session_scope,
-            "sdk_version": SUPPORTED_SDK_VERSION,
-            "sdk_cli_release_version": SUPPORTED_CLI_RELEASE_VERSION,
-            "runtime_build_version": self._runtime_build_version,
+            **self._runtime_pin.ledger_fields(),
+            "runtime_api_release_version": self._runtime_api_release_version,
+            "runtime_protocol_version": self._runtime_protocol_version,
             "observer": "copilot-sdk-session.on",
         })
         for request_type in self._pending_denials:
@@ -492,7 +672,7 @@ class CopilotUsageCollector:
             if row.get("sequence") != sequence or row.get("previous_signature") != previous:
                 return False
             expected = hmac.new(
-                self._key,
+                self._launch_key if row.get("kind") in {"runtime_pin", "runtime_status"} else self._key,
                 _LEDGER_DOMAIN + previous.encode("ascii") + b"\0" + _canonical(row),
                 hashlib.sha256,
             ).hexdigest()
@@ -525,16 +705,22 @@ class CopilotProofRun:
     ) -> "CopilotProofRun":
         """Start a fresh managed session and attach before any model request."""
         deadline = time.monotonic() + MAX_PROOF_SECONDS
-        client = create_proof_client(
+        prepared = create_proof_client(
             base_directory=base_directory,
             workspace_root=workspace_root,
             github_token=github_token,
         )
-        collector = CopilotUsageCollector(identity, evidence_key=evidence_key)
+        client = prepared.client
+        collector = CopilotUsageCollector(
+            identity, evidence_key=evidence_key, runtime_pin=prepared.runtime_pin,
+        )
         session = None
         try:
+            collector.record_runtime_pin()
+            _verify_runtime_pin(prepared.runtime_pin)
             await asyncio.wait_for(client.start(), timeout=_remaining(deadline))
-            runtime_build_version = await cls._verify_runtime_build(client, deadline)
+            api_release_version, protocol_version = await cls._verify_runtime_status(client, deadline)
+            collector.record_runtime_status(api_release_version, protocol_version)
             session = await asyncio.wait_for(
                 client.create_session(
                     model=identity.requested_model,
@@ -557,7 +743,7 @@ class CopilotProofRun:
                 ),
                 timeout=_remaining(deadline),
             )
-            collector.attach(session, runtime_build_version=runtime_build_version)
+            collector.attach(session)
             await cls._verify_empty_tools(session, collector, deadline)
             return cls(client, session, collector, deadline)
         except CopilotSDKError:
@@ -568,21 +754,26 @@ class CopilotProofRun:
             raise CopilotSDKError("pinned Copilot proof session could not be opened") from exc
 
     @staticmethod
-    async def _verify_runtime_build(client: Any, deadline: float) -> str:
-        """Check the connected executable build separately from its SDK release pin."""
+    async def _verify_runtime_status(client: Any, deadline: float) -> tuple[str, int]:
+        """Check API release/protocol; build identity comes from the verified artifact pin."""
         get_status = getattr(client, "get_status", None)
         if not callable(get_status):
-            raise CopilotSDKError("Copilot runtime build status is unavailable")
+            raise CopilotSDKError("Copilot runtime status is unavailable")
         try:
             status = await asyncio.wait_for(get_status(), timeout=_remaining(deadline))
         except CopilotSDKError:
             raise
         except Exception as exc:
-            raise CopilotSDKError("Copilot runtime build status could not be verified") from exc
-        runtime_build_version = _field(status, "version")
-        if runtime_build_version != SUPPORTED_RUNTIME_BUILD_VERSION:
-            raise CopilotSDKError("connected Copilot runtime build is unsupported")
-        return runtime_build_version
+            raise CopilotSDKError("Copilot runtime status could not be verified") from exc
+        api_release = _field(status, "version")
+        protocol = _field(status, "protocol_version")
+        if (
+            api_release != SUPPORTED_RUNTIME_API_RELEASE_VERSION
+            or protocol != SUPPORTED_RUNTIME_PROTOCOL_VERSION
+            or isinstance(protocol, bool)
+        ):
+            raise CopilotSDKError("connected Copilot runtime API release or protocol is unsupported")
+        return api_release, protocol
 
     @staticmethod
     async def _verify_empty_tools(session: Any, collector: CopilotUsageCollector, deadline: float) -> None:
@@ -648,8 +839,9 @@ class CopilotProofRun:
 
 __all__ = [
     "COPILOT_NEGATIVE_CONTROL_PROMPT", "CopilotLaunchIdentity", "CopilotProofRun", "CopilotSDKError",
-    "CopilotUsageCollector", "CopilotUsageReport", "MAX_PROOF_SECONDS",
-    "SUPPORTED_CLI_RELEASE_VERSION", "SUPPORTED_RUNTIME_BUILD_VERSION",
+    "CopilotRuntimePin", "CopilotUsageCollector", "CopilotUsageReport", "MAX_PROOF_SECONDS",
+    "SUPPORTED_CLI_RELEASE_VERSION", "SUPPORTED_RUNTIME_API_RELEASE_VERSION",
+    "SUPPORTED_RUNTIME_ARTIFACT_RELEASE", "SUPPORTED_RUNTIME_PROTOCOL_VERSION",
     "SUPPORTED_SDK_VERSION", "create_proof_client",
     "derive_evidence_key",
 ]
