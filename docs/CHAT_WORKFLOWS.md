@@ -98,6 +98,45 @@ to an owner and evidence row; explicitly disposition anything rejected,
 superseded, already fixed, or requiring hosted validation.
 ```
 
+To keep individual feedback obligations with their Beads task, first turn the
+source into short, distilled items and import them as pending:
+
+```sh
+agentflow feedback intake --bead <task-id> --source "design review" \
+  --source-ref "review document, section 3" --input feedback.json --cwd .
+agentflow feedback report --bead <task-id> --cwd .
+```
+
+The JSON input is an array of objects or an object with an `items` array. Each
+item can contain `text`, an optional validated `key`, a `source_ref`, and
+workspace-relative `artifacts`. Use concise feedback statements rather than
+provider transcripts or raw logs. Imported status, approval, acceptance, and
+disposition fields are ignored; every item starts pending. IDs are stable for
+the same source and text, or use the explicit key when the source supplies one.
+
+The controller records a disposition explicitly. Accepted items must link to an
+acceptance row on that task Bead, and the acceptance row records the feedback
+ID. Rejections need a reason. Deferred items remain unresolved; duplicates and
+superseded items stay linked to their canonical item or replacement. Mark an
+accepted item `fixed` only after its linked acceptance row is passed with actual
+evidence:
+
+```sh
+agentflow feedback disposition --bead <task-id> --id <feedback-id> \
+  --status accepted --by <controller> --acceptance-id <row-id> --cwd .
+agentflow feedback disposition --bead <task-id> --id <feedback-id> \
+  --status fixed --by <controller> --cwd .
+agentflow feedback report --bead <task-id> --json --cwd .
+```
+
+The report checks that the linked row and its evidence have not changed since
+verification and that tracked artifacts still match their recorded hashes. It
+returns a failing exit code while any obligation is unresolved or its proof is
+stale. Use a workspace-relative file path for local `actual_evidence` so the
+report can confirm and hash the linked result. Review findings can continue to
+use `agentflow review record`; feedback intake does not create a second
+approval path for those findings.
+
 ## 3. Approve and run one persistent controller
 
 After reviewing the proposed graph, send the approval in the same planning chat

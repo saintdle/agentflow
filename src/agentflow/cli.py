@@ -38,6 +38,7 @@ from agentflow import context_delivery as context_delivery_backend
 from agentflow import codex_app_server as codex_app_server_backend
 from agentflow import execution as execution_backend
 from agentflow import execution_limits as execution_limits_backend
+from agentflow import feedback as feedback_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
@@ -7307,6 +7308,167 @@ def acceptance_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _safe_feedback_text(value: Any, field: str, *, required: bool = True) -> str:
+    text = str(value or "")
+    if required and not text.strip():
+        raise ValueError(f"feedback {field} is required")
+    if len(text.encode("utf-8")) > 8_000 or any(
+        ord(char) < 32 and char not in "\n\r\t" for char in text
+    ):
+        raise ValueError(f"feedback {field} is malformed or too large")
+    if _rejects_secret(text):
+        raise ValueError(f"feedback {field} contains secret-like content")
+    return text
+
+
+def _load_feedback_target(args: argparse.Namespace):
+    cwd = _task_cwd(args)
+    bead_id = str(getattr(args, "bead", "") or "")
+    if not bead_id:
+        raise feedback_backend.FeedbackError("--bead is required")
+    issue = beads_backend.get_issue(cwd, bead_id)
+    task_id = str(issue.get("id") or "")
+    if not task_id or task_id != bead_id:
+        raise feedback_backend.FeedbackError("feedback target did not resolve to the requested task Bead")
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    stored = agentflow.get("feedback") if isinstance(agentflow, Mapping) else None
+    if stored is None:
+        ledger = feedback_backend.empty_ledger(task_id)
+    else:
+        errors = feedback_backend.validate_ledger(stored, task_id=task_id)
+        if errors:
+            raise feedback_backend.FeedbackError("; ".join(errors))
+        ledger = dict(stored)
+    acceptance = agentflow.get("acceptance") if isinstance(agentflow, Mapping) else None
+    return cwd, bead_id, task_id, ledger, acceptance
+
+
+def feedback_intake(args: argparse.Namespace) -> int:
+    try:
+        cwd, bead_id, task_id, ledger, _ = _load_feedback_target(args)
+        source = _safe_feedback_text(args.source, "source")
+        source_ref = _safe_feedback_text(getattr(args, "source_ref", ""), "source reference", required=False)
+        artifacts = list(getattr(args, "artifact", []) or [])
+        if getattr(args, "input", ""):
+            if getattr(args, "key", ""):
+                raise feedback_backend.FeedbackError("--key applies to a single --text item; put keys on JSON input items")
+            input_path = Path(args.input).expanduser().resolve(strict=True)
+            if not input_path.is_file():
+                raise feedback_backend.FeedbackError("feedback input must be a regular JSON file")
+            input_text = input_path.read_text(encoding="utf-8")
+            if len(input_text.encode("utf-8")) > 1_000_000:
+                raise feedback_backend.FeedbackError("feedback input exceeds 1 MB")
+            try:
+                payload = json.loads(input_text)
+            except json.JSONDecodeError as exc:
+                raise feedback_backend.FeedbackError(f"feedback input is not valid JSON: {exc}") from exc
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
+                raise feedback_backend.FeedbackError("feedback input must contain an items list")
+            for index, row in enumerate(rows, 1):
+                if not isinstance(row, Mapping):
+                    raise feedback_backend.FeedbackError(f"feedback input item {index} must be an object")
+                _safe_feedback_text(row.get("text"), f"item {index} text")
+                if "source_ref" in row:
+                    _safe_feedback_text(row.get("source_ref"), f"item {index} source reference", required=False)
+        else:
+            text_value = _safe_feedback_text(getattr(args, "text", ""), "text")
+            payload = [{
+                "text": text_value,
+                "key": str(getattr(args, "key", "") or ""),
+                "source_ref": source_ref,
+                "artifacts": artifacts,
+            }]
+        updated, item_ids, added = feedback_backend.import_items(
+            payload,
+            ledger,
+            task_id=task_id,
+            root=cwd,
+            source=source,
+            source_ref=source_ref,
+            artifacts=artifacts,
+            timestamp=_now(),
+        )
+        beads_backend.update_agentflow_metadata(cwd, bead_id, {"feedback": updated})
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot record feedback: {exc}", file=sys.stderr)
+        return 2
+    print(f"RECORDED {added} new feedback item(s) on bead:{bead_id}: {', '.join(item_ids)}")
+    print("All imported items remain pending controller disposition.")
+    return 0
+
+
+def feedback_disposition(args: argparse.Namespace) -> int:
+    try:
+        cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
+        note = _safe_feedback_text(getattr(args, "note", ""), "disposition reason", required=False)
+        by = _safe_feedback_text(args.by, "disposition author")
+        acceptance_id = str(getattr(args, "acceptance_id", "") or "")
+        if args.status == "accepted" and isinstance(acceptance, Mapping):
+            errors = _validate_acceptance_data(dict(acceptance))
+            if errors:
+                raise feedback_backend.FeedbackError("acceptance matrix is invalid: " + "; ".join(errors))
+        updated, updated_acceptance = feedback_backend.disposition_item(
+            ledger,
+            task_id=task_id,
+            item_id=args.id,
+            status=args.status,
+            by=by,
+            note=note,
+            acceptance=acceptance if isinstance(acceptance, Mapping) else None,
+            acceptance_id=acceptance_id,
+            related_id=str(getattr(args, "related", "") or ""),
+            root=cwd,
+            timestamp=_now(),
+        )
+        updates: dict[str, Any] = {"feedback": updated}
+        if updated_acceptance is not None:
+            updates["acceptance"] = updated_acceptance
+        beads_backend.update_agentflow_metadata(cwd, bead_id, updates)
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot disposition feedback: {exc}", file=sys.stderr)
+        return 2
+    print(f"DISPOSITIONED bead:{bead_id} {args.id}={args.status}")
+    return 0
+
+
+def feedback_report(args: argparse.Namespace) -> int:
+    try:
+        cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
+        result = feedback_backend.report(
+            ledger,
+            task_id=task_id,
+            root=cwd,
+            acceptance=acceptance,
+        )
+        matrix_errors = (
+            _validate_acceptance_data(dict(acceptance))
+            if isinstance(acceptance, Mapping)
+            else []
+        )
+        if matrix_errors:
+            result["errors"] = [*result["errors"], *[f"acceptance matrix: {error}" for error in matrix_errors]]
+            result["ok"] = False
+            result["unresolved_count"] = max(1, int(result["unresolved_count"]))
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot report feedback: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        state = "CLEAR" if result["ok"] else "UNRESOLVED"
+        print(f"{state} bead:{bead_id}: {result['unresolved_count']} unresolved feedback item(s)")
+        for item in result["items"]:
+            text_value = json.dumps(item["text"], ensure_ascii=False)
+            print(f"{item['id']} [{item['status']}] {item['state']}: {text_value}")
+            for reason in item["reasons"]:
+                print(f"  - {reason}")
+        for error in result["errors"]:
+            print(f"ERROR {error}")
+    return 0 if result["ok"] else 1
+
+
 def usage_record(args: argparse.Namespace) -> int:
     remaining_after = getattr(args, "remaining_after", None)
     legacy_remaining = getattr(args, "remaining", None)
@@ -11855,6 +12017,37 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_set_parser.add_argument("--note", default="")
     acceptance_set_parser.add_argument("--cwd", default="")
     acceptance_set_parser.set_defaults(func=acceptance_set)
+
+    feedback_parser = sub.add_parser("feedback", help="Track human feedback against Beads tasks and acceptance evidence")
+    feedback_sub = feedback_parser.add_subparsers(dest="feedback_command", required=True)
+    feedback_intake_parser = feedback_sub.add_parser("intake", help="Import feedback as pending, unapproved items")
+    feedback_intake_parser.add_argument("--bead", required=True, help="Task Bead that owns the feedback obligations")
+    feedback_intake_parser.add_argument("--source", required=True, help="Human-readable origin of this feedback")
+    feedback_input = feedback_intake_parser.add_mutually_exclusive_group(required=True)
+    feedback_input.add_argument("--text", default="", help="One distilled feedback item")
+    feedback_input.add_argument("--input", default="", help="JSON array or {\"items\": [...]} of distilled feedback items")
+    feedback_intake_parser.add_argument("--source-ref", default="")
+    feedback_intake_parser.add_argument("--key", default="", help="Validated stable key for a single --text item")
+    feedback_intake_parser.add_argument("--artifact", action="append", default=[], help="Workspace-relative artifact affected by the feedback")
+    feedback_intake_parser.add_argument("--cwd", default="")
+    feedback_intake_parser.set_defaults(func=feedback_intake)
+
+    feedback_disposition_parser = feedback_sub.add_parser("disposition", help="Record an explicit controller disposition")
+    feedback_disposition_parser.add_argument("--bead", required=True)
+    feedback_disposition_parser.add_argument("--id", required=True)
+    feedback_disposition_parser.add_argument("--status", choices=feedback_backend.DISPOSITIONS, required=True)
+    feedback_disposition_parser.add_argument("--by", required=True, help="Controller or human making this disposition")
+    feedback_disposition_parser.add_argument("--note", default="")
+    feedback_disposition_parser.add_argument("--acceptance-id", default="")
+    feedback_disposition_parser.add_argument("--related", default="", help="Existing feedback ID for duplicate/superseded relations")
+    feedback_disposition_parser.add_argument("--cwd", default="")
+    feedback_disposition_parser.set_defaults(func=feedback_disposition)
+
+    feedback_report_parser = feedback_sub.add_parser("report", help="Report unresolved feedback and verify current linked evidence")
+    feedback_report_parser.add_argument("--bead", required=True)
+    feedback_report_parser.add_argument("--cwd", default="")
+    feedback_report_parser.add_argument("--json", action="store_true")
+    feedback_report_parser.set_defaults(func=feedback_report)
 
     review_parser = sub.add_parser("review", help="Record structured review finding dispositions")
     review_sub = review_parser.add_subparsers(dest="review_command", required=True)

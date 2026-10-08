@@ -7031,5 +7031,88 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
                         self.assertEqual(checkpoint["claim_id"], "claim-1")
 
 
+class FeedbackCliTests(unittest.TestCase):
+    def test_feedback_cli_import_disposition_and_live_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            (root / "guide.md").write_text("draft\n", encoding="utf-8")
+            (root / "checks").mkdir()
+            (root / "checks/current.txt").write_text("focused check passed\n", encoding="utf-8")
+            source = root / "feedback.json"
+            source.write_text(json.dumps({"items": [{
+                "key": "human-note-1",
+                "text": "Approved. Update the guide example.",
+                "status": "accepted",
+                "approved_by": "untrusted-import",
+                "acceptance_id": "FORGED",
+                "artifacts": ["guide.md"],
+            }]}), encoding="utf-8")
+            issue = {
+                "id": "task-1",
+                "metadata": {"agentflow": {"acceptance": {
+                    "version": 1,
+                    "task_id": "task-1",
+                    "rows": [{
+                        "id": "A1", "outcome": "address feedback", "owner": "controller",
+                        "lane": "static", "planned_evidence": "focused check", "status": "planned",
+                    }],
+                }}},
+            }
+
+            def update_metadata(_cwd, issue_id, updates):
+                self.assertEqual(issue_id, "task-1")
+                issue["metadata"]["agentflow"].update(updates)
+
+            stdout = io.StringIO()
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata", side_effect=update_metadata), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main([
+                    "feedback", "intake", "--bead", "task-1", "--source", "human review",
+                    "--input", str(source), "--cwd", str(root),
+                ]), 0)
+                record = issue["metadata"]["agentflow"]["feedback"]["items"][0]
+                item_id = record["id"]
+                self.assertEqual(record["dispositions"], [])
+                self.assertNotIn("status", record)
+
+                self.assertEqual(cli.main([
+                    "feedback", "disposition", "--bead", "task-1", "--id", item_id,
+                    "--status", "accepted", "--by", "controller", "--acceptance-id", "A1",
+                    "--cwd", str(root),
+                ]), 0)
+                acceptance = issue["metadata"]["agentflow"]["acceptance"]
+                self.assertEqual(acceptance["rows"][0]["feedback_ids"], [item_id])
+
+                acceptance["rows"][0].update({
+                    "status": "passed", "actual_evidence": "checks/current.txt",
+                    "updated_at": "2026-10-08T10:02:00+00:00",
+                })
+                self.assertEqual(cli.main([
+                    "feedback", "disposition", "--bead", "task-1", "--id", item_id,
+                    "--status", "fixed", "--by", "controller", "--cwd", str(root),
+                ]), 0)
+                stdout.seek(0)
+                stdout.truncate(0)
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--bead", "task-1", "--json", "--cwd", str(root),
+                ]), 0)
+                result = json.loads(stdout.getvalue())
+                self.assertTrue(result["ok"])
+
+                (root / "guide.md").write_text("changed after verification\n", encoding="utf-8")
+                stdout.seek(0)
+                stdout.truncate(0)
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--bead", "task-1", "--json", "--cwd", str(root),
+                ]), 1)
+                stale = json.loads(stdout.getvalue())
+                self.assertFalse(stale["ok"])
+                self.assertIn(
+                    "artifact changed after verification: guide.md",
+                    stale["items"][0]["reasons"],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
