@@ -9,6 +9,7 @@ instead of authorizing another launch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Mapping
 
 
@@ -24,6 +25,26 @@ class LaunchRecoveryDecision:
     reason: str = ""
     session_id: str = ""
     provider_terminal: bool = False
+
+
+def herdr_pane_is_definitively_absent(returncode: int, output: str) -> bool:
+    """Recognize only Herdr's structured ``pane_not_found`` response.
+
+    A nonzero command status by itself is ambiguous: daemon, transport, and
+    parse failures must never authorize retiring a launch. Herdr identifies
+    ``pane get`` responses with a fixed CLI request id.
+    """
+
+    if returncode != 1 or not isinstance(output, str):
+        return False
+    try:
+        response = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(response, Mapping) or response.get("id") != "cli:pane:get":
+        return False
+    error = response.get("error")
+    return isinstance(error, Mapping) and error.get("code") == "pane_not_found"
 
 
 def _operator_required(

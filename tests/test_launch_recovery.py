@@ -1,15 +1,30 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow.launch_recovery import reduce_incomplete_launch
+from agentflow.launch_recovery import (
+    herdr_pane_is_definitively_absent,
+    reduce_incomplete_launch,
+)
 
 
 class LaunchRecoveryReducerTests(unittest.TestCase):
+    def test_only_structured_herdr_pane_not_found_proves_absence(self) -> None:
+        response = json.dumps({
+            "error": {"code": "pane_not_found", "message": "pane missing"},
+            "id": "cli:pane:get",
+        })
+        self.assertTrue(herdr_pane_is_definitively_absent(1, response))
+        self.assertFalse(herdr_pane_is_definitively_absent(1, '{"error":{"code":"daemon_offline"}}'))
+        self.assertFalse(herdr_pane_is_definitively_absent(1, response.replace("pane_not_found", "unknown")))
+        self.assertFalse(herdr_pane_is_definitively_absent(0, response))
+        self.assertFalse(herdr_pane_is_definitively_absent(1, "not JSON"))
+
     def test_ambiguous_timeout_is_operator_action_not_a_failed_or_retryable_launch(self) -> None:
         decision = reduce_incomplete_launch(
             "claimed_no_session",

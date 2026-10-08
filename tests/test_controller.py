@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -284,6 +285,82 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(loaded.resume_secret, "")
             self.assertTrue(loaded.verify_resume_proof(lease.resume_secret))
             self.assertFalse(loaded.verify_resume_proof("guessed-wrong-secret"))
+
+    def test_released_lease_requires_proof_and_preserves_incarnation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            first = RootController("root", "controller", state_path=state)
+            original = first.acquire()
+            first.release(original)
+
+            next_controller = RootController("root", "controller", state_path=state)
+            with self.assertRaises(controller_module.LeaseConflict):
+                next_controller.acquire()
+            resumed = next_controller.acquire(resume_proof=original.resume_secret)
+
+            self.assertEqual(resumed.continuity_id, original.continuity_id)
+            self.assertEqual(resumed.epoch, original.epoch + 1)
+            self.assertNotEqual(resumed.resume_secret, original.resume_secret)
+
+    def test_legacy_released_lease_recovery_requires_expired_signed_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = Clock(200.0)
+            state = Path(tmp) / "controller.json"
+            controller = RootController("root", "controller", state_path=state, clock=clock)
+            original = controller.acquire()
+            controller.release(original)
+            raw = json.loads(state.read_text(encoding="utf-8"))
+            raw.pop("dormant_lease", None)
+            state.write_text(json.dumps(raw), encoding="utf-8")
+            authority = "authority-secret-for-test"
+            contract = {
+                "schema": "agentflow.return@1", "workspace_root": "root",
+                "workflow_root": "workflow", "controller_id": "controller",
+                "lease_epoch": original.epoch, "continuity_id": original.continuity_id,
+                "task_id": "task-1", "claim_id": "claim-1", "launch_id": "launch-1",
+                "deadline_epoch": 100.0,
+                "authority_key_id": hashlib.sha256(authority.encode()).hexdigest()[:24],
+            }
+            contract["authority_hmac"] = controller_module._authority_mac(
+                authority, contract, domain="return-contract-v1",
+            )
+
+            resumed = controller.recover_released_incarnation(
+                workflow_root="workflow", contract=contract,
+                authority_secret=authority, resume_proof=original.resume_secret,
+            )
+            self.assertEqual(resumed.continuity_id, original.continuity_id)
+            self.assertEqual(resumed.epoch, original.epoch + 1)
+
+    def test_legacy_released_lease_recovery_rejects_unsigned_and_unexpired_contracts(self) -> None:
+        for deadline, sign in ((300.0, True), (100.0, False)):
+            with self.subTest(deadline=deadline, sign=sign), tempfile.TemporaryDirectory() as tmp:
+                clock = Clock(200.0)
+                state = Path(tmp) / "controller.json"
+                controller = RootController("root", "controller", state_path=state, clock=clock)
+                original = controller.acquire()
+                controller.release(original)
+                raw = json.loads(state.read_text(encoding="utf-8"))
+                raw.pop("dormant_lease", None)
+                state.write_text(json.dumps(raw), encoding="utf-8")
+                authority = "authority-secret-for-test"
+                contract = {
+                    "schema": "agentflow.return@1", "workspace_root": "root",
+                    "workflow_root": "workflow", "controller_id": "controller",
+                    "lease_epoch": original.epoch, "continuity_id": original.continuity_id,
+                    "task_id": "task-1", "claim_id": "claim-1", "launch_id": "launch-1",
+                    "deadline_epoch": deadline,
+                    "authority_key_id": hashlib.sha256(authority.encode()).hexdigest()[:24],
+                }
+                if sign:
+                    contract["authority_hmac"] = controller_module._authority_mac(
+                        authority, contract, domain="return-contract-v1",
+                    )
+                with self.assertRaises(controller_module.LeaseConflict):
+                    controller.recover_released_incarnation(
+                        workflow_root="workflow", contract=contract,
+                        authority_secret=authority, resume_proof=original.resume_secret,
+                    )
 
     def test_dispatch_is_fenced_before_post_launch_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

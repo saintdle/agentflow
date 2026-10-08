@@ -403,6 +403,7 @@ class RootController:
                     )
                     state["epoch"] = epoch
                     state["lease"] = lease.to_storage_dict()
+                    state.pop("dormant_lease", None)
                     self._write_state(state)
                     self._lease = lease
                     return lease
@@ -423,6 +424,40 @@ class RootController:
                     )
                 epoch = previous.epoch + 1
             else:
+                dormant_value = state.get("dormant_lease")
+                dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+                if dormant_value is not None and dormant is None:
+                    raise ControllerError("released controller incarnation record is malformed")
+                if dormant is not None:
+                    if (
+                        dormant.root != self.root
+                        or dormant.epoch != int(state.get("epoch", 0))
+                        or not dormant.continuity_id
+                    ):
+                        raise ControllerError("released controller incarnation does not match root state")
+                    if (
+                        dormant.controller == self.controller
+                        and dormant.verify_resume_proof(resume_proof)
+                    ):
+                        epoch = dormant.epoch + 1
+                        new_secret = secrets.token_urlsafe(32)
+                        lease = Lease(
+                            dormant.root, dormant.controller, epoch,
+                            f"{self.root}/{self.controller}/{epoch}",
+                            dormant.acquired_at, now, self.owner_id,
+                            new_secret, _hash_secret(new_secret),
+                            continuity_id=dormant.continuity_id,
+                        )
+                        state["epoch"] = epoch
+                        state["lease"] = lease.to_storage_dict()
+                        state.pop("dormant_lease", None)
+                        self._write_state(state)
+                        self._lease = lease
+                        return lease
+                    if not takeover:
+                        raise LeaseConflict(
+                            "released controller incarnation requires its protected resume proof"
+                        )
                 epoch = int(state.get("epoch", 0)) + 1
             token = f"{self.root}/{self.controller}/{epoch}"
             # A fresh, cryptographically random resume secret is minted for
@@ -440,6 +475,79 @@ class RootController:
                 continuity_id=uuid.uuid4().hex,
             )
             state["epoch"] = epoch
+            state["lease"] = lease.to_storage_dict()
+            state.pop("dormant_lease", None)
+            self._write_state(state)
+            self._lease = lease
+            return lease
+
+    def recover_released_incarnation(
+        self,
+        *,
+        workflow_root: str,
+        contract: Mapping[str, Any],
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Lease:
+        """Restore a legacy released lease only from its signed expired launch.
+
+        Older released state discarded the resume-proof hash. This narrow
+        migration accepts no caller-supplied continuity value: it derives the
+        incarnation from an expired, controller-signed return contract and
+        requires the matching protected controller credential to be present.
+        Product callers must additionally verify the protected launch ledger,
+        task claim, checkpoint, and provider pane before invoking this method.
+        """
+
+        if not resume_proof:
+            raise LeaseConflict("protected controller resume proof is required")
+        if (
+            not isinstance(contract, Mapping)
+            or contract.get("schema") != "agentflow.return@1"
+            or contract.get("workspace_root") != self.root
+            or contract.get("workflow_root") != workflow_root
+            or contract.get("controller_id") != self.controller
+            or not str(contract.get("task_id") or "")
+            or not str(contract.get("claim_id") or "")
+            or not str(contract.get("launch_id") or "")
+            or not str(contract.get("continuity_id") or "")
+            or not authority_secret
+            or not hmac.compare_digest(
+                str(contract.get("authority_key_id") or ""),
+                hashlib.sha256(authority_secret.encode("utf-8")).hexdigest()[:24],
+            )
+            or not hmac.compare_digest(
+                str(contract.get("authority_hmac") or ""),
+                _authority_mac(authority_secret, contract, domain="return-contract-v1"),
+            )
+        ):
+            raise LeaseConflict("signed launch does not authenticate this released controller incarnation")
+        deadline = contract.get("deadline_epoch")
+        epoch = contract.get("lease_epoch")
+        if (
+            isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+            or float(self.clock()) < float(deadline)
+            or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
+        ):
+            raise LeaseConflict("signed launch is not an expired, epoch-bound recovery contract")
+
+        with self._locked():
+            state = _read_json(self.state_path)
+            if self._read_lease(state) is not None or state.get("dormant_lease") is not None:
+                raise LeaseConflict("released controller state is no longer eligible for legacy recovery")
+            old_epoch = int(state.get("epoch", 0))
+            if old_epoch != epoch:
+                raise LeaseConflict("signed launch epoch no longer matches released controller state")
+            new_epoch = old_epoch + 1
+            now = float(self.clock())
+            secret = secrets.token_urlsafe(32)
+            lease = Lease(
+                self.root, self.controller, new_epoch,
+                f"{self.root}/{self.controller}/{new_epoch}", now, now,
+                self.owner_id, secret, _hash_secret(secret),
+                continuity_id=str(contract["continuity_id"]),
+            )
+            state["epoch"] = new_epoch
             state["lease"] = lease.to_storage_dict()
             self._write_state(state)
             self._lease = lease
@@ -542,6 +650,11 @@ class RootController:
                 raise FencedLease("controller lease is no longer current")
             state = _read_json(self.state_path)
             state["epoch"] = current.epoch
+            # Keep the private proof hash and incarnation identity across a
+            # clean release so an authenticated later resume does not become
+            # a different result-owning controller. The next acquisition
+            # consumes this record and rotates the proof as usual.
+            state["dormant_lease"] = current.to_storage_dict()
             state["lease"] = None
             self._write_state(state)
             self._lease = None
@@ -1010,6 +1123,136 @@ class RootController:
                 "terminal": False,
                 "next_action": "select next ready descendant",
                 "last_check": last_check,
+            })
+            return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+
+    def cancel_expired_preidentity_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        *,
+        commit_cancellation: Callable[[], None],
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fence a proved-expired identity-pending launch before clearing it.
+
+        ``commit_cancellation`` must atomically persist the signed Herdr audit
+        disposition and revoke its result channel. If checkpoint persistence
+        then fails, a retry can finish clearing the pointer from that durable
+        disposition without accepting a late result.
+        """
+
+        for name, value in (("task", task_id), ("claim", claim_id), ("launch", launch_id)):
+            if not value:
+                raise ControllerError(f"preidentity cancellation {name} is required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+            reason = str(document.get("terminal_reason") or "")
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            retired_check = f"cancelled expired preidentity launch {launch_id} for {task_id}"
+            if (
+                checkpoint.admission_phase(document) == "terminal"
+                and checkpoint.resume_state(document) == "blocked"
+                and document.get("terminal") is True
+                and reason.startswith(expected_reason)
+                and str(document.get("root") or "") == self.root
+                and str(document.get("controller") or "") == self.controller
+                and not rows and document.get("task") == self.root
+                and not document.get("active_tasks")
+                and document.get("last_check") == retired_check
+            ):
+                commit_cancellation()
+                return self._result(document, resumed=True)
+            eligible = (
+                checkpoint.admission_phase(document) == "terminal"
+                and checkpoint.resume_state(document) == "blocked"
+                and document.get("terminal") is True
+                and reason.startswith(expected_reason)
+                and str(document.get("root") or "") == self.root
+                and str(document.get("controller") or "") == self.controller
+                and len(rows) == 1
+                and rows[0].get("task") == task_id
+                and rows[0].get("claim_id") == claim_id
+                and rows[0].get("state") == "identity_pending"
+                and not rows[0].get("session_id")
+            )
+            if not eligible:
+                raise ControllerError("checkpoint is not the exact expired identity-pending task halt")
+            # Cross-file crash semantics are deliberate: Herdr is atomically
+            # fenced first, and only then is the checkpoint pointer cleared.
+            commit_cancellation()
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "root": self.root,
+                "controller": self.controller,
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "blocked",
+                "status": "blocked",
+                "terminal": True,
+                "active_tasks": [],
+                "next_action": "explicitly continue with a distinct ready task",
+                "last_check": retired_check,
+            })
+            return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+
+    def acknowledge_cancelled_preidentity_halt(
+        self,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        *,
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Reopen only a signed cancelled-preidentity halt for distinct ready work."""
+
+        if not workflow_root or not cancelled_task or not ready_task:
+            raise ControllerError("workflow root, cancelled task, and ready descendant are required")
+        if ready_task == cancelled_task:
+            raise ControllerError("continuation must select a task distinct from the cancelled launch")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            reason = str(document.get("terminal_reason") or "")
+            recognized = reason.startswith(
+                f"USER_ACTION_REQUIRED: task {cancelled_task} provider identity never resolved within "
+            )
+            if (
+                checkpoint.admission_phase(document) != "terminal"
+                or checkpoint.resume_state(document) != "blocked"
+                or not document.get("terminal")
+                or not recognized
+                or str(document.get("root") or "") != self.root
+                or str(document.get("controller") or "") != self.controller
+                or document.get("active_tasks")
+                or document.get("actor")
+                or document.get("claim_id")
+                or document.get("session_id")
+            ):
+                raise ControllerError("checkpoint is not an eligible cancelled preidentity halt")
+            acknowledgement = (
+                f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+                f"ready descendant {ready_task} after {cancelled_task}"
+            )
+            if len(acknowledgement) > checkpoint.FIELD_MAX:
+                raise ControllerError("workflow and task IDs are too long to acknowledge safely")
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "root": self.root,
+                "controller": self.controller,
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "advancing",
+                "status": "advancing",
+                "terminal": False,
+                "next_action": "select explicitly verified ready descendant",
+                "last_check": acknowledgement,
             })
             return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
 
