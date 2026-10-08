@@ -706,16 +706,20 @@ def _child_main(supplied_token: str) -> int:
     result = _child_diagnostic(env)
     encoded = _json_bytes(result)
     if len(encoded) > MAX_EVIDENCE:
-        encoded = _json_bytes({
-            "schema": RESULT_SCHEMA, "status": "halted", "code": "child_result_invalid",
-            "authenticated": False, "thread_start_attempted": False,
-            "profile_observed": False, "thread_id_present": False,
-            "instruction_sources_empty": None, "inventory_status": "unverified",
-            "cleanup_ok": False, "elapsed_ms": 0,
-            "failure_phase": None, "failure_kind": None, "failure_category": None,
-        })
+        encoded = _json_bytes(_empty_child_result("child_result_invalid", cleanup_ok=False))
     sys.stdout.buffer.write(encoded)
     return 0
+
+
+def _empty_child_result(code: str, *, cleanup_ok: bool = True) -> dict[str, Any]:
+    return {
+        "schema": RESULT_SCHEMA, "status": "halted", "code": code,
+        "authenticated": False, "thread_start_attempted": False,
+        "profile_observed": False, "thread_id_present": False,
+        "instruction_sources_empty": None, "inventory_status": "unverified",
+        "cleanup_ok": cleanup_ok, "elapsed_ms": 0,
+        "failure_phase": None, "failure_kind": None, "failure_category": None,
+    }
 
 
 def _decode_child(data: bytes) -> dict[str, Any]:
@@ -772,6 +776,22 @@ def _decode_child(data: bytes) -> dict[str, Any]:
     if invalid_thread_start:
         raise Halt("child_result_invalid")
     return {key: value[key] for key in expected}
+
+
+def _decode_child_preflight_halt(data: bytes) -> dict[str, Any]:
+    """Keep only the fixed pre-SDK layout rejection from the child entrypoint."""
+    if len(data) > MAX_EVIDENCE:
+        raise Halt("child_result_invalid")
+    try:
+        value = json.loads(data)
+    except Exception:
+        raise Halt("child_result_invalid") from None
+    if (not isinstance(value, dict) or set(value) != {"status", "code"}
+            or value.get("status") != "halted" or value.get("code") != "trial_layout_invalid"):
+        raise Halt("child_result_invalid")
+    # The child entrypoint emits this record only when its allowlisted
+    # environment/path checks fail, before importing or starting the SDK.
+    return _empty_child_result("trial_layout_invalid")
 
 
 def _kill_owned_group(proc: subprocess.Popen[bytes]) -> bool:
@@ -861,9 +881,12 @@ def _run_trial(root: Path) -> dict[str, Any]:
             remaining = max(0.1, TOTAL_TIMEOUT - CLEANUP_TIMEOUT - (time.monotonic() - started))
             stdout, _ = proc.communicate(input=(child_token + "\n").encode("ascii"), timeout=remaining)
             cleanup_ok = _kill_owned_group(proc)
-            if proc.returncode != 0:
+            if proc.returncode == 0:
+                result = _decode_child(stdout)
+            elif proc.returncode == 2:
+                result = _decode_child_preflight_halt(stdout)
+            else:
                 raise Halt("child_result_invalid")
-            result = _decode_child(stdout)
             if not cleanup_ok:
                 result["cleanup_ok"] = False
         except subprocess.TimeoutExpired:

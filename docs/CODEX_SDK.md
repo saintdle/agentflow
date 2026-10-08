@@ -76,8 +76,8 @@ pre-inference worker guard must remain unchanged.
 
 ## No-inference SDK preflight diagnostic
 
-`scripts/trials/codex_preflight_no_inference.py` is a separate source-only
-diagnostic, not a worker entry point or an admission switch. Its default
+`scripts/trials/codex_preflight_no_inference.py` is a separate opt-in
+no-inference diagnostic, not a worker entry point or an admission switch. Its default
 invocation and `--help` do not create files or start a process; `--run` is
 required, along with a new private `--trial-dir`. The directory holds only a
 synthetic fixture, a generated permission-profile config, isolated home/cache
@@ -102,11 +102,15 @@ The normal auth-home boundary is compared with the POSIX account-home path
 metadata; credential files in that home are not opened. Environments whose
 effective `HOME` does not match the account metadata fail closed.
 
-Even a matching profile notification is not a pass: the pinned SDK does not
-provide complete proof of all tools and instruction surfaces. Unknown or
-uncontrolled inventory remains blocked. Attempts are durably reserved before
-the child starts; ambiguous timeouts are not retried, and the directory allows
-at most two explicit attempts. Output is a bounded, sanitized status record.
+Even a matching profile notification is not a pass: the pinned SDK can report
+active permission-profile metadata and list some integration surfaces, but it
+does not provide a complete per-thread inventory of effective tools and
+instruction sources. Unknown or uncontrolled inventory remains blocked.
+Attempts are durably reserved before the child starts; ambiguous timeouts are
+not retried, and the directory allows at most two explicit attempts. Output is
+a bounded, sanitized status record. A fixed early layout rejection is
+identified as occurring before SDK import and does not claim that a thread
+start was attempted; malformed or unexpected child output remains ambiguous.
 Bounded-call failures report a fixed RPC phase and `exception` or `deadline`
 kind. The nullable `failure_category` is populated only for an observed
 immediate exception in result schema `agentflow.codex_preflight_result.v2`; it
@@ -116,11 +120,10 @@ types reduced to `unknown`. Deadlines and non-exception halts have a null
 category. Exception class names, messages, arguments, causes, contexts,
 tracebacks, and server data are never serialized. A family category identifies
 only the observed exception type boundary; it does not establish the underlying
-SDK cause, which remains unverified without separately authorized runtime
-evidence.
-Source review of the pinned SDK confirms the existing typed `initialize()` call
-sequence is compatible with its client API. It does not identify the cause of
-the previously observed initialize failure or substitute for live verification.
+SDK cause. Source inspection of SDK 0.160.1 confirms its no-argument typed
+`initialize()` method supplies the client information and capabilities and
+sends the `initialized` notification itself. That establishes call
+compatibility, not successful runtime initialization or permission enforcement.
 Do not interpret this diagnostic as model-tool isolation evidence, approval for
 inference, or authorization to weaken the App Server worker guard. No SDK
 runtime result is included in the source-only fake tests.
@@ -190,17 +193,17 @@ login, logout, or token refresh. These checks are best-effort: unsupported
 endpoints, missing authentication, or unavailable account metadata must be
 reported as unavailable, not interpreted as permission to launch or as
 evidence of available capacity. Diagnostic values and catalogue entries do not
-establish model entitlement or guaranteed capacity. See the official [Codex SDK guide](https://learn.chatgpt.com/docs/codex-sdk)
-and [App Server protocol](https://learn.chatgpt.com/docs/app-server).
+establish model entitlement or guaranteed capacity. See the official [Codex SDK guide](https://developers.openai.com/codex/codex-sdk)
+and [App Server protocol](https://developers.openai.com/codex/app-server).
 
 If a future release enables App Server worker execution, each task will still
 require explicit approval of its exact model, effort, workspace, allowed
-skills, and launch budget. The prototype supports only the existing
-`shell-readonly` handoff profile and pins the SDK thread and turn to
-`Sandbox.read_only` and approval policy `never`. These restrictions are
-necessary but not sufficient to establish isolation from same-user controller
-authority, so the current hard guard rejects App Server worker tasks before
-inference. `shell-write`, `no-shell`, `provider-default`, and sterile or
+skills, and launch budget. The pinned schema can carry thread configuration
+and report active permission-profile metadata, but those fields do not prove
+that the requested rules govern every effective tool or isolate controller
+authority. The current hard guard rejects App Server worker tasks before
+inference until the full tool inventory and runtime boundary are verified.
+`shell-write`, `no-shell`, `provider-default`, and sterile or
 restricted-outbound tasks are also rejected; SDK subdelegation is disabled.
 Do not weaken the guard or permissions to make a task eligible. Diagnostics do
 not start a worker and are not workflow consent.

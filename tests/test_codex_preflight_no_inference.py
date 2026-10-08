@@ -600,6 +600,42 @@ class CodexPreflightTests(unittest.TestCase):
             self.assertNotIn(str(root), json.dumps(report))
             self.assertNotIn("secret-key", json.dumps(report))
 
+    def test_nonzero_child_exit_preserves_only_the_sanitized_pre_sdk_halt(self):
+        class EarlyHaltProcess:
+            pid = 987655
+            returncode = 2
+
+            def __init__(self, _command, **_kwargs):
+                pass
+
+            def communicate(self, input=None, timeout=None):
+                return b'{"status":"halted","code":"trial_layout_invalid"}', None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trial"
+            with mock.patch.object(preflight.subprocess, "Popen", EarlyHaltProcess), \
+                 mock.patch.object(preflight.os, "killpg", side_effect=ProcessLookupError):
+                report = preflight._run_trial(root)
+
+            self.assertEqual(report["status"], "halted")
+            self.assertEqual(report["code"], "trial_layout_invalid")
+            self.assertFalse(report["thread_start_attempted"])
+            self.assertFalse(report["profile_observed"])
+            state = json.loads((root / "authority" / "attempts.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(state["attempts"]), 1)
+            self.assertEqual(state["attempts"][0]["status"], "halted")
+
+    def test_pre_sdk_child_halt_decoder_rejects_unbounded_diagnostic_shapes(self):
+        for payload in (
+            b'{"status":"halted","code":"rpc_failed"}',
+            b'{"status":"ambiguous","code":"trial_layout_invalid"}',
+            b'{"status":"halted","code":"trial_layout_invalid","private":"detail"}',
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                preflight.Halt, "child_result_invalid",
+            ):
+                preflight._decode_child_preflight_halt(payload)
+
     def test_timeout_is_durably_ambiguous_and_not_retried(self):
         class TimedOut:
             pid = 876543
