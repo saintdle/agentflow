@@ -1714,9 +1714,25 @@ def _controller_step_serial(
         item for item in descendants
         if str(item.get("status") or "").lower() == "in_progress"
         and str(item.get("assignee") or "") == lease.controller
+        and not _authenticated_cancelled_preidentity(
+            root, workflow_root, str(item.get("id") or ""),
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
     ]
     if orphaned:
+        if getattr(args, "_continuation_task", ""):
+            raise controller_backend.ControllerError(
+                "workflow acquired other in-progress work after continuation validation"
+            )
         claimed = orphaned[0]
+    elif getattr(args, "_continuation_task", ""):
+        continuation_task = str(args._continuation_task)
+        exact = beads_backend.claim_issue_exact(
+            cwd, task=continuation_task, root=workflow_root,
+            actor=lease.controller, persist=False,
+        )
+        claimed = exact.issue
+        args._continuation_task = ""
     else:
         claimed = beads_backend.claim_ready(cwd, parent=workflow_root, labels=[], actor=lease.controller)
     stop_reason = ""
@@ -2154,7 +2170,11 @@ def _controller_step_parallel(
 
     # Tasks returned as in_progress after a crash can be adopted only from a
     # durable Herdr binding; a claimed_no_session marker above is never retried.
-    while not draining and not attention_required and len(active) < policy.max_parallel_workers:
+    continuation_dispatched = False
+    while (
+        not draining and not attention_required and len(active) < policy.max_parallel_workers
+        and not continuation_dispatched
+    ):
         descendants = beads_backend.root_descendants(cwd, workflow_root)
         active_ids = {item["task"] for item in active}
         orphaned = [
@@ -2162,10 +2182,29 @@ def _controller_step_parallel(
             if str(item.get("status") or "").lower() == "in_progress"
             and str(item.get("assignee") or "") == lease.controller
             and str(item.get("id") or "") not in active_ids
+            and not _authenticated_cancelled_preidentity(
+                root, workflow_root, str(item.get("id") or ""),
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            )
         ]
-        claimed = orphaned[0] if orphaned else beads_backend.claim_ready(
-            cwd, parent=workflow_root, labels=[], actor=lease.controller
-        )
+        if orphaned:
+            if getattr(args, "_continuation_task", ""):
+                raise controller_backend.ControllerError(
+                    "workflow acquired other in-progress work after continuation validation"
+                )
+            claimed = orphaned[0]
+        elif getattr(args, "_continuation_task", ""):
+            exact = beads_backend.claim_issue_exact(
+                cwd, task=str(args._continuation_task), root=workflow_root,
+                actor=lease.controller, persist=False,
+            )
+            claimed = exact.issue
+            args._continuation_task = ""
+            continuation_dispatched = True
+        else:
+            claimed = beads_backend.claim_ready(
+                cwd, parent=workflow_root, labels=[], actor=lease.controller
+            )
         if claimed is None:
             break
         task_id = str(claimed.get("id") or "")
@@ -2455,6 +2494,296 @@ def _verify_no_ready_ack_candidate(
     return task_id
 
 
+def _verify_cancelled_preidentity_continuation(
+    root: Path,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    *,
+    authority_secret: str,
+) -> str:
+    """Prove a signed retired launch and one distinct, currently ready child."""
+    if not cancelled_task or not ready_task or ready_task == cancelled_task:
+        raise controller_backend.ControllerError(
+            "cancelled-preidentity continuation requires a distinct ready task"
+        )
+    document = controller._load_checkpoint()
+    record = _herdr_session_record(root, cancelled_task)
+    reason = f"USER_ACTION_REQUIRED: task {cancelled_task} provider identity never resolved within "
+    if (
+        checkpoint_backend.admission_phase(document) != "terminal"
+        or checkpoint_backend.resume_state(document) != "blocked"
+        or document.get("terminal") is not True
+        or not str(document.get("terminal_reason") or "").startswith(reason)
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != controller.controller
+        or str(document.get("task") or "") != controller.root
+        or document.get("active_tasks")
+        or document.get("actor") or document.get("claim_id") or document.get("session_id")
+        or document.get("last_check") != (
+            f"cancelled expired preidentity launch {record.get('launch_id') if isinstance(record, Mapping) else ''} "
+            f"for {cancelled_task}"
+        )
+    ):
+        raise controller_backend.ControllerError(
+            "checkpoint is not the exact safely retired preidentity halt"
+        )
+    if controller.session_ledger().get("blocked"):
+        raise controller_backend.ControllerError("cannot continue a blocked controller budget")
+    if not _authenticated_cancelled_preidentity(
+        root, workflow_root, cancelled_task, authority_secret=authority_secret,
+    ):
+        raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
+    assert isinstance(record, Mapping)
+    channel = record.get("return_channel")
+    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("controller_id") != lease.controller
+        or int(contract.get("lease_epoch", 0)) > lease.epoch
+    ):
+        raise controller_backend.ControllerError("cancelled launch belongs to another controller incarnation")
+    cancelled_issue = beads_backend.get_issue(root, cancelled_task)
+    metadata = cancelled_issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    if (
+        str(cancelled_issue.get("status") or "").lower() != "in_progress"
+        or str(cancelled_issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != cancelled_task
+        or str(agentflow.get("actor") or "") != lease.controller
+        or str(agentflow.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
+    ):
+        raise controller_backend.ControllerError("cancelled task no longer has its exact signed Beads claim")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
+    )
+
+    root_issue = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(root_issue.get("id") or "") != workflow_root
+        or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise controller_backend.ControllerError("workflow root is missing, mismatched, or terminal")
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    by_id = {str(row.get("id") or ""): row for row in descendants}
+    if cancelled_task not in by_id or ready_task not in by_id:
+        raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
+    if str(by_id[cancelled_task].get("status") or "").lower() != "in_progress":
+        raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
+    for row in descendants:
+        task_id = str(row.get("id") or "")
+        status = str(row.get("status") or "").lower()
+        if task_id != cancelled_task and status == "in_progress":
+            raise controller_backend.ControllerError("another workflow task is still claimed in progress")
+        other = _herdr_session_record(root, task_id) if task_id else None
+        if not isinstance(other, Mapping):
+            continue
+        if task_id == cancelled_task:
+            continue
+        if str(other.get("status") or "").lower() in {"launching", "identity_pending", "launched", "running"}:
+            raise controller_backend.ControllerError("another descendant has an active Herdr lifecycle")
+        if str(other.get("status") or "").lower() not in {"completed"}:
+            raise controller_backend.ControllerError("another descendant has an unresolved Herdr lifecycle")
+        other_channel = other.get("return_channel")
+        other_result = other.get("result")
+        other_binding = other.get("binding")
+        if not (
+            isinstance(other_channel, Mapping) and other_channel.get("state") == "consumed"
+            and isinstance(other_result, Mapping) and other_result.get("outcome") == "completed"
+            and isinstance(other_binding, Mapping)
+            and str(other_binding.get("root") or "") == str(root)
+            and str(other_binding.get("task_id") or "") == task_id
+        ):
+            raise controller_backend.ControllerError("another descendant has an unauthenticated result")
+
+    if str(by_id[ready_task].get("status") or "").lower() in reconciliation_backend.TERMINAL:
+        raise controller_backend.ControllerError("continuation task is terminal")
+    common = ["ready", "--parent", workflow_root, "--limit", "1", "--sort", "priority"]
+    assigned = beads_backend._json_output(
+        beads_backend.run(root, *common, "--assignee", lease.controller, "--json"),
+        "bd ready --assignee",
+    )
+    def rows_for(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            return value.get("issues", []) if isinstance(value.get("issues"), list) else ([value] if value.get("id") else [])
+        if isinstance(value, list):
+            return value
+        raise beads_backend.BeadsError("bd ready returned an unexpected JSON shape")
+    rows = rows_for(assigned)
+    if not rows:
+        shared = beads_backend._json_output(
+            beads_backend.run(root, *common, "--unassigned", "--json"),
+            "bd ready --unassigned",
+        )
+        rows = rows_for(shared)
+    if len(rows) != 1 or not isinstance(rows[0], Mapping) or str(rows[0].get("id") or "") != ready_task:
+        raise controller_backend.ControllerError("requested continuation is not the exact current ready task")
+    return ready_task
+
+
+def controller_recover_preidentity(args: argparse.Namespace) -> int:
+    """Retire one expired, absent-pane identity-pending launch under its root lease."""
+    try:
+        _reject_custom_controller_state_path(args)
+        raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
+        workflow_root = raw_workflow_root.strip()
+        task_id = str(getattr(args, "task", "") or "")
+        launch_id = str(getattr(args, "launch_id", "") or "")
+        pane_id = str(getattr(args, "pane_id", "") or "")
+        if not workflow_root or workflow_root != raw_workflow_root:
+            raise ValueError("--workflow-root is required as an exact Beads root ID")
+        if not task_id or not launch_id or not pane_id:
+            raise ValueError("--task, --launch-id, and --pane-id are required")
+        controller, root = _controller_instance(args)
+        with controller.supervisor_lock():
+            beads_backend.get_issue(root, workflow_root)
+            key_path = _resume_key_path(argparse.Namespace(
+                root=str(root), workflow_root=workflow_root, resume_key_file="",
+            ))
+            _require_external_accounting_storage(key_path, str(root.resolve()))
+            if (
+                key_path.is_symlink() or key_path.parent.is_symlink()
+                or key_path.resolve() != key_path.absolute()
+                or not key_path.is_file()
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical protected controller credential is unavailable"
+                )
+            if os.name == "posix" and (
+                key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical controller credential permissions are too broad"
+                )
+            credentials = _read_controller_credentials(key_path)
+            raw_credentials = json.loads(key_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(raw_credentials, Mapping)
+                or raw_credentials.get("schema") != "agentflow.controller_credentials"
+                or raw_credentials.get("version") != 2
+                or credentials.get("workspace_root") != str(root.resolve())
+                or credentials.get("workflow_root") != workflow_root
+                or not credentials.get("continuity_id")
+                or not credentials.get("authority_secret")
+                or not credentials.get("resume_secret")
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical controller credential does not authenticate this workflow incarnation"
+                )
+            state = _read_json_value(str(controller.state_path))
+            if not isinstance(state, Mapping):
+                raise controller_backend.LeaseConflict("controller state is malformed")
+            active = controller._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = controller._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            if dormant_value is not None and dormant is None:
+                raise controller_backend.LeaseConflict("released controller incarnation record is malformed")
+            proof = credentials["resume_secret"]
+            preauthenticated_epoch: int | None = None
+            for candidate in (active, dormant):
+                if (
+                    candidate is not None
+                    and candidate.root == str(root)
+                    and candidate.controller == controller.controller
+                    and candidate.continuity_id == credentials["continuity_id"]
+                    and candidate.epoch == int(state.get("epoch", -1))
+                    and candidate.verify_resume_proof(proof)
+                ):
+                    preauthenticated_epoch = candidate.epoch
+                    break
+
+            # Validate all immutable protected evidence before changing a
+            # released/legacy lease epoch or writing a cancellation record.
+            snapshot = _preidentity_recovery_snapshot(
+                controller, root, workflow_root, task_id, launch_id, pane_id,
+                authority_secret=credentials["authority_secret"],
+                expected_current_epoch=preauthenticated_epoch,
+            )
+            contract = snapshot["contract"]
+            if credentials["continuity_id"] != contract.get("continuity_id"):
+                raise controller_backend.LeaseConflict(
+                    "canonical credential and signed launch continuity do not match"
+                )
+            if snapshot["record"].get("status") != "cancelled_preidentity":
+                _require_definitively_absent_herdr_pane(pane_id)
+            if active is not None:
+                if (
+                    active.root != str(root) or active.controller != controller.controller
+                    or active.epoch != int(state.get("epoch", -1))
+                    or active.continuity_id != contract.get("continuity_id")
+                    or not active.verify_resume_proof(proof)
+                ):
+                    raise controller_backend.LeaseConflict("active lease does not match the protected launch")
+                lease = controller.authorize(proof)
+            elif dormant is not None:
+                if (
+                    dormant.root != str(root) or dormant.controller != controller.controller
+                    or dormant.continuity_id != contract.get("continuity_id")
+                    or not dormant.verify_resume_proof(proof)
+                    or dormant.epoch != int(state.get("epoch", -1))
+                    or dormant.epoch < int(contract.get("lease_epoch", -1))
+                ):
+                    raise controller_backend.LeaseConflict("released lease does not match the protected launch")
+                lease = controller.acquire(resume_proof=proof)
+                _, credentials = _controller_credentials(args, lease, key_path=key_path)
+            else:
+                lease = controller.recover_released_incarnation(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                )
+                _, credentials = _controller_credentials(args, lease, key_path=key_path)
+
+            snapshot = _preidentity_recovery_snapshot(
+                controller, root, workflow_root, task_id, launch_id, pane_id,
+                authority_secret=credentials["authority_secret"],
+                expected_current_epoch=lease.epoch,
+            )
+            def commit_cancellation() -> None:
+                current = _preidentity_recovery_snapshot(
+                    controller, root, workflow_root, task_id, launch_id, pane_id,
+                    authority_secret=credentials["authority_secret"],
+                    expected_current_epoch=lease.epoch,
+                )
+                if current["contract"] != snapshot["contract"]:
+                    raise ValueError("signed launch changed during recovery")
+                _commit_preidentity_cancellation(
+                    root, workflow_root, task_id, launch_id, pane_id,
+                    current["contract"], authority_secret=credentials["authority_secret"],
+                )
+            result = controller.cancel_expired_preidentity_task(
+                task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
+                commit_cancellation=commit_cancellation, lease=lease,
+            )
+            payload = {
+                "operation": "recover-preidentity", "ok": True,
+                "root": str(root), "workflow_root": workflow_root,
+                "task_id": task_id, "launch_id": launch_id,
+                "result": result.to_dict(),
+            }
+            _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="PREIDENTITY RECOVERY")
+            return 0
+    except (
+        controller_backend.ControllerError, controller_backend.FencedLease,
+        beads_backend.BeadsError, herdr_backend.HerdrError,
+        OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": "recover-preidentity", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="PREIDENTITY RECOVERY FAILED",
+        )
+        return 2
+
+
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
@@ -2472,8 +2801,22 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         acknowledge_no_ready = operation == "resume" and bool(
             getattr(args, "acknowledge_no_ready_halt", False)
         )
-        if acknowledge_no_ready and bool(getattr(args, "takeover", False)):
+        continue_cancelled_task = str(
+            getattr(args, "continue_after_cancelled_preidentity", "") or ""
+        ) if operation == "resume" else ""
+        continue_ready_task = str(getattr(args, "continue_task", "") or "") if operation == "resume" else ""
+        if bool(continue_cancelled_task) != bool(continue_ready_task):
+            raise ValueError(
+                "--continue-after-cancelled-preidentity and --continue-task must be supplied together"
+            )
+        if acknowledge_no_ready and continue_cancelled_task:
+            raise ValueError("choose one explicit controller continuation acknowledgement")
+        if (acknowledge_no_ready or continue_cancelled_task) and bool(getattr(args, "takeover", False)):
             raise ValueError("--acknowledge-no-ready-halt requires authenticated reattach, not takeover")
+        if continue_cancelled_task and getattr(args, "resume_token", ""):
+            raise ValueError(
+                "cancelled-preidentity continuation requires the canonical protected credential, not --resume-token"
+            )
 
         # Validate the exact Beads root before acquiring a lease or writing
         # protected credentials.  The lock covers every long-running root
@@ -2481,6 +2824,30 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         # rotate the fencing token out from underneath a live supervisor.
         with controller.supervisor_lock():
             key_path = _resume_key_path(args)
+            if continue_cancelled_task:
+                canonical_path = _resume_key_path(argparse.Namespace(
+                    root=str(_root_arg(args)), workflow_root=workflow_root, resume_key_file="",
+                ))
+                if key_path != canonical_path:
+                    raise ValueError(
+                        "cancelled-preidentity continuation requires the canonical controller credential"
+                    )
+                _require_external_accounting_storage(key_path, str(root.resolve()))
+                if (
+                    key_path.is_symlink() or key_path.parent.is_symlink()
+                    or key_path.resolve() != key_path.absolute() or not key_path.is_file()
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential is unavailable")
+                raw_credential = json.loads(key_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_credential, Mapping) or (
+                    raw_credential.get("schema") != "agentflow.controller_credentials"
+                    or raw_credential.get("version") != 2
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential is malformed")
+                if os.name == "posix" and (
+                    key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential permissions are too broad")
             beads_backend.get_issue(root, workflow_root)
             if operation == "supervise":
                 credentials = _read_controller_credentials(key_path)
@@ -2515,29 +2882,30 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     legacy = _legacy_resume_key_path(args)
                     if not resume_proof and legacy is not None:
                         resume_proof = _read_resume_key(legacy)
-                if acknowledge_no_ready:
+                if acknowledge_no_ready or continue_cancelled_task:
                     state = (
                         json.loads(controller.state_path.read_text(encoding="utf-8"))
                         if controller.state_path.exists() else {}
                     )
-                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
                     credentials = _read_controller_credentials(key_path)
-                    legacy = _legacy_resume_key_path(args)
-                    if not credentials and legacy is not None:
-                        credentials = _read_controller_credentials(legacy)
+                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
+                    if previous is None and continue_cancelled_task and isinstance(state, Mapping):
+                        dormant_raw = state.get("dormant_lease")
+                        previous = controller._read_lease({"lease": dormant_raw}) if isinstance(dormant_raw, Mapping) else None
+                    checkpoint_epoch = controller._load_checkpoint().get("epoch")
                     if (
-                        previous is None
-                        or previous.root != str(root)
+                        previous is None or previous.root != str(root)
                         or previous.controller != controller.controller
                         or not previous.verify_resume_proof(resume_proof)
                         or credentials.get("workspace_root") != str(root.resolve())
                         or credentials.get("workflow_root") != workflow_root
                         or credentials.get("continuity_id") != previous.continuity_id
                         or not credentials.get("authority_secret")
+                        or (continue_cancelled_task and int(state.get("epoch", -1)) != int(checkpoint_epoch or -2))
                     ):
                         raise controller_backend.LeaseConflict(
-                            "--acknowledge-no-ready-halt requires the protected credential "
-                            "for this workflow incarnation"
+                            "explicit controller continuation requires the protected credential "
+                            "and exact resumable workflow incarnation"
                         )
                 lease = controller.acquire(
                     takeover=bool(getattr(args, "takeover", False)),
@@ -2550,6 +2918,16 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             if acknowledge_no_ready:
                 ready_task = _verify_no_ready_ack_candidate(root, workflow_root, controller, lease)
                 controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
+            if continue_cancelled_task:
+                ready_task = continue_ready_task
+                _verify_cancelled_preidentity_continuation(
+                    root, workflow_root, continue_cancelled_task, ready_task,
+                    controller, lease, authority_secret=credentials["authority_secret"],
+                )
+                controller.acknowledge_cancelled_preidentity_halt(
+                    workflow_root, continue_cancelled_task, ready_task, lease=lease,
+                )
+                args._continuation_task = ready_task
             _bind_current_controller_sessions(root, workflow_root, lease)
 
             # An authenticated resume acknowledges a required safe-boundary
@@ -3337,6 +3715,8 @@ def _reserve_execution_attempt(
     root: Path, workflow_root: str, task_id: str, *,
     limits: execution_limits_backend.ExecutionLimits,
     policy_max_attempts: int, authority_secret: str,
+    claim_id: str, lease_id: str, launch_id: str,
+    controller_id: str, continuity_id: str, lease_epoch: int,
 ) -> Mapping[str, Any]:
     path = _execution_limit_ledger_path(root, workflow_root)
     key = _execution_ledger_key(root, workflow_root, task_id)
@@ -3377,6 +3757,15 @@ def _reserve_execution_attempt(
                 "execution_limits": limits.to_dict(), "deadline_epoch": deadline_epoch,
                 "attempt": attempt, "max_attempts": max_attempts, "status": "active",
             }
+        if not error:
+            row["launch_identity"] = {
+                "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+                "task_id": task_id, "claim_id": claim_id, "lease_id": lease_id,
+                "launch_id": launch_id, "controller_id": controller_id,
+                "continuity_id": continuity_id, "lease_epoch": lease_epoch,
+            }
+        elif isinstance(old, Mapping) and isinstance(old.get("launch_identity"), Mapping):
+            row["launch_identity"] = dict(old["launch_identity"])
         row["authority_hmac"] = _authority_mac(
             authority_secret, row, domain="execution-limit-ledger-v1",
         )
@@ -3408,7 +3797,453 @@ def _verify_execution_snapshot_against_ledger(
         or entry.get("max_attempts") != snapshot.get("max_attempts")
     ):
         raise ValueError("signed execution limits do not match the protected monotonic ledger")
+    identity = entry.get("launch_identity")
+    if isinstance(identity, Mapping):
+        expected_identity = {
+            "workspace_root": str(root.resolve()),
+            "workflow_root": workflow_root, "task_id": task_id,
+            "claim_id": str(snapshot.get("claim_id") or ""),
+            "lease_id": str(snapshot.get("lease_id") or ""),
+            "launch_id": str(snapshot.get("launch_id") or ""),
+            "controller_id": str(snapshot.get("controller_id") or ""),
+            "continuity_id": str(snapshot.get("continuity_id") or ""),
+            "lease_epoch": snapshot.get("lease_epoch"),
+        }
+        if dict(identity) != expected_identity:
+            raise ValueError("protected launch identity does not match the signed execution snapshot")
     return entry
+
+
+def _expired_preidentity_ledger_disposition(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    """Bind an old signed attempt to its launch and durably expire it."""
+    path = _execution_limit_ledger_path(root, workflow_root)
+    key = _execution_ledger_key(root, workflow_root, task_id)
+    identity = {
+        "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    with _execution_limit_ledger_transaction(path) as ledger:
+        entry = ledger["entries"].get(key)
+        entry = dict(_verify_execution_ledger_entry(entry, authority_secret=authority_secret))
+        if (
+            entry.get("attempt") != contract.get("attempt")
+            or entry.get("max_attempts") != contract.get("max_attempts")
+            or entry.get("execution_limits") != contract.get("execution_limits")
+            or entry.get("deadline_epoch") != contract.get("deadline_epoch")
+        ):
+            raise ValueError("protected launch ledger does not match the exact signed attempt")
+        existing_identity = entry.get("launch_identity")
+        if existing_identity is not None and (
+            not isinstance(existing_identity, Mapping)
+            or dict(existing_identity) != identity
+        ):
+            raise ValueError("protected launch ledger identity does not match the signed launch")
+        if time.time() < float(entry["deadline_epoch"]):
+            raise ValueError("task execution deadline has not durably expired")
+        if entry.get("status") not in {"active", "expired"}:
+            raise ValueError("protected launch ledger is not active or expired")
+        entry["launch_identity"] = identity
+        entry["status"] = "expired"
+        entry["authority_hmac"] = _authority_mac(
+            authority_secret, entry, domain="execution-limit-ledger-v1",
+        )
+        ledger["entries"][key] = entry
+    return entry
+
+
+def _preidentity_recovery_snapshot(
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    launch_id: str,
+    pane_id: str,
+    *,
+    authority_secret: str,
+    expected_current_epoch: int | None = None,
+) -> dict[str, Any]:
+    """Prove the exact halted launch before any lease or state transition."""
+    document = controller._load_checkpoint()
+    expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+    rows = controller.active_tasks()
+    already_retired = (
+        not rows and document.get("task") == controller.root
+        and not document.get("active_tasks")
+        and document.get("last_check") == f"cancelled expired preidentity launch {launch_id} for {task_id}"
+    )
+    if (
+        checkpoint_backend.admission_phase(document) != "terminal"
+        or checkpoint_backend.resume_state(document) != "blocked"
+        or document.get("terminal") is not True
+        or not str(document.get("terminal_reason") or "").startswith(expected_reason)
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != controller.controller
+        or not (
+            already_retired
+            or (len(rows) == 1 and rows[0].get("task") == task_id
+                and rows[0].get("state") == "identity_pending" and not rows[0].get("session_id"))
+        )
+    ):
+        raise ValueError("checkpoint is not the exact expired identity-pending halt")
+
+    raw_state = _read_json_value(str(controller.state_path))
+    raw_lease = raw_state.get("lease") if isinstance(raw_state, Mapping) else None
+    if raw_lease is not None and not isinstance(raw_lease, Mapping):
+        raise ValueError("controller lease state is malformed")
+    stored_epoch = int(raw_state.get("epoch", -1))
+    if stored_epoch != int(document.get("epoch", -2)) and stored_epoch != expected_current_epoch:
+        raise ValueError("checkpoint epoch does not match protected controller state")
+
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    descendant_ids = {str(item.get("id") or "") for item in descendants}
+    if task_id not in descendant_ids:
+        raise ValueError("identity-pending task is not a descendant of the exact workflow root")
+    if any(
+        str(item.get("id") or "") != task_id
+        and str(item.get("status") or "").lower() == "in_progress"
+        for item in descendants
+    ):
+        raise ValueError("another workflow descendant is still claimed in progress")
+    task_issue = beads_backend.get_issue(root, task_id)
+    if str(task_issue.get("status") or "").lower() != "in_progress":
+        raise ValueError("exact task is no longer in progress")
+    metadata = task_issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    actor = str(agentflow.get("actor") or "")
+    if not claim_token or not actor:
+        raise ValueError("exact live Beads claim is unavailable")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, task_issue, task=task_id, root=workflow_root, actor=actor,
+    )
+
+    herdr_path = root / ".agentflow/herdr/sessions.json"
+    herdr_state = _load_herdr_state(herdr_path)
+    sessions = herdr_state.get("sessions")
+    record = sessions.get(task_id) if isinstance(sessions, Mapping) else None
+    if not isinstance(record, Mapping):
+        raise ValueError("exact Herdr launch record is unavailable")
+    was_cancelled = record.get("status") == "cancelled_preidentity"
+    if (
+        record.get("status") not in {"identity_pending", "cancelled_preidentity"}
+        or record.get("root") != str(root)
+        or record.get("workflow_root") != workflow_root
+        or record.get("task_id") != task_id
+        or record.get("claim_id") != str(agentflow.get("claim_id") or "")
+        or record.get("pane_id") != pane_id
+        or record.get("launch_id") != launch_id
+        or record.get("attempt") is None
+        or record.get("binding") not in (None, {})
+        or record.get("result") not in (None, {})
+    ):
+        raise ValueError("Herdr record does not match the exact unbound launch")
+    channel = record.get("return_channel")
+    if not isinstance(channel, Mapping) or channel.get("state") != ("revoked" if was_cancelled else "issued"):
+        raise ValueError("identity-pending launch has no issued return channel")
+    raw_contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_contract_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if raw_contract_path.is_symlink() or raw_contract_path.resolve() != expected_contract_path.resolve():
+        raise ValueError("signed launch contract is outside the exact task launch runtime")
+    if not raw_contract_path.is_file() or raw_contract_path.stat().st_size > 32 * 1024:
+        raise ValueError("signed launch contract is unavailable")
+    contract = json.loads(raw_contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("signed launch contract is malformed")
+    binding = _verify_return_contract_binding(
+        contract, expected_contract_path, task_id, record,
+        root=root, authority_secret=authority_secret, require_issued=not was_cancelled,
+    )
+    if was_cancelled:
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract, pane_id=pane_id,
+            authority_secret=authority_secret,
+        )
+        if channel.get("revocation") != dict(disposition):
+            raise ValueError("return channel revocation does not match the signed cancellation")
+    expected = {
+        "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": str(agentflow.get("claim_id") or ""),
+        "lease_id": str(record.get("lease_id") or ""), "launch_id": launch_id,
+        "controller_id": controller.controller, "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    actual = {
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    if actual != expected or (
+        not already_retired and document.get("epoch") != contract.get("lease_epoch")
+    ) or (
+        already_retired and int(document.get("epoch", 0)) < int(contract.get("lease_epoch", 0))
+    ):
+        raise ValueError("checkpoint and signed launch identities do not match exactly")
+    if not already_retired and (
+        rows[0].get("claim_id") != expected["claim_id"] or rows[0].get("actor") != actor
+    ):
+        raise ValueError("checkpoint claim does not match the exact Beads task claim")
+    if hashlib.sha256(claim_token.encode("utf-8")).hexdigest() != contract.get("claim_token_sha256"):
+        raise ValueError("live Beads claim does not match the signed launch")
+    if (
+        str(record.get("provider") or "") != str(contract.get("provider") or "")
+        or int(record.get("attempt") or 0) != int(contract.get("attempt") or 0)
+        or str(agentflow.get("claim_id") or "") != str(binding.get("claim_id") or "")
+    ):
+        raise ValueError("Herdr identity does not match the signed launch contract")
+    attempts = record.get("attempts")
+    matching_attempts = [
+        item for item in attempts if isinstance(item, Mapping)
+        and int(item.get("attempt") or 0) == int(contract.get("attempt") or 0)
+        and str(item.get("launch_id") or "") == launch_id
+    ] if isinstance(attempts, list) else []
+    if len(matching_attempts) != 1 or matching_attempts[0].get("pane_id") != pane_id or matching_attempts[0].get("status") != "identity_pending":
+        raise ValueError("launch attempt history does not match the exact pending pane")
+    execution_entry = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if execution_entry is None:
+        raise ValueError("expired preidentity recovery requires an existing protected execution ledger row")
+    if (
+        time.time() < float(execution_entry.get("deadline_epoch", 0))
+        or execution_entry.get("status") not in {"active", "expired"}
+    ):
+        raise ValueError("protected launch deadline is not durably expired")
+    if was_cancelled and not _authenticated_cancelled_preidentity(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    ):
+        raise ValueError("cancelled preidentity launch is not backed by an expired protected ledger row")
+    for descendant in descendants:
+        descendant_id = str(descendant.get("id") or "")
+        other = sessions.get(descendant_id) if isinstance(sessions, Mapping) else None
+        if descendant_id != task_id and isinstance(other, Mapping) and str(other.get("status") or "") in {
+            "launching", "identity_pending", "launched", "running",
+        }:
+            raise ValueError("another workflow descendant has an active Herdr lifecycle")
+    root_issue = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(root_issue.get("id") or "") != workflow_root
+        or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise ValueError("workflow root is missing, mismatched, or terminal")
+    return {
+        "contract": dict(contract), "binding": dict(binding),
+        "contract_path": expected_contract_path, "record": dict(record),
+        "claim_token": claim_token, "actor": actor,
+    }
+
+
+def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
+    herdr = _provider_command("herdr")
+    if not herdr:
+        raise ValueError("Herdr is unavailable; pane absence is unknown")
+    try:
+        probe = subprocess.run(
+            [herdr, "pane", "get", pane_id], capture_output=True,
+            text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Herdr pane state is unknown") from exc
+    if not launch_recovery_backend.herdr_pane_is_definitively_absent(
+        probe.returncode, probe.stdout or "",
+    ):
+        raise ValueError("Herdr did not definitively report the exact pane absent")
+
+
+def _preidentity_disposition(
+    contract: Mapping[str, Any], *, pane_id: str, authority_secret: str,
+) -> dict[str, Any]:
+    value = {
+        "schema": "agentflow.preidentity-cancellation@1",
+        "status": "cancelled_preidentity",
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "pane_id": pane_id,
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "attempt": contract.get("attempt"),
+        "deadline_epoch": contract.get("deadline_epoch"),
+        "recorded_at": _now(),
+        "reason": "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+    }
+    value["authority_key_id"] = _credential_key_id(authority_secret)
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="preidentity-cancellation-v1",
+    )
+    return value
+
+
+def _verify_preidentity_disposition(
+    value: Any,
+    contract: Mapping[str, Any],
+    *,
+    pane_id: str,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or (
+        value.get("schema") != "agentflow.preidentity-cancellation@1"
+        or value.get("status") != "cancelled_preidentity"
+        or value.get("pane_id") != pane_id
+        or value.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, value, domain="preidentity-cancellation-v1",
+        )
+    ):
+        raise ValueError("preidentity cancellation audit disposition is not authenticated")
+    fields = (
+        "workspace_root", "workflow_root", "task_id", "claim_id", "lease_id",
+        "launch_id", "controller_id", "continuity_id", "lease_epoch", "attempt",
+        "deadline_epoch",
+    )
+    if any(value.get(field) != contract.get(field) for field in fields):
+        raise ValueError("preidentity cancellation does not match the exact signed launch")
+    return value
+
+
+def _commit_preidentity_cancellation(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    launch_id: str,
+    pane_id: str,
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> None:
+    """Atomically revoke the late-result channel and retain an audit record."""
+    state_path = root / ".agentflow/herdr/sessions.json"
+    with _herdr_transaction(state_path) as state:
+        record = state.get("sessions", {}).get(task_id)
+        if not isinstance(record, dict):
+            raise ValueError("exact Herdr launch record disappeared during recovery")
+        channel = record.get("return_channel")
+        if not isinstance(channel, dict):
+            raise ValueError("exact Herdr return channel disappeared during recovery")
+        current_contract = channel.get("contract_binding")
+        if not isinstance(current_contract, Mapping) or dict(current_contract) != dict(contract):
+            raise ValueError("signed Herdr launch changed during recovery")
+        if record.get("status") == "cancelled_preidentity":
+            disposition = _verify_preidentity_disposition(
+                record.get("recovery_disposition"), contract,
+                pane_id=pane_id, authority_secret=authority_secret,
+            )
+            if channel.get("state") != "revoked" or channel.get("revocation") != dict(disposition):
+                raise ValueError("cancelled Herdr channel is not durably fenced")
+            _expired_preidentity_ledger_disposition(
+                root, workflow_root, task_id, contract,
+                authority_secret=authority_secret,
+            )
+            return
+        if (
+            record.get("status") != "identity_pending"
+            or record.get("root") != str(root)
+            or record.get("workflow_root") != workflow_root
+            or record.get("task_id") != task_id
+            or record.get("launch_id") != launch_id
+            or record.get("pane_id") != pane_id
+            or record.get("binding") not in (None, {})
+            or record.get("result") not in (None, {})
+            or channel.get("state") != "issued"
+        ):
+            raise ValueError("Herdr launch is no longer an unbound identity-pending attempt")
+        _require_definitively_absent_herdr_pane(pane_id)
+        _expired_preidentity_ledger_disposition(
+            root, workflow_root, task_id, contract,
+            authority_secret=authority_secret,
+        )
+        disposition = _preidentity_disposition(
+            contract, pane_id=pane_id, authority_secret=authority_secret,
+        )
+        # Preserve the attempt list and count. This is a separate lifecycle
+        # disposition; it never fabricates provider output or task failure.
+        record["status"] = "cancelled_preidentity"
+        record["recovery_disposition"] = disposition
+        channel["state"] = "revoked"
+        channel["revoked_at"] = disposition["recorded_at"]
+        channel["revocation"] = disposition
+
+
+def _authenticated_cancelled_preidentity(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    *,
+    authority_secret: str,
+) -> bool:
+    """Return true only for a signed, ledger-backed retired launch."""
+    try:
+        state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+        sessions = state.get("sessions")
+        record = sessions.get(task_id) if isinstance(sessions, Mapping) else None
+        if not isinstance(record, Mapping) or record.get("status") != "cancelled_preidentity":
+            return False
+        channel = record.get("return_channel")
+        if not isinstance(channel, Mapping) or channel.get("state") != "revoked":
+            return False
+        contract = channel.get("contract_binding")
+        if not isinstance(contract, Mapping):
+            return False
+        contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+        if contract_path.is_symlink() or not contract_path.is_file():
+            return False
+        binding = _verify_return_contract_binding(
+            contract, contract_path, task_id, record,
+            root=root, authority_secret=authority_secret, require_issued=False,
+        )
+        if (
+            str(binding.get("workflow_root") or "") != workflow_root
+            or str(binding.get("launch_id") or "") != str(record.get("launch_id") or "")
+        ):
+            return False
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract,
+            pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+        )
+        if channel.get("revocation") != dict(disposition) or record.get("result") not in (None, {}):
+            return False
+        _verify_execution_snapshot_against_ledger(
+            root, workflow_root, task_id, contract, authority_secret=authority_secret,
+        )
+        entry = _read_any_execution_ledger_entry(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        )
+        return bool(
+            entry and entry.get("status") == "expired"
+            and dict(entry.get("launch_identity") or {}) == {
+                "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+                "task_id": task_id, "claim_id": str(contract.get("claim_id") or ""),
+                "lease_id": str(contract.get("lease_id") or ""),
+                "launch_id": str(contract.get("launch_id") or ""),
+                "controller_id": str(contract.get("controller_id") or ""),
+                "continuity_id": str(contract.get("continuity_id") or ""),
+                "lease_epoch": contract.get("lease_epoch"),
+            }
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def _mint_return_channel(
@@ -5098,6 +5933,9 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         limits=execution_limits,
                         policy_max_attempts=policy_attempt_cap,
                         authority_secret=authority_secret,
+                        claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                        launch_id=launch_id, controller_id=lease.controller,
+                        continuity_id=lease.continuity_id, lease_epoch=lease.epoch,
                     )
                     attempt = int(limit_entry["attempt"])
                 elif prior_limit_entry is not None:
@@ -11409,7 +12247,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--acknowledge-no-ready-halt", action="store_true",
         help="explicitly acknowledge a recognized no-ready-work halt after a fresh safe-boundary check",
     )
+    controller_resume_parser.add_argument(
+        "--continue-after-cancelled-preidentity", metavar="CANCELLED_TASK",
+        help="explicitly continue a signed cancelled preidentity halt; requires --continue-task",
+    )
+    controller_resume_parser.add_argument(
+        "--continue-task", metavar="READY_TASK",
+        help="exact distinct ready descendant to claim after cancelled preidentity recovery",
+    )
     controller_resume_parser.set_defaults(func=controller_resume)
+    controller_recover_parser = controller_sub.add_parser(
+        "recover-preidentity",
+        help="Retire one expired identity-pending launch only after Herdr confirms its exact pane is absent",
+    )
+    controller_recover_parser.add_argument("--root", required=True)
+    controller_recover_parser.add_argument("--workflow-root", required=True)
+    controller_recover_parser.add_argument("--controller", default="agentflow-controller")
+    controller_recover_parser.add_argument("--task", required=True)
+    controller_recover_parser.add_argument("--launch-id", required=True)
+    controller_recover_parser.add_argument("--pane-id", required=True)
+    controller_recover_parser.add_argument("--state-path", default="")
+    controller_recover_parser.add_argument("--checkpoint-path", default="")
+    controller_recover_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_recover_parser.add_argument("--json", action="store_true")
+    controller_recover_parser.set_defaults(func=controller_recover_preidentity)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",
         help="Run one protected root supervisor in a separate terminal; explicitly rerun it after a crash",

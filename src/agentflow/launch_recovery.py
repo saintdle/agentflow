@@ -84,6 +84,14 @@ def reduce_incomplete_launch(
     session_id = str(binding.get("session_id") or "")
     pane_id = str(record.get("pane_id") or "") if record else ""
 
+    if lifecycle == "cancelled_preidentity":
+        return _operator_required(
+            task_id,
+            "has an authenticated cancelled preidentity launch. Continue only through the "
+            "explicit controller continuation flow with a distinct ready descendant",
+            provider_terminal=True,
+        )
+
     if lifecycle == "launching":
         if record and str(record.get("launch_outcome") or "").lower() == "ambiguous":
             observation = record.get("launch_observation")

@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agentflow import cli
+from agentflow import execution_limits as execution_limits_backend
 from tests import _state_home  # noqa: F401  # external controller authority
 
 
@@ -2703,6 +2704,378 @@ def _run_controller_json(func, args) -> dict:
     with mock.patch("sys.stdout", buffer):
         func(args)
     return json.loads(buffer.getvalue())
+
+
+def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict, Path, dict]:
+    """Create one real signed identity-pending launch and its halted checkpoint."""
+    fixture = ValidLaunch(base / "workspace", seed_lease=False)
+    fixture.task_issue["status"] = "in_progress"
+    fixture.task_issue["metadata"]["agentflow"]["launch"]["execution_limits"] = {
+        "deadline_seconds": 600, "max_retries": 1,
+    }
+    fixture.lease = fixture._seed_lease()
+    fixture._persist_claim()
+    fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
+    with fixture.beads_patches(), \
+         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+         mock.patch.object(
+             cli.subprocess, "run",
+             side_effect=fixture.herdr_run(
+                 stdout=_agent_started_stdout(
+                     fixture.provider, pane_id="pane-pending", agent_session=None,
+                 ),
+             ),
+         ), contextlib.redirect_stdout(io.StringIO()):
+        if cli.herdr_launch(fixture.launch_args()) != 0:
+            raise AssertionError("fixture provider launch did not reach identity_pending")
+
+    state_path = fixture.root / ".agentflow/herdr/sessions.json"
+    herdr_state = json.loads(state_path.read_text(encoding="utf-8"))
+    record = herdr_state["sessions"][fixture.task_id]
+    if record.get("status") != "identity_pending":
+        raise AssertionError("fixture did not persist identity_pending")
+    attempts = json.loads(json.dumps(record.get("attempts", [])))
+    contract_path = Path(record["return_channel"]["contract_path"])
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    fixture.contract = contract
+    # The authenticated launch is aged past its original one-shot deadline
+    # while preserving a valid controller MAC and the existing ledger row.
+    contract["deadline_epoch"] = time.time() - 10
+    contract["authority_hmac"] = cli._authority_mac(
+        fixture.authority_secret, contract, domain="return-contract-v1",
+    )
+    cli._private_atomic_json(contract_path, contract)
+    with cli._herdr_transaction(state_path) as state:
+        current = state["sessions"][fixture.task_id]
+        current["deadline_epoch"] = contract["deadline_epoch"]
+        channel = current["return_channel"]
+        channel["contract_binding"] = contract
+        channel["contract_sha256"] = cli._canonical_json_digest(contract)
+    ledger_path = cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root)
+    key = cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id)
+    with cli._execution_limit_ledger_transaction(ledger_path) as ledger:
+        entry = ledger["entries"][key]
+        entry["deadline_epoch"] = contract["deadline_epoch"]
+        entry["authority_hmac"] = cli._authority_mac(
+            fixture.authority_secret, entry, domain="execution-limit-ledger-v1",
+        )
+    controller = cli.controller_backend.RootController(
+        str(fixture.root), fixture.controller,
+        state_path=cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json",
+        checkpoint_path=cli._controller_state_dir(fixture.root, fixture.workflow_root) / "checkpoint.json",
+    )
+    controller.reserve_active_task({
+        "task": fixture.task_id, "root": str(fixture.root),
+        "actor": fixture.controller, "claim_id": "claim-1",
+    }, lease=fixture.lease)
+    controller.bind_active_task(
+        fixture.task_id, session_id="", state="identity_pending", lease=fixture.lease,
+    )
+    controller.halt(
+        "blocked",
+        f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within 1800s",
+        lease=fixture.lease,
+    )
+    return fixture, controller, contract, ledger_path, {"attempts": attempts, "state_path": state_path}
+
+
+class PreidentityRecoveryCommandTests(unittest.TestCase):
+    def _rewrite_deadline(self, fixture: ValidLaunch, contract: dict, ledger_path: Path, deadline: float) -> None:
+        contract["deadline_epoch"] = deadline
+        contract["authority_hmac"] = cli._authority_mac(
+            fixture.authority_secret, contract, domain="return-contract-v1",
+        )
+        contract_path = Path(contract["contract_path"])
+        cli._private_atomic_json(contract_path, contract)
+        state_path = fixture.root / ".agentflow/herdr/sessions.json"
+        with cli._herdr_transaction(state_path) as state:
+            record = state["sessions"][fixture.task_id]
+            record["deadline_epoch"] = deadline
+            channel = record["return_channel"]
+            channel["contract_binding"] = contract
+            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+        key = cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id)
+        with cli._execution_limit_ledger_transaction(ledger_path) as ledger:
+            entry = ledger["entries"][key]
+            entry["deadline_epoch"] = deadline
+            entry["authority_hmac"] = cli._authority_mac(
+                fixture.authority_secret, entry, domain="execution-limit-ledger-v1",
+            )
+
+    def _args(self, fixture: ValidLaunch, *, task: str | None = None, launch_id: str | None = None,
+              pane_id: str | None = None, workflow_root: str | None = None,
+              controller: str | None = None) -> argparse.Namespace:
+        return argparse.Namespace(
+            root=str(fixture.root), workflow_root=workflow_root or fixture.workflow_root,
+            controller=controller or fixture.controller, state_path="", checkpoint_path="",
+            stale_after=300.0, task=task or fixture.task_id,
+            launch_id=launch_id or str(fixture.contract["launch_id"] if hasattr(fixture, "contract") else ""),
+            pane_id=pane_id or "pane-pending", json=True,
+            _supervisor_lock_path=str(
+                fixture.root / ".agentflow/test-controller-locks/recovery.lock"
+            ),
+        )
+
+    def _run_recovery(self, fixture: ValidLaunch, args: argparse.Namespace, *, pane_response: str | None = None,
+                      pane_returncode: int = 1, descendants_override: list | None = None) -> tuple[dict, mock.Mock]:
+        output = json.dumps({
+            "error": {"code": "pane_not_found", "message": "pane missing"},
+            "id": "cli:pane:get",
+        }) if pane_response is None else pane_response
+        pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
+            ["herdr", "pane", "get", args.pane_id], pane_returncode,
+            stdout=output, stderr="",
+        ))
+        descendants_patch = (
+            mock.patch.object(cli.beads_backend, "root_descendants", return_value=descendants_override)
+            if descendants_override is not None else contextlib.nullcontext()
+        )
+        with fixture.beads_patches(), descendants_patch, \
+             mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+             mock.patch.object(cli.subprocess, "run", pane_probe):
+            payload = _run_controller_json(cli.controller_recover_preidentity, args)
+        return payload, pane_probe
+
+    def test_recovery_revokes_channel_then_clears_pointer_and_allows_only_explicit_distinct_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(base)
+                fixture.contract = contract
+                old_attempts = baseline["attempts"]
+                checkpoint_before_cancel = controller._load_checkpoint()
+                # Exercise the pre-dormant legacy state: clean release had no
+                # stored proof hash, so recovery must use only the exact
+                # signed launch plus the protected canonical credential.
+                controller.release(fixture.lease)
+                released = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                released.pop("dormant_lease", None)
+                cli._private_atomic_json(controller.state_path, released)
+                args = self._args(fixture)
+                result, pane_probe = self._run_recovery(fixture, args)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(pane_probe.call_count, 2)
+                checkpoint = controller._load_checkpoint()
+                self.assertEqual(checkpoint["task"], str(fixture.root))
+                self.assertEqual(checkpoint["active_tasks"], [])
+                self.assertTrue(checkpoint["terminal"])
+                self.assertTrue(checkpoint["last_check"].startswith("cancelled expired preidentity launch "))
+                state_path = baseline["state_path"]
+                herdr_state = json.loads(state_path.read_text(encoding="utf-8"))
+                record = herdr_state["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "cancelled_preidentity")
+                self.assertEqual(record["return_channel"]["state"], "revoked")
+                self.assertIsNone(record["result"])
+                self.assertEqual(record["attempts"], old_attempts)
+                key = cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id)
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                entry = ledger["entries"][key]
+                self.assertEqual(entry["status"], "expired")
+                self.assertEqual(entry["attempt"], 1)
+                self.assertEqual(entry["deadline_epoch"], contract["deadline_epoch"])
+                self.assertEqual(entry["launch_identity"]["launch_id"], contract["launch_id"])
+                with self.assertRaisesRegex(ValueError, "deadline expired"):
+                    cli._reserve_execution_attempt(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                        limits=execution_limits_backend.parse_limits(contract["execution_limits"]),
+                        policy_max_attempts=entry["max_attempts"],
+                        authority_secret=fixture.authority_secret,
+                        claim_id=contract["claim_id"], lease_id=contract["lease_id"],
+                        launch_id="retry-must-not-launch",
+                        controller_id=contract["controller_id"],
+                        continuity_id=contract["continuity_id"],
+                        lease_epoch=contract["lease_epoch"],
+                    )
+                still_expired = json.loads(ledger_path.read_text(encoding="utf-8"))["entries"][key]
+                self.assertEqual(still_expired["attempt"], entry["attempt"])
+                self.assertEqual(still_expired["deadline_epoch"], entry["deadline_epoch"])
+
+                # A valid late inbox cannot consume a revoked channel.
+                channel = record["return_channel"]
+                result_path = Path(channel["result_path"])
+                result_path.write_text(json.dumps({"outcome": "completed", "acceptance_results": []}), encoding="utf-8")
+                marker = {
+                    "schema": "agentflow.result-submission@1",
+                    "contract_sha256": cli._file_sha256(Path(channel["contract_path"])),
+                    "result_sha256": cli._file_sha256(result_path),
+                    "submitted_at": cli._now(),
+                }
+                cli._private_atomic_json(Path(channel["submission_file"]), marker)
+                late = cli._ingest_submitted_result(
+                    fixture.root, fixture.task_id, authority_secret=fixture.authority_secret,
+                )
+                self.assertEqual(late.status, "pending")
+                current = json.loads(state_path.read_text(encoding="utf-8"))["sessions"][fixture.task_id]
+                self.assertEqual(current["return_channel"]["state"], "revoked")
+                self.assertIsNone(current["result"])
+
+                # Simulate a crash after the Herdr tombstone/ledger write but
+                # before checkpoint pointer clearing. Retry is idempotent and
+                # uses the same active lease without a pane query.
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint_before_cancel)
+                retried, retry_probe = self._run_recovery(fixture, args)
+                self.assertTrue(retried["ok"], retried)
+                self.assertEqual(retry_probe.call_count, 0)
+                self.assertEqual(controller._load_checkpoint()["active_tasks"], [])
+
+                # Explicit reopening identifies one distinct ready child;
+                # stale in-progress work is ignored only while its signed
+                # cancellation and expired ledger record still verify.
+                ready = dict(fixture.task_issue, id="task-2", status="open", assignee="")
+                ready["parent"] = fixture.workflow_root
+                ready["metadata"] = {"agentflow": {}}
+                def get_issue(_cwd, issue_id):
+                    if issue_id == fixture.workflow_root:
+                        return fixture.root_issue
+                    if issue_id == fixture.task_id:
+                        return fixture.task_issue
+                    if issue_id == "task-2":
+                        return ready
+                    raise AssertionError(issue_id)
+                def run_beads(_cwd, *argv):
+                    if argv[0] == "ready":
+                        rows = [] if "--assignee" in argv else [{"id": "task-2"}]
+                        return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+                    if argv[0] == "update" and argv[1] == "task-2":
+                        ready.update({"status": "in_progress", "assignee": fixture.controller})
+                        return subprocess.CompletedProcess(["bd", *argv], 0, "", "")
+                    raise AssertionError(argv)
+                current_state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                current_lease = cli.controller_backend.Lease.from_dict(current_state["lease"])
+                credentials = cli._read_controller_credentials(cli._resume_key_path(self._args(fixture)))
+                resume_args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root,
+                    once=True,
+                    _supervisor_lock_path=str(fixture.root / ".agentflow/test-controller-locks/resume.lock"),
+                )
+                resume_args.continue_after_cancelled_preidentity = fixture.task_id
+                resume_args.continue_task = "task-2"
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_beads), \
+                     mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                     mock.patch.object(cli, "_persist_claim_identity"), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_dispatch_via_herdr", return_value=lambda _task: {
+                         "state": "running", "session_id": "session-task-2",
+                     }):
+                    resumed = _run_controller_json(cli.controller_resume, resume_args)
+                self.assertTrue(resumed["ok"], resumed)
+                self.assertEqual(resumed["result"]["state"], "running")
+                self.assertEqual(resumed["result"]["checkpoint"]["task"], "task-2")
+                self.assertNotEqual(resumed["result"]["checkpoint"]["task"], fixture.task_id)
+                self.assertEqual(current_lease.continuity_id, resumed["lease"]["continuity_id"])
+
+    def test_recovery_rejects_unknown_panes_missing_ledger_and_wrong_task_binding_without_clearing(self) -> None:
+        cases = (
+            "unknown-pane", "live-pane", "missing-ledger", "unexpired-deadline",
+            "wrong-root", "wrong-task", "wrong-controller", "wrong-continuity",
+            "bad-signature", "wrong-claim", "committed-binding", "committed-result",
+            "sibling-active",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, _contract, ledger_path, baseline = _expired_preidentity_fixture(base)
+                    fixture.contract = _contract
+                    if case == "missing-ledger":
+                        ledger_path.unlink()
+                    if case == "unexpired-deadline":
+                        self._rewrite_deadline(fixture, _contract, ledger_path, time.time() + 3600)
+                    if case == "wrong-claim":
+                        fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "wrong-claim"
+                    if case == "committed-binding":
+                        path = baseline["state_path"]
+                        with cli._herdr_transaction(path) as herdr:
+                            herdr["sessions"][fixture.task_id]["binding"] = {"session_id": "committed"}
+                    if case == "committed-result":
+                        with cli._herdr_transaction(baseline["state_path"]) as herdr:
+                            herdr["sessions"][fixture.task_id]["result"] = {"outcome": "completed"}
+                    if case == "wrong-continuity":
+                        credential_path = cli._resume_key_path(self._args(fixture))
+                        raw_credential = json.loads(credential_path.read_text(encoding="utf-8"))
+                        raw_credential["continuity_id"] = "foreign-continuity"
+                        cli._private_atomic_json(credential_path, raw_credential)
+                    if case == "bad-signature":
+                        contract_path = Path(_contract["contract_path"])
+                        bad_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+                        bad_contract["authority_hmac"] = "0" * 64
+                        cli._private_atomic_json(contract_path, bad_contract)
+                        with cli._herdr_transaction(baseline["state_path"]) as herdr:
+                            channel = herdr["sessions"][fixture.task_id]["return_channel"]
+                            channel["contract_binding"] = bad_contract
+                            channel["contract_sha256"] = cli._canonical_json_digest(bad_contract)
+                    if case == "sibling-active":
+                        result, pane_probe = self._run_recovery(
+                            fixture, self._args(fixture), descendants_override=[
+                                fixture.task_issue,
+                                {"id": "sibling", "status": "in_progress", "parent": fixture.workflow_root},
+                            ],
+                        )
+                        self.assertFalse(result["ok"])
+                        self.assertEqual(pane_probe.call_count, 0)
+                        self.assertEqual(controller._load_checkpoint()["active_tasks"][0]["task"], fixture.task_id)
+                        continue
+                    if case == "wrong-root":
+                        args = self._args(fixture, workflow_root="foreign-root")
+                    elif case == "wrong-task":
+                        args = self._args(fixture, task="foreign-task")
+                    elif case == "wrong-controller":
+                        args = self._args(fixture, controller="foreign-controller")
+                    else:
+                        args = self._args(fixture)
+                    pane_response = None
+                    pane_returncode = 1
+                    if case == "unknown-pane":
+                        pane_response = json.dumps({"error": {"code": "daemon_offline"}, "id": "cli:pane:get"})
+                    elif case == "live-pane":
+                        pane_response = json.dumps({"id": "cli:pane:get", "result": {"pane_id": "pane-pending"}})
+                        pane_returncode = 0
+                    result, pane_probe = self._run_recovery(
+                        fixture, args, pane_response=pane_response,
+                        pane_returncode=pane_returncode,
+                    )
+                    self.assertFalse(result["ok"], (case, result))
+                    if case in {"unknown-pane", "live-pane"}:
+                        self.assertEqual(pane_probe.call_count, 1)
+                    else:
+                        self.assertEqual(pane_probe.call_count, 0)
+                    current = json.loads(baseline["state_path"].read_text(encoding="utf-8"))["sessions"][fixture.task_id]
+                    self.assertEqual(current["status"], "identity_pending")
+                    self.assertEqual(current["return_channel"]["state"], "issued")
+                    self.assertEqual(controller._load_checkpoint()["active_tasks"][0]["task"], fixture.task_id)
+
+    def test_recovery_command_and_distinct_continuation_flags_are_registered(self) -> None:
+        parser = cli.build_parser()
+        recovery = parser.parse_args([
+            "controller", "recover-preidentity", "--root", "/tmp/workspace",
+            "--workflow-root", "wf", "--task", "task", "--launch-id", "launch",
+            "--pane-id", "pane",
+        ])
+        self.assertIs(recovery.func, cli.controller_recover_preidentity)
+        resume = parser.parse_args([
+            "controller", "resume", "--root", "/tmp/workspace", "--workflow-root", "wf",
+            "--continue-after-cancelled-preidentity", "task", "--continue-task", "child",
+        ])
+        self.assertEqual(resume.continue_after_cancelled_preidentity, "task")
+        self.assertEqual(resume.continue_task, "child")
+
+    def test_dormant_release_recovery_preserves_incarnation_and_rotates_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, _ledger, _baseline = _expired_preidentity_fixture(base)
+                controller.release(fixture.lease)
+                args = self._args(fixture)
+                result, pane_probe = self._run_recovery(fixture, args)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(pane_probe.call_count, 2)
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                lease = cli.controller_backend.Lease.from_dict(state["lease"])
+                self.assertEqual(lease.continuity_id, contract["continuity_id"])
+                self.assertEqual(lease.epoch, contract["lease_epoch"] + 1)
 
 
 class ControllerResumeCredentialTests(unittest.TestCase):
