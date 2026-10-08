@@ -2544,7 +2544,20 @@ def _verify_cancelled_preidentity_continuation(
         )
     document = controller._load_checkpoint()
     record = _herdr_session_record(root, cancelled_task)
-    retired_check = f"cancelled expired preidentity launch {record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
+    disposition = record.get("recovery_disposition") if isinstance(record, Mapping) else None
+    retirement_reason = (
+        str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
+    )
+    if retirement_reason not in {
+        "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+        "superseded_legacy_scope",
+    }:
+        raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
+    marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
+    retired_check = (
+        f"cancelled {marker_reason} preidentity launch "
+        f"{record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
+    )
     if (
         checkpoint_backend.admission_phase(document) != "terminal"
         or checkpoint_backend.resume_state(document) != "blocked"
@@ -2555,10 +2568,7 @@ def _verify_cancelled_preidentity_continuation(
         or str(document.get("task") or "") != controller.root
         or document.get("active_tasks")
         or document.get("actor") or document.get("claim_id") or document.get("session_id")
-        or document.get("last_check") != (
-            f"cancelled expired preidentity launch {record.get('launch_id') if isinstance(record, Mapping) else ''} "
-            f"for {cancelled_task}"
-        )
+        or document.get("last_check") != retired_check
     ):
         raise controller_backend.ControllerError(
             "checkpoint is not the exact safely retired preidentity halt"
@@ -2570,6 +2580,7 @@ def _verify_cancelled_preidentity_continuation(
     ):
         raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
     assert isinstance(record, Mapping)
+    legacy_scope = retirement_reason == "superseded_legacy_scope"
     channel = record.get("return_channel")
     contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
     if (
@@ -2585,7 +2596,7 @@ def _verify_cancelled_preidentity_continuation(
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
     claim_token = str(agentflow.get("claim_token") or "")
     if (
-        str(cancelled_issue.get("status") or "").lower() != "in_progress"
+        str(cancelled_issue.get("status") or "").lower() != ("blocked" if legacy_scope else "in_progress")
         or str(cancelled_issue.get("assignee") or "") != lease.controller
         or str(agentflow.get("root") or "") != workflow_root
         or str(agentflow.get("task") or "") != cancelled_task
@@ -2597,9 +2608,12 @@ def _verify_cancelled_preidentity_continuation(
         )
     ):
         raise controller_backend.ControllerError("cancelled task no longer has its exact signed Beads claim")
-    beads_backend.verify_task_ancestry_and_ownership(
-        root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
-    )
+    if not legacy_scope:
+        beads_backend.verify_task_ancestry_and_ownership(
+            root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
+        )
+    elif str(cancelled_issue.get("parent") or "") != workflow_root:
+        raise controller_backend.ControllerError("blocked legacy task is no longer under the exact workflow root")
 
     root_issue = beads_backend.get_issue(root, workflow_root)
     if (
@@ -2611,8 +2625,11 @@ def _verify_cancelled_preidentity_continuation(
     by_id = {str(row.get("id") or ""): row for row in descendants}
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
-    if str(by_id[cancelled_task].get("status") or "").lower() != "in_progress":
+    expected_cancelled_status = "blocked" if legacy_scope else "in_progress"
+    if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
+    if legacy_scope and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
+        raise controller_backend.ControllerError("blocked legacy task owner changed before continuation")
     for row in descendants:
         task_id = str(row.get("id") or "")
         status = str(row.get("status") or "").lower()
@@ -2665,7 +2682,22 @@ def _verify_cancelled_preidentity_continuation(
 
 
 def controller_recover_preidentity(args: argparse.Namespace) -> int:
-    """Retire one expired, absent-pane identity-pending launch under its root lease."""
+    return _controller_preidentity_retirement(args, superseded_legacy_scope=False)
+
+
+def controller_retire_superseded_legacy_preidentity(args: argparse.Namespace) -> int:
+    """Retire an authenticated unbudgeted legacy launch after its scope ends."""
+    return _controller_preidentity_retirement(args, superseded_legacy_scope=True)
+
+
+def _controller_preidentity_retirement(
+    args: argparse.Namespace, *, superseded_legacy_scope: bool,
+) -> int:
+    """Retire one exact absent-pane identity-pending launch under its root lease."""
+    operation_name = (
+        "retire-superseded-legacy-preidentity" if superseded_legacy_scope
+        else "recover-preidentity"
+    )
     try:
         _reject_custom_controller_state_path(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
@@ -2741,6 +2773,7 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
                 controller, root, workflow_root, task_id, launch_id, pane_id,
                 authority_secret=credentials["authority_secret"],
                 expected_current_epoch=preauthenticated_epoch,
+                superseded_legacy_scope=superseded_legacy_scope,
             )
             contract = snapshot["contract"]
             if credentials["continuity_id"] != contract.get("continuity_id"):
@@ -2769,6 +2802,7 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
                 lease = controller.recover_released_incarnation(
                     workflow_root=workflow_root, contract=contract,
                     authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    superseded_legacy_scope=superseded_legacy_scope,
                     persist_credentials=lambda candidate: _controller_credentials(
                         args, candidate, key_path=key_path,
                     ),
@@ -2778,6 +2812,7 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
                 lease = controller.recover_released_incarnation(
                     workflow_root=workflow_root, contract=contract,
                     authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    superseded_legacy_scope=superseded_legacy_scope,
                     persist_credentials=lambda candidate: _controller_credentials(
                         args, candidate, key_path=key_path,
                     ),
@@ -2788,25 +2823,34 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
                 controller, root, workflow_root, task_id, launch_id, pane_id,
                 authority_secret=credentials["authority_secret"],
                 expected_current_epoch=lease.epoch,
+                superseded_legacy_scope=superseded_legacy_scope,
             )
             def commit_cancellation() -> None:
                 current = _preidentity_recovery_snapshot(
                     controller, root, workflow_root, task_id, launch_id, pane_id,
                     authority_secret=credentials["authority_secret"],
                     expected_current_epoch=lease.epoch,
+                    superseded_legacy_scope=superseded_legacy_scope,
                 )
                 if current["contract"] != snapshot["contract"]:
                     raise ValueError("signed launch changed during recovery")
                 _commit_preidentity_cancellation(
                     root, workflow_root, task_id, launch_id, pane_id,
                     current["contract"], authority_secret=credentials["authority_secret"],
+                    superseded_legacy_scope=superseded_legacy_scope,
                 )
-            result = controller.cancel_expired_preidentity_task(
-                task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
-                commit_cancellation=commit_cancellation, lease=lease,
-            )
+            if superseded_legacy_scope:
+                result = controller.cancel_superseded_legacy_preidentity_task(
+                    task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
+                    commit_cancellation=commit_cancellation, lease=lease,
+                )
+            else:
+                result = controller.cancel_expired_preidentity_task(
+                    task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
+                    commit_cancellation=commit_cancellation, lease=lease,
+                )
             payload = {
-                "operation": "recover-preidentity", "ok": True,
+                "operation": operation_name, "ok": True,
                 "root": str(root), "workflow_root": workflow_root,
                 "task_id": task_id, "launch_id": launch_id,
                 "result": result.to_dict(),
@@ -2819,7 +2863,7 @@ def controller_recover_preidentity(args: argparse.Namespace) -> int:
         OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
     ) as exc:
         _json_or_status(
-            {"operation": "recover-preidentity", "ok": False, "error": str(exc)},
+            {"operation": operation_name, "ok": False, "error": str(exc)},
             as_json=bool(getattr(args, "json", False)), title="PREIDENTITY RECOVERY FAILED",
         )
         return 2
@@ -3909,6 +3953,29 @@ def _expired_preidentity_ledger_disposition(
     return entry
 
 
+def _verify_unbudgeted_legacy_preidentity(
+    root: Path, workflow_root: str, task_id: str,
+    contract: Mapping[str, Any], record: Mapping[str, Any], *, authority_secret: str,
+) -> None:
+    """Require genuinely legacy signed evidence with no protected budget row."""
+    budget_fields = {
+        "execution_limits", "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+        "max_attempts", "max_retries", "execution_limit_capabilities", "budget",
+    }
+    if any(field in contract for field in budget_fields | {"attempt"}):
+        raise ValueError("legacy-scope retirement requires a signed launch without structured budget metadata")
+    if any(field in record for field in budget_fields):
+        raise ValueError("legacy-scope retirement found budget metadata in the Herdr launch record")
+    ledger_path = _execution_limit_ledger_path(root, workflow_root)
+    if ledger_path.is_symlink() or ledger_path.parent.is_symlink():
+        raise ValueError("legacy-scope retirement found an unsafe execution ledger path")
+    entry = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if entry is not None:
+        raise ValueError("legacy-scope retirement found a protected execution ledger row")
+
+
 def _preidentity_recovery_snapshot(
     controller: controller_backend.RootController,
     root: Path,
@@ -3919,15 +3986,18 @@ def _preidentity_recovery_snapshot(
     *,
     authority_secret: str,
     expected_current_epoch: int | None = None,
+    superseded_legacy_scope: bool = False,
 ) -> dict[str, Any]:
     """Prove the exact halted launch before any lease or state transition."""
     document = controller._load_checkpoint()
     expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+    retirement_reason = "superseded_legacy_scope" if superseded_legacy_scope else "expired"
+    retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
     rows = controller.active_tasks()
     already_retired = (
         not rows and document.get("task") == controller.root
         and not document.get("active_tasks")
-        and document.get("last_check") == f"cancelled expired preidentity launch {launch_id} for {task_id}"
+        and document.get("last_check") == retired_check
     )
     retained_draining = (
         checkpoint_backend.admission_phase(document) == "draining"
@@ -3947,7 +4017,7 @@ def _preidentity_recovery_snapshot(
         and str(document.get("terminal_reason") or "").startswith(expected_reason)
     )
     if (
-        not (terminal_halt or retained_draining or already_retired)
+        not ((terminal_halt and not superseded_legacy_scope) or retained_draining or already_retired)
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
         or not (
@@ -3977,8 +4047,9 @@ def _preidentity_recovery_snapshot(
     ):
         raise ValueError("another workflow descendant is still claimed in progress")
     task_issue = beads_backend.get_issue(root, task_id)
-    if str(task_issue.get("status") or "").lower() != "in_progress":
-        raise ValueError("exact task is no longer in progress")
+    expected_task_status = "blocked" if superseded_legacy_scope else "in_progress"
+    if str(task_issue.get("status") or "").lower() != expected_task_status:
+        raise ValueError("exact task no longer has the expected retained claim status")
     metadata = task_issue.get("metadata")
     agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
@@ -3986,9 +4057,19 @@ def _preidentity_recovery_snapshot(
     actor = str(agentflow.get("actor") or "")
     if not claim_token or not actor:
         raise ValueError("exact live Beads claim is unavailable")
-    beads_backend.verify_task_ancestry_and_ownership(
-        root, task_issue, task=task_id, root=workflow_root, actor=actor,
-    )
+    if superseded_legacy_scope:
+        if (
+            str(task_issue.get("assignee") or "") != controller.controller
+            or actor != controller.controller
+            or str(agentflow.get("root") or "") != workflow_root
+            or str(agentflow.get("task") or "") != task_id
+            or str(task_issue.get("parent") or "") != workflow_root
+        ):
+            raise ValueError("blocked legacy claim no longer matches its exact owner and workflow root")
+    else:
+        beads_backend.verify_task_ancestry_and_ownership(
+            root, task_issue, task=task_id, root=workflow_root, actor=actor,
+        )
 
     herdr_path = root / ".agentflow/herdr/sessions.json"
     herdr_state = _load_herdr_state(herdr_path)
@@ -4031,6 +4112,8 @@ def _preidentity_recovery_snapshot(
             record.get("recovery_disposition"), contract, pane_id=pane_id,
             authority_secret=authority_secret,
         )
+        if (disposition.get("reason") == "superseded_legacy_scope") != superseded_legacy_scope:
+            raise ValueError("cancelled preidentity launch requires its matching retirement command")
         if channel.get("revocation") != dict(disposition):
             raise ValueError("return channel revocation does not match the signed cancellation")
     expected = {
@@ -4065,32 +4148,51 @@ def _preidentity_recovery_snapshot(
         raise ValueError("live Beads claim does not match the signed launch")
     if (
         str(record.get("provider") or "") != str(contract.get("provider") or "")
-        or int(record.get("attempt") or 0) != int(contract.get("attempt") or 0)
+        or (
+            not superseded_legacy_scope
+            and int(record.get("attempt") or 0) != int(contract.get("attempt") or 0)
+        )
         or str(agentflow.get("claim_id") or "") != str(binding.get("claim_id") or "")
     ):
         raise ValueError("Herdr identity does not match the signed launch contract")
     attempts = record.get("attempts")
     matching_attempts = [
         item for item in attempts if isinstance(item, Mapping)
-        and int(item.get("attempt") or 0) == int(contract.get("attempt") or 0)
+        and (
+            superseded_legacy_scope
+            or int(item.get("attempt") or 0) == int(contract.get("attempt") or 0)
+        )
         and str(item.get("launch_id") or "") == launch_id
     ] if isinstance(attempts, list) else []
     if len(matching_attempts) != 1 or matching_attempts[0].get("pane_id") != pane_id or matching_attempts[0].get("status") != "identity_pending":
         raise ValueError("launch attempt history does not match the exact pending pane")
-    execution_entry = _verify_execution_snapshot_against_ledger(
-        root, workflow_root, task_id, contract, authority_secret=authority_secret,
-    )
-    if execution_entry is None:
-        raise ValueError("expired preidentity recovery requires an existing protected execution ledger row")
-    if (
-        time.time() < float(execution_entry.get("deadline_epoch", 0))
-        or execution_entry.get("status") not in {"active", "expired"}
-    ):
-        raise ValueError("protected launch deadline is not durably expired")
+    if superseded_legacy_scope:
+        _verify_unbudgeted_legacy_preidentity(
+            root, workflow_root, task_id, contract, record,
+            authority_secret=authority_secret,
+        )
+        if (
+            not isinstance(record.get("attempt"), int)
+            or isinstance(record.get("attempt"), bool)
+            or record.get("attempt") < 1
+            or matching_attempts[0].get("attempt") != record.get("attempt")
+        ):
+            raise ValueError("legacy launch attempt history does not match the durable session count")
+    else:
+        execution_entry = _verify_execution_snapshot_against_ledger(
+            root, workflow_root, task_id, contract, authority_secret=authority_secret,
+        )
+        if execution_entry is None:
+            raise ValueError("expired preidentity recovery requires an existing protected execution ledger row")
+        if (
+            time.time() < float(execution_entry.get("deadline_epoch", 0))
+            or execution_entry.get("status") not in {"active", "expired"}
+        ):
+            raise ValueError("protected launch deadline is not durably expired")
     if was_cancelled and not _authenticated_cancelled_preidentity(
         root, workflow_root, task_id, authority_secret=authority_secret,
     ):
-        raise ValueError("cancelled preidentity launch is not backed by an expired protected ledger row")
+        raise ValueError("cancelled preidentity launch is not backed by its authenticated retirement record")
     for descendant in descendants:
         descendant_id = str(descendant.get("id") or "")
         other = sessions.get(descendant_id) if isinstance(sessions, Mapping) else None
@@ -4130,6 +4232,7 @@ def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
 
 def _preidentity_disposition(
     contract: Mapping[str, Any], *, pane_id: str, authority_secret: str,
+    superseded_legacy_scope: bool = False,
 ) -> dict[str, Any]:
     value = {
         "schema": "agentflow.preidentity-cancellation@1",
@@ -4144,11 +4247,17 @@ def _preidentity_disposition(
         "controller_id": str(contract.get("controller_id") or ""),
         "continuity_id": str(contract.get("continuity_id") or ""),
         "lease_epoch": contract.get("lease_epoch"),
-        "attempt": contract.get("attempt"),
-        "deadline_epoch": contract.get("deadline_epoch"),
         "recorded_at": _now(),
-        "reason": "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+        "reason": (
+            "superseded_legacy_scope" if superseded_legacy_scope
+            else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+        ),
     }
+    if superseded_legacy_scope:
+        value["budget_availability"] = "unknown"
+    else:
+        value["attempt"] = contract.get("attempt")
+        value["deadline_epoch"] = contract.get("deadline_epoch")
     value["authority_key_id"] = _credential_key_id(authority_secret)
     value["authority_hmac"] = _authority_mac(
         authority_secret, value, domain="preidentity-cancellation-v1",
@@ -4175,11 +4284,28 @@ def _verify_preidentity_disposition(
         raise ValueError("preidentity cancellation audit disposition is not authenticated")
     fields = (
         "workspace_root", "workflow_root", "task_id", "claim_id", "lease_id",
-        "launch_id", "controller_id", "continuity_id", "lease_epoch", "attempt",
-        "deadline_epoch",
+        "launch_id", "controller_id", "continuity_id", "lease_epoch",
     )
     if any(value.get(field) != contract.get(field) for field in fields):
         raise ValueError("preidentity cancellation does not match the exact signed launch")
+    if value.get("reason") == "superseded_legacy_scope":
+        if (
+            value.get("budget_availability") != "unknown"
+            or any(field in value for field in (
+                "attempt", "max_attempts", "max_retries", "execution_limits",
+                "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+            ))
+            or any(field in contract for field in (
+                "attempt", "max_attempts", "max_retries", "execution_limits", "deadline_epoch",
+                "deadline_seconds", "expires_at", "issued_at", "execution_limit_capabilities", "budget",
+            ))
+        ):
+            raise ValueError("legacy-scope disposition contains structured budget metadata")
+    else:
+        if value.get("reason") != "expired launch deadline; Herdr definitively reports pane absent before provider identity":
+            raise ValueError("preidentity cancellation reason is not recognized")
+        if any(value.get(field) != contract.get(field) for field in ("attempt", "deadline_epoch")):
+            raise ValueError("preidentity cancellation does not preserve its signed deadline")
     return value
 
 
@@ -4192,6 +4318,7 @@ def _commit_preidentity_cancellation(
     contract: Mapping[str, Any],
     *,
     authority_secret: str,
+    superseded_legacy_scope: bool = False,
 ) -> None:
     """Atomically revoke the late-result channel and retain an audit record."""
     state_path = root / ".agentflow/herdr/sessions.json"
@@ -4210,12 +4337,20 @@ def _commit_preidentity_cancellation(
                 record.get("recovery_disposition"), contract,
                 pane_id=pane_id, authority_secret=authority_secret,
             )
+            if (disposition.get("reason") == "superseded_legacy_scope") != superseded_legacy_scope:
+                raise ValueError("preidentity retirement mode does not match the durable disposition")
             if channel.get("state") != "revoked" or channel.get("revocation") != dict(disposition):
                 raise ValueError("cancelled Herdr channel is not durably fenced")
-            _expired_preidentity_ledger_disposition(
-                root, workflow_root, task_id, contract,
-                authority_secret=authority_secret,
-            )
+            if superseded_legacy_scope:
+                _verify_unbudgeted_legacy_preidentity(
+                    root, workflow_root, task_id, contract, record,
+                    authority_secret=authority_secret,
+                )
+            else:
+                _expired_preidentity_ledger_disposition(
+                    root, workflow_root, task_id, contract,
+                    authority_secret=authority_secret,
+                )
             return
         if (
             record.get("status") != "identity_pending"
@@ -4230,12 +4365,19 @@ def _commit_preidentity_cancellation(
         ):
             raise ValueError("Herdr launch is no longer an unbound identity-pending attempt")
         _require_definitively_absent_herdr_pane(pane_id)
-        _expired_preidentity_ledger_disposition(
-            root, workflow_root, task_id, contract,
-            authority_secret=authority_secret,
-        )
+        if superseded_legacy_scope:
+            _verify_unbudgeted_legacy_preidentity(
+                root, workflow_root, task_id, contract, record,
+                authority_secret=authority_secret,
+            )
+        else:
+            _expired_preidentity_ledger_disposition(
+                root, workflow_root, task_id, contract,
+                authority_secret=authority_secret,
+            )
         disposition = _preidentity_disposition(
             contract, pane_id=pane_id, authority_secret=authority_secret,
+            superseded_legacy_scope=superseded_legacy_scope,
         )
         # Preserve the attempt list and count. This is a separate lifecycle
         # disposition; it never fabricates provider output or task failure.
@@ -4284,6 +4426,12 @@ def _authenticated_cancelled_preidentity(
         )
         if channel.get("revocation") != dict(disposition) or record.get("result") not in (None, {}):
             return False
+        if disposition.get("reason") == "superseded_legacy_scope":
+            _verify_unbudgeted_legacy_preidentity(
+                root, workflow_root, task_id, contract, record,
+                authority_secret=authority_secret,
+            )
+            return True
         _verify_execution_snapshot_against_ledger(
             root, workflow_root, task_id, contract, authority_secret=authority_secret,
         )
@@ -12331,6 +12479,21 @@ def build_parser() -> argparse.ArgumentParser:
     controller_recover_parser.add_argument("--stale-after", type=float, default=300.0)
     controller_recover_parser.add_argument("--json", action="store_true")
     controller_recover_parser.set_defaults(func=controller_recover_preidentity)
+    controller_legacy_retire_parser = controller_sub.add_parser(
+        "retire-superseded-legacy-preidentity",
+        help="Retire an unbudgeted legacy identity-pending launch after its owning scope is superseded",
+    )
+    controller_legacy_retire_parser.add_argument("--root", required=True)
+    controller_legacy_retire_parser.add_argument("--workflow-root", required=True)
+    controller_legacy_retire_parser.add_argument("--controller", default="agentflow-controller")
+    controller_legacy_retire_parser.add_argument("--task", required=True)
+    controller_legacy_retire_parser.add_argument("--launch-id", required=True)
+    controller_legacy_retire_parser.add_argument("--pane-id", required=True)
+    controller_legacy_retire_parser.add_argument("--state-path", default="")
+    controller_legacy_retire_parser.add_argument("--checkpoint-path", default="")
+    controller_legacy_retire_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_legacy_retire_parser.add_argument("--json", action="store_true")
+    controller_legacy_retire_parser.set_defaults(func=controller_retire_superseded_legacy_preidentity)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",
         help="Run one protected root supervisor in a separate terminal; explicitly rerun it after a crash",

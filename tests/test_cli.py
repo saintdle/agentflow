@@ -2817,7 +2817,8 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         )
 
     def _run_recovery(self, fixture: ValidLaunch, args: argparse.Namespace, *, pane_response: str | None = None,
-                      pane_returncode: int = 1, descendants_override: list | None = None) -> tuple[dict, mock.Mock]:
+                      pane_returncode: int = 1, descendants_override: list | None = None,
+                      legacy_scope: bool = False) -> tuple[dict, mock.Mock]:
         output = json.dumps({
             "error": {"code": "pane_not_found", "message": "pane missing"},
             "id": "cli:pane:get",
@@ -2833,8 +2834,43 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         with fixture.beads_patches(), descendants_patch, \
              mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
              mock.patch.object(cli.subprocess, "run", pane_probe):
-            payload = _run_controller_json(cli.controller_recover_preidentity, args)
+            runner = (
+                cli.controller_retire_superseded_legacy_preidentity
+                if legacy_scope else cli.controller_recover_preidentity
+            )
+            payload = _run_controller_json(runner, args)
         return payload, pane_probe
+
+    def _legacy_fixture(self, base: Path):
+        fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(base)
+        fixture.task_issue["status"] = "blocked"
+        fixture.task_issue["metadata"]["agentflow"]["launch"].pop("execution_limits", None)
+        for field in ("execution_limits", "deadline_epoch", "attempt", "max_attempts"):
+            contract.pop(field, None)
+        contract["authority_hmac"] = cli._authority_mac(
+            fixture.authority_secret, contract, domain="return-contract-v1",
+        )
+        contract_path = Path(contract["contract_path"])
+        cli._private_atomic_json(contract_path, contract)
+        with cli._herdr_transaction(baseline["state_path"]) as state:
+            record = state["sessions"][fixture.task_id]
+            for field in (
+                "execution_limits", "deadline_epoch", "max_attempts",
+                "execution_limit_capabilities",
+            ):
+                record.pop(field, None)
+            channel = record["return_channel"]
+            channel["contract_binding"] = contract
+            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+        ledger_path.unlink(missing_ok=True)
+        checkpoint = controller._load_checkpoint()
+        checkpoint.update({
+            "state": "draining", "status": "draining", "terminal": False,
+            "terminal_reason": "accumulated and truncated prior halt history",
+        })
+        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+        fixture.contract = contract
+        return fixture, controller, contract, ledger_path, baseline
 
     def test_recovery_revokes_channel_then_clears_pointer_and_allows_only_explicit_distinct_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3055,12 +3091,326 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
             "--pane-id", "pane",
         ])
         self.assertIs(recovery.func, cli.controller_recover_preidentity)
+        legacy = parser.parse_args([
+            "controller", "retire-superseded-legacy-preidentity", "--root", "/tmp/workspace",
+            "--workflow-root", "wf", "--task", "task", "--launch-id", "launch", "--pane-id", "pane",
+        ])
+        self.assertIs(legacy.func, cli.controller_retire_superseded_legacy_preidentity)
         resume = parser.parse_args([
             "controller", "resume", "--root", "/tmp/workspace", "--workflow-root", "wf",
             "--continue-after-cancelled-preidentity", "task", "--continue-task", "child",
         ])
         self.assertEqual(resume.continue_after_cancelled_preidentity, "task")
         self.assertEqual(resume.continue_task, "child")
+
+    def test_superseded_legacy_retirement_preserves_unknown_budget_and_fences_late_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, ledger_path, baseline = self._legacy_fixture(base)
+                attempts = baseline["attempts"]
+                self.assertFalse(ledger_path.exists())
+                self.assertTrue(all(field not in contract for field in (
+                    "execution_limits", "deadline_epoch", "expires_at", "issued_at", "attempt", "max_attempts",
+                )))
+                controller.release(fixture.lease)
+                released = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                released.pop("dormant_lease", None)
+                cli._private_atomic_json(controller.state_path, released)
+                result, pane_probe = self._run_recovery(
+                    fixture, self._args(fixture), legacy_scope=True,
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["operation"], "retire-superseded-legacy-preidentity")
+                self.assertEqual(pane_probe.call_count, 2)
+                checkpoint = controller._load_checkpoint()
+                self.assertTrue(checkpoint["terminal"])
+                self.assertTrue(checkpoint["last_check"].startswith(
+                    "cancelled superseded_legacy_scope preidentity launch "
+                ))
+                record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                disposition = record["recovery_disposition"]
+                self.assertEqual(record["status"], "cancelled_preidentity")
+                self.assertEqual(record["return_channel"]["state"], "revoked")
+                self.assertEqual(record["attempts"], attempts)
+                self.assertEqual(disposition["reason"], "superseded_legacy_scope")
+                self.assertEqual(disposition["budget_availability"], "unknown")
+                self.assertNotIn("deadline_epoch", disposition)
+                self.assertNotIn("execution_limits", disposition)
+                self.assertFalse(ledger_path.exists())
+                retry, retry_probe = self._run_recovery(
+                    fixture, self._args(fixture), legacy_scope=True,
+                )
+                self.assertTrue(retry["ok"], retry)
+                self.assertEqual(retry_probe.call_count, 0)
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+                other_limits = execution_limits_backend.parse_limits({
+                    "deadline_seconds": 120, "max_retries": 0,
+                })
+                assert other_limits is not None
+                cli._reserve_execution_attempt(
+                    fixture.root, fixture.workflow_root, "other-budgeted-task",
+                    limits=other_limits, policy_max_attempts=1,
+                    authority_secret=fixture.authority_secret,
+                    claim_id="claim-other", lease_id="lease-other", launch_id="launch-other",
+                    controller_id=fixture.controller, continuity_id=contract["continuity_id"],
+                    lease_epoch=contract["lease_epoch"],
+                )
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id),
+                    ledger["entries"],
+                )
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+
+                channel = record["return_channel"]
+                result_path = Path(channel["result_path"])
+                result_path.write_text(json.dumps({"outcome": "completed", "acceptance_results": []}), encoding="utf-8")
+                marker = {
+                    "schema": "agentflow.result-submission@1",
+                    "contract_sha256": cli._file_sha256(Path(channel["contract_path"])),
+                    "result_sha256": cli._file_sha256(result_path), "submitted_at": cli._now(),
+                }
+                cli._private_atomic_json(Path(channel["submission_file"]), marker)
+                late = cli._ingest_submitted_result(
+                    fixture.root, fixture.task_id, authority_secret=fixture.authority_secret,
+                )
+                self.assertEqual(late.status, "pending")
+                self.assertIsNone(json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["result"])
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                current_lease = cli.controller_backend.Lease.from_dict(state["lease"])
+                ready = {
+                    "id": "distinct-ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                def get_issue(_cwd, issue_id):
+                    return {
+                        fixture.workflow_root: fixture.root_issue,
+                        fixture.task_id: fixture.task_issue,
+                        "distinct-ready-task": ready,
+                    }[issue_id]
+                def run_beads(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": "distinct-ready-task"}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+                original_metadata = json.loads(json.dumps(fixture.task_issue["metadata"]))
+                original_assignee = fixture.task_issue["assignee"]
+                for bad_status, bad_owner, bad_claim in (
+                    ("open", original_assignee, False),
+                    ("closed", original_assignee, False),
+                    ("blocked", "foreign-controller", False),
+                    ("blocked", original_assignee, True),
+                ):
+                    fixture.task_issue["status"] = bad_status
+                    fixture.task_issue["assignee"] = bad_owner
+                    if bad_claim:
+                        fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "changed-claim"
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                         mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                        with self.assertRaises(cli.controller_backend.ControllerError):
+                            cli._verify_cancelled_preidentity_continuation(
+                                fixture.root, fixture.workflow_root, fixture.task_id,
+                                "distinct-ready-task", controller, current_lease,
+                                authority_secret=fixture.authority_secret,
+                            )
+                    fixture.task_issue["status"] = "blocked"
+                    fixture.task_issue["assignee"] = original_assignee
+                    fixture.task_issue["metadata"] = json.loads(json.dumps(original_metadata))
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                    selected = cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                        "distinct-ready-task", controller, current_lease,
+                        authority_secret=fixture.authority_secret,
+                    )
+                self.assertEqual(selected, "distinct-ready-task")
+                controller.acknowledge_cancelled_preidentity_halt(
+                    fixture.workflow_root, fixture.task_id, "distinct-ready-task", lease=current_lease,
+                )
+                checkpoint = controller._load_checkpoint()
+                self.assertEqual(checkpoint["pending_continuation_task"], "distinct-ready-task")
+                self.assertFalse(checkpoint["terminal"])
+
+    def test_legacy_retirement_retries_after_credential_write_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, ledger_path, baseline = self._legacy_fixture(base)
+                controller.release(fixture.lease)
+                released = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                released.pop("dormant_lease", None)
+                cli._private_atomic_json(controller.state_path, released)
+                args = self._args(fixture)
+                original = cli._controller_credentials
+                calls = 0
+
+                def fail_once(*writer_args, **writer_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise OSError("credential write crash")
+                    return original(*writer_args, **writer_kwargs)
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=fail_once):
+                    first, _ = self._run_recovery(fixture, args, legacy_scope=True)
+                    self.assertFalse(first["ok"])
+                    self.assertEqual(first["error"], "credential write crash")
+                    self.assertEqual(json.loads(controller.state_path.read_text())["epoch"], fixture.lease.epoch)
+                    self.assertEqual(controller._load_checkpoint()["state"], "draining")
+                    self.assertEqual(
+                        json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["status"],
+                        "identity_pending",
+                    )
+                    second, _ = self._run_recovery(fixture, args, legacy_scope=True)
+                self.assertTrue(second["ok"], second)
+                self.assertEqual(json.loads(controller.state_path.read_text())["epoch"], fixture.lease.epoch + 1)
+                self.assertEqual(
+                    json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["status"],
+                    "cancelled_preidentity",
+                )
+                self.assertFalse(ledger_path.exists())
+
+    def test_superseded_legacy_task_cannot_be_relaunched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, _controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                result, _probe = self._run_recovery(
+                    fixture, self._args(fixture), legacy_scope=True,
+                )
+                self.assertTrue(result["ok"], result)
+                state = json.loads(cli._controller_state_dir(
+                    fixture.root, fixture.workflow_root,
+                ).joinpath("state.json").read_text())
+                fixture.lease = cli.controller_backend.Lease.from_dict(state["lease"])
+                fixture._persist_claim()
+                fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
+                launch_args = fixture.launch_args()
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli, "_ensure_herdr_server"), \
+                     mock.patch.object(cli, "_require_herdr_provider_integration"), \
+                     mock.patch.object(cli, "_require_claude_model_switch_version"), \
+                     mock.patch.object(cli, "_require_claude_model_switch_hooks"):
+                    launch_result = _run_controller_json(cli.herdr_launch, launch_args)
+                self.assertFalse(launch_result["ok"], launch_result)
+                self.assertIn("collision", launch_result["error"])
+                record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "cancelled_preidentity")
+
+    def test_superseded_legacy_rejects_budget_evidence_mismatches_before_pane_probe(self) -> None:
+        for case in ("signed-deadline", "malformed-ledger", "malformed-target-ledger", "wrong-claim", "bad-signature"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, contract, ledger_path, baseline = self._legacy_fixture(base)
+                    if case == "signed-deadline":
+                        contract["deadline_epoch"] = time.time() - 10
+                        contract["authority_hmac"] = cli._authority_mac(
+                            fixture.authority_secret, contract, domain="return-contract-v1",
+                        )
+                        cli._private_atomic_json(Path(contract["contract_path"]), contract)
+                        with cli._herdr_transaction(baseline["state_path"]) as state:
+                            channel = state["sessions"][fixture.task_id]["return_channel"]
+                            channel["contract_binding"] = contract
+                            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                    elif case == "malformed-ledger":
+                        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                        ledger_path.write_text("not json", encoding="utf-8")
+                    elif case == "malformed-target-ledger":
+                        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                        ledger_path.write_text(json.dumps({
+                            "schema": "agentflow.execution-limit-ledger@1",
+                            "entries": {cli._execution_ledger_key(
+                                fixture.root, fixture.workflow_root, fixture.task_id,
+                            ): {"status": "active"}},
+                        }), encoding="utf-8")
+                    elif case == "wrong-claim":
+                        fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "foreign-claim"
+                    else:
+                        contract["authority_hmac"] = "0" * 64
+                        cli._private_atomic_json(Path(contract["contract_path"]), contract)
+                        with cli._herdr_transaction(baseline["state_path"]) as state:
+                            channel = state["sessions"][fixture.task_id]["return_channel"]
+                            channel["contract_binding"] = contract
+                            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                    result, pane_probe = self._run_recovery(
+                        fixture, self._args(fixture), legacy_scope=True,
+                    )
+                    self.assertFalse(result["ok"], (case, result))
+                    self.assertEqual(pane_probe.call_count, 0)
+                    self.assertEqual(
+                        json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["status"],
+                        "identity_pending",
+                    )
+                    self.assertEqual(controller._load_checkpoint()["state"], "draining")
+
+    def test_superseded_legacy_rejects_active_or_ambiguous_lifecycle_evidence(self) -> None:
+        cases = (
+            "unknown-pane", "live-pane", "committed-binding", "committed-result",
+            "sibling-active", "wrong-continuity", "wrong-epoch", "open-task",
+            "closed-task", "changed-owner",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                    if case == "committed-binding":
+                        with cli._herdr_transaction(baseline["state_path"]) as state:
+                            state["sessions"][fixture.task_id]["binding"] = {"session_id": "committed"}
+                    elif case == "committed-result":
+                        with cli._herdr_transaction(baseline["state_path"]) as state:
+                            state["sessions"][fixture.task_id]["result"] = {"outcome": "completed"}
+                    elif case == "wrong-continuity":
+                        credential_path = cli._resume_key_path(self._args(fixture))
+                        credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+                        credentials["continuity_id"] = "foreign-continuity"
+                        cli._private_atomic_json(credential_path, credentials)
+                    elif case == "wrong-epoch":
+                        state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                        state["epoch"] += 1
+                        cli._private_atomic_json(controller.state_path, state)
+                    elif case == "open-task":
+                        fixture.task_issue["status"] = "open"
+                    elif case == "closed-task":
+                        fixture.task_issue["status"] = "closed"
+                    elif case == "changed-owner":
+                        fixture.task_issue["assignee"] = "foreign-controller"
+                    if case == "sibling-active":
+                        result, pane_probe = self._run_recovery(
+                            fixture, self._args(fixture), legacy_scope=True,
+                            descendants_override=[
+                                fixture.task_issue,
+                                {"id": "sibling", "status": "in_progress", "parent": fixture.workflow_root},
+                            ],
+                        )
+                    else:
+                        response = None
+                        returncode = 1
+                        if case == "unknown-pane":
+                            response = json.dumps({"error": {"code": "daemon_offline"}, "id": "cli:pane:get"})
+                        elif case == "live-pane":
+                            response = json.dumps({"id": "cli:pane:get", "result": {"pane_id": "pane-pending"}})
+                            returncode = 0
+                        result, pane_probe = self._run_recovery(
+                            fixture, self._args(fixture), legacy_scope=True,
+                            pane_response=response, pane_returncode=returncode,
+                        )
+                    self.assertFalse(result["ok"], (case, result))
+                    self.assertEqual(pane_probe.call_count, 1 if case in {"unknown-pane", "live-pane"} else 0)
+                    self.assertEqual(
+                        json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["status"],
+                        "identity_pending",
+                    )
+                    self.assertEqual(controller._load_checkpoint()["state"], "draining")
 
     def test_dormant_release_recovery_preserves_incarnation_and_rotates_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

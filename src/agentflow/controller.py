@@ -489,15 +489,18 @@ class RootController:
         authority_secret: str,
         resume_proof: str,
         persist_credentials: Callable[[Lease], Any] | None = None,
+        superseded_legacy_scope: bool = False,
     ) -> Lease:
-        """Restore a legacy released lease only from its signed expired launch.
+        """Restore a released lease only from its exact signed launch.
 
         Older released state discarded the resume-proof hash. This narrow
         migration accepts no caller-supplied continuity value: it derives the
-        incarnation from an expired, controller-signed return contract and
-        requires the matching protected controller credential to be present.
-        Product callers must additionally verify the protected launch ledger,
-        task claim, checkpoint, and provider pane before invoking this method.
+        incarnation from a controller-signed return contract and requires the
+        matching protected controller credential. The default path still
+        requires an expired structured deadline. The explicit legacy-scope
+        path accepts only a signed contract with no structured-budget fields;
+        callers must additionally authenticate the missing ledger, task
+        claim, checkpoint, and absent provider pane before invoking it.
         """
 
         if not resume_proof:
@@ -525,12 +528,20 @@ class RootController:
             raise LeaseConflict("signed launch does not authenticate this released controller incarnation")
         deadline = contract.get("deadline_epoch")
         epoch = contract.get("lease_epoch")
-        if (
+        budget_fields = {
+            "execution_limits", "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+            "attempt", "max_attempts", "max_retries", "execution_limit_capabilities", "budget",
+        }
+        if superseded_legacy_scope:
+            if any(field in contract for field in budget_fields):
+                raise LeaseConflict("legacy-scope recovery requires a signed contract without budget metadata")
+        elif (
             isinstance(deadline, bool) or not isinstance(deadline, (int, float))
             or float(self.clock()) < float(deadline)
-            or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
         ):
             raise LeaseConflict("signed launch is not an expired, epoch-bound recovery contract")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise LeaseConflict("signed launch does not carry a valid controller epoch")
 
         with self._locked():
             state = _read_json(self.state_path)
@@ -1263,6 +1274,7 @@ class RootController:
         *,
         commit_cancellation: Callable[[], None],
         lease: Lease | str | None = None,
+        retirement_reason: str = "expired",
     ) -> ResumeResult:
         """Fence a proved-expired identity-pending launch before clearing it.
 
@@ -1272,6 +1284,8 @@ class RootController:
         disposition without accepting a late result.
         """
 
+        if retirement_reason not in {"expired", "superseded_legacy_scope"}:
+            raise ControllerError("unsupported preidentity retirement reason")
         for name, value in (("task", task_id), ("claim", claim_id), ("launch", launch_id)):
             if not value:
                 raise ControllerError(f"preidentity cancellation {name} is required")
@@ -1280,7 +1294,7 @@ class RootController:
             expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
             reason = str(document.get("terminal_reason") or "")
             rows = _active_tasks_from_checkpoint(document, self.root)
-            retired_check = f"cancelled expired preidentity launch {launch_id} for {task_id}"
+            retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
             terminal_halt = (
                 checkpoint.admission_phase(document) == "terminal"
                 and checkpoint.resume_state(document) == "blocked"
@@ -1310,6 +1324,7 @@ class RootController:
                 return self._result(document, resumed=True)
             eligible = (
                 ((terminal_halt and reason.startswith(expected_reason)) or retained_draining)
+                and (retirement_reason == "expired" or retained_draining)
                 and str(document.get("root") or "") == self.root
                 and str(document.get("controller") or "") == self.controller
                 and len(rows) == 1
@@ -1319,7 +1334,7 @@ class RootController:
                 and not rows[0].get("session_id")
             )
             if not eligible:
-                raise ControllerError("checkpoint is not the exact expired identity-pending task halt")
+                raise ControllerError("checkpoint is not the exact eligible identity-pending task halt")
             # Cross-file crash semantics are deliberate: Herdr is atomically
             # fenced first, and only then is the checkpoint pointer cleared.
             commit_cancellation()
@@ -1342,6 +1357,22 @@ class RootController:
             })
             return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
 
+    def cancel_superseded_legacy_preidentity_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        *,
+        commit_cancellation: Callable[[], None],
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Retire an authenticated legacy launch after its owning scope ends."""
+        return self.cancel_expired_preidentity_task(
+            task_id, claim_id, launch_id,
+            commit_cancellation=commit_cancellation, lease=lease,
+            retirement_reason="superseded_legacy_scope",
+        )
+
     def acknowledge_cancelled_preidentity_halt(
         self,
         workflow_root: str,
@@ -1360,9 +1391,10 @@ class RootController:
             document = self._load_checkpoint()
             reason = str(document.get("terminal_reason") or "")
             retired_check = str(document.get("last_check") or "")
-            recognized = retired_check.startswith("cancelled expired preidentity launch ") and retired_check.endswith(
-                f" for {cancelled_task}"
-            )
+            recognized = (
+                retired_check.startswith("cancelled expired preidentity launch ")
+                or retired_check.startswith("cancelled superseded_legacy_scope preidentity launch ")
+            ) and retired_check.endswith(f" for {cancelled_task}")
             if (
                 checkpoint.admission_phase(document) != "terminal"
                 or checkpoint.resume_state(document) != "blocked"

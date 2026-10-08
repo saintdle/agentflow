@@ -68,3 +68,30 @@ distinct current ready descendant. Agentflow verifies the signed cancellation,
 controller incarnation, root, and absence of other active work before
 reopening the checkpoint. This flow does not close the cancelled Beads task
 or claim a provider result for it.
+
+## Superseded legacy launch without budget metadata
+
+Some older signed launches predate structured execution budgets. Their return
+contracts and session records have no deadline or retry ledger, so Agentflow
+cannot establish that their launch deadline expired. When the owning scope has
+been superseded, retire that launch explicitly instead of treating an advisory
+identity timer as a deadline:
+
+```sh
+agentflow controller retire-superseded-legacy-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID
+```
+
+This command accepts only an authenticated signed legacy contract with no
+structured-budget fields or protected task ledger row, the exact retained
+identity-pending checkpoint and claim, no committed binding or result, no
+other active work, and Herdr's definitive `pane_not_found` response. Any
+present or malformed budget evidence, a live or uncertain pane, or mismatched
+identity leaves the task unchanged. The signed retirement says
+`superseded_legacy_scope` and records budget availability as unknown; it does
+not manufacture an expiry, attempt count, or ledger entry. It revokes the old
+result channel before clearing the checkpoint pointer. Continue only through
+the distinct-ready-task command above, using the same protected controller
+credential and the cancelled task ID.
