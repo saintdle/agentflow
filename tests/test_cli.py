@@ -7113,6 +7113,154 @@ class FeedbackCliTests(unittest.TestCase):
                     stale["items"][0]["reasons"],
                 )
 
+    def test_root_feedback_report_includes_pending_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            root_issue = {"id": "workflow-1", "metadata": {"agentflow": {}}}
+            ledger = cli.feedback_backend.empty_ledger("task-child")
+            ledger, item_id, _ = cli.feedback_backend.intake_item(
+                ledger,
+                task_id="task-child",
+                root=root,
+                source="review",
+                text="Clarify the setup step.",
+                key="setup-step",
+            )
+            child_issue = {
+                "id": "task-child",
+                "metadata": {"agentflow": {"feedback": ledger}},
+            }
+            stdout = io.StringIO()
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[child_issue]), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--root", "workflow-1", "--json", "--cwd", str(root),
+                ]), 1)
+            result = json.loads(stdout.getvalue())
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["task_count"], 2)
+            self.assertEqual(result["unresolved_count"], 1)
+            child_report = next(task for task in result["tasks"] if task["task_id"] == "task-child")
+            self.assertEqual(child_report["items"][0]["id"], item_id)
+            self.assertEqual(child_report["items"][0]["state"], "unresolved")
+
+    def test_root_feedback_report_fails_closed_on_malformed_child_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            root_issue = {"id": "workflow-1", "metadata": {"agentflow": {}}}
+            child_issue = {
+                "id": "task-child",
+                "metadata": {"agentflow": {"feedback": {
+                    "schema": "agentflow.feedback@1", "task_id": "wrong-task", "items": [],
+                }}},
+            }
+            stdout = io.StringIO()
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[child_issue]), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--root", "workflow-1", "--json", "--cwd", str(root),
+                ]), 1)
+            result = json.loads(stdout.getvalue())
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["unresolved_count"], 1)
+            self.assertTrue(any("task_id does not match the Bead" in error for error in result["errors"]))
+
+    def test_root_feedback_report_fails_closed_when_beads_enumeration_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            root_issue = {"id": "workflow-1", "metadata": {"agentflow": {}}}
+            stdout = io.StringIO()
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                 mock.patch.object(
+                     cli.beads_backend, "root_descendants",
+                     side_effect=cli.beads_backend.BeadsError("workspace read failed"),
+                 ), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--root", "workflow-1", "--json", "--cwd", str(root),
+                ]), 1)
+            result = json.loads(stdout.getvalue())
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["unresolved_count"], 1)
+            self.assertIn("cannot enumerate feedback workflow", result["errors"][0])
+
+    def test_root_feedback_report_is_clear_when_all_task_items_are_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+
+            def fixed_feedback(task_id: str, evidence_name: str):
+                evidence_path = root / evidence_name
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                evidence_path.write_text("focused check passed\n", encoding="utf-8")
+                ledger = cli.feedback_backend.empty_ledger(task_id)
+                ledger, item_id, _ = cli.feedback_backend.intake_item(
+                    ledger,
+                    task_id=task_id,
+                    root=root,
+                    source="review",
+                    text=f"Address the request for {task_id}.",
+                    key=f"{task_id}-item",
+                )
+                acceptance = {
+                    "version": 1,
+                    "task_id": task_id,
+                    "rows": [{
+                        "id": "A1", "outcome": "feedback request is addressed",
+                        "owner": "controller", "lane": "static",
+                        "planned_evidence": "focused check", "status": "planned",
+                    }],
+                }
+                ledger, acceptance = cli.feedback_backend.disposition_item(
+                    ledger,
+                    task_id=task_id,
+                    item_id=item_id,
+                    status="accepted",
+                    by="controller",
+                    acceptance=acceptance,
+                    acceptance_id="A1",
+                    timestamp="2026-10-08T10:01:00+00:00",
+                )
+                acceptance["rows"][0].update({
+                    "status": "passed", "actual_evidence": evidence_name,
+                    "updated_at": "2026-10-08T10:02:00+00:00",
+                })
+                ledger, _ = cli.feedback_backend.disposition_item(
+                    ledger,
+                    task_id=task_id,
+                    item_id=item_id,
+                    status="fixed",
+                    by="controller",
+                    acceptance=acceptance,
+                    root=root,
+                    timestamp="2026-10-08T10:03:00+00:00",
+                )
+                return ledger, acceptance
+
+            root_ledger, root_acceptance = fixed_feedback("workflow-1", "checks/root.txt")
+            child_ledger, child_acceptance = fixed_feedback("task-child", "checks/child.txt")
+            root_issue = {
+                "id": "workflow-1",
+                "metadata": {"agentflow": {"feedback": root_ledger, "acceptance": root_acceptance}},
+            }
+            child_issue = {
+                "id": "task-child",
+                "metadata": {"agentflow": {"feedback": child_ledger, "acceptance": child_acceptance}},
+            }
+            stdout = io.StringIO()
+            with mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[child_issue]), \
+                 contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli.main([
+                    "feedback", "report", "--root", "workflow-1", "--json", "--cwd", str(root),
+                ]), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["task_count"], 2)
+            self.assertEqual(result["unresolved_count"], 0)
+            self.assertTrue(all(task["items"][0]["state"] == "resolved" for task in result["tasks"]))
+
 
 if __name__ == "__main__":
     unittest.main()

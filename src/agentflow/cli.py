@@ -7435,22 +7435,19 @@ def feedback_disposition(args: argparse.Namespace) -> int:
 
 def feedback_report(args: argparse.Namespace) -> int:
     try:
-        cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
-        result = feedback_backend.report(
-            ledger,
-            task_id=task_id,
-            root=cwd,
-            acceptance=acceptance,
-        )
-        matrix_errors = (
-            _validate_acceptance_data(dict(acceptance))
-            if isinstance(acceptance, Mapping)
-            else []
-        )
-        if matrix_errors:
-            result["errors"] = [*result["errors"], *[f"acceptance matrix: {error}" for error in matrix_errors]]
-            result["ok"] = False
-            result["unresolved_count"] = max(1, int(result["unresolved_count"]))
+        cwd = _task_cwd(args)
+        root_id = str(getattr(args, "root", "") or "")
+        if root_id:
+            result = _feedback_root_report(cwd, root_id)
+            label = f"root:{root_id}"
+        else:
+            cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
+            result = _feedback_issue_report(
+                {"id": task_id, "metadata": {"agentflow": {"feedback": ledger, "acceptance": acceptance}}},
+                cwd=cwd,
+                expected_task_id=task_id,
+            )
+            label = f"bead:{bead_id}"
     except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
         print(f"Cannot report feedback: {exc}", file=sys.stderr)
         return 2
@@ -7458,15 +7455,134 @@ def feedback_report(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         state = "CLEAR" if result["ok"] else "UNRESOLVED"
-        print(f"{state} bead:{bead_id}: {result['unresolved_count']} unresolved feedback item(s)")
-        for item in result["items"]:
-            text_value = json.dumps(item["text"], ensure_ascii=False)
-            print(f"{item['id']} [{item['status']}] {item['state']}: {text_value}")
-            for reason in item["reasons"]:
-                print(f"  - {reason}")
-        for error in result["errors"]:
-            print(f"ERROR {error}")
+        print(f"{state} {label}: {result['unresolved_count']} unresolved feedback item(s)")
+        task_reports = result.get("tasks")
+        if isinstance(task_reports, list):
+            for task in task_reports:
+                task_state = "CLEAR" if task["ok"] else "UNRESOLVED"
+                print(f"Task {task['task_id']}: {task_state}")
+                _print_feedback_items(task["items"])
+                for error in task["errors"]:
+                    print(f"  ERROR {error}")
+            for error in result.get("errors", []):
+                print(f"ERROR {error}")
+        else:
+            _print_feedback_items(result["items"])
+            for error in result["errors"]:
+                print(f"ERROR {error}")
     return 0 if result["ok"] else 1
+
+
+def _print_feedback_items(items: list[Mapping[str, Any]]) -> None:
+    for item in items:
+        text_value = json.dumps(item.get("text", ""), ensure_ascii=False)
+        print(f"{item['id']} [{item['status']}] {item['state']}: {text_value}")
+        for reason in item["reasons"]:
+            print(f"  - {reason}")
+
+
+def _feedback_issue_report(
+    issue: Mapping[str, Any], *, cwd: Path, expected_task_id: str
+) -> dict[str, Any]:
+    task_id = str(issue.get("id") or "")
+    if not task_id or task_id != expected_task_id:
+        return {
+            "task_id": expected_task_id,
+            "ok": False,
+            "unresolved_count": 1,
+            "items": [],
+            "errors": ["Bead ID is missing or does not match the selected task"],
+        }
+    metadata = issue.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, Mapping):
+        return {
+            "task_id": task_id, "ok": False, "unresolved_count": 1,
+            "items": [], "errors": ["Bead metadata is malformed"],
+        }
+    agentflow = metadata.get("agentflow", {})
+    if not isinstance(agentflow, Mapping):
+        return {
+            "task_id": task_id, "ok": False, "unresolved_count": 1,
+            "items": [], "errors": ["Bead Agentflow metadata is malformed"],
+        }
+    if "feedback" in agentflow:
+        ledger = agentflow["feedback"]
+        if not isinstance(ledger, Mapping):
+            return {
+                "task_id": task_id, "ok": False, "unresolved_count": 1,
+                "items": [], "errors": ["feedback ledger is unreadable or malformed"],
+            }
+        ledger = dict(ledger)
+    else:
+        ledger = feedback_backend.empty_ledger(task_id)
+    acceptance = agentflow.get("acceptance")
+    result = feedback_backend.report(
+        ledger, task_id=task_id, root=cwd, acceptance=acceptance
+    )
+    if isinstance(acceptance, Mapping):
+        matrix_errors = _validate_acceptance_data(dict(acceptance))
+        if matrix_errors:
+            result["errors"] = [
+                *result["errors"],
+                *[f"acceptance matrix: {error}" for error in matrix_errors],
+            ]
+            result["ok"] = False
+            result["unresolved_count"] = max(1, int(result["unresolved_count"]))
+    return result
+
+
+def _feedback_root_report(cwd: Path, root_id: str) -> dict[str, Any]:
+    errors: list[str] = []
+    try:
+        root_issue = beads_backend.get_issue(cwd, root_id)
+        if str(root_issue.get("id") or "") != root_id:
+            raise beads_backend.BeadsError("root Bead ID did not match the requested workflow root")
+        descendants = beads_backend.root_descendants(cwd, root_id)
+    except beads_backend.BeadsError as exc:
+        return {
+            "root_id": root_id,
+            "ok": False,
+            "unresolved_count": 1,
+            "task_count": 0,
+            "tasks": [],
+            "errors": [f"cannot enumerate feedback workflow: {exc}"],
+        }
+
+    issues: list[Mapping[str, Any]] = [root_issue]
+    seen = {root_id}
+    for descendant in descendants:
+        if not isinstance(descendant, Mapping):
+            errors.append("workflow descendant record is unreadable or malformed")
+            continue
+        descendant_id = str(descendant.get("id") or "")
+        if not descendant_id or descendant_id in seen:
+            errors.append(f"workflow descendant has a missing or duplicate Bead ID: {descendant_id or '(empty)'}")
+            continue
+        seen.add(descendant_id)
+        issues.append(descendant)
+
+    tasks: list[dict[str, Any]] = []
+    unresolved_count = len(errors)
+    for issue in issues:
+        task_id = str(issue.get("id") or "")
+        task_result = _feedback_issue_report(
+            issue, cwd=cwd, expected_task_id=task_id
+        )
+        tasks.append(task_result)
+        unresolved_count += int(task_result.get("unresolved_count") or 0)
+        errors.extend(
+            f"{task_id}: {error}" for error in task_result.get("errors", [])
+        )
+    return {
+        "root_id": root_id,
+        "ok": not errors and all(task["ok"] for task in tasks),
+        "unresolved_count": unresolved_count,
+        "task_count": len(tasks),
+        "tasks": tasks,
+        "errors": errors,
+    }
 
 
 def usage_record(args: argparse.Namespace) -> int:
@@ -12044,7 +12160,9 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_disposition_parser.set_defaults(func=feedback_disposition)
 
     feedback_report_parser = feedback_sub.add_parser("report", help="Report unresolved feedback and verify current linked evidence")
-    feedback_report_parser.add_argument("--bead", required=True)
+    feedback_target = feedback_report_parser.add_mutually_exclusive_group(required=True)
+    feedback_target.add_argument("--bead", help="Report one task Bead")
+    feedback_target.add_argument("--root", help="Report the workflow root and its exact Beads descendants")
     feedback_report_parser.add_argument("--cwd", default="")
     feedback_report_parser.add_argument("--json", action="store_true")
     feedback_report_parser.set_defaults(func=feedback_report)

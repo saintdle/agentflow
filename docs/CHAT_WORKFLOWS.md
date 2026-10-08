@@ -105,6 +105,7 @@ source into short, distilled items and import them as pending:
 agentflow feedback intake --bead <task-id> --source "design review" \
   --source-ref "review document, section 3" --input feedback.json --cwd .
 agentflow feedback report --bead <task-id> --cwd .
+agentflow feedback report --root <workflow-root-id> --json --cwd .
 ```
 
 The JSON input is an array of objects or an object with an `items` array. Each
@@ -136,6 +137,11 @@ stale. Use a workspace-relative file path for local `actual_evidence` so the
 report can confirm and hash the linked result. Review findings can continue to
 use `agentflow review record`; feedback intake does not create a second
 approval path for those findings.
+
+Use `--root` for a workflow-wide report. It covers the selected root Bead and
+only its exact Beads descendants. The aggregate fails closed if a task ledger
+or its Agentflow metadata is malformed, and includes a separate report for each
+task so a pending child obligation cannot disappear in a root-only summary.
 
 ## 3. Approve and run one persistent controller
 
