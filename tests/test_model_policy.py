@@ -241,6 +241,21 @@ class ValidateRouteMatrixTests(unittest.TestCase):
     def test_claude_sonnet_coding_passes(self) -> None:
         self._assert_pass(provider="claude", role="coding", model="claude-sonnet-5", effort="medium")
 
+    def test_claude_sonnet_coding_max_passes(self) -> None:
+        self._assert_pass(provider="claude", role="coding", model="claude-sonnet-5", effort="max")
+
+    def test_claude_sonnet_exploration_max_fails(self) -> None:
+        self._assert_fail(provider="claude", role="exploration", model="claude-sonnet-5", effort="max")
+
+    def test_claude_sonnet_editing_max_fails(self) -> None:
+        self._assert_fail(provider="claude", role="editing", model="claude-sonnet-5", effort="max")
+
+    def test_claude_sonnet_coding_max_rejects_generic_alias(self) -> None:
+        self._assert_fail(provider="claude", role="coding", model="sonnet", effort="max")
+
+    def test_claude_sonnet_coding_max_rejects_wrong_provider(self) -> None:
+        self._assert_fail(provider="copilot", role="coding", model="claude-sonnet-5", effort="max")
+
     def test_claude_sonnet_editing_passes(self) -> None:
         self._assert_pass(provider="claude", role="editing", model="claude-sonnet-5", effort="medium")
 
