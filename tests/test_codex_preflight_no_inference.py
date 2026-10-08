@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
@@ -304,6 +305,62 @@ class CodexPreflightTests(unittest.TestCase):
         self.assertEqual(child_calls, [])
         self.assertIn("trial_layout_invalid", output)
 
+        self.assertEqual(self.loader_guard.call_count, 0)
+        self.assertEqual(self.spawn_guard.call_count, 0)
+        self.assertEqual(self.sdk_import_attempts, [])
+
+    def test_darwin_text_encoding_marker_is_platform_and_value_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, env, token = _parent_child_context(Path(temporary) / "trial")
+            marker = f"0x{os.getuid():X}:0:1"
+            env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
+            with mock.patch.object(preflight.sys, "platform", "darwin"), \
+                 mock.patch.object(preflight.Path, "cwd", return_value=workspace):
+                preflight._validate_child_context(env, token)
+                for invalid in ("malformed", f"0x{os.getuid() + 1:X}:0:1", "0x1:0:999999"):
+                    with self.subTest(value=invalid):
+                        env[preflight.DARWIN_TEXT_ENCODING_ENV] = invalid
+                        with self.assertRaises(preflight.Halt) as raised:
+                            preflight._validate_child_context(env, token)
+                        self.assertEqual(raised.exception.code, "trial_layout_invalid")
+                env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
+                env["UNRELATED_RUNTIME_VALUE"] = "rejected"
+                with self.assertRaises(preflight.Halt) as raised:
+                    preflight._validate_child_context(env, token)
+                self.assertEqual(raised.exception.code, "trial_layout_invalid")
+
+            env.pop("UNRELATED_RUNTIME_VALUE")
+            with mock.patch.object(preflight.sys, "platform", "linux"):
+                with self.assertRaises(preflight.Halt) as raised:
+                    preflight._validate_child_context(env, token)
+                self.assertEqual(raised.exception.code, "trial_layout_invalid")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS child runtime injects the CoreFoundation marker")
+    def test_real_isolated_child_accepts_only_the_runtime_darwin_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trial"
+            workspace, env, token = _parent_child_context(root)
+            # Reproduce the reported launch: Popen receives only the synthesized
+            # environment while macOS adds this one runtime marker to Python -I.
+            env.pop(preflight.DARWIN_TEXT_ENCODING_ENV, None)
+            child_code = (
+                "import os, runpy; "
+                f"ns=runpy.run_path({str(RUNNER)!r}); "
+                f"assert {preflight.DARWIN_TEXT_ENCODING_ENV!r} in os.environ; "
+                f"ns['_validate_child_context'](dict(os.environ), {token!r}); "
+                "print('validated')"
+            )
+            self.spawn_denial.stop()
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-I", "-c", child_code], cwd=workspace, env=env,
+                    capture_output=True, text=True, check=False,
+                )
+            finally:
+                self.spawn_guard = self.spawn_denial.start()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "validated")
         self.assertEqual(self.loader_guard.call_count, 0)
         self.assertEqual(self.spawn_guard.call_count, 0)
         self.assertEqual(self.sdk_import_attempts, [])

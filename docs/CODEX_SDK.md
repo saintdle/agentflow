@@ -98,6 +98,10 @@ fixture, and generated profile before loading the SDK. Its mode marker and
 one-shot stdin token are invocation controls, not authentication or same-user
 attestation; the checks reject accidental/path-confused entry but do not create
 a same-user security boundary.
+On macOS, the parent may pass `__CF_USER_TEXT_ENCODING` when its runtime provides
+it. The child accepts this single platform marker only on Darwin, bound to the
+current POSIX user ID and two bounded decimal selectors; other injected
+environment keys remain rejected.
 The normal auth-home boundary is compared with the POSIX account-home path
 metadata; credential files in that home are not opened. Environments whose
 effective `HOME` does not match the account metadata fail closed.

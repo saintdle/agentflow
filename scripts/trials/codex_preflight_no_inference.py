@@ -37,6 +37,7 @@ CHILD_TOKEN_ENV = "AGENTFLOW_PREFLIGHT_CHILD_TOKEN"
 CHILD_MODE_ENV = "AGENTFLOW_PREFLIGHT_CHILD_MODE"
 CHILD_WORKSPACE_ENV = "AGENTFLOW_PREFLIGHT_WORKSPACE"
 NORMAL_CODEX_HOME_ENV = "AGENTFLOW_PREFLIGHT_NORMAL_CODEX_HOME"
+DARWIN_TEXT_ENCODING_ENV = "__CF_USER_TEXT_ENCODING"
 
 _CODES = frozenset({
     "authentication_required", "sdk_unavailable", "sdk_pin_mismatch",
@@ -277,6 +278,11 @@ def _prepare_trial(root: Path, attempt: int) -> tuple[Path, Path, dict[str, str]
         CHILD_WORKSPACE_ENV: str(workspace),
         NORMAL_CODEX_HOME_ENV: str(codex_home),
     }
+    if sys.platform == "darwin" and DARWIN_TEXT_ENCODING_ENV in os.environ:
+        text_encoding = os.environ[DARWIN_TEXT_ENCODING_ENV]
+        if not _valid_darwin_text_encoding(text_encoding):
+            raise Halt("trial_layout_invalid")
+        env[DARWIN_TEXT_ENCODING_ENV] = text_encoding
     config_hash = hashlib.sha256(rendered).hexdigest()
     fixture_hash = hashlib.sha256(FIXTURE).hexdigest()
     return workspace, paths["authority"], env, config_hash, fixture_hash
@@ -313,6 +319,24 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def _valid_darwin_text_encoding(value: str) -> bool:
+    """Accept only the bounded CoreFoundation marker for this macOS user."""
+    if sys.platform != "darwin" or not hasattr(os, "getuid") or not isinstance(value, str):
+        return False
+    parts = value.split(":")
+    if len(parts) != 3:
+        return False
+    user_id, encoding, language = parts
+    if user_id.lower() != f"0x{os.getuid():X}".lower():
+        return False
+    for selector in (encoding, language):
+        if (not selector.isascii() or not selector.isdecimal() or len(selector) > 5
+                or (len(selector) > 1 and selector.startswith("0"))
+                or int(selector) > 0xFFFF):
+            return False
+    return True
+
+
 def _validate_child_context(env: dict[str, str], supplied_token: str) -> None:
     """Validate the disposable parent-created layout before importing the SDK."""
     if os.name != "posix":
@@ -322,7 +346,13 @@ def _validate_child_context(env: dict[str, str], supplied_token: str) -> None:
         "PATH", "LANG", "LC_ALL", "AGENTFLOW_PREFLIGHT_CONFIG",
         CHILD_WORKSPACE_ENV, NORMAL_CODEX_HOME_ENV, CHILD_MODE_ENV, CHILD_TOKEN_ENV,
     }
-    if set(env) != required or env.get(CHILD_MODE_ENV) != CHILD_MODE_VALUE:
+    env_keys = set(env)
+    extra_keys = env_keys - required
+    if (not required.issubset(env_keys)
+            or extra_keys - {DARWIN_TEXT_ENCODING_ENV}
+            or (DARWIN_TEXT_ENCODING_ENV in extra_keys
+                and not _valid_darwin_text_encoding(env[DARWIN_TEXT_ENCODING_ENV]))
+            or env.get(CHILD_MODE_ENV) != CHILD_MODE_VALUE):
         raise Halt("trial_layout_invalid")
     token = env.get(CHILD_TOKEN_ENV, "")
     if (len(token) != 64 or any(char not in "0123456789abcdef" for char in token)
