@@ -133,6 +133,60 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertEqual(row["state"], "identity_pending")
             self.assertEqual(row["session_id"], "")
 
+    def test_pending_identity_reconcile_preserves_checkpoint_for_bad_token_or_pane(self) -> None:
+        for case in ("claim-token", "empty-pane", "conflicting-pane"):
+            with self.subTest(case=case), self._launched_budgeted_execution() as (
+                fixture, args, controller, lease, _record,
+            ):
+                checkpoint = controller._load_checkpoint()
+                checkpoint["active_tasks"] = controller.active_tasks()
+                checkpoint["active_tasks"][0]["state"] = "identity_pending"
+                checkpoint["active_tasks"][0]["session_id"] = ""
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                before = controller.checkpoint_path.read_bytes()
+                if case == "claim-token":
+                    fixture.task_issue["metadata"]["agentflow"]["claim_token"] = "changed-token"
+                else:
+                    with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                        record = state["sessions"][fixture.task_id]
+                        if case == "empty-pane":
+                            record["binding"]["pane_id"] = ""
+                        else:
+                            record["pane_id"] = "conflicting-pane"
+                with self.assertRaises(ValueError):
+                    cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+                row = controller.active_tasks()[0]
+                self.assertEqual(row["state"], "identity_pending")
+                self.assertEqual(row["session_id"], "")
+
+    def test_revoked_expiry_receipt_replays_after_checkpoint_crash(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            snapshot = cli._bound_execution_expiry_snapshot(
+                args, controller, fixture.root, fixture.workflow_root, lease, fixture.task_id,
+                authority_secret=args._authority_secret,
+            )
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                # Simulate the crash boundary after the signed Herdr/ledger
+                # retirement commits but before RootController writes its halt.
+                cli._commit_expired_bound_execution(
+                    fixture.root, fixture.workflow_root, fixture.task_id, snapshot,
+                    authority_secret=args._authority_secret,
+                )
+                self.assertEqual(len(controller.active_tasks()), 1)
+                result = cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result.terminal)
+            self.assertEqual(controller.active_tasks(), [])
+            current = cli._herdr_session_record(fixture.root, fixture.task_id)
+            self.assertEqual(current["status"], "expired_execution")
+            self.assertEqual(
+                current["return_channel"]["contract_binding"]["deadline_epoch"], deadline,
+            )
+
     def test_bound_retirement_verifier_replays_the_staged_target_checkpoint(self) -> None:
         """A crash after target persistence re-verifies this exact bound retirement."""
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):

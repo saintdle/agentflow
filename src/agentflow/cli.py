@@ -5299,6 +5299,7 @@ def _reconcile_pending_bound_execution_identity(
     }
     if (
         not session_id
+        or not str(binding.get("pane_id") or "")
         or any(not expected or str(binding.get(field) or "") != expected
                for field, expected in expected_binding.items())
         or str(record.get("root") or "") != str(root)
@@ -5311,6 +5312,10 @@ def _reconcile_pending_bound_execution_identity(
         or contract.get("controller_id") != lease.controller
         or contract.get("continuity_id") != lease.continuity_id
         or contract.get("lease_epoch") != lease.epoch
+        or (
+            str(record.get("pane_id") or "")
+            and str(record.get("pane_id") or "") != str(binding.get("pane_id") or "")
+        )
     ):
         raise ValueError("resolved bound execution does not match its exact pending reservation")
     limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
@@ -5323,6 +5328,7 @@ def _reconcile_pending_bound_execution_identity(
     metadata = issue.get("metadata")
     agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
     if (
         str(issue.get("status") or "").lower() != "in_progress"
         or str(issue.get("assignee") or "") != lease.controller
@@ -5330,6 +5336,11 @@ def _reconcile_pending_bound_execution_identity(
         or str(agentflow.get("task") or "") != task_id
         or str(agentflow.get("actor") or "") != lease.controller
         or str(agentflow.get("claim_id") or "") != claim_id
+        or not claim_token
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
     ):
         raise ValueError("resolved bound execution no longer has its exact live claim")
     beads_backend.verify_task_ancestry_and_ownership(
@@ -5370,8 +5381,39 @@ def _expire_bound_execution_if_due(
     if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
         # Identity-pending recovery has its own stricter signed path.
         return None
+    if record.get("status") == "expired_execution":
+        # A crash may happen after the authenticated Herdr/ledger tombstone
+        # commits and before the controller clears its active checkpoint row.
+        # Only the full signed receipt verifier may admit that replay.
+        snapshot = _bound_execution_expiry_snapshot(
+            args, controller, root, workflow_root, lease, task_id,
+            authority_secret=authority_secret,
+        )
+
+        def commit_revoked_replay() -> None:
+            latest = _bound_execution_expiry_snapshot(
+                args, controller, root, workflow_root, lease, task_id,
+                authority_secret=authority_secret,
+            )
+            if (
+                latest.get("contract") != snapshot.get("contract")
+                or latest.get("binding") != snapshot.get("binding")
+                or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+            ):
+                raise ValueError("bound execution changed during expiry disposition")
+            _commit_expired_bound_execution(
+                root, workflow_root, task_id, latest,
+                authority_secret=authority_secret,
+            )
+
+        return controller.expire_bound_execution_task(
+            task_id, str(snapshot["contract"].get("claim_id") or ""),
+            str(snapshot["contract"].get("launch_id") or ""),
+            str(snapshot["binding"].get("session_id") or ""),
+            commit_expiration=commit_revoked_replay, lease=lease,
+        )
     if (
-        str(record.get("status") or "") not in {"launched", "running", "expired_execution"}
+        str(record.get("status") or "") not in {"launched", "running"}
         or record.get("result") not in (None, {})
     ):
         return None
