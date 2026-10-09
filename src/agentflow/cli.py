@@ -5244,6 +5244,11 @@ def _verify_launch_authority(
         metadata = issue.get("metadata")
         agentflow_meta = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
         agentflow_meta = agentflow_meta if isinstance(agentflow_meta, Mapping) else {}
+        launch_meta = agentflow_meta.get("launch")
+        launch_meta = launch_meta if isinstance(launch_meta, Mapping) else {}
+        graph_execution_limits = launch_meta.get(
+            "execution_limits", agentflow_meta.get("execution_limits"),
+        )
         stored_root = str(agentflow_meta.get("root") or "")
         stored_task = str(agentflow_meta.get("task") or "")
         stored_actor = str(agentflow_meta.get("actor") or "")
@@ -5276,6 +5281,10 @@ def _verify_launch_authority(
             "claim_id": stored_claim_id or claim,
             "claim_token": stored_claim_token,
             "actor": str(issue.get("assignee") or actor or ""),
+            # Return the current graph policy from the same exact Beads
+            # snapshot that authenticated this task claim. Launch callers
+            # compare it with their pinned typed handoff at protected fences.
+            "_graph_execution_limits": graph_execution_limits,
         }
 
     # No durable workflow root: fall back to the local claim cache alone,
@@ -6261,10 +6270,44 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 raise ValueError("authenticated root preflight digest changed before launch")
 
         def _authorize() -> dict[str, Any]:
-            return _verify_launch_authority(
+            identity = _verify_launch_authority(
                 root, task_id, claim_id, lease_id,
                 workflow_root=workflow_root, beads_cwd=root, actor=actor,
             )
+            if workflow_root:
+                try:
+                    current_graph_limits = execution_limits_backend.parse_limits(
+                        identity.get("_graph_execution_limits")
+                    )
+                    current_handoff_limits = execution_limits_backend.parse_limits(
+                        typed_handoff.manifest.get("execution_limits")
+                    )
+                except execution_limits_backend.ExecutionLimitError as exc:
+                    raise ValueError(f"invalid current graph execution limits: {exc}") from exc
+                graph_value = (
+                    current_graph_limits.to_dict()
+                    if current_graph_limits is not None else None
+                )
+                handoff_value = (
+                    current_handoff_limits.to_dict()
+                    if current_handoff_limits is not None else None
+                )
+                requested_value = (
+                    requested_execution_limits.to_dict()
+                    if requested_execution_limits is not None else None
+                )
+                if (
+                    requested_limits_present
+                    and (graph_value != handoff_value or graph_value != requested_value)
+                ) or (
+                    not requested_limits_present
+                    and graph_value is not None
+                    and graph_value != handoff_value
+                ):
+                    raise ValueError(
+                        "current Beads execution limits do not match the requested pinned launch policy"
+                    )
+            return identity
 
         identity = _authorize()
         _revalidate_contract()
@@ -6413,6 +6456,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 )
                 limit_entry: Mapping[str, Any] | None = None
                 if execution_limits is not None:
+                    # Beads is external to the controller lock and may change
+                    # after the earlier authorization/preflight. Re-read the
+                    # exact claim and its current graph budget immediately
+                    # before consuming the protected attempt.
+                    identity = _authorize()
                     assert policy_attempt_cap is not None
                     limit_entry = _reserve_execution_attempt(
                         root, workflow_root, task_id,
@@ -6618,6 +6666,10 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         "--", *provider_tail,
                     ]
                     try:
+                        # Root preflight and argv construction can take time.
+                        # Re-read the current Beads claim/policy after those
+                        # checks and immediately before the provider spawn.
+                        _authorize()
                         launched = subprocess.run(
                             argv, capture_output=True, text=True, timeout=30, check=False,
                         )

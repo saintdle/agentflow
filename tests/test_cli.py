@@ -5729,6 +5729,121 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(provider_tail[2], "--deadline-epoch")
             self.assertEqual(float(provider_tail[3]), record["deadline_epoch"])
 
+    def test_tightened_graph_limits_before_reservation_block_dispatch(self) -> None:
+        """A graph update between dispatch materialization and the
+        authenticated reservation fence must block before debit or spawn."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            launch = fixture.task_issue["metadata"]["agentflow"]["launch"]
+            launch.update(
+                execution_limits={"deadline_seconds": 1800, "max_retries": 0},
+                sterile=True,
+            )
+            fixture.task_issue["metadata"]["agentflow"].update(
+                tool_profile="shell-readonly", output_boundary=".",
+            )
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            state_home = base / "protected-state"
+            capture: dict = {}
+            actual_herdr_launch = cli.herdr_launch
+
+            def tighten_before_reservation(namespace):
+                launch["execution_limits"] = {"deadline_seconds": 60, "max_retries": 0}
+                return actual_herdr_launch(namespace)
+
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "add_comment"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)), \
+                 mock.patch.object(cli, "herdr_launch", side_effect=tighten_before_reservation):
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertEqual(payload["result"]["state"], "blocked", payload)
+            self.assertEqual(capture, {})
+            state_path = fixture.root / ".agentflow/herdr/sessions.json"
+            if state_path.exists():
+                self.assertNotIn(
+                    fixture.task_id,
+                    json.loads(state_path.read_text(encoding="utf-8"))["sessions"],
+                )
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}):
+                self.assertFalse(
+                    cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root).exists()
+                )
+
+    def test_tightened_graph_limits_after_reservation_block_spawn_without_refund(self) -> None:
+        """A graph change after attempt reservation blocks the final spawn
+        fence and keeps the already-consumed protected attempt intact."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            launch = fixture.task_issue["metadata"]["agentflow"]["launch"]
+            launch.update(
+                execution_limits={"deadline_seconds": 1800, "max_retries": 0},
+                sterile=True,
+            )
+            fixture.task_issue["metadata"]["agentflow"].update(
+                tool_profile="shell-readonly", output_boundary=".",
+            )
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            state_home = base / "protected-state"
+            capture: dict = {}
+            graph_change = {"done": False}
+            real_ledger_transaction = cli._execution_limit_ledger_transaction
+
+            @contextlib.contextmanager
+            def tighten_after_reservation(path):
+                with real_ledger_transaction(path) as ledger_value:
+                    yield ledger_value
+                if not graph_change["done"]:
+                    # This is after the protected attempt commit but before
+                    # the pre-spawn authorization fence.
+                    launch["execution_limits"] = {"deadline_seconds": 60, "max_retries": 0}
+                    graph_change["done"] = True
+
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli.beads_backend, "add_comment"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(
+                     cli, "_execution_limit_ledger_transaction",
+                     side_effect=tighten_after_reservation,
+                 ), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                payload = _run_controller_json(cli.controller_resume, args)
+                state_path = fixture.root / ".agentflow/herdr/sessions.json"
+                record = json.loads(state_path.read_text(encoding="utf-8"))["sessions"][fixture.task_id]
+                secret = cli._accounting_authority_secret(
+                    fixture.root, fixture.workflow_root,
+                    continuity_id=record["return_channel"]["contract_binding"]["continuity_id"],
+                    authority_key_id=record["return_channel"]["contract_binding"]["authority_key_id"],
+                )
+                ledger = cli._read_any_execution_ledger_entry(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=secret,
+                )
+
+            self.assertTrue(graph_change["done"], "test must change graph after reservation")
+            self.assertEqual(payload["result"]["state"], "blocked", payload)
+            self.assertEqual(capture, {}, "Herdr start must not occur after graph policy changes")
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(record["execution_limits"], {"deadline_seconds": 1800, "max_retries": 0})
+            self.assertEqual(record["attempt"], 1)
+            self.assertEqual(ledger["execution_limits"], {"deadline_seconds": 1800, "max_retries": 0})
+            self.assertEqual(ledger["attempt"], 1)
+            self.assertEqual(ledger["max_attempts"], 1)
+            self.assertEqual(ledger["status"], "active")
+
     def test_dispatch_blocks_handoff_limit_mismatch_before_reservation_or_preflight(self) -> None:
         """A graph budget missing from the materialized sterile contract is
         rejected before root preflight, protected attempt accounting, or spawn."""
@@ -5856,6 +5971,67 @@ class ControllerRunTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(external_state)}):
                 self.assertFalse(
                     cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root).exists()
+                )
+
+    def test_direct_budgeted_handoff_remains_valid_for_unconfigured_legacy_graph(self) -> None:
+        """A direct typed handoff may carry explicit limits when the older
+        task graph has no structured limit declaration."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            limits = {"deadline_seconds": 60, "max_retries": 0}
+            state_home = base / "protected-state"
+            capture: dict = {}
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 fixture.beads_patches(), \
+                 mock.patch.object(cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"):
+                fixture.lease = fixture._seed_lease()
+                fixture.authority_secret = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=fixture.workflow_root,
+                        resume_key_file="",
+                    ),
+                    fixture.lease,
+                )[1]["authority_secret"]
+                fixture._persist_claim()
+                handoff_path = cli._materialize_launch_handoff(
+                    fixture.root, fixture.task_id, fixture.provider,
+                    role=fixture.role, execution_limits=limits,
+                )
+                handoff = cli.provider_argv_backend.validate_confined_handoff(
+                    handoff_path, root=fixture.root,
+                    provider=fixture.provider, task_id=fixture.task_id,
+                )
+                _, root_preflight_sha256 = cli._run_actual_root_preflight(
+                    root=fixture.root, workflow_root=fixture.workflow_root,
+                    task_id=fixture.task_id, actor=fixture.actor,
+                    claim=fixture.claim_token, lease=fixture.lease.token,
+                    session_name=fixture.session_name, provider=fixture.provider,
+                    role=fixture.role, model=fixture.model, effort=fixture.effort,
+                    handoff=handoff,
+                )
+                fixture.handoff_path = handoff_path
+                fixture.handoff = handoff
+                fixture.root_preflight_sha256 = root_preflight_sha256
+                args = fixture.launch_args(
+                    handoff=str(handoff_path),
+                    handoff_content_sha256=handoff.content_sha256,
+                    handoff_manifest_sha256=handoff.manifest_sha256,
+                    handoff_preflight_sha256=handoff.preflight_sha256,
+                    root_preflight_sha256=root_preflight_sha256,
+                )
+                self.assertFalse(hasattr(args, "execution_limits"))
+                with mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                    self.assertEqual(cli.herdr_launch(args), 0)
+                record = json.loads(
+                    (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+                )["sessions"][fixture.task_id]
+                self.assertEqual(record["execution_limits"], limits)
+                self.assertEqual(record["max_attempts"], 1)
+                self.assertEqual(
+                    Path(capture["argv"][capture["argv"].index("--") + 2]).name,
+                    "execution_limits.py",
                 )
 
     def test_codex_app_server_guard_returns_durable_task_block_without_starting_worker(self) -> None:
