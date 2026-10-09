@@ -297,11 +297,10 @@ def _prepare_trial(root: Path, attempt: int) -> tuple[Path, Path, dict[str, str]
         CHILD_WORKSPACE_ENV: str(workspace),
         NORMAL_CODEX_HOME_ENV: str(codex_home),
     }
-    if sys.platform == "darwin" and DARWIN_TEXT_ENCODING_ENV in os.environ:
-        text_encoding = os.environ[DARWIN_TEXT_ENCODING_ENV]
-        if not _valid_darwin_text_encoding(text_encoding):
-            raise Halt("trial_layout_invalid")
-        env[DARWIN_TEXT_ENCODING_ENV] = text_encoding
+    if sys.platform == "darwin":
+        if not hasattr(os, "getuid"):
+            raise Halt("unsupported_platform")
+        env[DARWIN_TEXT_ENCODING_ENV] = f"0x{os.getuid():X}:0:0"
     config_hash = hashlib.sha256(rendered).hexdigest()
     fixture_hash = hashlib.sha256(FIXTURE).hexdigest()
     return workspace, paths["authority"], env, config_hash, fixture_hash
