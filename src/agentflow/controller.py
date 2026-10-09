@@ -1936,6 +1936,33 @@ class RootController:
             matches[0]["state"] = state
             return self._result(self._checkpoint_active_tasks(document, rows, current), dispatched=True)
 
+    def reconcile_pending_active_task_binding(
+        self,
+        task_id: str,
+        claim_id: str,
+        session_id: str,
+        *,
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fence a resolved native identity onto its exact pending reservation."""
+        if not task_id or not claim_id or not session_id:
+            raise ControllerError("resolved task, claim, and session identity are required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            matches = [item for item in rows if item["task"] == task_id]
+            if (
+                len(matches) != 1
+                or matches[0]["state"] != "identity_pending"
+                or matches[0]["claim_id"] != claim_id
+                or matches[0]["actor"] != current.controller
+                or matches[0]["session_id"]
+            ):
+                raise ControllerError("task has no exact unresolved identity-pending reservation")
+            matches[0]["session_id"] = session_id
+            matches[0]["state"] = "running"
+            return self._result(self._checkpoint_active_tasks(document, rows, current), resumed=True)
+
     def complete_active_task(
         self, task_id: str, *, lease: Lease | str | None = None,
     ) -> ResumeResult:

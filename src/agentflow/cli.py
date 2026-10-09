@@ -5249,6 +5249,98 @@ def _authenticated_expired_bound_execution(
         return False
 
 
+def _reconcile_pending_bound_execution_identity(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    lease: controller_backend.Lease,
+    row: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> bool:
+    """Fence one resolved native binding onto its exact pending checkpoint row."""
+    task_id = str(row.get("task") or "")
+    claim_id = str(row.get("claim_id") or "")
+    if not task_id or not claim_id or row.get("session_id"):
+        raise ValueError("identity-pending checkpoint row is malformed")
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or record.get("status") == "identity_pending":
+        return False
+    if str(record.get("status") or "") not in {"launched", "running"}:
+        raise ValueError("identity-pending task has no reconcilable bound Herdr record")
+    binding = record.get("binding")
+    channel = record.get("return_channel")
+    if not isinstance(binding, Mapping) or not isinstance(channel, Mapping):
+        raise ValueError("resolved bound execution lacks its durable identity")
+    session_id = str(binding.get("session_id") or "")
+    launch_id = str(record.get("launch_id") or "")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if (
+        not launch_id or contract_path.is_symlink()
+        or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file()
+    ):
+        raise ValueError("resolved bound execution contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("resolved bound execution contract is malformed")
+    _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+    )
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": task_id,
+        "claim_id": claim_id,
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": launch_id,
+        "provider": str(contract.get("provider") or ""),
+    }
+    if (
+        not session_id
+        or any(not expected or str(binding.get(field) or "") != expected
+               for field, expected in expected_binding.items())
+        or str(record.get("root") or "") != str(root)
+        or str(record.get("workflow_root") or "") != workflow_root
+        or str(record.get("task_id") or "") != task_id
+        or str(record.get("claim_id") or "") != claim_id
+        or str(record.get("launch_id") or "") != launch_id
+        or str(record.get("provider") or "") != str(contract.get("provider") or "")
+        or str(record.get("model") or "") != str(contract.get("model") or "")
+        or contract.get("controller_id") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("lease_epoch") != lease.epoch
+    ):
+        raise ValueError("resolved bound execution does not match its exact pending reservation")
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None:
+        return False
+    _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    if (
+        str(issue.get("status") or "").lower() != "in_progress"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or str(agentflow.get("claim_id") or "") != claim_id
+    ):
+        raise ValueError("resolved bound execution no longer has its exact live claim")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, issue, task=task_id, root=workflow_root, actor=lease.controller,
+    )
+    controller.reconcile_pending_active_task_binding(
+        task_id, claim_id, session_id, lease=lease,
+    )
+    return True
+
+
 def _expire_bound_execution_if_due(
     args: argparse.Namespace,
     controller: controller_backend.RootController,
@@ -5259,13 +5351,21 @@ def _expire_bound_execution_if_due(
     rows = controller.active_tasks()
     if not rows:
         return None
-    if len(rows) != 1 or rows[0].get("state") not in {"launched", "running"}:
+    if len(rows) != 1:
         return None
     task_id = str(rows[0].get("task") or "")
     workflow_root = str(getattr(args, "workflow_root", "") or "")
     authority_secret = str(getattr(args, "_authority_secret", "") or "")
     if not task_id or not workflow_root or not authority_secret:
         raise ValueError("bound expiry requires the authenticated controller execution context")
+    if rows[0].get("state") == "identity_pending" and not rows[0].get("session_id"):
+        _reconcile_pending_bound_execution_identity(
+            args, controller, root, workflow_root, lease, rows[0],
+            authority_secret=authority_secret,
+        )
+        rows = controller.active_tasks()
+    if len(rows) != 1 or rows[0].get("state") not in {"launched", "running"}:
+        return None
     record = _herdr_session_record(root, task_id)
     if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
         # Identity-pending recovery has its own stricter signed path.

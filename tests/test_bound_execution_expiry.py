@@ -85,6 +85,54 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertEqual(controller.active_tasks(), [])
             self.assertIsNone(cli._expire_bound_execution_if_due(args, controller, fixture.root, lease))
 
+    def test_due_bound_expiry_reconciles_exact_pending_identity_before_retiring(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            checkpoint = controller._load_checkpoint()
+            checkpoint["active_tasks"] = controller.active_tasks()
+            checkpoint["active_tasks"][0]["state"] = "identity_pending"
+            checkpoint["active_tasks"][0]["session_id"] = ""
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                result = cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result.terminal)
+            self.assertEqual(
+                cli._herdr_session_record(fixture.root, fixture.task_id)["status"],
+                "expired_execution",
+            )
+
+    def test_pending_identity_reconcile_rejects_a_wrong_claim(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, _record):
+            checkpoint = controller._load_checkpoint()
+            checkpoint["active_tasks"] = controller.active_tasks()
+            checkpoint["active_tasks"][0]["state"] = "identity_pending"
+            checkpoint["active_tasks"][0]["session_id"] = ""
+            checkpoint["active_tasks"][0]["claim_id"] = "forged-claim"
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+            with self.assertRaisesRegex(ValueError, "exact pending reservation"):
+                cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+            row = controller.active_tasks()[0]
+            self.assertEqual(row["state"], "identity_pending")
+            self.assertEqual(row["claim_id"], "forged-claim")
+
+    def test_pending_identity_reconcile_rejects_a_wrong_provider(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, _record):
+            checkpoint = controller._load_checkpoint()
+            checkpoint["active_tasks"] = controller.active_tasks()
+            checkpoint["active_tasks"][0]["state"] = "identity_pending"
+            checkpoint["active_tasks"][0]["session_id"] = ""
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+            with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                state["sessions"][fixture.task_id]["provider"] = "forged-provider"
+            with self.assertRaisesRegex(ValueError, "exact pending reservation"):
+                cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+            row = controller.active_tasks()[0]
+            self.assertEqual(row["state"], "identity_pending")
+            self.assertEqual(row["session_id"], "")
+
     def test_bound_retirement_verifier_replays_the_staged_target_checkpoint(self) -> None:
         """A crash after target persistence re-verifies this exact bound retirement."""
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
