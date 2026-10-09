@@ -1304,6 +1304,19 @@ class RootController:
             raise ControllerError(f"task {task_id} is not ready")
         return task_id
 
+    @staticmethod
+    def _require_pending_continuation_target(document: Mapping[str, Any], task_id: str) -> str:
+        pending = document.get("pending_continuation_task")
+        if pending in (None, ""):
+            return ""
+        if not isinstance(pending, str) or not pending.strip():
+            raise ControllerError("durable continuation target is malformed")
+        if task_id != pending:
+            raise ControllerError(
+                f"task {task_id} does not match durable continuation target {pending}"
+            )
+        return pending
+
     def _base_checkpoint(self) -> dict[str, Any]:
         return checkpoint.build_checkpoint(
             {
@@ -1400,6 +1413,7 @@ class RootController:
         task_id = self._assert_task_root(task)
         with self.fence(lease) as current:
             document = self._load_checkpoint()
+            self._require_pending_continuation_target(document, task_id)
             rows = _active_tasks_from_checkpoint(document, self.root)
             if any(item["task"] == task_id for item in rows):
                 raise ControllerError(f"task {task_id} is already present in the active task set")
@@ -1518,56 +1532,68 @@ class RootController:
         leaves an auditable halt for an operator instead of an implicit retry.
         """
 
-        current_lease = self.assert_lease(lease)
-        document = self._load_checkpoint()
-        phase = checkpoint.admission_phase(document)
-        state = checkpoint.resume_state(document)
-        if phase == "terminal":
-            return self._result(document, resumed=True)
-        if phase == "draining":
-            # A resumable deadline status can coexist with a durable drain.
-            # Reconciliation may continue elsewhere, but this admission API
-            # must never turn it into permission to select a fresh candidate.
-            return self._result(document, resumed=True)
-        if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
-            return self._result(document, resumed=True)
+        # Keep selection and the pending-target check in the same lease-fenced
+        # transaction as the durable pre-launch reservation. Once the exact
+        # target is reserved, claimed_no_session replaces the pending pointer
+        # atomically; a competing scheduler then observes that reservation.
+        with self.fence(lease) as current_lease:
+            document = self._load_checkpoint()
+            phase = checkpoint.admission_phase(document)
+            state = checkpoint.resume_state(document)
+            if phase == "terminal":
+                return self._result(document, resumed=True)
+            if phase == "draining":
+                # A resumable deadline status can coexist with a durable drain.
+                # Reconciliation may continue elsewhere, but this admission API
+                # must never turn it into permission to select a fresh candidate.
+                return self._result(document, resumed=True)
+            if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
+                return self._result(document, resumed=True)
+            candidate_rows = [dict(task) for task in tasks]
+            for candidate in candidate_rows:
+                self._assert_task_root(candidate)
+            candidates = sorted(
+                candidate_rows,
+                key=lambda item: str(item.get("task") or item.get("task_id") or item.get("id") or ""),
+            )
+            if not candidates:
+                return self._result(document, resumed=True)
 
-        candidate_rows = [dict(task) for task in tasks]
-        for candidate in candidate_rows:
-            self._assert_task_root(candidate)
-        candidates = sorted(
-            candidate_rows,
-            key=lambda item: str(item.get("task") or item.get("task_id") or item.get("id") or ""),
-        )
-        if not candidates:
-            return self._result(document, resumed=True)
-        selected = candidates[0]
-        task_id = self._assert_task_root(selected)
-        claim = selected.get("claim_id") or selected.get("claim") or ""
-        actor = str(selected.get("actor") or selected.get("assignee") or "")
-        before_launch = dict(document)
-        before_launch.update(
-            {
-                "task": task_id,
-                "phase": str(selected.get("phase") or "dispatch"),
-                "next_action": "resume claimed task",
-                "root": self.root,
-                "controller": self.controller,
-                "actor": actor,
-                "claim_id": str(claim),
-                "epoch": current_lease.epoch,
-                "lease_token": current_lease.token,
-                "session_id": "",
-                "state": "claimed_no_session",
-                "status": "claimed_no_session",
-                "terminal": False,
-            }
-        )
-        if document.get("pending_continuation_task") == task_id:
-            # The durable claimed-no-session pointer now names this exact
-            # target, so it atomically replaces the pending selection.
-            before_launch["pending_continuation_task"] = ""
-        document = self._save_checkpoint(before_launch, lease=current_lease)
+            pending_target = str(document.get("pending_continuation_task") or "")
+            if pending_target:
+                matching = [candidate for candidate in candidates if self._assert_task_root(candidate) == pending_target]
+                if len(matching) != 1:
+                    raise ControllerError(
+                        f"resume candidates must contain exactly one durable continuation target {pending_target}"
+                    )
+                selected = matching[0]
+            else:
+                selected = candidates[0]
+            task_id = self._assert_task_root(selected)
+            self._require_pending_continuation_target(document, task_id)
+            claim = selected.get("claim_id") or selected.get("claim") or ""
+            actor = str(selected.get("actor") or selected.get("assignee") or "")
+            before_launch = dict(document)
+            before_launch.update(
+                {
+                    "task": task_id,
+                    "phase": str(selected.get("phase") or "dispatch"),
+                    "next_action": "resume claimed task",
+                    "root": self.root,
+                    "controller": self.controller,
+                    "actor": actor,
+                    "claim_id": str(claim),
+                    "epoch": current_lease.epoch,
+                    "lease_token": current_lease.token,
+                    "session_id": "",
+                    "state": "claimed_no_session",
+                    "status": "claimed_no_session",
+                    "terminal": False,
+                }
+            )
+            if pending_target:
+                before_launch["pending_continuation_task"] = ""
+            document = checkpoint.write_checkpoint(self.checkpoint_path, before_launch)
         if dispatch is None:
             return self._result(document, resumed=False)
 

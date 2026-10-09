@@ -4003,6 +4003,59 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 self.assertTrue(second["ok"], second)
                 self._assert_continuation_committed(args, controller, "ready-task")
 
+    def test_post_clear_crash_cannot_dispatch_other_task_before_exact_target_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, _old_lease = self._continuation_fixture(base)
+                original_clear = cli.controller_backend.RootController.clear_explicit_continuation
+
+                def clear_then_crash(instance, **kwargs):
+                    original_clear(instance, **kwargs)
+                    raise OSError("simulated crash after intent clear")
+
+                with mock.patch.object(
+                    cli.controller_backend.RootController,
+                    "clear_explicit_continuation",
+                    new=clear_then_crash,
+                ):
+                    first = self._run_continuation_once(args)
+
+                self.assertEqual(first["error"], "simulated crash after intent clear")
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credentials = cli._read_controller_credentials(cli._resume_key_path(args))
+                lease = controller.authorize(credentials["resume_secret"])
+                dispatched: list[str] = []
+
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError,
+                    "durable continuation target",
+                ):
+                    controller.resume(
+                        [{"task": "other-task", "root": str(controller.root)}],
+                        dispatch=lambda selected: dispatched.append(selected["task"]),
+                        lease=lease,
+                    )
+
+                self.assertEqual(dispatched, [])
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+
+                result = controller.resume(
+                    [
+                        {"task": "other-task", "root": str(controller.root)},
+                        {"task": "ready-task", "root": str(controller.root)},
+                    ],
+                    dispatch=lambda selected: dispatched.append(selected["task"]) or {
+                        "session_id": "session-ready",
+                    },
+                    lease=lease,
+                )
+                self.assertEqual(dispatched, ["ready-task"])
+                self.assertEqual(result.task, "ready-task")
+                self.assertEqual(result.checkpoint["pending_continuation_task"], "")
+
     def _exercise_retry(self, *, parallel: bool, claim_landed: bool = False) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()

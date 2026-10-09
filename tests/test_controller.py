@@ -637,6 +637,92 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(failures, [])
             self.assertEqual({row["task"] for row in controller.active_tasks()}, {"task-a", "task-b"})
 
+    def test_pending_continuation_rejects_unrelated_reservation_without_checkpoint_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = controller.acquire()
+            controller.halt(
+                "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                lease=lease,
+            )
+            document = controller._load_checkpoint()
+            document["last_check"] = "cancelled expired preidentity launch old-launch for old"
+            checkpoint.write_checkpoint(cp, document)
+            controller.acknowledge_cancelled_preidentity_halt(
+                "workflow", "old", "ready-task", lease=lease,
+            )
+            before = cp.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "durable continuation target"):
+                controller.reserve_active_task(
+                    {"task": "other-task", "root": "root", "claim_id": "claim-other"},
+                    lease=lease,
+                )
+
+            self.assertEqual(cp.read_bytes(), before)
+            reserved = controller.reserve_active_task(
+                {"task": "ready-task", "root": "root", "claim_id": "claim-ready"},
+                lease=lease,
+            )
+            self.assertEqual(reserved.checkpoint["pending_continuation_task"], "")
+            self.assertEqual([row["task"] for row in reserved.checkpoint["active_tasks"]], ["ready-task"])
+
+    def test_concurrent_resumes_cannot_dispatch_an_unrelated_pending_continuation_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            first = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = first.acquire()
+            first.halt(
+                "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                lease=lease,
+            )
+            document = first._load_checkpoint()
+            document["last_check"] = "cancelled expired preidentity launch old-launch for old"
+            checkpoint.write_checkpoint(cp, document)
+            first.acknowledge_cancelled_preidentity_halt(
+                "workflow", "old", "ready-task", lease=lease,
+            )
+            second = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            barrier = threading.Barrier(2)
+            dispatched: list[str] = []
+            failures: list[BaseException] = []
+
+            def resume(controller: RootController, task_id: str) -> None:
+                try:
+                    barrier.wait(timeout=3)
+                    controller.resume(
+                        [{"task": task_id, "root": "root"}],
+                        dispatch=lambda task: dispatched.append(task["task"]) or {
+                            "session_id": f"session-{task['task']}"
+                        },
+                        lease=lease,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            threads = [
+                threading.Thread(target=resume, args=(first, "other-task")),
+                threading.Thread(target=resume, args=(second, "ready-task")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads), "resume threads did not finish")
+            self.assertTrue(
+                all(isinstance(exc, ControllerError) for exc in failures),
+                f"unexpected concurrent resume failures: {failures}",
+            )
+            self.assertEqual(dispatched, ["ready-task"])
+            final = checkpoint.load_checkpoint(cp)
+            self.assertEqual(final["task"], "ready-task")
+            self.assertEqual(final["state"], "running")
+            self.assertEqual(final["pending_continuation_task"], "")
+
     def test_prelaunch_reservation_is_not_duplicated_after_restart(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "controller.json"
