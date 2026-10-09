@@ -27,24 +27,40 @@ class LaunchRecoveryDecision:
     provider_terminal: bool = False
 
 
-def herdr_pane_is_definitively_absent(returncode: int, output: str) -> bool:
+def herdr_pane_is_definitively_absent(
+    returncode: int, stdout: str, stderr: str = "", *, pane_id: str,
+) -> bool:
     """Recognize only Herdr's structured ``pane_not_found`` response.
 
     A nonzero command status by itself is ambiguous: daemon, transport, and
-    parse failures must never authorize retiring a launch. Herdr identifies
+    parse failures must never authorize retiring a launch. Exactly one output
+    stream must contain the structured error for this exact pane; success,
+    conflicting, duplicate, or noisy output remains ambiguous. Herdr identifies
     ``pane get`` responses with a fixed CLI request id.
     """
 
-    if returncode != 1 or not isinstance(output, str):
+    if returncode != 1 or not pane_id or not isinstance(stdout, str) or not isinstance(stderr, str):
+        return False
+    outputs = [value.strip() for value in (stdout, stderr) if value.strip()]
+    if len(outputs) != 1:
         return False
     try:
-        response = json.loads(output)
+        response = json.loads(outputs[0])
     except (json.JSONDecodeError, TypeError):
         return False
-    if not isinstance(response, Mapping) or response.get("id") != "cli:pane:get":
+    if (
+        not isinstance(response, Mapping)
+        or set(response) != {"error", "id"}
+        or response.get("id") != "cli:pane:get"
+    ):
         return False
     error = response.get("error")
-    return isinstance(error, Mapping) and error.get("code") == "pane_not_found"
+    return (
+        isinstance(error, Mapping)
+        and set(error) == {"code", "message"}
+        and error.get("code") == "pane_not_found"
+        and error.get("message") == f"pane {pane_id} not found"
+    )
 
 
 def _operator_required(

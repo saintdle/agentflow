@@ -4451,7 +4451,7 @@ def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError("Herdr pane state is unknown") from exc
     if not launch_recovery_backend.herdr_pane_is_definitively_absent(
-        probe.returncode, probe.stdout or "",
+        probe.returncode, probe.stdout or "", probe.stderr or "", pane_id=pane_id,
     ):
         raise ValueError("Herdr did not definitively report the exact pane absent")
 

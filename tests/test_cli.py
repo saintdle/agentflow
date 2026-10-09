@@ -2819,13 +2819,14 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
     def _run_recovery(self, fixture: ValidLaunch, args: argparse.Namespace, *, pane_response: str | None = None,
                       pane_returncode: int = 1, descendants_override: list | None = None,
                       legacy_scope: bool = False) -> tuple[dict, mock.Mock]:
-        output = json.dumps({
-            "error": {"code": "pane_not_found", "message": "pane missing"},
+        output = pane_response or ""
+        error_output = json.dumps({
+            "error": {"code": "pane_not_found", "message": f"pane {args.pane_id} not found"},
             "id": "cli:pane:get",
-        }) if pane_response is None else pane_response
+        }) if pane_response is None else ""
         pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
             ["herdr", "pane", "get", args.pane_id], pane_returncode,
-            stdout=output, stderr="",
+            stdout=output, stderr=error_output,
         ))
         descendants_patch = (
             mock.patch.object(cli.beads_backend, "root_descendants", return_value=descendants_override)
@@ -2903,14 +2904,16 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
 
     def _run_owner_epoch_repair(self, fixture: ValidLaunch, args: argparse.Namespace,
                                 *, pane_response: str | None = None,
+                                pane_stderr: str | None = None,
                                 pane_returncode: int = 1) -> tuple[dict, mock.Mock]:
-        output = json.dumps({
-            "error": {"code": "pane_not_found", "message": "pane missing"},
+        output = pane_response or ""
+        error_output = pane_stderr if pane_stderr is not None else json.dumps({
+            "error": {"code": "pane_not_found", "message": f"pane {args.pane_id} not found"},
             "id": "cli:pane:get",
-        }) if pane_response is None else pane_response
+        }) if pane_response is None else ""
         pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
             ["herdr", "pane", "get", args.pane_id], pane_returncode,
-            stdout=output, stderr="",
+            stdout=output, stderr=error_output,
         ))
         with fixture.beads_patches(), \
              mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
@@ -2926,6 +2929,8 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 result, pane_probe = self._run_owner_epoch_repair(fixture, args)
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(pane_probe.call_count, 2)
+                for call in pane_probe.call_args_list:
+                    self.assertEqual(call.args[0][1:], ["pane", "get", args.pane_id])
                 state = json.loads(controller.state_path.read_text(encoding="utf-8"))
                 self.assertEqual(state["epoch"], args.abandoned_epoch + 1)
                 self.assertNotIn("abandoned_epoch_repair", state)
@@ -3128,7 +3133,10 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(controller.state_path.read_bytes(), before)
 
     def test_owner_epoch_repair_fails_closed_on_ack_snapshot_and_pane_mismatches(self) -> None:
-        for mode in ("no-ack", "state-hash", "checkpoint-hash", "contract-hash", "unknown-pane"):
+        for mode in (
+            "no-ack", "state-hash", "checkpoint-hash", "contract-hash", "unknown-pane",
+            "conflicting-streams", "wrong-pane-stderr",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 base = Path(temporary).resolve()
                 with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
@@ -3142,13 +3150,27 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                         args.expected_checkpoint_sha256 = "0" * 64
                     elif mode == "contract-hash":
                         args.expected_contract_sha256 = "0" * 64
+                    elif mode == "conflicting-streams":
+                        pane = json.dumps({"id": "cli:pane:get", "result": {"pane_id": args.pane_id}})
                     else:
                         pane = json.dumps({"error": {"code": "transport_error"}})
+                    pane_stderr = None
+                    if mode == "conflicting-streams":
+                        pane_stderr = json.dumps({
+                            "error": {"code": "pane_not_found", "message": f"pane {args.pane_id} not found"},
+                            "id": "cli:pane:get",
+                        })
+                    elif mode == "wrong-pane-stderr":
+                        pane = None
+                        pane_stderr = json.dumps({
+                            "error": {"code": "pane_not_found", "message": "pane different-pane not found"},
+                            "id": "cli:pane:get",
+                        })
                     before_state = controller.state_path.read_bytes()
                     before_cp = controller.checkpoint_path.read_bytes()
                     before_credentials = cli._resume_key_path(args).read_bytes()
                     result, _ = self._run_owner_epoch_repair(
-                        fixture, args, pane_response=pane,
+                        fixture, args, pane_response=pane, pane_stderr=pane_stderr,
                     )
                     self.assertFalse(result["ok"], result)
                     self.assertEqual(controller.state_path.read_bytes(), before_state)
