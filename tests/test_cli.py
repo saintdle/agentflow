@@ -277,6 +277,17 @@ class ValidLaunch:
 
 
 class AgentflowTests(unittest.TestCase):
+    def test_removed_legacy_cutover_command_keeps_policy_migration(self) -> None:
+        parser = cli.build_parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            parser.parse_args(["migrate", "legacy", "--dry-run", "--from", "/tmp/legacy"])
+        self.assertEqual(error.exception.code, 2)
+
+        policy = parser.parse_args(["policy", "migrate", "--root", "/tmp/project", "--dry-run"])
+        self.assertEqual((policy.command, policy.policy_command), ("policy", "migrate"))
+
+        self.assertIsNone(importlib.util.find_spec("agentflow.migration"))
+
     def test_controller_rejects_synthetic_task_files(self) -> None:
         with self.assertRaises(SystemExit):
             cli.build_parser().parse_args(

@@ -20,7 +20,6 @@ REQUIRED_WHEEL_FILES = {
     "agentflow/context_budget.py",
     "agentflow/execution.py",
     "agentflow/guidance.py",
-    "agentflow/migration.py",
     "agentflow/publication.py",
     "agentflow/reconciliation.py",
     "agentflow/resources/agents/claude/agentflow-controller.md",
@@ -64,6 +63,7 @@ REQUIRED_WHEEL_FILES = {
     "*.dist-info/licenses/NOTICE",
     "*.dist-info/licenses/THIRD_PARTY_NOTICES.md",
 }
+FORBIDDEN_WHEEL_FILES = {"agentflow/migration.py"}
 FORBIDDEN_PATH_PARTS = {
     ".agentflow",
     ".beads",
@@ -156,6 +156,10 @@ def inspect(dist: Path, expected_version: str) -> None:
     )
     if missing:
         raise ValueError(f"wheel is missing required runtime files: {', '.join(missing)}")
+
+    unexpected = sorted(FORBIDDEN_WHEEL_FILES.intersection(members))
+    if unexpected:
+        raise ValueError(f"wheel contains removed runtime files: {', '.join(unexpected)}")
 
     metadata_names = [name for name in members if name.endswith(".dist-info/METADATA")]
     if len(metadata_names) != 1:

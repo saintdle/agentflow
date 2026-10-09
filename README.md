@@ -294,8 +294,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 - [Agent-led installation and setup](AGENT_SETUP.md)
 - [Chat-first workflows and copy/paste prompts](docs/CHAT_WORKFLOWS.md)
-- [Installation, upgrades, and legacy migration](docs/INSTALLATION.md)
-- [Transactional legacy cutover and rollback](docs/MIGRATION.md)
+- [Installation and upgrades](docs/INSTALLATION.md)
 - [First workflow tutorial](docs/FIRST_WORKFLOW.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Local session history and context audit](docs/HISTORY.md)

@@ -14,7 +14,7 @@ class AgentLedDocumentationTests(unittest.TestCase):
 
         self.assertIn("saintdle-agentflow", setup)
         self.assertIn("agentflow install --dry-run", setup)
-        self.assertIn("transactional legacy migration", setup)
+        self.assertNotIn("transactional legacy migration", setup)
         self.assertIn("Preserve unrelated", setup)
         self.assertIn("AGENT_SETUP.md", readme)
         self.assertNotIn("/Users/dean", setup)

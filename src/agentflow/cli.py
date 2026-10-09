@@ -44,7 +44,6 @@ from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
 from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import events as events_backend
-from agentflow import migration as migration_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
@@ -8509,60 +8508,6 @@ def install(args: argparse.Namespace) -> int:
     return 0
 
 
-def migrate_legacy(args: argparse.Namespace) -> int:
-    """Preview, apply, or roll back a private legacy-install cutover."""
-
-    try:
-        if args.rollback:
-            result = migration_backend.rollback(args.rollback)
-            operation = "rollback"
-        else:
-            if not args.legacy_root:
-                raise migration_backend.MigrationError("--from is required for dry-run and apply")
-            legacy_root = Path(args.legacy_root).expanduser()
-            if args.dry_run:
-                command = Path(args.new_command).expanduser() if args.new_command else None
-                result = migration_backend.plan(legacy_root, new_command=command)
-                operation = "dry-run"
-            else:
-                raw_command = args.new_command or sys.argv[0]
-                if not Path(raw_command).is_absolute():
-                    raw_command = shutil.which(raw_command) or raw_command
-                result = migration_backend.apply(
-                    legacy_root,
-                    new_command=Path(raw_command).expanduser(),
-                )
-                operation = "apply"
-    except (migration_backend.MigrationError, OSError) as exc:
-        print(f"Legacy migration refused: {exc}", file=sys.stderr)
-        return 2
-
-    if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
-    operations = result.get("operations", [])
-    changed = sum(
-        1
-        for item in operations
-        if item.get("status") in {"planned", "applied", "rolled-back"}
-    )
-    if operation == "dry-run":
-        print(f"DRY_RUN: {changed} exact legacy-owned integration link(s) would be replaced.")
-        print(
-            f"Preserved unmanaged entries discovered: "
-            f"{len(result.get('preserved_unmanaged_entries', []))}."
-        )
-        print("No files were changed. Review the plan, stop active legacy work, then use --apply.")
-    elif operation == "apply":
-        print(f"MIGRATION_APPLIED: {changed} integration(s) replaced transactionally.")
-        print(f"Migration ID: {result['id']}")
-        print(f"Rollback: agentflow migrate legacy --rollback {result['id']}")
-    else:
-        print(f"MIGRATION_ROLLED_BACK: {changed} integration(s) restored.")
-        print(f"Migration ID: {result['id']}")
-    return 0
-
-
 def _parse_acceptance_row(value: str) -> dict[str, str]:
     parts = [part.strip() for part in value.split("::", 4)]
     if len(parts) != 5 or not all(parts):
@@ -13239,28 +13184,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     install_parser.set_defaults(func=install)
-
-    migrate_parser = sub.add_parser(
-        "migrate", help="Run an explicit, reversible installation migration"
-    )
-    migrate_sub = migrate_parser.add_subparsers(dest="migrate_command", required=True)
-    migrate_legacy_parser = migrate_sub.add_parser(
-        "legacy", help="Replace only integrations provably owned by a legacy checkout"
-    )
-    migrate_legacy_parser.add_argument(
-        "--from", dest="legacy_root", default="",
-        help="legacy Agentflow checkout; required except with --rollback",
-    )
-    migrate_action = migrate_legacy_parser.add_mutually_exclusive_group(required=True)
-    migrate_action.add_argument("--dry-run", action="store_true")
-    migrate_action.add_argument("--apply", action="store_true")
-    migrate_action.add_argument("--rollback", metavar="MIGRATION_ID", default="")
-    migrate_legacy_parser.add_argument(
-        "--new-command", default="",
-        help="packaged Agentflow executable; defaults to the command running this migration",
-    )
-    migrate_legacy_parser.add_argument("--json", action="store_true")
-    migrate_legacy_parser.set_defaults(func=migrate_legacy)
 
     config_commands_backend.register_parser(
         sub,
