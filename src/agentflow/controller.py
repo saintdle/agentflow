@@ -2429,6 +2429,97 @@ class RootController:
             retirement_reason="superseded_legacy_scope",
         )
 
+    def expire_bound_execution_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        session_id: str,
+        *,
+        commit_expiration: Callable[[], None],
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fence one signed-deadline-expired bound task before retiring its slot."""
+        for name, value in (
+            ("task", task_id), ("claim", claim_id), ("launch", launch_id),
+            ("session", session_id),
+        ):
+            if not value:
+                raise ControllerError(f"expired bound execution {name} is required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            marker = f"expired bound execution launch {launch_id} for {task_id}"
+            already_retired = (
+                checkpoint.admission_phase(document) == "terminal"
+                and checkpoint.resume_state(document) == "blocked"
+                and document.get("terminal") is True
+                and document.get("root") == self.root
+                and document.get("controller") == self.controller
+                and document.get("epoch") == current.epoch
+                and document.get("lease_token") == current.token
+                and document.get("task") == self.root
+                and not rows and not document.get("active_tasks")
+                and document.get("last_check") == marker
+            )
+            if already_retired:
+                commit_expiration()
+                return self._result(document, resumed=True)
+
+            active = (
+                checkpoint.admission_phase(document) == "controller"
+                and document.get("terminal") is False
+                and document.get("root") == self.root
+                and document.get("controller") == self.controller
+                and document.get("epoch") == current.epoch
+                and document.get("lease_token") == current.token
+                and document.get("task") in {self.root, task_id}
+                and len(rows) == 1
+                and rows[0].get("task") == task_id
+                and rows[0].get("claim_id") == claim_id
+                and rows[0].get("actor") == self.controller
+                and rows[0].get("state") in {"launched", "running"}
+                and rows[0].get("session_id") == session_id
+                and (
+                    document.get("task") == self.root
+                    and not document.get("actor")
+                    and not document.get("claim_id")
+                    and not document.get("session_id")
+                    or document.get("task") == task_id
+                    and document.get("actor") == self.controller
+                    and document.get("claim_id") == claim_id
+                    and document.get("session_id") == session_id
+                )
+            )
+            if not active:
+                raise ControllerError(
+                    "checkpoint is not the exact current single bound-task reservation"
+                )
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "root": self.root,
+                "controller": self.controller,
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "blocked",
+                "status": "blocked",
+                "terminal": True,
+                "terminal_reason": (
+                    f"USER_ACTION_REQUIRED: task {task_id} reached its signed execution deadline "
+                    "with no authenticated result; its exact Herdr pane is absent"
+                ),
+                "active_tasks": [],
+                "last_check": marker,
+                "next_action": "explicitly continue with a distinct ready task",
+            })
+            commit_expiration()
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
+            return self._result(saved, resumed=True)
+
     def acknowledge_cancelled_preidentity_halt(
         self,
         workflow_root: str,
@@ -2455,6 +2546,7 @@ class RootController:
                 retired_check.startswith("cancelled expired preidentity launch ")
                 or retired_check.startswith("cancelled superseded_legacy_scope preidentity launch ")
                 or retired_check.startswith("cancelled owner_abandoned_epoch preidentity launch ")
+                or retired_check.startswith("expired bound execution launch ")
             ) and retired_check.endswith(f" for {cancelled_task}")
             if (
                 checkpoint.admission_phase(document) != "terminal"

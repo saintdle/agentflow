@@ -117,6 +117,14 @@ def reduce_incomplete_launch(
             provider_terminal=True,
         )
 
+    if lifecycle == "expired_execution":
+        return _operator_required(
+            task_id,
+            "has a signed expired bound-execution disposition. Continue only through the "
+            "explicit controller continuation flow with a distinct ready descendant",
+            provider_terminal=True,
+        )
+
     if lifecycle == "launching":
         if record and str(record.get("launch_outcome") or "").lower() == "ambiguous":
             observation = record.get("launch_observation")

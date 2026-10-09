@@ -1747,6 +1747,10 @@ def _controller_step_serial(
             root, workflow_root, str(item.get("id") or ""),
             authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
+        and not _authenticated_expired_bound_execution(
+            root, workflow_root, str(item.get("id") or ""),
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
     ]
     if orphaned:
         if continuation_task and (
@@ -2230,6 +2234,10 @@ def _controller_step_parallel(
                 root, workflow_root, str(item.get("id") or ""),
                 authority_secret=str(getattr(args, "_authority_secret", "") or ""),
             )
+            and not _authenticated_expired_bound_execution(
+                root, workflow_root, str(item.get("id") or ""),
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            )
         ]
         if orphaned:
             if continuation_task and (
@@ -2440,6 +2448,16 @@ def _controller_step(
     root_issue = beads_backend.get_issue(cwd, workflow_root) if workflow_root else None
     policy = _controller_execution_policy(cwd, root, workflow_root, root_issue=root_issue)
     document = controller._load_checkpoint()
+    expired = _expire_bound_execution_if_due(args, controller, root, lease)
+    if expired is not None:
+        return ({
+            "operation": operation, "ok": True, "root": str(root),
+            "controller": lease.controller, "lease": lease.to_dict(),
+            "result": expired.to_dict(), "stop_reason": "TASK_BLOCKED",
+            "workflow_root": workflow_root,
+            "session_control": controller.session_ledger(),
+        }, True)
+    document = controller._load_checkpoint()
     has_active_collection = bool(document.get("active_tasks"))
     phase = checkpoint_backend.admission_phase(document)
     if phase == "draining" or policy.max_parallel_workers > 1 or has_active_collection:
@@ -2566,18 +2584,29 @@ def _verify_cancelled_preidentity_continuation(
         )
     document = controller._load_checkpoint()
     record = _herdr_session_record(root, cancelled_task)
-    disposition = record.get("recovery_disposition") if isinstance(record, Mapping) else None
+    bound_expired = bool(
+        isinstance(record, Mapping) and record.get("status") == "expired_execution"
+    )
+    disposition = (
+        record.get("execution_disposition") if bound_expired
+        else record.get("recovery_disposition") if isinstance(record, Mapping) else None
+    )
     retirement_reason = (
+        _BOUND_EXECUTION_EXPIRY_REASON if bound_expired
+        else
         str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
     )
     if retirement_reason not in {
         "expired launch deadline; Herdr definitively reports pane absent before provider identity",
         "superseded_legacy_scope",
         "owner_abandoned_epoch",
+        _BOUND_EXECUTION_EXPIRY_REASON,
     }:
         raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
     marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
     retired_check = (
+        f"expired bound execution launch {record.get('launch_id')} for {cancelled_task}"
+        if bound_expired else
         f"cancelled {marker_reason} preidentity launch "
         f"{record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
     )
@@ -2622,12 +2651,17 @@ def _verify_cancelled_preidentity_continuation(
         )
     if controller.session_ledger().get("blocked"):
         raise controller_backend.ControllerError("cannot continue a blocked controller budget")
-    if not _authenticated_cancelled_preidentity(
+    if bound_expired:
+        if not _authenticated_expired_bound_execution(
+            root, workflow_root, cancelled_task, authority_secret=authority_secret,
+        ):
+            raise controller_backend.ControllerError("expired task has no authenticated bound execution retirement")
+    elif not _authenticated_cancelled_preidentity(
         root, workflow_root, cancelled_task, authority_secret=authority_secret,
     ):
         raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
     assert isinstance(record, Mapping)
-    legacy_scope = retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
+    legacy_scope = not bound_expired and retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
     channel = record.get("return_channel")
     contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
     if (
@@ -2680,12 +2714,19 @@ def _verify_cancelled_preidentity_continuation(
     for row in descendants:
         task_id = str(row.get("id") or "")
         status = str(row.get("status") or "").lower()
-        if task_id != cancelled_task and status == "in_progress":
+        retired_bound = task_id != cancelled_task and _authenticated_expired_bound_execution(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        )
+        if task_id != cancelled_task and status == "in_progress" and not retired_bound:
             raise controller_backend.ControllerError("another workflow task is still claimed in progress")
         other = _herdr_session_record(root, task_id) if task_id else None
         if not isinstance(other, Mapping):
             continue
         if task_id == cancelled_task:
+            continue
+        if str(other.get("status") or "").lower() == "expired_execution" and retired_bound:
+            if str(row.get("status") or "").lower() != "in_progress":
+                raise controller_backend.ControllerError("expired bound task claim changed before continuation")
             continue
         if str(other.get("status") or "").lower() in {"launching", "identity_pending", "launched", "running"}:
             raise controller_backend.ControllerError("another descendant has an active Herdr lifecycle")
@@ -3115,13 +3156,19 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         acknowledge_no_ready = operation == "resume" and bool(
             getattr(args, "acknowledge_no_ready_halt", False)
         )
-        continue_cancelled_task = str(
+        continue_after_preidentity = str(
             getattr(args, "continue_after_cancelled_preidentity", "") or ""
         ) if operation == "resume" else ""
+        continue_after_expired = str(
+            getattr(args, "continue_after_expired_task", "") or ""
+        ) if operation == "resume" else ""
+        if continue_after_preidentity and continue_after_expired and continue_after_preidentity != continue_after_expired:
+            raise ValueError("choose one exact task for explicit continuation")
+        continue_cancelled_task = continue_after_expired or continue_after_preidentity
         continue_ready_task = str(getattr(args, "continue_task", "") or "") if operation == "resume" else ""
         if bool(continue_cancelled_task) != bool(continue_ready_task):
             raise ValueError(
-                "--continue-after-cancelled-preidentity and --continue-task must be supplied together"
+                "an explicit continuation task and --continue-task must be supplied together"
             )
         if acknowledge_no_ready and continue_cancelled_task:
             raise ValueError("choose one explicit controller continuation acknowledgement")
@@ -3129,7 +3176,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             raise ValueError("--acknowledge-no-ready-halt requires authenticated reattach, not takeover")
         if continue_cancelled_task and getattr(args, "resume_token", ""):
             raise ValueError(
-                "cancelled-preidentity continuation requires the canonical protected credential, not --resume-token"
+                "explicit continuation requires the canonical protected credential, not --resume-token"
             )
 
         # Validate the exact Beads root before acquiring a lease or writing
@@ -4778,6 +4825,431 @@ def _authenticated_cancelled_preidentity(
         )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         return False
+
+
+_BOUND_EXECUTION_EXPIRY_REASON = (
+    "signed execution deadline expired; Herdr definitively reported the exact bound pane absent"
+)
+
+
+def _bound_execution_expiry_disposition(
+    contract: Mapping[str, Any], binding: Mapping[str, Any], *,
+    authority_secret: str,
+) -> dict[str, Any]:
+    value = {
+        "schema": "agentflow.bound-execution-expiry@1",
+        "status": "expired_execution",
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "pane_id": str(binding.get("pane_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "provider": str(contract.get("provider") or ""),
+        "model": str(contract.get("model") or ""),
+        "session_id": str(binding.get("session_id") or ""),
+        "binding_sha256": _canonical_json_digest(dict(binding)),
+        "execution_limits": contract.get("execution_limits"),
+        "attempt": contract.get("attempt"),
+        "max_attempts": contract.get("max_attempts"),
+        "deadline_epoch": contract.get("deadline_epoch"),
+        "recorded_at": _now(),
+        "reason": _BOUND_EXECUTION_EXPIRY_REASON,
+        "authority_key_id": _credential_key_id(authority_secret),
+    }
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="bound-execution-expiry-v1",
+    )
+    return value
+
+
+def _verify_bound_execution_expiry_disposition(
+    value: Any, contract: Mapping[str, Any], binding: Mapping[str, Any], *,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or (
+        value.get("schema") != "agentflow.bound-execution-expiry@1"
+        or value.get("status") != "expired_execution"
+        or value.get("reason") != _BOUND_EXECUTION_EXPIRY_REASON
+        or value.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, value, domain="bound-execution-expiry-v1",
+        )
+    ):
+        raise ValueError("bound execution expiry disposition is not authenticated")
+    expected = {
+        "workspace_root": contract.get("workspace_root"),
+        "workflow_root": contract.get("workflow_root"),
+        "task_id": contract.get("task_id"),
+        "claim_id": contract.get("claim_id"),
+        "lease_id": contract.get("lease_id"),
+        "launch_id": contract.get("launch_id"),
+        "controller_id": contract.get("controller_id"),
+        "continuity_id": contract.get("continuity_id"),
+        "lease_epoch": contract.get("lease_epoch"),
+        "provider": contract.get("provider"),
+        "model": contract.get("model"),
+        "pane_id": binding.get("pane_id"),
+        "session_id": binding.get("session_id"),
+        "binding_sha256": _canonical_json_digest(dict(binding)),
+        "execution_limits": contract.get("execution_limits"),
+        "attempt": contract.get("attempt"),
+        "max_attempts": contract.get("max_attempts"),
+        "deadline_epoch": contract.get("deadline_epoch"),
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise ValueError("bound execution expiry does not preserve the exact signed identity and budget")
+    return value
+
+
+def _verify_expired_bound_execution_record(
+    root: Path, workflow_root: str, task_id: str, record: Mapping[str, Any], *,
+    authority_secret: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    channel = record.get("return_channel")
+    binding = record.get("binding")
+    contract_binding = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    if (
+        record.get("status") != "expired_execution"
+        or not isinstance(channel, Mapping) or channel.get("state") != "revoked"
+        or not isinstance(binding, Mapping) or not binding.get("session_id")
+        or not isinstance(contract_binding, Mapping)
+        or record.get("result") not in (None, {})
+    ):
+        raise ValueError("Herdr record is not an exact expired bound execution")
+    launch_id = str(record.get("launch_id") or "")
+    path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if path.is_symlink() or path.resolve() != expected_path.resolve() or not path.is_file():
+        raise ValueError("expired execution has no canonical signed return contract")
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("expired execution return contract is malformed")
+    verified_contract = _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret, require_issued=False,
+    )
+    if dict(verified_contract) != dict(contract) or dict(contract_binding) != dict(contract):
+        raise ValueError("expired execution identity changed after launch")
+    for field in ("root", "task_id", "claim_id", "lease_id", "launch_id", "pane_id", "provider"):
+        expected = str(contract.get(field) or "")
+        if not expected or str(binding.get(field) or "") != expected:
+            raise ValueError("expired execution provider binding differs from its signed contract")
+    disposition = _verify_bound_execution_expiry_disposition(
+        record.get("execution_disposition"), contract, binding,
+        authority_secret=authority_secret,
+    )
+    if channel.get("revocation") != dict(disposition):
+        raise ValueError("expired execution return channel lacks its exact signed revocation")
+    entry = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if (
+        entry is None or entry.get("status") != "expired"
+        or float(entry.get("deadline_epoch", 0)) != float(contract.get("deadline_epoch", 0))
+    ):
+        raise ValueError("expired execution has no matching protected budget tombstone")
+    return contract, binding
+
+
+def _bound_execution_expiry_snapshot(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    lease: controller_backend.Lease,
+    task_id: str,
+    *,
+    authority_secret: str,
+) -> dict[str, Any]:
+    document = controller._load_checkpoint()
+    rows = controller.active_tasks()
+    if (
+        len(rows) != 1 or rows[0].get("task") != task_id
+        or rows[0].get("state") not in {"launched", "running"}
+        or not rows[0].get("session_id")
+        or document.get("epoch") != lease.epoch
+        or document.get("lease_token") != lease.token
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != lease.controller
+    ):
+        raise ValueError("checkpoint is not the exact single current bound execution")
+    state = _read_json_value(str(controller.state_path))
+    stored_lease = controller._read_lease(state) if isinstance(state, Mapping) else None
+    if (
+        stored_lease is None or stored_lease.to_dict() != lease.to_dict()
+        or int(state.get("epoch", -1)) != lease.epoch
+    ):
+        raise ValueError("protected controller state no longer carries the current lease")
+    key_path = _resume_key_path(argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file="",
+    ))
+    if key_path.is_symlink() or not key_path.is_file() or key_path.parent.is_symlink():
+        raise ValueError("canonical controller credential is unavailable")
+    credentials = _read_controller_credentials(key_path)
+    if (
+        credentials.get("workspace_root") != str(root.resolve())
+        or credentials.get("workflow_root") != workflow_root
+        or credentials.get("continuity_id") != lease.continuity_id
+        or not credentials.get("resume_secret")
+        or not lease.verify_resume_proof(credentials["resume_secret"])
+        or not hmac.compare_digest(credentials.get("authority_secret", ""), authority_secret)
+    ):
+        raise ValueError("canonical controller credential does not authenticate the current lease")
+
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    claim_id = str(agentflow.get("claim_id") or "")
+    if (
+        str(issue.get("status") or "").lower() != "in_progress"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or not claim_id or not claim_token
+    ):
+        raise ValueError("bound execution no longer has its exact live Beads claim")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, issue, task=task_id, root=workflow_root, actor=lease.controller,
+    )
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    if not any(str(row.get("id") or "") == task_id for row in descendants):
+        raise ValueError("bound execution is not under the exact workflow root")
+    if any(
+        str(row.get("id") or "") != task_id
+        and str(row.get("status") or "").lower() == "in_progress"
+        for row in descendants
+    ):
+        raise ValueError("another workflow task is still claimed in progress")
+
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping):
+        raise ValueError("exact bound Herdr launch record is unavailable")
+    status = str(record.get("status") or "")
+    binding = record.get("binding")
+    channel = record.get("return_channel")
+    if not isinstance(binding, Mapping) or not isinstance(channel, Mapping):
+        raise ValueError("bound execution identity or return channel is unavailable")
+    session_id = str(binding.get("session_id") or "")
+    if (
+        record.get("root") != str(root) or record.get("workflow_root") != workflow_root
+        or record.get("task_id") != task_id or record.get("claim_id") != claim_id
+        or record.get("pane_id") == "" or not session_id
+        or rows[0].get("claim_id") != claim_id or rows[0].get("session_id") != session_id
+        or status not in {"launched", "running", "expired_execution"}
+        or (status != "expired_execution" and channel.get("state") != "issued")
+        or (status == "expired_execution" and channel.get("state") != "revoked")
+        or record.get("result") not in (None, {})
+    ):
+        raise ValueError("Herdr record no longer matches the exact bound active task")
+    if not hmac.compare_digest(
+        hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+        str(channel.get("contract_binding", {}).get("claim_token_sha256") or "")
+        if isinstance(channel.get("contract_binding"), Mapping) else "",
+    ):
+        raise ValueError("Herdr launch is not bound to the current exact claim token")
+    launch_id = str(record.get("launch_id") or "")
+    if not launch_id or not str(record.get("pane_id") or ""):
+        raise ValueError("bound launch is missing its exact pane or launch ID")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if contract_path.is_symlink() or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file():
+        raise ValueError("bound launch contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("bound launch contract is malformed")
+    verified_contract = _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+        require_issued=(status != "expired_execution"),
+    )
+    if dict(verified_contract) != dict(contract):
+        raise ValueError("return contract changed during bound execution verification")
+    for field in ("root", "task_id", "claim_id", "lease_id", "launch_id", "pane_id", "provider"):
+        expected = str(contract.get(field) or "")
+        if not expected or str(binding.get(field) or "") != expected:
+            raise ValueError("provider session binding differs from the signed return contract")
+    if (
+        contract.get("workflow_root") != workflow_root
+        or contract.get("claim_id") != claim_id
+        or contract.get("controller_id") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("lease_epoch") != lease.epoch
+        or contract.get("provider") != record.get("provider")
+        or contract.get("model") != record.get("model")
+    ):
+        raise ValueError("bound launch does not match the current controller incarnation")
+    launch = agentflow.get("launch")
+    launch = launch if isinstance(launch, Mapping) else {}
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None or dict(launch.get("execution_limits") or {}) != limits.to_dict():
+        raise ValueError("current task graph no longer matches the signed structured execution limits")
+    ledger = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if ledger is None or ledger.get("status") not in {"active", "expired"}:
+        raise ValueError("bound execution has no active protected execution budget")
+    deadline = float(contract.get("deadline_epoch") or 0)
+    if not deadline:
+        raise ValueError("signed bound execution has no absolute deadline")
+    if status == "expired_execution":
+        _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record, authority_secret=authority_secret,
+        )
+    else:
+        if channel.get("state") != "issued":
+            raise ValueError("bound execution return capability is not issued")
+        for field in ("result_path", "submission_file"):
+            path = Path(str(contract.get(field) or "")).expanduser()
+            try:
+                path.resolve().relative_to((root / ".agentflow/runtime").resolve())
+            except ValueError as exc:
+                raise ValueError(f"bound execution {field} is outside managed runtime") from exc
+            if path.is_symlink() or path.exists():
+                raise ValueError(f"bound execution already has a {field} and cannot be expired safely")
+    return {
+        "contract": dict(contract), "binding": dict(binding), "record": dict(record),
+        "deadline_epoch": deadline, "ledger": dict(ledger), "status": status,
+    }
+
+
+def _commit_expired_bound_execution(
+    root: Path, workflow_root: str, task_id: str,
+    snapshot: Mapping[str, Any], *, authority_secret: str,
+) -> None:
+    contract = snapshot["contract"]
+    binding = snapshot["binding"]
+    if snapshot.get("status") == "expired_execution":
+        record = _herdr_session_record(root, task_id)
+        if not isinstance(record, Mapping):
+            raise ValueError("expired bound execution record disappeared")
+        _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record, authority_secret=authority_secret,
+        )
+        return
+    _require_definitively_absent_herdr_pane(str(snapshot["record"].get("pane_id") or ""))
+    state_path = root / ".agentflow/herdr/sessions.json"
+    with _herdr_transaction(state_path) as state:
+        record = state.get("sessions", {}).get(task_id)
+        if not isinstance(record, dict):
+            raise ValueError("exact bound Herdr launch record disappeared during expiry")
+        channel = record.get("return_channel")
+        if not isinstance(channel, dict):
+            raise ValueError("exact bound return channel disappeared during expiry")
+        if record.get("status") == "expired_execution":
+            _verify_expired_bound_execution_record(
+                root, workflow_root, task_id, record,
+                authority_secret=authority_secret,
+            )
+            return
+        current_contract = channel.get("contract_binding")
+        if (
+            not isinstance(current_contract, Mapping)
+            or dict(current_contract) != dict(contract)
+            or record.get("binding") != dict(binding)
+            or record.get("result") not in (None, {})
+            or record.get("status") not in {"launched", "running"}
+            or channel.get("state") != "issued"
+        ):
+            raise ValueError("bound launch changed or received a result before expiry committed")
+        submission = Path(str(binding.get("submission_file") or "")).expanduser()
+        if submission.is_symlink() or submission.exists():
+            raise ValueError("a worker submission appeared before expiry could revoke its capability")
+        ledger = _expired_preidentity_ledger_disposition(
+            root, workflow_root, task_id, contract,
+            authority_secret=authority_secret,
+        )
+        if ledger.get("status") != "expired":
+            raise ValueError("protected execution budget did not durably expire")
+        disposition = _bound_execution_expiry_disposition(
+            contract, binding, authority_secret=authority_secret,
+        )
+        record["status"] = "expired_execution"
+        record["execution_disposition"] = disposition
+        channel["state"] = "revoked"
+        channel["revoked_at"] = disposition["recorded_at"]
+        channel["revocation"] = disposition
+
+
+def _authenticated_expired_bound_execution(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> bool:
+    try:
+        record = _herdr_session_record(root, task_id)
+        if not isinstance(record, Mapping):
+            return False
+        contract, _binding = _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record,
+            authority_secret=authority_secret,
+        )
+        return (
+            contract.get("workspace_root") == str(root.resolve())
+            and contract.get("workflow_root") == workflow_root
+            and contract.get("task_id") == task_id
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _expire_bound_execution_if_due(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    lease: controller_backend.Lease,
+) -> controller_backend.ResumeResult | None:
+    document = controller._load_checkpoint()
+    rows = controller.active_tasks()
+    if not rows:
+        return None
+    if len(rows) != 1 or rows[0].get("state") not in {"launched", "running"}:
+        return None
+    task_id = str(rows[0].get("task") or "")
+    workflow_root = str(getattr(args, "workflow_root", "") or "")
+    authority_secret = str(getattr(args, "_authority_secret", "") or "")
+    if not task_id or not workflow_root or not authority_secret:
+        raise ValueError("bound expiry requires the authenticated controller execution context")
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
+        # Identity-pending recovery has its own stricter signed path.
+        return None
+    snapshot = _bound_execution_expiry_snapshot(
+        args, controller, root, workflow_root, lease, task_id,
+        authority_secret=authority_secret,
+    )
+    if time.time() < float(snapshot["deadline_epoch"]):
+        return None
+    if snapshot.get("status") != "expired_execution":
+        _require_definitively_absent_herdr_pane(str(snapshot["record"].get("pane_id") or ""))
+
+    def commit() -> None:
+        latest = _bound_execution_expiry_snapshot(
+            args, controller, root, workflow_root, lease, task_id,
+            authority_secret=authority_secret,
+        )
+        if (
+            latest.get("contract") != snapshot.get("contract")
+            or latest.get("binding") != snapshot.get("binding")
+            or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+        ):
+            raise ValueError("bound execution changed during expiry disposition")
+        _commit_expired_bound_execution(
+            root, workflow_root, task_id, latest,
+            authority_secret=authority_secret,
+        )
+
+    return controller.expire_bound_execution_task(
+        task_id, str(snapshot["contract"].get("claim_id") or ""),
+        str(snapshot["contract"].get("launch_id") or ""),
+        str(snapshot["binding"].get("session_id") or ""),
+        commit_expiration=commit, lease=lease,
+    )
 
 
 def _mint_return_channel(
@@ -12821,6 +13293,10 @@ def build_parser() -> argparse.ArgumentParser:
     controller_resume_parser.add_argument(
         "--continue-after-cancelled-preidentity", metavar="CANCELLED_TASK",
         help="explicitly continue a signed cancelled preidentity halt; requires --continue-task",
+    )
+    controller_resume_parser.add_argument(
+        "--continue-after-expired-task", metavar="EXPIRED_TASK",
+        help="explicitly continue a signed expired bound-task halt; requires --continue-task",
     )
     controller_resume_parser.add_argument(
         "--continue-task", metavar="READY_TASK",
