@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -83,3 +84,74 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             ))
             self.assertEqual(controller.active_tasks(), [])
             self.assertIsNone(cli._expire_bound_execution_if_due(args, controller, fixture.root, lease))
+
+    def test_bound_retirement_verifier_replays_the_staged_target_checkpoint(self) -> None:
+        """A crash after target persistence re-verifies this exact bound retirement."""
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                self.assertIsNotNone(
+                    cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+                )
+
+            ready = {
+                "id": "ready-task", "status": "open", "assignee": "",
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+
+            def get_issue(_root, task_id):
+                return {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                }[task_id]
+
+            def ready_command(_root, *_argv):
+                return subprocess.CompletedProcess([], 0, json.dumps([{"id": ready["id"]}]), "")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(
+                     cli.beads_backend, "root_descendants",
+                     return_value=[fixture.task_issue, ready],
+                 ), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                self.assertEqual(
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    ),
+                    ready["id"],
+                )
+                controller.acknowledge_cancelled_preidentity_halt(
+                    fixture.workflow_root, fixture.task_id, ready["id"],
+                    authority_secret=args._authority_secret, lease=lease,
+                )
+                # The target checkpoint is durable. Replaying after the
+                # simulated crash must take the staged/open path, not reject
+                # it as a terminal checkpoint or accept another retirement kind.
+                self.assertEqual(
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        allow_staged_selection=True,
+                        expected_retirement_kind="expired_execution",
+                    ),
+                    ready["id"],
+                )
+                with self.assertRaisesRegex(cli.controller_backend.ControllerError, "does not match"):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        allow_staged_selection=True,
+                        expected_retirement_kind="cancelled_preidentity",
+                    )
+
+            with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                current = state["sessions"][fixture.task_id]
+                current["binding"]["provider"] = "forged-provider"
+            self.assertFalse(cli._authenticated_expired_bound_execution(
+                fixture.root, fixture.workflow_root, fixture.task_id,
+                authority_secret=args._authority_secret,
+            ))
