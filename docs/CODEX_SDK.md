@@ -120,7 +120,7 @@ identified as occurring before SDK import and does not claim that a thread
 start was attempted; malformed or unexpected child output remains ambiguous.
 Bounded-call failures report a fixed RPC phase and `exception` or `deadline`
 kind. The nullable `failure_category` is populated only for an observed
-immediate exception in result schema `agentflow.codex_preflight_result.v2`; it
+immediate exception in result schema `agentflow.codex_preflight_result.v3`; it
 is one of a small allowlist of built-in, already-loaded
 pinned-SDK, or already-loaded Pydantic exception families, with unrecognized
 types reduced to `unknown`. Deadlines and non-exception halts have a null

@@ -32,7 +32,10 @@ PARENT_CHILD_MODE = "parent-issued-v1"
 
 def _fake_sdk(*, authenticated: bool = False, profile: str = preflight.PROFILE,
               wait: bool = False, close_fails: bool = False, fail_at: str | None = None,
-              failure: BaseException | None = None):
+              failure: BaseException | None = None,
+              prefix_notifications: list[object] | None = None,
+              settings_thread_id: str = "private-thread-id",
+              settings_inner_override: object | None = None):
     class Typed:
         def __init__(self, **values):
             self.__dict__.update(values)
@@ -46,12 +49,28 @@ def _fake_sdk(*, authenticated: bool = False, profile: str = preflight.PROFILE,
     class StartedNotification(Typed):
         pass
 
+    class AccountUpdatedNotification(Typed):
+        pass
+
+    class AppListUpdatedNotification(Typed):
+        pass
+
+    class Thread(Typed):
+        pass
+
+    class ThreadSettings(Typed):
+        pass
+
+    class ActivePermissionProfile(Typed):
+        pass
+
     class FakeClient:
         instances = []
 
         def __init__(self, config):
             self.config = config
             self.calls = []
+            self.prefix_notifications = list(prefix_notifications or [])
             self.instances.append(self)
 
         def fail_if(self, phase):
@@ -81,7 +100,9 @@ def _fake_sdk(*, authenticated: bool = False, profile: str = preflight.PROFILE,
         def account_read(self, params):
             self.calls.append(("account_read", params.refresh_token))
             self.fail_if("account_read")
-            account = SimpleNamespace(root=SimpleNamespace(type="chatgpt")) if authenticated else None
+            account = SimpleNamespace(
+                root=SimpleNamespace(type="chatgpt", plan_type="pro"),
+            ) if authenticated else None
             # A valid ChatGPT account may correctly report that it requires
             # OpenAI authentication; the boolean is not an auth-presence test.
             return SimpleNamespace(account=account, requires_openai_auth=True)
@@ -101,19 +122,32 @@ def _fake_sdk(*, authenticated: bool = False, profile: str = preflight.PROFILE,
             if wait:
                 import threading
                 threading.Event().wait(0.05)
-            if self.calls.count("next_notification") == 1:
+            notification_index = self.calls.count("next_notification")
+            if notification_index <= len(self.prefix_notifications):
+                event = self.prefix_notifications[notification_index - 1]
+                if type(event) is tuple and len(event) == 2:
+                    method, payload = event
+                    return SimpleNamespace(method=method, payload=payload)
+                return event
+            if notification_index == len(self.prefix_notifications) + 1:
                 return SimpleNamespace(
                     method="thread/started",
-                    payload=StartedNotification(thread=SimpleNamespace(id="private-thread-id")),
+                    payload=StartedNotification(thread=Thread(id="private-thread-id")),
                 )
             settings = SimpleNamespace(
-                active_permission_profile=SimpleNamespace(id=profile, extends=":read-only"),
+                active_permission_profile=ActivePermissionProfile(id=profile, extends=":read-only"),
                 cwd=str(Path.cwd().resolve()), model=preflight.MODEL, effort=preflight.EFFORT,
                 approval_policy="never",
             )
+            thread_settings = ThreadSettings(**settings.__dict__)
+            if settings_inner_override is not None:
+                thread_settings = settings_inner_override
             return SimpleNamespace(
                 method="thread/settings/updated",
-                payload=SettingsNotification(thread_id="private-thread-id", thread_settings=settings),
+                payload=SettingsNotification(
+                    thread_id=settings_thread_id,
+                    thread_settings=thread_settings,
+                ),
             )
 
         def close(self):
@@ -126,12 +160,23 @@ def _fake_sdk(*, authenticated: bool = False, profile: str = preflight.PROFILE,
                 raise AssertionError(f"forbidden SDK API accessed: {name}")
             raise AttributeError(name)
 
-    sdk = SimpleNamespace(__version__=preflight.SDK_PIN)
+    sdk = SimpleNamespace(
+        __version__=preflight.SDK_PIN,
+        AccountUpdatedNotification=AccountUpdatedNotification,
+        AppListUpdatedNotification=AppListUpdatedNotification,
+        Thread=Thread,
+        ThreadSettings=ThreadSettings,
+        ActivePermissionProfile=ActivePermissionProfile,
+        ThreadStartedNotification=StartedNotification,
+        ThreadSettingsUpdatedNotification=SettingsNotification,
+    )
     config = type("Config", (), {"__init__": lambda self, **values: self.__dict__.update(values)})
     approval = type("Approval", (), {"__init__": lambda self, **values: self.__dict__.update(values)})
     approval_value = SimpleNamespace(never="never")
     return (sdk, FakeClient, config, approval, approval_value, Typed, Typed,
-            Typed, SettingsNotification, Typed, StartedNotification), FakeClient
+            Typed, SettingsNotification, Typed, StartedNotification,
+            AccountUpdatedNotification, AppListUpdatedNotification, Thread,
+            ThreadSettings, ActivePermissionProfile), FakeClient
 
 
 def _trial_context(root: Path, attempt: int = 1):
@@ -166,6 +211,10 @@ def _child_result(**changes):
         "thread_id_present": False, "instruction_sources_empty": None,
         "inventory_status": "unverified", "cleanup_ok": True, "elapsed_ms": 1,
         "failure_phase": None, "failure_kind": None, "failure_category": None,
+        "notification_count": 0, "startup_notifications_skipped": 0,
+        "first_notification_method": None, "first_notification_payload": None,
+        "rejected_notification_method": None, "rejected_notification_payload": None,
+        "notification_mismatch_reason": None,
     }
     value.update(changes)
     return (json.dumps(value, separators=(",", ":")) + "\n").encode()
@@ -211,6 +260,23 @@ class CodexPreflightTests(unittest.TestCase):
              mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             code = preflight.main(["--child"])
         return code, child_calls, stdout.getvalue()
+
+    def _diagnose_prefix_notification(self, factory, **sdk_options):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trial"
+            workspace, env = _trial_context(root)
+            notifications = []
+            modules, _FakeClient = _fake_sdk(
+                authenticated=True, prefix_notifications=notifications, **sdk_options,
+            )
+            produced = factory(modules[0])
+            if type(produced) is list:
+                notifications.extend(produced)
+            else:
+                notifications.append(produced)
+            with mock.patch.object(preflight, "_load_sdk", return_value=modules), \
+                 mock.patch.object(preflight.Path, "cwd", return_value=workspace):
+                return preflight._child_diagnostic(env)
 
     def test_default_and_help_are_no_side_effects(self):
         with mock.patch.object(preflight.subprocess, "Popen", side_effect=AssertionError("spawned")):
@@ -640,6 +706,156 @@ class CodexPreflightTests(unittest.TestCase):
             self.assertEqual(result["status"], "halted")
             self.assertNotIn("private-thread-id", json.dumps(result))
 
+    def test_empty_app_list_startup_notification_is_diagnosed_and_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "trial"
+            workspace, env = _trial_context(root)
+            notifications = []
+            modules, _FakeClient = _fake_sdk(
+                authenticated=True, prefix_notifications=notifications,
+            )
+            notifications.append(("app/list/updated", modules[0].AppListUpdatedNotification(data=[])))
+            with mock.patch.object(preflight, "_load_sdk", return_value=modules), \
+                 mock.patch.object(preflight.Path, "cwd", return_value=workspace):
+                result = preflight._child_diagnostic(env)
+            self.assertEqual(result["code"], "tool_inventory_unverified")
+            self.assertEqual(result["notification_count"], 3)
+            self.assertEqual(result["startup_notifications_skipped"], 2)
+            self.assertEqual(result["first_notification_method"], "app_list_updated")
+            self.assertEqual(result["first_notification_payload"], "app_list_updated")
+            self.assertIsNone(result["notification_mismatch_reason"])
+            self.assertNotIn("private-thread-id", json.dumps(result))
+
+    def test_typed_account_update_is_skipped_only_when_account_decision_matches(self):
+        matching = self._diagnose_prefix_notification(
+            lambda sdk: ("account/updated", sdk.AccountUpdatedNotification(
+                auth_mode="chatgpt", plan_type="pro",
+            )),
+        )
+        self.assertEqual(matching["code"], "tool_inventory_unverified")
+        self.assertEqual(matching["first_notification_method"], "account_updated")
+        self.assertEqual(matching["first_notification_payload"], "account_updated")
+        self.assertEqual(matching["startup_notifications_skipped"], 2)
+
+        changed_auth = self._diagnose_prefix_notification(
+            lambda sdk: ("account/updated", sdk.AccountUpdatedNotification(
+                auth_mode="apiKey", plan_type="pro",
+            )),
+        )
+        self.assertEqual(changed_auth["code"], "settings_unsupported")
+        self.assertEqual(changed_auth["notification_mismatch_reason"], "account_state_mismatch")
+        self.assertNotIn("apiKey", json.dumps(changed_auth))
+
+        changed_plan = self._diagnose_prefix_notification(
+            lambda sdk: ("account/updated", sdk.AccountUpdatedNotification(
+                auth_mode="chatgpt", plan_type="private-plan-label",
+            )),
+        )
+        self.assertEqual(changed_plan["notification_mismatch_reason"], "account_state_mismatch")
+        self.assertNotIn("private-plan-label", json.dumps(changed_plan))
+
+    def test_unknown_malformed_nonempty_and_wrong_target_notifications_fail_closed(self):
+        cases = (
+            (
+                "malformed_app_list",
+                lambda sdk: ("app/list/updated", sdk.AppListUpdatedNotification(data=None)),
+                "startup_payload_malformed", "app_list_updated", "app_list_updated",
+            ),
+            (
+                "nonempty_app_list",
+                lambda sdk: ("app/list/updated", sdk.AppListUpdatedNotification(
+                    data=["private-app-name"],
+                )),
+                "startup_payload_not_empty", "app_list_updated", "app_list_updated",
+            ),
+            (
+                "unknown_method",
+                lambda sdk: SimpleNamespace(
+                    method="private/credential-like-method",
+                    payload=sdk.AppListUpdatedNotification(data=[]),
+                    params={"credential": "private-auth-token", "threadId": "private-foreign-thread-id",
+                            "detail": "arbitrary-private-detail"},
+                ),
+                "method_unknown", "unknown", "app_list_updated",
+            ),
+            (
+                "unknown_parser_class",
+                lambda _sdk: ("app/list/updated", SimpleNamespace(data=[])),
+                "payload_type_mismatch", "app_list_updated", "unknown",
+            ),
+            (
+                "missing_payload",
+                lambda _sdk: SimpleNamespace(
+                    method="app/list/updated", params={"credential": "private-auth-token"},
+                ),
+                "payload_type_mismatch", "app_list_updated", "unknown",
+            ),
+            (
+                "wrong_target_thread_started",
+                lambda sdk: ("thread/started", sdk.ThreadStartedNotification(
+                    thread=sdk.Thread(id="private-foreign-thread-id"),
+                )),
+                "target_thread_mismatch", "thread_started", "thread_started",
+            ),
+        )
+        for name, factory, reason, method, payload in cases:
+            with self.subTest(case=name):
+                result = self._diagnose_prefix_notification(factory)
+                self.assertEqual(result["code"], "settings_unsupported")
+                self.assertEqual(result["notification_mismatch_reason"], reason)
+                self.assertEqual(result["rejected_notification_method"], method)
+                self.assertEqual(result["rejected_notification_payload"], payload)
+                rendered = json.dumps(result)
+                for private in (
+                    "private/credential-like-method", "private-app-name",
+                    "private-foreign-thread-id", "private-thread-id", "credential",
+                    "private-auth-token", "arbitrary-private-detail",
+                ):
+                    self.assertNotIn(private, rendered)
+
+    def test_wrong_target_settings_notification_is_reported_without_thread_id(self):
+        result = self._diagnose_prefix_notification(
+            lambda sdk: ("account/updated", sdk.AccountUpdatedNotification(
+                auth_mode="chatgpt", plan_type="pro",
+            )),
+            settings_thread_id="private-foreign-thread-id",
+        )
+        self.assertEqual(result["code"], "settings_mismatch")
+        self.assertEqual(result["rejected_notification_method"], "thread_settings_updated")
+        self.assertEqual(result["rejected_notification_payload"], "thread_settings_updated")
+        self.assertEqual(result["notification_mismatch_reason"], "target_thread_mismatch")
+        self.assertNotIn("private-foreign-thread-id", json.dumps(result))
+
+    def test_settings_notification_requires_exact_typed_thread_settings(self):
+        result = self._diagnose_prefix_notification(
+            lambda sdk: ("account/updated", sdk.AccountUpdatedNotification(
+                auth_mode="chatgpt", plan_type="pro",
+            )),
+            settings_inner_override=SimpleNamespace(
+                active_permission_profile=SimpleNamespace(id=preflight.PROFILE, extends=":read-only"),
+                cwd="/private/workspace", model=preflight.MODEL,
+                effort=preflight.EFFORT, approval_policy="never",
+            ),
+        )
+        self.assertEqual(result["code"], "settings_mismatch")
+        self.assertEqual(result["notification_mismatch_reason"], "settings_mismatch")
+        self.assertEqual(result["rejected_notification_payload"], "thread_settings_updated")
+        self.assertNotIn("/private/workspace", json.dumps(result))
+
+    def test_notification_diagnostic_counters_are_capped(self):
+        result = self._diagnose_prefix_notification(
+            lambda sdk: [
+                ("account/updated", sdk.AccountUpdatedNotification(
+                    auth_mode="chatgpt", plan_type="pro",
+                ))
+                for _ in range(preflight.MAX_NOTIFICATION_EVENTS + 1)
+            ],
+        )
+        self.assertEqual(result["code"], "settings_notification_budget_exhausted")
+        self.assertEqual(result["notification_count"], preflight.MAX_NOTIFICATION_EVENTS)
+        self.assertEqual(result["startup_notifications_skipped"], preflight.MAX_NOTIFICATION_EVENTS)
+        self.assertEqual(result["notification_mismatch_reason"], "notification_limit")
+
     def test_profile_notification_wait_and_cleanup_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "trial"
@@ -775,6 +991,18 @@ class CodexPreflightTests(unittest.TestCase):
             {"failure_phase": "thread_start", "failure_kind": "exception",
              "failure_category": "sdk_rpc_error", "thread_start_attempted": False,
              "status": "ambiguous", "code": "thread_start_ambiguous"},
+            {"notification_count": True},
+            {"notification_count": preflight.MAX_NOTIFICATION_EVENTS + 1},
+            {"startup_notifications_skipped": 1},
+            {"notification_count": 1, "first_notification_method": "thread_started"},
+            {"notification_count": 1, "first_notification_method": "private_method",
+             "first_notification_payload": "unknown"},
+            {"notification_count": 1, "first_notification_method": "thread_started",
+             "first_notification_payload": "thread_started", "rejected_notification_method": "unknown",
+             "rejected_notification_payload": "unknown"},
+            {"notification_count": 1, "first_notification_method": "thread_started",
+             "first_notification_payload": "thread_started", "rejected_notification_method": "unknown",
+             "rejected_notification_payload": "unknown", "notification_mismatch_reason": "private"},
         )
         for changes in invalid:
             with self.subTest(changes=changes), self.assertRaisesRegex(preflight.Halt, "child_result_invalid"):
@@ -785,6 +1013,14 @@ class CodexPreflightTests(unittest.TestCase):
             failure_phase="thread_start", failure_kind="exception", failure_category="sdk_rpc_error",
         ))
         self.assertTrue(ambiguous["thread_start_attempted"])
+        safe_notification = preflight._decode_child(_child_result(
+            notification_count=1, startup_notifications_skipped=0,
+            first_notification_method="unknown", first_notification_payload="unknown",
+            rejected_notification_method="unknown", rejected_notification_payload="unknown",
+            notification_mismatch_reason="method_unknown",
+        ))
+        self.assertEqual(safe_notification["rejected_notification_method"], "unknown")
+        self.assertNotIn("private_method", json.dumps(safe_notification))
         cleanup_override = preflight._decode_child(_child_result(
             status="halted", code="cleanup_failed", cleanup_ok=False, thread_start_attempted=True,
             failure_phase="thread_start", failure_kind="exception", failure_category="sdk_rpc_error",

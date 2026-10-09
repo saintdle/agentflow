@@ -29,8 +29,9 @@ RPC_TIMEOUT = 10
 PROFILE_WAIT = 30
 CLEANUP_TIMEOUT = 5
 MAX_EVIDENCE = 16 * 1024
+MAX_NOTIFICATION_EVENTS = 8
 STATE_SCHEMA = "agentflow.codex_preflight_state.v1"
-RESULT_SCHEMA = "agentflow.codex_preflight_result.v2"
+RESULT_SCHEMA = "agentflow.codex_preflight_result.v3"
 FIXTURE = b"Synthetic preflight fixture. No project source or skills.\n"
 CHILD_MODE_VALUE = "parent-issued-v1"
 CHILD_TOKEN_ENV = "AGENTFLOW_PREFLIGHT_CHILD_TOKEN"
@@ -43,6 +44,7 @@ _CODES = frozenset({
     "authentication_required", "sdk_unavailable", "sdk_pin_mismatch",
     "initialize_failed", "config_unverified", "legacy_sandbox_present",
     "thread_start_failed", "thread_start_ambiguous", "settings_timeout", "settings_unsupported",
+    "settings_notification_budget_exhausted",
     "settings_mismatch", "tool_inventory_unverified", "rpc_timeout", "rpc_failed",
     "cleanup_failed", "child_timeout", "child_result_invalid",
     "attempt_budget_exhausted", "attempt_state_invalid", "attempt_lock_unavailable",
@@ -57,6 +59,23 @@ _RPC_FAILURE_CATEGORIES = frozenset({
     "sdk_transport_closed", "sdk_rpc_error", "sdk_error", "response_validation",
     "timeout_exception", "os_error", "value_error", "type_error", "unknown",
 })
+_NOTIFICATION_METHODS = frozenset({
+    "thread_started", "thread_settings_updated", "account_updated", "app_list_updated", "unknown",
+})
+_NOTIFICATION_PAYLOADS = frozenset({
+    "thread_started", "thread_settings_updated", "account_updated", "app_list_updated", "unknown",
+})
+_NOTIFICATION_MISMATCH_REASONS = frozenset({
+    "method_unknown", "payload_type_mismatch", "target_thread_mismatch",
+    "startup_payload_malformed", "startup_payload_not_empty", "settings_mismatch",
+    "account_state_mismatch", "notification_limit",
+})
+_NOTIFICATION_METHOD_CATEGORIES = {
+    "thread/started": "thread_started",
+    "thread/settings/updated": "thread_settings_updated",
+    "account/updated": "account_updated",
+    "app/list/updated": "app_list_updated",
+}
 
 
 class Halt(RuntimeError):
@@ -576,14 +595,16 @@ def _load_sdk() -> tuple[Any, ...]:
     import openai_codex
     from openai_codex.client import CodexClient, CodexConfig
     from openai_codex.generated.v2_all import (
+        ActivePermissionProfile, AccountUpdatedNotification, AppListUpdatedNotification,
         AskForApproval, AskForApprovalValue, ConfigReadParams, ConfigReadResponse,
-        GetAccountParams, ThreadSettingsUpdatedNotification, ThreadStartParams,
-        ThreadStartedNotification,
+        GetAccountParams, Thread, ThreadSettings, ThreadSettingsUpdatedNotification,
+        ThreadStartParams, ThreadStartedNotification,
     )
     return (openai_codex, CodexClient, CodexConfig, AskForApproval,
             AskForApprovalValue, ConfigReadParams, ConfigReadResponse,
             GetAccountParams, ThreadSettingsUpdatedNotification, ThreadStartParams,
-            ThreadStartedNotification)
+            ThreadStartedNotification, AccountUpdatedNotification,
+            AppListUpdatedNotification, Thread, ThreadSettings, ActivePermissionProfile)
 
 
 def _child_diagnostic(env: dict[str, str]) -> dict[str, Any]:
@@ -593,13 +614,19 @@ def _child_diagnostic(env: dict[str, str]) -> dict[str, Any]:
         "profile_observed": False, "thread_id_present": False,
         "instruction_sources_empty": None, "inventory_status": "unverified",
         "cleanup_ok": True, "failure_phase": None, "failure_kind": None,
-        "failure_category": None,
+        "failure_category": None, "notification_count": 0,
+        "startup_notifications_skipped": 0,
+        "first_notification_method": None, "first_notification_payload": None,
+        "rejected_notification_method": None, "rejected_notification_payload": None,
+        "notification_mismatch_reason": None,
     }
     client = None
     started = time.monotonic()
     try:
         (sdk, Client, Config, Approval, ApprovalValue, ReadParams, ReadResponse,
-         AccountParams, SettingsNotification, ThreadParams, StartedNotification) = _load_sdk()
+         AccountParams, SettingsNotification, ThreadParams, StartedNotification,
+         AccountNotification, AppListNotification, Thread, ThreadSettings,
+         ActivePermissionProfile) = _load_sdk()
         if str(getattr(sdk, "__version__", "")) != SDK_PIN:
             raise Halt("sdk_pin_mismatch")
         workspace = str(Path.cwd().resolve())
@@ -639,6 +666,8 @@ def _child_diagnostic(env: dict[str, str]) -> dict[str, Any]:
         account_root = getattr(account_value, "root", None)
         if account_value is None or getattr(account_root, "type", None) != "chatgpt":
             raise Halt("authentication_required")
+        account_plan_value = getattr(account_root, "plan_type", None)
+        account_plan_type = _enum(account_plan_value) if account_plan_value is not None else None
         result["authenticated"] = True
         params = ThreadParams(
             cwd=workspace, model=MODEL,
@@ -661,38 +690,122 @@ def _child_diagnostic(env: dict[str, str]) -> dict[str, Any]:
         sources = getattr(response, "instruction_sources", None)
         result["instruction_sources_empty"] = sources == []
         deadline = time.monotonic() + PROFILE_WAIT
+        observed_notifications = 0
+
+        def reject_notification(
+            method_category: str, payload_category: str, reason: str,
+            *, code: str = "settings_unsupported",
+        ) -> None:
+            result["rejected_notification_method"] = method_category
+            result["rejected_notification_payload"] = payload_category
+            result["notification_mismatch_reason"] = reason
+            raise Halt(code)
+
         while time.monotonic() < deadline:
             notification = _bounded_call(
                 client, client.next_notification, deadline - time.monotonic(),
                 "settings_notification", deadline_code="settings_timeout",
             )
-            if getattr(notification, "method", "") != "thread/settings/updated":
-                if getattr(notification, "method", "") == "thread/started":
-                    started_payload = getattr(notification, "payload", None)
-                    if (isinstance(started_payload, StartedNotification)
-                            and str(getattr(getattr(started_payload, "thread", None), "id", "")) == thread_id):
-                        continue
-                raise Halt("settings_unsupported")
+            observed_notifications += 1
+            method_value = getattr(notification, "method", None)
             payload = getattr(notification, "payload", None)
-            if not isinstance(payload, SettingsNotification):
-                raise Halt("settings_unsupported")
+            method_category = (
+                _NOTIFICATION_METHOD_CATEGORIES.get(method_value, "unknown")
+                if type(method_value) is str else "unknown"
+            )
+            payload_categories = (
+                (StartedNotification, "thread_started"),
+                (SettingsNotification, "thread_settings_updated"),
+                (AccountNotification, "account_updated"),
+                (AppListNotification, "app_list_updated"),
+            )
+            payload_category = next(
+                (category for payload_type, category in payload_categories if type(payload) is payload_type),
+                "unknown",
+            )
+            if result["first_notification_method"] is None:
+                result["first_notification_method"] = method_category
+                result["first_notification_payload"] = payload_category
+            result["notification_count"] = min(observed_notifications, MAX_NOTIFICATION_EVENTS)
+            if observed_notifications > MAX_NOTIFICATION_EVENTS:
+                reject_notification(
+                    method_category, payload_category, "notification_limit",
+                    code="settings_notification_budget_exhausted",
+                )
+
+            if method_category == "thread_started":
+                if payload_category != "thread_started":
+                    reject_notification(method_category, payload_category, "payload_type_mismatch")
+                started_thread = getattr(payload, "thread", None)
+                if (type(started_thread) is not Thread
+                        or type(getattr(started_thread, "id", None)) is not str
+                        or getattr(started_thread, "id", None) != thread_id):
+                    reject_notification(method_category, payload_category, "target_thread_mismatch")
+                result["startup_notifications_skipped"] += 1
+                continue
+
+            if method_category == "account_updated":
+                if payload_category != "account_updated":
+                    reject_notification(method_category, payload_category, "payload_type_mismatch")
+                auth_mode_value = getattr(payload, "auth_mode", None)
+                plan_type_value = getattr(payload, "plan_type", None)
+                auth_mode = _enum(auth_mode_value) if auth_mode_value is not None else None
+                plan_type = _enum(plan_type_value) if plan_type_value is not None else None
+                # The pinned payload carries account metadata only. Keep the earlier ChatGPT
+                # decision stable by rejecting non-ChatGPT modes and any changed account plan.
+                if (auth_mode not in {None, "chatgpt", "chatgptAuthTokens"}
+                        or (plan_type is not None and plan_type != account_plan_type)):
+                    reject_notification(method_category, payload_category, "account_state_mismatch")
+                result["startup_notifications_skipped"] += 1
+                continue
+
+            if method_category == "app_list_updated":
+                if payload_category != "app_list_updated":
+                    reject_notification(method_category, payload_category, "payload_type_mismatch")
+                apps = getattr(payload, "data", None)
+                if type(apps) is not list:
+                    reject_notification(method_category, payload_category, "startup_payload_malformed")
+                if apps:
+                    reject_notification(method_category, payload_category, "startup_payload_not_empty")
+                # Only the exact pinned app-list type with an empty list is harmless to skip.
+                result["startup_notifications_skipped"] += 1
+                continue
+
+            if method_category == "unknown":
+                reject_notification(method_category, payload_category, "method_unknown")
+
+            if method_category != "thread_settings_updated":
+                reject_notification(method_category, payload_category, "method_unknown")
+            if payload_category != "thread_settings_updated":
+                reject_notification(method_category, payload_category, "payload_type_mismatch")
+            if (type(getattr(payload, "thread_id", None)) is not str
+                    or getattr(payload, "thread_id", None) != thread_id):
+                reject_notification(
+                    method_category, payload_category, "target_thread_mismatch",
+                    code="settings_mismatch",
+                )
             settings = getattr(payload, "thread_settings", None)
             profile = getattr(settings, "active_permission_profile", None)
-            if (getattr(payload, "thread_id", None) != thread_id or profile is None
+            if (type(settings) is not ThreadSettings
+                    or type(profile) is not ActivePermissionProfile
                     or getattr(profile, "id", None) != PROFILE
                     or getattr(profile, "extends", None) != ":read-only"
                     or _path_text(getattr(settings, "cwd", "")) != workspace
                     or getattr(settings, "model", None) != MODEL
                     or _enum(getattr(settings, "effort", None)) != EFFORT
                     or _enum(getattr(settings, "approval_policy", None)) != "never"):
-                raise Halt("settings_mismatch")
+                reject_notification(
+                    method_category, payload_category, "settings_mismatch",
+                    code="settings_mismatch",
+                )
             result["profile_observed"] = True
             break
         if not result["profile_observed"]:
             raise Halt("settings_timeout")
         if sources != []:
             raise Halt("tool_inventory_unverified")
-        # The pinned API cannot enumerate every enabled tool/instruction surface.
+        # The pinned API cannot enumerate the full effective tool/instruction surface or prove
+        # lifecycle A1 enforcement; active-profile metadata remains diagnostic evidence only.
         raise Halt("tool_inventory_unverified")
     except RPCFailure as exc:
         result["code"] = exc.code
@@ -751,6 +864,10 @@ def _empty_child_result(code: str, *, cleanup_ok: bool = True) -> dict[str, Any]
         "instruction_sources_empty": None, "inventory_status": "unverified",
         "cleanup_ok": cleanup_ok, "elapsed_ms": 0,
         "failure_phase": None, "failure_kind": None, "failure_category": None,
+        "notification_count": 0, "startup_notifications_skipped": 0,
+        "first_notification_method": None, "first_notification_payload": None,
+        "rejected_notification_method": None, "rejected_notification_payload": None,
+        "notification_mismatch_reason": None,
     }
 
 
@@ -764,7 +881,10 @@ def _decode_child(data: bytes) -> dict[str, Any]:
     expected = {"schema", "status", "code", "authenticated", "thread_start_attempted",
                 "profile_observed", "thread_id_present", "instruction_sources_empty",
                 "inventory_status", "cleanup_ok", "elapsed_ms", "failure_phase", "failure_kind",
-                "failure_category"}
+                "failure_category", "notification_count", "startup_notifications_skipped",
+                "first_notification_method", "first_notification_payload",
+                "rejected_notification_method", "rejected_notification_payload",
+                "notification_mismatch_reason"}
     if (not isinstance(value, dict) or set(value) != expected or value.get("schema") != RESULT_SCHEMA
             or value.get("status") not in {"blocked", "halted", "ambiguous"}
             or value.get("code") not in _CODES
@@ -780,6 +900,31 @@ def _decode_child(data: bytes) -> dict[str, Any]:
         raise Halt("child_result_invalid")
     if (value.get("instruction_sources_empty") is not None
             and type(value.get("instruction_sources_empty")) is not bool):
+        raise Halt("child_result_invalid")
+    notification_count = value.get("notification_count")
+    skipped_count = value.get("startup_notifications_skipped")
+    if (type(notification_count) is not int or not 0 <= notification_count <= MAX_NOTIFICATION_EVENTS
+            or type(skipped_count) is not int or not 0 <= skipped_count <= notification_count):
+        raise Halt("child_result_invalid")
+    first_method, first_payload = (
+        value.get("first_notification_method"), value.get("first_notification_payload")
+    )
+    rejected_method, rejected_payload = (
+        value.get("rejected_notification_method"), value.get("rejected_notification_payload")
+    )
+    mismatch_reason = value.get("notification_mismatch_reason")
+    if ((first_method is None) != (first_payload is None)
+            or (first_method is None) != (notification_count == 0)
+            or (first_method is not None
+                and (not isinstance(first_method, str) or first_method not in _NOTIFICATION_METHODS
+                     or not isinstance(first_payload, str) or first_payload not in _NOTIFICATION_PAYLOADS))
+            or ((rejected_method is None) != (rejected_payload is None))
+            or ((rejected_method is None) != (mismatch_reason is None))
+            or (rejected_method is not None
+                and (not isinstance(rejected_method, str) or rejected_method not in _NOTIFICATION_METHODS
+                     or not isinstance(rejected_payload, str) or rejected_payload not in _NOTIFICATION_PAYLOADS
+                     or not isinstance(mismatch_reason, str)
+                     or mismatch_reason not in _NOTIFICATION_MISMATCH_REASONS))):
         raise Halt("child_result_invalid")
     failure_phase, failure_kind = value.get("failure_phase"), value.get("failure_kind")
     if ((failure_phase is None) != (failure_kind is None)
@@ -926,13 +1071,21 @@ def _run_trial(root: Path) -> dict[str, Any]:
             result = {"schema": RESULT_SCHEMA, "status": "ambiguous", "code": "child_timeout",
                       "thread_start_attempted": True, "profile_observed": False,
                       "cleanup_ok": cleanup_ok, "failure_phase": None,
-                      "failure_kind": None, "failure_category": None}
+                      "failure_kind": None, "failure_category": None,
+                      "notification_count": 0, "startup_notifications_skipped": 0,
+                      "first_notification_method": None, "first_notification_payload": None,
+                      "rejected_notification_method": None, "rejected_notification_payload": None,
+                      "notification_mismatch_reason": None}
         except Halt:
             cleanup_ok = _kill_owned_group(proc)
             result = {"schema": RESULT_SCHEMA, "status": "ambiguous", "code": "child_result_invalid",
                       "thread_start_attempted": True, "profile_observed": False,
                       "cleanup_ok": cleanup_ok, "failure_phase": None,
-                      "failure_kind": None, "failure_category": None}
+                      "failure_kind": None, "failure_category": None,
+                      "notification_count": 0, "startup_notifications_skipped": 0,
+                      "first_notification_method": None, "first_notification_payload": None,
+                      "rejected_notification_method": None, "rejected_notification_payload": None,
+                      "notification_mismatch_reason": None}
         result.update({"attempt": attempt, "sdk_pin": SDK_PIN,
                        "workspace_sha256": fixture_hash, "config_sha256": config_hash})
         status = result["status"] if result["status"] in {"blocked", "halted", "ambiguous"} else "ambiguous"
