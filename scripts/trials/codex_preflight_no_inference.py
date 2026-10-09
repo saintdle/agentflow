@@ -348,9 +348,18 @@ def _valid_darwin_text_encoding(value: str) -> bool:
     if user_id.lower() != f"0x{os.getuid():X}".lower():
         return False
     for selector in (encoding, language):
-        if (not selector.isascii() or not selector.isdecimal() or len(selector) > 5
-                or (len(selector) > 1 and selector.startswith("0"))
-                or int(selector) > 0xFFFF):
+        if not selector.isascii():
+            return False
+        if selector.isdecimal():
+            if len(selector) > 5 or (len(selector) > 1 and selector.startswith("0")):
+                return False
+            parsed_selector = int(selector, 10)
+        elif (selector.startswith("0x") and 3 <= len(selector) <= 6
+              and all(character in "0123456789abcdefABCDEF" for character in selector[2:])):
+            parsed_selector = int(selector[2:], 16)
+        else:
+            return False
+        if parsed_selector > 0xFFFF:
             return False
     return True
 

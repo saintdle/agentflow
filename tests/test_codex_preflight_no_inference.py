@@ -383,18 +383,39 @@ class CodexPreflightTests(unittest.TestCase):
     def test_darwin_text_encoding_marker_is_platform_and_value_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace, env, token = _parent_child_context(Path(temporary) / "trial")
-            marker = f"0x{os.getuid():X}:0:1"
-            env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
+            user_id = os.getuid()
+            valid_markers = (
+                ("decimal_selectors", f"0x{user_id:X}:0:1"),
+                ("hex_selectors", f"0x{user_id:X}:0x0:0x1"),
+                ("mixed_selectors", f"0x{user_id:X}:0:0x1"),
+                ("hexadecimal_limit", f"0x{user_id:X}:0xFFFF:65535"),
+            )
+            invalid_markers = (
+                ("malformed_fields", "malformed"),
+                ("wrong_uid", f"0x{user_id + 1:X}:0x0:0x1"),
+                ("malformed_hex", f"0x{user_id:X}:0xGG:0"),
+                ("uppercase_hex_prefix", f"0x{user_id:X}:0X1:0"),
+                ("hex_overflow", f"0x{user_id:X}:0x10000:0"),
+                ("decimal_overflow", f"0x{user_id:X}:65536:0"),
+                ("hex_too_wide", f"0x{user_id:X}:0x00000:0"),
+                ("decimal_leading_zero", f"0x{user_id:X}:00:0"),
+                ("non_ascii_selector", f"0x{user_id:X}:１:0"),
+                ("missing_field", f"0x{user_id:X}:0"),
+                ("extra_field", f"0x{user_id:X}:0:1:0"),
+            )
             with mock.patch.object(preflight.sys, "platform", "darwin"), \
                  mock.patch.object(preflight.Path, "cwd", return_value=workspace):
-                preflight._validate_child_context(env, token)
-                for invalid in ("malformed", f"0x{os.getuid() + 1:X}:0:1", "0x1:0:999999"):
-                    with self.subTest(value=invalid):
-                        env[preflight.DARWIN_TEXT_ENCODING_ENV] = invalid
+                for label, marker in valid_markers:
+                    with self.subTest(case=label):
+                        env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
+                        preflight._validate_child_context(env, token)
+                for label, marker in invalid_markers:
+                    with self.subTest(case=label):
+                        env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
                         with self.assertRaises(preflight.Halt) as raised:
                             preflight._validate_child_context(env, token)
                         self.assertEqual(raised.exception.code, "trial_layout_invalid")
-                env[preflight.DARWIN_TEXT_ENCODING_ENV] = marker
+                env[preflight.DARWIN_TEXT_ENCODING_ENV] = valid_markers[0][1]
                 env["UNRELATED_RUNTIME_VALUE"] = "rejected"
                 with self.assertRaises(preflight.Halt) as raised:
                     preflight._validate_child_context(env, token)
