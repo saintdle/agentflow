@@ -1,6 +1,6 @@
 formula = "agentflow-controlled-rework"
-description = "Controller-led pull workflow with an approved contract and specification, dynamic sub-primary writers, parallel review/security/CI gates, and one final integration decision."
-version = 2
+description = "Controller-led workflow with an approved contract, a validated end-to-end pilot slice before broad writer dispatch, incremental acceptance for later slices, parallel review/security/CI gates, and one final integration decision."
+version = 3
 type = "workflow"
 
 [vars.work_name]
@@ -45,16 +45,59 @@ gitless boundary, measurable acceptance, and a planned validation lane.
 """
 
 [[steps]]
+id = "pilot-slice"
+title = "Writer: implement one pilot slice for {{work_name}}"
+needs = ["specification"]
+labels = ["agentflow", "af:stage:code", "af:role:writer"]
+description = """
+Implement one bounded, complete end-to-end slice from the approved contract
+and project-owned acceptance-to-evidence matrix. Use the required project
+skills and domain sources named in the specification. Keep the slice small
+enough to exercise the intended implementation and validation path before
+broad writer dispatch.
+
+## Acceptance criteria
+
+The pilot delivers one observable end-to-end behavior, with its changed files,
+local tests, project-owned acceptance criteria, and evidence recorded for
+independent controller validation.
+"""
+
+[[steps]]
+id = "pilot-validation"
+title = "Controller: independently validate the pilot slice for {{work_name}}"
+needs = ["pilot-slice"]
+labels = ["agentflow", "af:stage:integration", "af:role:controller"]
+description = """
+Independently evaluate the pilot against the project-owned acceptance criteria
+and authoritative checks recorded in the approved contract, acceptance-to-
+evidence matrix, and required project skills. Run the stated checks and inspect
+the resulting behavior and evidence; do not rely only on the pilot writer's
+summary. Record the verdict and any evidence gaps. Keep the pilot return
+unaccepted and route a bounded correction to its writer if criteria fail.
+
+## Acceptance criteria
+
+The controller records a separate verdict with evidence from the declared
+authoritative lanes. This step stays open while a material project criterion
+fails or lacks evidence, so broad writer dispatch remains blocked.
+"""
+
+[[steps]]
 id = "writer-swarm"
 title = "Controller: coordinate {{work_name}} sub-primary writers"
 type = "task"
-needs = ["specification"]
+needs = ["specification", "pilot-slice", "pilot-validation"]
 labels = ["agentflow", "af:stage:dispatch", "af:role:controller"]
 description = """
-Create one child bead per complete vertical slice. A sub-primary writer owns
-that slice end to end, including local tests and evidence. Give child beads
-disjoint writable boundaries, explicit entry and exit state, required project
-skills, provider/model budget, exact checks, and a halt contract.
+After the pilot passes independent controller validation, create one child bead
+per additional complete vertical slice. Assign one responsible sub-primary
+writer to each slice end to end, including local tests and evidence. Each later
+slice adds incremental acceptance criteria for its changed behavior and names
+its project criteria sources and authoritative checks. Preserve accepted pilot
+behavior and the approved shared contract in aggregate validation. Give child
+beads disjoint writable boundaries, explicit entry and exit state, required
+project skills, provider/model budget, exact checks, and a halt contract.
 
 Keep shared files and cross-slice decisions with the controller. Add each slice
 with `bd create --parent=<this-task-id> --no-inherit-labels` and labels `agentflow`,
@@ -66,26 +109,33 @@ accepted work one change at a time, and rerun affected cross-slice checks.
 
 ## Acceptance criteria
 
-Every writer return is judged by the controller. Accepted slices are integrated
+Every writer return is judged by the controller. Each slice has one responsible
+writer and incremental acceptance criteria. Accepted slices are integrated
 with disjoint ownership and cross-slice evidence; rejected work remains with
 its original writer.
 """
 
 [[steps]]
-id = "pedagogy-review"
-title = "Read-only pedagogy review for {{work_name}}"
+id = "project-domain-review"
+title = "Read-only project-domain review for {{work_name}}"
 needs = ["writer-swarm"]
-labels = ["agentflow", "af:stage:review", "af:role:reviewer", "af:cap:pedagogy", "af:mode:read-only"]
+labels = ["agentflow", "af:stage:review", "af:role:reviewer", "af:mode:read-only"]
 description = """
-Review the complete learner or user journey without editing. Return only
-actionable findings with stable IDs, severity, exact evidence, expected and
-actual behavior, proposed correction, authoritative evidence lane, and
-confidence. Return APPROVE when no material issue remains.
+Review the complete change against the project-specific review criteria in the
+approved specification. Use the required project skills named there; they
+determine the review scope. For non-learner work, follow the relevant project
+criteria without adding pedagogy assumptions. For learner-facing work, include
+learner-journey and pedagogy criteria when the specification requires them.
+Return only actionable findings with stable IDs, severity, exact evidence,
+expected and actual behavior, proposed correction, authoritative evidence lane,
+and confidence. Return APPROVE when no material issue remains.
 
 ## Acceptance criteria
 
-A read-only pedagogy or user-journey verdict is returned to the controller with
-reproducible evidence.
+A read-only verdict covers the project criteria selected in the specification,
+with reproducible evidence and explicit untested lanes. Learner-journey and
+pedagogy criteria are included only when the project specification calls for
+them.
 """
 
 [[steps]]
@@ -132,7 +182,7 @@ polls external CI, and failed checks are routed as bounded corrective work.
 [[steps]]
 id = "controller-integration"
 title = "Controller: final judgment for {{work_name}}"
-needs = ["pedagogy-review", "lifecycle-review", "ci-validation"]
+needs = ["project-domain-review", "lifecycle-review", "ci-validation"]
 labels = ["agentflow", "af:stage:integration", "af:role:controller"]
 description = """
 Disposition every reviewer finding. Reproduce accepted high and medium

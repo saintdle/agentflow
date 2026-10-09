@@ -9,8 +9,7 @@ To have a ChatGPT/Codex or Claude coding agent—or GitHub Copilot Chat in an ID
 with Agent mode and terminal access—perform these steps, send it the copy/paste
 request in the repository's
 [agent-led setup contract](../AGENT_SETUP.md). That contract adds preservation,
-legacy-migration, redaction, verification, and halt requirements around the
-commands below.
+redaction, verification, and halt requirements around the commands below.
 
 ## Prerequisites
 
@@ -163,12 +162,6 @@ changes. See [Configuration](CONFIGURATION.md#model-policy).
 
 Read `CHANGELOG.md` before every `0.x` upgrade. Back up shared configuration and
 Beads state before applying a documented migration.
-
-If the command and provider integrations currently point into an older source
-checkout, do not overwrite them with a generic installer. Follow the
-[transactional legacy migration](MIGRATION.md), which previews exact ownership,
-keeps a private rollback manifest, and leaves project state outside its write
-boundary.
 
 ## Uninstall
 

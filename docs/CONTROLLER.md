@@ -26,3 +26,107 @@ acknowledgement is recorded in the checkpoint before ordinary scheduling
 proceeds; the scheduler still performs its normal atomic claim. It cannot
 reopen completed/failed workflows or other safety/user-action halts, and it
 does not clear prior results, evidence, or checkpoint history.
+
+## Expired provider identity
+
+When a controller is halted because a provider identity never resolved, first
+inspect the exact task, launch, and pane recorded by Agentflow. Recovery is
+available only when the protected launch ledger proves that the original
+deadline has expired, the signed launch still matches the checkpoint and
+current Beads claim, and Herdr returns its structured `pane_not_found` response
+for that exact pane. A timeout, daemon error, or any other pane response leaves
+the halt in place.
+
+Use the launch ID and pane ID from the authenticated lifecycle record:
+
+```sh
+agentflow controller recover-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID
+```
+
+This records a separate signed cancellation disposition, revokes the old
+return channel, and then clears the checkpoint's active pointer. It preserves
+the original task, claim, launch attempt, deadline, and result history. A late
+provider submission cannot be accepted, and the cancelled task cannot be
+launched again under the expired budget.
+
+Recovery leaves the workflow halted until an operator explicitly selects a
+different ready descendant using the same canonical protected controller
+credential:
+
+```sh
+agentflow controller resume \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --continue-after-cancelled-preidentity TASK --continue-task READY_TASK
+```
+
+`TASK` must be the cancelled preidentity task and `READY_TASK` must be a
+distinct current ready descendant. Agentflow verifies the signed cancellation,
+controller incarnation, root, and absence of other active work before
+reopening the checkpoint. This flow does not close the cancelled Beads task
+or claim a provider result for it.
+
+If this explicit continuation is interrupted while its protected credential
+is being rotated, rerun the same command with the same task IDs. Ordinary
+controller start, resume, supervise, recovery, stop, progress, rotate, and
+waiver commands remain fenced until that exact continuation finishes. Mutating
+controller commands always use the namespaced checkpoint; `--checkpoint-path`
+is available only to read-only `controller status`.
+
+## Superseded legacy launch without budget metadata
+
+Some older signed launches predate structured execution budgets. Their return
+contracts and session records have no deadline or retry ledger, so Agentflow
+cannot establish that their launch deadline expired. When the owning scope has
+been superseded, retire that launch explicitly instead of treating an advisory
+identity timer as a deadline:
+
+```sh
+agentflow controller retire-superseded-legacy-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID
+```
+
+This command accepts only an authenticated signed legacy contract with no
+structured-budget fields or protected task ledger row, the exact retained
+identity-pending checkpoint and claim, no committed binding or result, no
+other active work, and Herdr's definitive `pane_not_found` response. Any
+present or malformed budget evidence, a live or uncertain pane, or mismatched
+identity leaves the task unchanged. The signed retirement says
+`superseded_legacy_scope` and records budget availability as unknown; it does
+not manufacture an expiry, attempt count, or ledger entry. It revokes the old
+result channel before clearing the checkpoint pointer. Continue only through
+the distinct-ready-task command above, using the same protected controller
+credential and the cancelled task ID.
+
+## One explicitly authorized abandoned-epoch repair
+
+Ordinary recovery rejects a controller state epoch that no longer matches the
+signed launch. A separate owner repair command exists only for an explicitly
+authorized, exact unowned legacy epoch gap. It requires the canonical
+protected credential, the signed unbudgeted launch, a definitively absent
+pane, and the exact state, checkpoint, and contract SHA-256 fingerprints from
+the approved snapshot. It does not dispatch work or reset a claim, history, or
+budget. Do not substitute newly calculated fingerprints if any snapshot has
+changed; the command must fail closed and be reassessed.
+
+```sh
+agentflow controller repair-abandoned-epoch \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID \
+  --acknowledge-abandoned-epoch --abandoned-epoch EPOCH \
+  --expected-state-sha256 STATE_SHA256 \
+  --expected-checkpoint-sha256 CHECKPOINT_SHA256 \
+  --expected-contract-sha256 CONTRACT_SHA256
+```
+
+The repair records a protected signed intent before rotating the controller
+credential and lease. Rerun only this exact command after an interrupted
+transaction. After the old launch is durably cancelled, the command leaves
+the workflow halted; continue only by explicitly selecting a distinct ready
+descendant with the continuation command above.

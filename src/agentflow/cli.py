@@ -38,12 +38,12 @@ from agentflow import context_delivery as context_delivery_backend
 from agentflow import codex_app_server as codex_app_server_backend
 from agentflow import execution as execution_backend
 from agentflow import execution_limits as execution_limits_backend
+from agentflow import feedback as feedback_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
 from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import events as events_backend
-from agentflow import migration as migration_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
 from agentflow import history as history_backend
@@ -705,6 +705,14 @@ def _reject_custom_controller_state_path(args: argparse.Namespace) -> None:
         )
 
 
+def _reject_custom_controller_checkpoint(args: argparse.Namespace) -> None:
+    """Keep controller authority bound to its canonical namespaced checkpoint."""
+    if str(getattr(args, "checkpoint_path", "") or ""):
+        raise ValueError(
+            "controller mutations require the canonical namespaced controller checkpoint"
+        )
+
+
 def _root_acceptance_passed(issue: Mapping[str, Any], *, beads_cwd: Path | None = None) -> bool:
     """GOAL_COMPLETE requires the canonical acceptance matrix, not root status.
 
@@ -1362,6 +1370,20 @@ def _dispatch_via_herdr(
             manifest = handoff.manifest
         except provider_argv_backend.ProviderArgvError:
             return {"state": "blocked", "session_id": ""}
+        # The graph is the authority for requested limits. Packaging and
+        # provider launch consume the typed handoff, so verify that the
+        # materialized contract carried the exact graph policy before root
+        # preflight or any protected attempt reservation can occur.
+        expected_limits = execution_limits.to_dict() if execution_limits else None
+        try:
+            materialized_limits = execution_limits_backend.parse_limits(
+                manifest.get("execution_limits")
+            )
+        except execution_limits_backend.ExecutionLimitError:
+            return {"state": "blocked", "session_id": ""}
+        actual_limits = materialized_limits.to_dict() if materialized_limits else None
+        if actual_limits != expected_limits:
+            return {"state": "blocked", "session_id": ""}
         session_name = f"agentflow-{_slug(task_id)}"
         context_values = tuple(
             str(value) for value in manifest.get("context", [])
@@ -1709,13 +1731,46 @@ def _controller_step_serial(
     # claim_ready() would never surface it again and it would sit
     # undiscoverable. Adopt it instead of claiming something new.
     descendants = beads_backend.root_descendants(cwd, workflow_root)
+    selection_checkpoint = controller._load_checkpoint()
+    pending_target = str(selection_checkpoint.get("pending_continuation_task") or "")
+    requested_target = str(getattr(args, "_continuation_task", "") or "")
+    if pending_target and requested_target and pending_target != requested_target:
+        raise controller_backend.ControllerError(
+            "continuation target differs from the durable pending task"
+        )
+    continuation_task = pending_target or requested_target
     orphaned = [
         item for item in descendants
         if str(item.get("status") or "").lower() == "in_progress"
         and str(item.get("assignee") or "") == lease.controller
+        and not _authenticated_cancelled_preidentity(
+            root, workflow_root, str(item.get("id") or ""),
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
+        and not _authenticated_expired_bound_execution(
+            root, workflow_root, str(item.get("id") or ""),
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
     ]
     if orphaned:
+        if continuation_task and (
+            len(orphaned) != 1 or str(orphaned[0].get("id") or "") != continuation_task
+        ):
+            raise controller_backend.ControllerError(
+                "workflow has in-progress work other than the durable continuation target"
+            )
+        if continuation_task:
+            beads_backend.verify_task_ancestry_and_ownership(
+                cwd, orphaned[0], task=continuation_task,
+                root=workflow_root, actor=lease.controller,
+            )
         claimed = orphaned[0]
+    elif continuation_task:
+        exact = beads_backend.claim_issue_exact(
+            cwd, task=continuation_task, root=workflow_root,
+            actor=lease.controller, persist=False,
+        )
+        claimed = exact.issue
     else:
         claimed = beads_backend.claim_ready(cwd, parent=workflow_root, labels=[], actor=lease.controller)
     stop_reason = ""
@@ -1787,6 +1842,8 @@ def _controller_step_serial(
         result = controller.resume(
             [selected], dispatch=_dispatch_via_herdr(args, root, cwd, workflow_root, lease), lease=lease,
         )
+        if continuation_task:
+            args._continuation_task = ""
         action_required: dict[str, str] | None = None
         if result.dispatched:
             controller.record_session_event(
@@ -2153,7 +2210,19 @@ def _controller_step_parallel(
 
     # Tasks returned as in_progress after a crash can be adopted only from a
     # durable Herdr binding; a claimed_no_session marker above is never retried.
-    while not draining and not attention_required and len(active) < policy.max_parallel_workers:
+    continuation_dispatched = False
+    while (
+        not draining and not attention_required and len(active) < policy.max_parallel_workers
+        and not continuation_dispatched
+    ):
+        selection_checkpoint = controller._load_checkpoint()
+        pending_target = str(selection_checkpoint.get("pending_continuation_task") or "")
+        requested_target = str(getattr(args, "_continuation_task", "") or "")
+        if pending_target and requested_target and pending_target != requested_target:
+            raise controller_backend.ControllerError(
+                "continuation target differs from the durable pending task"
+            )
+        continuation_task = pending_target or requested_target
         descendants = beads_backend.root_descendants(cwd, workflow_root)
         active_ids = {item["task"] for item in active}
         orphaned = [
@@ -2161,10 +2230,41 @@ def _controller_step_parallel(
             if str(item.get("status") or "").lower() == "in_progress"
             and str(item.get("assignee") or "") == lease.controller
             and str(item.get("id") or "") not in active_ids
+            and not _authenticated_cancelled_preidentity(
+                root, workflow_root, str(item.get("id") or ""),
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            )
+            and not _authenticated_expired_bound_execution(
+                root, workflow_root, str(item.get("id") or ""),
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            )
         ]
-        claimed = orphaned[0] if orphaned else beads_backend.claim_ready(
-            cwd, parent=workflow_root, labels=[], actor=lease.controller
-        )
+        if orphaned:
+            if continuation_task and (
+                len(orphaned) != 1 or str(orphaned[0].get("id") or "") != continuation_task
+            ):
+                raise controller_backend.ControllerError(
+                    "workflow has in-progress work other than the durable continuation target"
+                )
+            if continuation_task:
+                beads_backend.verify_task_ancestry_and_ownership(
+                    cwd, orphaned[0], task=continuation_task,
+                    root=workflow_root, actor=lease.controller,
+                )
+            claimed = orphaned[0]
+            if continuation_task:
+                continuation_dispatched = True
+        elif continuation_task:
+            exact = beads_backend.claim_issue_exact(
+                cwd, task=continuation_task, root=workflow_root,
+                actor=lease.controller, persist=False,
+            )
+            claimed = exact.issue
+            continuation_dispatched = True
+        else:
+            claimed = beads_backend.claim_ready(
+                cwd, parent=workflow_root, labels=[], actor=lease.controller
+            )
         if claimed is None:
             break
         task_id = str(claimed.get("id") or "")
@@ -2241,6 +2341,8 @@ def _controller_step_parallel(
         })
         # This atomic reservation precedes all handoff/preflight/provider work.
         controller.reserve_active_task(selected, lease=lease)
+        if continuation_task:
+            args._continuation_task = ""
         dispatched = _dispatch_via_herdr(args, root, cwd, workflow_root, lease)(selected)
         session_id = str(dispatched.get("session_id") or "")
         dispatch_state = str(dispatched.get("state") or "")
@@ -2345,6 +2447,16 @@ def _controller_step(
     cwd = root
     root_issue = beads_backend.get_issue(cwd, workflow_root) if workflow_root else None
     policy = _controller_execution_policy(cwd, root, workflow_root, root_issue=root_issue)
+    document = controller._load_checkpoint()
+    expired = _expire_bound_execution_if_due(args, controller, root, lease)
+    if expired is not None:
+        return ({
+            "operation": operation, "ok": True, "root": str(root),
+            "controller": lease.controller, "lease": lease.to_dict(),
+            "result": expired.to_dict(), "stop_reason": "TASK_BLOCKED",
+            "workflow_root": workflow_root,
+            "session_control": controller.session_ledger(),
+        }, True)
     document = controller._load_checkpoint()
     has_active_collection = bool(document.get("active_tasks"))
     phase = checkpoint_backend.admission_phase(document)
@@ -2454,9 +2566,588 @@ def _verify_no_ready_ack_candidate(
     return task_id
 
 
+def _verify_cancelled_preidentity_continuation(
+    root: Path,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    *,
+    authority_secret: str,
+    allow_staged_selection: bool = False,
+    expected_retirement_kind: str = "cancelled_preidentity",
+) -> str:
+    """Prove a signed retired launch and one distinct, currently ready child."""
+    if not cancelled_task or not ready_task or ready_task == cancelled_task:
+        raise controller_backend.ControllerError(
+            "cancelled-preidentity continuation requires a distinct ready task"
+        )
+    document = controller._load_checkpoint()
+    record = _herdr_session_record(root, cancelled_task)
+    bound_expired = bool(
+        isinstance(record, Mapping) and record.get("status") == "expired_execution"
+    )
+    actual_retirement_kind = "expired_execution" if bound_expired else "cancelled_preidentity"
+    if expected_retirement_kind not in {"cancelled_preidentity", "expired_execution"}:
+        raise controller_backend.ControllerError("continuation retirement kind is invalid")
+    if actual_retirement_kind != expected_retirement_kind:
+        raise controller_backend.ControllerError("continuation flag does not match the retired task kind")
+    disposition = (
+        record.get("execution_disposition") if bound_expired
+        else record.get("recovery_disposition") if isinstance(record, Mapping) else None
+    )
+    retirement_reason = (
+        _BOUND_EXECUTION_EXPIRY_REASON if bound_expired
+        else
+        str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
+    )
+    if retirement_reason not in {
+        "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+        "superseded_legacy_scope",
+        "owner_abandoned_epoch",
+        _BOUND_EXECUTION_EXPIRY_REASON,
+    }:
+        raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
+    marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
+    retired_check = (
+        f"expired bound execution launch {record.get('launch_id')} for {cancelled_task}"
+        if bound_expired else
+        f"cancelled {marker_reason} preidentity launch "
+        f"{record.get('launch_id') if isinstance(record, Mapping) else ''} for {cancelled_task}"
+    )
+    selected_check = (
+        f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+        f"ready descendant {ready_task} after {cancelled_task}"
+    )
+    staged_selection = bool(
+        allow_staged_selection
+        and checkpoint_backend.resume_state(document) == "advancing"
+        and checkpoint_backend.admission_phase(document) == "open"
+        and document.get("terminal") is False
+        and document.get("pending_continuation_task") == ready_task
+        and document.get("last_check") == selected_check
+        and document.get("epoch") == lease.epoch
+        and document.get("lease_token") == lease.token
+    )
+    if (
+        not staged_selection and (
+        checkpoint_backend.admission_phase(document) != "terminal"
+        or checkpoint_backend.resume_state(document) != "blocked"
+        or document.get("terminal") is not True
+        or document.get("last_check") != retired_check
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != controller.controller
+        or str(document.get("task") or "") != controller.root
+        or document.get("active_tasks")
+        or document.get("actor") or document.get("claim_id") or document.get("session_id")
+        or document.get("last_check") != retired_check
+        )
+    ) or (
+        staged_selection and (
+            str(document.get("root") or "") != str(root)
+            or str(document.get("controller") or "") != controller.controller
+            or str(document.get("task") or "") != controller.root
+            or document.get("active_tasks")
+            or document.get("actor") or document.get("claim_id") or document.get("session_id")
+        )
+    ):
+        raise controller_backend.ControllerError(
+            "checkpoint is not the exact safely retired preidentity halt"
+        )
+    if controller.session_ledger().get("blocked"):
+        raise controller_backend.ControllerError("cannot continue a blocked controller budget")
+    if bound_expired:
+        if not _authenticated_expired_bound_execution(
+            root, workflow_root, cancelled_task, authority_secret=authority_secret,
+        ):
+            raise controller_backend.ControllerError("expired task has no authenticated bound execution retirement")
+    elif not _authenticated_cancelled_preidentity(
+        root, workflow_root, cancelled_task, authority_secret=authority_secret,
+    ):
+        raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
+    assert isinstance(record, Mapping)
+    legacy_scope = not bound_expired and retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
+    channel = record.get("return_channel")
+    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("controller_id") != lease.controller
+        or int(contract.get("lease_epoch", 0)) > lease.epoch
+    ):
+        raise controller_backend.ControllerError("cancelled launch belongs to another controller incarnation")
+    cancelled_issue = beads_backend.get_issue(root, cancelled_task)
+    metadata = cancelled_issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    if (
+        str(cancelled_issue.get("status") or "").lower() != ("blocked" if legacy_scope else "in_progress")
+        or str(cancelled_issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != cancelled_task
+        or str(agentflow.get("actor") or "") != lease.controller
+        or str(agentflow.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
+    ):
+        raise controller_backend.ControllerError("cancelled task no longer has its exact signed Beads claim")
+    if not legacy_scope:
+        beads_backend.verify_task_ancestry_and_ownership(
+            root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
+        )
+    elif str(cancelled_issue.get("parent") or "") != workflow_root:
+        raise controller_backend.ControllerError("blocked legacy task is no longer under the exact workflow root")
+
+    root_issue = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(root_issue.get("id") or "") != workflow_root
+        or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise controller_backend.ControllerError("workflow root is missing, mismatched, or terminal")
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    by_id = {str(row.get("id") or ""): row for row in descendants}
+    if cancelled_task not in by_id or ready_task not in by_id:
+        raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
+    expected_cancelled_status = "blocked" if legacy_scope else "in_progress"
+    if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
+        raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
+    if legacy_scope and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
+        raise controller_backend.ControllerError("blocked legacy task owner changed before continuation")
+    for row in descendants:
+        task_id = str(row.get("id") or "")
+        status = str(row.get("status") or "").lower()
+        retired_bound = task_id != cancelled_task and _authenticated_expired_bound_execution(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        )
+        if task_id != cancelled_task and status == "in_progress" and not retired_bound:
+            raise controller_backend.ControllerError("another workflow task is still claimed in progress")
+        other = _herdr_session_record(root, task_id) if task_id else None
+        if not isinstance(other, Mapping):
+            continue
+        if task_id == cancelled_task:
+            continue
+        if str(other.get("status") or "").lower() == "expired_execution" and retired_bound:
+            if str(row.get("status") or "").lower() != "in_progress":
+                raise controller_backend.ControllerError("expired bound task claim changed before continuation")
+            continue
+        if str(other.get("status") or "").lower() in {"launching", "identity_pending", "launched", "running"}:
+            raise controller_backend.ControllerError("another descendant has an active Herdr lifecycle")
+        if str(other.get("status") or "").lower() not in {"completed"}:
+            if str(other.get("status") or "").lower() == "cancelled_preidentity":
+                _verify_retired_preidentity_descendant(
+                    root, workflow_root, task_id, row, controller, lease,
+                    authority_secret=authority_secret,
+                )
+                continue
+            raise controller_backend.ControllerError("another descendant has an unresolved Herdr lifecycle")
+        other_channel = other.get("return_channel")
+        other_result = other.get("result")
+        other_binding = other.get("binding")
+        if not (
+            isinstance(other_channel, Mapping) and other_channel.get("state") == "consumed"
+            and isinstance(other_result, Mapping) and other_result.get("outcome") == "completed"
+            and isinstance(other_binding, Mapping)
+            and str(other_binding.get("root") or "") == str(root)
+            and str(other_binding.get("task_id") or "") == task_id
+        ):
+            raise controller_backend.ControllerError("another descendant has an unauthenticated result")
+
+    if str(by_id[ready_task].get("status") or "").lower() in reconciliation_backend.TERMINAL:
+        raise controller_backend.ControllerError("continuation task is terminal")
+    common = ["ready", "--parent", workflow_root, "--limit", "1", "--sort", "priority"]
+    assigned = beads_backend._json_output(
+        beads_backend.run(root, *common, "--assignee", lease.controller, "--json"),
+        "bd ready --assignee",
+    )
+    def rows_for(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            return value.get("issues", []) if isinstance(value.get("issues"), list) else ([value] if value.get("id") else [])
+        if isinstance(value, list):
+            return value
+        raise beads_backend.BeadsError("bd ready returned an unexpected JSON shape")
+    rows = rows_for(assigned)
+    if not rows:
+        shared = beads_backend._json_output(
+            beads_backend.run(root, *common, "--unassigned", "--json"),
+            "bd ready --unassigned",
+        )
+        rows = rows_for(shared)
+    if len(rows) != 1 or not isinstance(rows[0], Mapping) or str(rows[0].get("id") or "") != ready_task:
+        raise controller_backend.ControllerError("requested continuation is not the exact current ready task")
+    return ready_task
+
+
+def _verify_retired_preidentity_descendant(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    descendant: Mapping[str, Any],
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    *,
+    authority_secret: str,
+) -> None:
+    """Accept only another independently authenticated, blocked legacy retirement."""
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or not _authenticated_cancelled_preidentity(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    ):
+        raise controller_backend.ControllerError(
+            "another descendant has an unauthenticated preidentity retirement"
+        )
+    disposition = record.get("recovery_disposition")
+    reason = str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
+    if reason not in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
+        raise controller_backend.ControllerError(
+            "another descendant has an unsupported preidentity retirement"
+        )
+    channel = record.get("return_channel")
+    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    epoch = contract.get("lease_epoch") if isinstance(contract, Mapping) else None
+    if (
+        not isinstance(contract, Mapping)
+        or record.get("task_id") != task_id
+        or record.get("root") != str(root)
+        or record.get("workflow_root") != workflow_root
+        or record.get("launch_id") != contract.get("launch_id")
+        or record.get("binding") not in (None, {})
+        or record.get("result") not in (None, {})
+        or contract.get("controller_id") != lease.controller
+        or contract.get("actor") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or not isinstance(epoch, int) or isinstance(epoch, bool)
+        or epoch < 0 or epoch > lease.epoch
+    ):
+        raise controller_backend.ControllerError(
+            "another preidentity retirement belongs to a different controller incarnation"
+        )
+
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    if (
+        str(issue.get("id") or "") != task_id
+        or str(issue.get("parent") or "") != workflow_root
+        or str(issue.get("status") or "").lower() != "blocked"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(descendant.get("status") or "").lower() != "blocked"
+        or str(descendant.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or not str(contract.get("claim_id") or "")
+        or not claim_token
+        or str(agentflow.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
+    ):
+        raise controller_backend.ControllerError(
+            "another retired task no longer has its exact blocked Beads claim"
+        )
+
+
+def controller_recover_preidentity(args: argparse.Namespace) -> int:
+    return _controller_preidentity_retirement(args, superseded_legacy_scope=False)
+
+
+def controller_retire_superseded_legacy_preidentity(args: argparse.Namespace) -> int:
+    """Retire an authenticated unbudgeted legacy launch after its scope ends."""
+    return _controller_preidentity_retirement(args, superseded_legacy_scope=True)
+
+
+def controller_repair_abandoned_epoch(args: argparse.Namespace) -> int:
+    """Repair one explicitly acknowledged abandoned controller epoch gap."""
+    return _controller_preidentity_retirement(args, owner_abandoned_epoch=True)
+
+
+def _controller_preidentity_retirement(
+    args: argparse.Namespace, *, superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
+) -> int:
+    """Retire one exact absent-pane identity-pending launch under its root lease."""
+    operation_name = (
+        "repair-abandoned-epoch" if owner_abandoned_epoch
+        else "retire-superseded-legacy-preidentity" if superseded_legacy_scope
+        else "recover-preidentity"
+    )
+    try:
+        _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
+        raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
+        workflow_root = raw_workflow_root.strip()
+        task_id = str(getattr(args, "task", "") or "")
+        launch_id = str(getattr(args, "launch_id", "") or "")
+        pane_id = str(getattr(args, "pane_id", "") or "")
+        if not workflow_root or workflow_root != raw_workflow_root:
+            raise ValueError("--workflow-root is required as an exact Beads root ID")
+        if not task_id or not launch_id or not pane_id:
+            raise ValueError("--task, --launch-id, and --pane-id are required")
+        controller, root = _controller_instance(args)
+        with controller.supervisor_lock():
+            beads_backend.get_issue(root, workflow_root)
+            key_path = _resume_key_path(argparse.Namespace(
+                root=str(root), workflow_root=workflow_root, resume_key_file="",
+            ))
+            _require_external_accounting_storage(key_path, str(root.resolve()))
+            if (
+                key_path.is_symlink() or key_path.parent.is_symlink()
+                or key_path.resolve() != key_path.absolute()
+                or not key_path.is_file()
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical protected controller credential is unavailable"
+                )
+            if os.name == "posix" and (
+                key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical controller credential permissions are too broad"
+                )
+            credentials = _read_controller_credentials(key_path)
+            raw_credentials = json.loads(key_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(raw_credentials, Mapping)
+                or raw_credentials.get("schema") != "agentflow.controller_credentials"
+                or raw_credentials.get("version") != 2
+                or credentials.get("workspace_root") != str(root.resolve())
+                or credentials.get("workflow_root") != workflow_root
+                or not credentials.get("continuity_id")
+                or not credentials.get("authority_secret")
+                or not credentials.get("resume_secret")
+            ):
+                raise controller_backend.LeaseConflict(
+                    "canonical controller credential does not authenticate this workflow incarnation"
+                )
+            state = _read_json_value(str(controller.state_path))
+            if not isinstance(state, Mapping):
+                raise controller_backend.LeaseConflict("controller state is malformed")
+            active = controller._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = controller._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            if dormant_value is not None and dormant is None:
+                raise controller_backend.LeaseConflict("released controller incarnation record is malformed")
+            proof = credentials["resume_secret"]
+            preauthenticated_epoch: int | None = None
+            for candidate in (active, dormant):
+                if (
+                    candidate is not None
+                    and candidate.root == str(root)
+                    and candidate.controller == controller.controller
+                    and candidate.continuity_id == credentials["continuity_id"]
+                    and candidate.epoch == int(state.get("epoch", -1))
+                    and candidate.verify_resume_proof(proof)
+                ):
+                    preauthenticated_epoch = candidate.epoch
+                    break
+
+            abandoned_epoch = getattr(args, "abandoned_epoch", None)
+            expected_state_sha256 = str(getattr(args, "expected_state_sha256", "") or "")
+            expected_checkpoint_sha256 = str(getattr(args, "expected_checkpoint_sha256", "") or "")
+            expected_contract_sha256 = str(getattr(args, "expected_contract_sha256", "") or "")
+            repair_pending = (
+                isinstance(state.get("abandoned_epoch_repair"), Mapping)
+                or isinstance(state.get("abandoned_epoch_repair_receipt"), Mapping)
+            )
+            if owner_abandoned_epoch:
+                if not bool(getattr(args, "acknowledge_abandoned_epoch", False)):
+                    raise ValueError("--acknowledge-abandoned-epoch is required for this one scoped repair")
+                if (
+                    isinstance(abandoned_epoch, bool) or not isinstance(abandoned_epoch, int)
+                    or abandoned_epoch < 1
+                    or any(len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+                           for value in (expected_state_sha256, expected_checkpoint_sha256,
+                                         expected_contract_sha256))
+                ):
+                    raise ValueError("exact abandoned epoch and three lowercase SHA-256 anchors are required")
+                if not repair_pending and (
+                    active is not None or dormant is not None
+                    or state.get("epoch") != abandoned_epoch
+                    or state.get("lease") is not None
+                    or state.get("dormant_lease") is not None
+                ):
+                    raise controller_backend.LeaseConflict(
+                        "owner repair requires the exact unowned abandoned epoch with no active or dormant lease"
+                    )
+                if preauthenticated_epoch is None:
+                    preauthenticated_epoch = abandoned_epoch
+
+            # Validate all immutable protected evidence before changing a
+            # released/legacy lease epoch or writing a cancellation record.
+            snapshot = _preidentity_recovery_snapshot(
+                controller, root, workflow_root, task_id, launch_id, pane_id,
+                authority_secret=credentials["authority_secret"],
+                expected_current_epoch=preauthenticated_epoch,
+                superseded_legacy_scope=superseded_legacy_scope,
+                owner_abandoned_epoch=owner_abandoned_epoch,
+            )
+            contract = snapshot["contract"]
+            if credentials["continuity_id"] != contract.get("continuity_id"):
+                raise controller_backend.LeaseConflict(
+                    "canonical credential and signed launch continuity do not match"
+                )
+            if snapshot["record"].get("status") != "cancelled_preidentity":
+                _require_definitively_absent_herdr_pane(pane_id)
+            if owner_abandoned_epoch:
+                raw_contract_sha256 = hashlib.sha256(
+                    Path(snapshot["contract_path"]).read_bytes()
+                ).hexdigest()
+                if raw_contract_sha256 != expected_contract_sha256:
+                    raise controller_backend.LeaseConflict(
+                        "signed launch contract changed from the explicitly acknowledged snapshot"
+                    )
+                if not repair_pending and (
+                    hashlib.sha256(controller.state_path.read_bytes()).hexdigest()
+                    != expected_state_sha256
+                    or hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest()
+                    != expected_checkpoint_sha256
+                ):
+                    raise controller_backend.LeaseConflict(
+                        "controller state or checkpoint changed from the explicitly acknowledged snapshot"
+                    )
+                if owner_abandoned_epoch and repair_pending:
+                    repair_record = state.get("abandoned_epoch_repair")
+                    if repair_record is None:
+                        repair_record = state.get("abandoned_epoch_repair_receipt")
+                    if not isinstance(repair_record, Mapping):
+                        raise controller_backend.LeaseConflict("owner-repair retry record is malformed")
+                    actual_checkpoint_sha256 = hashlib.sha256(
+                        controller.checkpoint_path.read_bytes()
+                    ).hexdigest()
+                    allowed_checkpoint_sha256 = set()
+                    if "abandoned_epoch_repair" in state:
+                        allowed_checkpoint_sha256.add(str(repair_record.get("checkpoint_sha256") or ""))
+                    retired_checkpoint_sha256 = str(repair_record.get("retired_checkpoint_sha256") or "")
+                    if retired_checkpoint_sha256:
+                        allowed_checkpoint_sha256.add(retired_checkpoint_sha256)
+                    if actual_checkpoint_sha256 not in allowed_checkpoint_sha256:
+                        raise controller_backend.LeaseConflict(
+                            "checkpoint changed from the exact staged owner-repair transaction"
+                        )
+                lease = controller.repair_abandoned_epoch(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    abandoned_epoch=abandoned_epoch, acknowledge_abandoned_epoch=True,
+                    state_sha256=expected_state_sha256,
+                    checkpoint_sha256=expected_checkpoint_sha256,
+                    contract_sha256=expected_contract_sha256,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
+                )
+                credentials = _read_controller_credentials(key_path)
+            elif active is not None:
+                if (
+                    active.root != str(root) or active.controller != controller.controller
+                    or active.epoch != int(state.get("epoch", -1))
+                    or active.continuity_id != contract.get("continuity_id")
+                    or not active.verify_resume_proof(proof)
+                ):
+                    raise controller_backend.LeaseConflict("active lease does not match the protected launch")
+                lease = controller.authorize(proof)
+            elif dormant is not None:
+                if (
+                    dormant.root != str(root) or dormant.controller != controller.controller
+                    or dormant.continuity_id != contract.get("continuity_id")
+                    or dormant.epoch != int(state.get("epoch", -1))
+                    or dormant.epoch < int(contract.get("lease_epoch", -1))
+                ):
+                    raise controller_backend.LeaseConflict("released lease does not match the protected launch")
+                lease = controller.recover_released_incarnation(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    superseded_legacy_scope=superseded_legacy_scope,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
+                )
+                credentials = _read_controller_credentials(key_path)
+            else:
+                lease = controller.recover_released_incarnation(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    superseded_legacy_scope=superseded_legacy_scope,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
+                )
+                credentials = _read_controller_credentials(key_path)
+
+            snapshot = _preidentity_recovery_snapshot(
+                controller, root, workflow_root, task_id, launch_id, pane_id,
+                authority_secret=credentials["authority_secret"],
+                expected_current_epoch=lease.epoch,
+                superseded_legacy_scope=superseded_legacy_scope,
+                owner_abandoned_epoch=owner_abandoned_epoch,
+            )
+            def commit_cancellation() -> None:
+                current = _preidentity_recovery_snapshot(
+                    controller, root, workflow_root, task_id, launch_id, pane_id,
+                    authority_secret=credentials["authority_secret"],
+                    expected_current_epoch=lease.epoch,
+                    superseded_legacy_scope=superseded_legacy_scope,
+                    owner_abandoned_epoch=owner_abandoned_epoch,
+                )
+                if current["contract"] != snapshot["contract"]:
+                    raise ValueError("signed launch changed during recovery")
+                _commit_preidentity_cancellation(
+                    root, workflow_root, task_id, launch_id, pane_id,
+                    current["contract"], authority_secret=credentials["authority_secret"],
+                    superseded_legacy_scope=superseded_legacy_scope,
+                    owner_abandoned_epoch=owner_abandoned_epoch,
+                )
+            if superseded_legacy_scope:
+                result = controller.cancel_superseded_legacy_preidentity_task(
+                    task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
+                    commit_cancellation=commit_cancellation, lease=lease,
+                )
+            else:
+                result = controller.cancel_expired_preidentity_task(
+                    task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
+                    commit_cancellation=commit_cancellation, lease=lease,
+                    retirement_reason=("owner_abandoned_epoch" if owner_abandoned_epoch else "expired"),
+                    _abandoned_epoch_repair_authority=(
+                        {
+                            "workflow_root": workflow_root,
+                            "task_id": task_id,
+                            "claim_id": str(snapshot["contract"].get("claim_id") or ""),
+                            "launch_id": launch_id,
+                            "contract_sha256": expected_contract_sha256,
+                            "authority_secret": credentials["authority_secret"],
+                        } if owner_abandoned_epoch else None
+                    ),
+                )
+            payload = {
+                "operation": operation_name, "ok": True,
+                "root": str(root), "workflow_root": workflow_root,
+                "task_id": task_id, "launch_id": launch_id,
+                "result": result.to_dict(),
+            }
+            _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="PREIDENTITY RECOVERY")
+            return 0
+    except (
+        controller_backend.ControllerError, controller_backend.FencedLease,
+        beads_backend.BeadsError, herdr_backend.HerdrError,
+        OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": operation_name, "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="PREIDENTITY RECOVERY FAILED",
+        )
+        return 2
+
+
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
         workflow_root = raw_workflow_root.strip()
         if not workflow_root:
@@ -2471,8 +3162,31 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         acknowledge_no_ready = operation == "resume" and bool(
             getattr(args, "acknowledge_no_ready_halt", False)
         )
-        if acknowledge_no_ready and bool(getattr(args, "takeover", False)):
+        continue_after_preidentity = str(
+            getattr(args, "continue_after_cancelled_preidentity", "") or ""
+        ) if operation == "resume" else ""
+        continue_after_expired = str(
+            getattr(args, "continue_after_expired_task", "") or ""
+        ) if operation == "resume" else ""
+        if continue_after_preidentity and continue_after_expired:
+            raise ValueError("choose exactly one explicit continuation kind")
+        continuation_kind = (
+            "expired_execution" if continue_after_expired else "cancelled_preidentity"
+        )
+        continue_cancelled_task = continue_after_expired or continue_after_preidentity
+        continue_ready_task = str(getattr(args, "continue_task", "") or "") if operation == "resume" else ""
+        if bool(continue_cancelled_task) != bool(continue_ready_task):
+            raise ValueError(
+                "an explicit continuation task and --continue-task must be supplied together"
+            )
+        if acknowledge_no_ready and continue_cancelled_task:
+            raise ValueError("choose one explicit controller continuation acknowledgement")
+        if (acknowledge_no_ready or continue_cancelled_task) and bool(getattr(args, "takeover", False)):
             raise ValueError("--acknowledge-no-ready-halt requires authenticated reattach, not takeover")
+        if continue_cancelled_task and getattr(args, "resume_token", ""):
+            raise ValueError(
+                "explicit continuation requires the canonical protected credential, not --resume-token"
+            )
 
         # Validate the exact Beads root before acquiring a lease or writing
         # protected credentials.  The lock covers every long-running root
@@ -2480,6 +3194,30 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         # rotate the fencing token out from underneath a live supervisor.
         with controller.supervisor_lock():
             key_path = _resume_key_path(args)
+            if continue_cancelled_task:
+                canonical_path = _resume_key_path(argparse.Namespace(
+                    root=str(_root_arg(args)), workflow_root=workflow_root, resume_key_file="",
+                ))
+                if key_path != canonical_path:
+                    raise ValueError(
+                        "cancelled-preidentity continuation requires the canonical controller credential"
+                    )
+                _require_external_accounting_storage(key_path, str(root.resolve()))
+                if (
+                    key_path.is_symlink() or key_path.parent.is_symlink()
+                    or key_path.resolve() != key_path.absolute() or not key_path.is_file()
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential is unavailable")
+                raw_credential = json.loads(key_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_credential, Mapping) or (
+                    raw_credential.get("schema") != "agentflow.controller_credentials"
+                    or raw_credential.get("version") != 2
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential is malformed")
+                if os.name == "posix" and (
+                    key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+                ):
+                    raise controller_backend.LeaseConflict("canonical controller credential permissions are too broad")
             beads_backend.get_issue(root, workflow_root)
             if operation == "supervise":
                 credentials = _read_controller_credentials(key_path)
@@ -2514,34 +3252,111 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     legacy = _legacy_resume_key_path(args)
                     if not resume_proof and legacy is not None:
                         resume_proof = _read_resume_key(legacy)
-                if acknowledge_no_ready:
+                if acknowledge_no_ready or continue_cancelled_task:
                     state = (
                         json.loads(controller.state_path.read_text(encoding="utf-8"))
                         if controller.state_path.exists() else {}
                     )
-                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
                     credentials = _read_controller_credentials(key_path)
-                    legacy = _legacy_resume_key_path(args)
-                    if not credentials and legacy is not None:
-                        credentials = _read_controller_credentials(legacy)
+                    previous = controller._read_lease(state) if isinstance(state, Mapping) else None
+                    if previous is None and continue_cancelled_task and isinstance(state, Mapping):
+                        dormant_raw = state.get("dormant_lease")
+                        previous = controller._read_lease({"lease": dormant_raw}) if isinstance(dormant_raw, Mapping) else None
+                    checkpoint_epoch = controller._load_checkpoint().get("epoch")
                     if (
-                        previous is None
-                        or previous.root != str(root)
+                        previous is None or previous.root != str(root)
                         or previous.controller != controller.controller
-                        or not previous.verify_resume_proof(resume_proof)
                         or credentials.get("workspace_root") != str(root.resolve())
                         or credentials.get("workflow_root") != workflow_root
                         or credentials.get("continuity_id") != previous.continuity_id
                         or not credentials.get("authority_secret")
                     ):
                         raise controller_backend.LeaseConflict(
-                            "--acknowledge-no-ready-halt requires the protected credential "
-                            "for this workflow incarnation"
+                            "explicit controller continuation requires the protected credential "
+                            "and exact resumable workflow incarnation"
                         )
-                lease = controller.acquire(
-                    takeover=bool(getattr(args, "takeover", False)),
-                    resume_proof=resume_proof,
-                )
+                    if continue_cancelled_task:
+                        stored_proof = str(credentials.get("resume_secret") or "")
+                        if not stored_proof or not hmac.compare_digest(
+                            resume_proof.encode("utf-8"), stored_proof.encode("utf-8"),
+                        ):
+                            raise controller_backend.LeaseConflict(
+                                "explicit controller continuation requires its exact canonical protected credential"
+                            )
+                        continuation_intent = controller.pending_explicit_continuation(
+                            workflow_root=workflow_root,
+                            cancelled_task=continue_cancelled_task,
+                            ready_task=continue_ready_task,
+                            authority_secret=credentials["authority_secret"],
+                            resume_proof=resume_proof,
+                        )
+                        state_epoch = int(state.get("epoch", -1))
+                        checkpoint_epoch_value = int(checkpoint_epoch or -1)
+                        continuation_already_selected = False
+                        if continuation_intent is not None:
+                            previous_epoch = int(continuation_intent.get("previous_epoch", -1))
+                            candidate_epoch = int(continuation_intent.get("epoch", -1))
+                            if (
+                                state_epoch not in {previous_epoch, candidate_epoch}
+                                or checkpoint_epoch_value not in {previous_epoch, candidate_epoch}
+                                or (state_epoch == previous_epoch and checkpoint_epoch_value != previous_epoch)
+                            ):
+                                raise controller_backend.LeaseConflict(
+                                    "staged continuation state and checkpoint epochs do not match"
+                                )
+                            continuation_already_selected = checkpoint_epoch_value == candidate_epoch
+                        elif (
+                            state_epoch != checkpoint_epoch_value
+                            or not previous.verify_resume_proof(resume_proof)
+                        ):
+                            raise controller_backend.LeaseConflict(
+                                "explicit controller continuation requires its exact current protected credential"
+                            )
+                        # Verify the chosen task before rotating credentials.
+                        # A retry after the signed target checkpoint is already
+                        # durable may finish the staged transaction without
+                        # selecting or dispatching a different task.
+                        _verify_cancelled_preidentity_continuation(
+                            root, workflow_root, continue_cancelled_task,
+                            continue_ready_task, controller, previous,
+                            authority_secret=credentials["authority_secret"],
+                            allow_staged_selection=continuation_already_selected,
+                            expected_retirement_kind=continuation_kind,
+                        )
+                        if continuation_already_selected:
+                            lease = controller.authorize_explicit_continuation(
+                                workflow_root=workflow_root,
+                                cancelled_task=continue_cancelled_task,
+                                ready_task=continue_ready_task,
+                                authority_secret=credentials["authority_secret"],
+                                resume_proof=resume_proof,
+                            )
+                        else:
+                            lease = controller.reattach_for_explicit_continuation(
+                                workflow_root=workflow_root,
+                                cancelled_task=continue_cancelled_task,
+                                ready_task=continue_ready_task,
+                                checkpoint_epoch=checkpoint_epoch_value,
+                                authority_secret=credentials["authority_secret"],
+                                resume_proof=resume_proof,
+                                persist_credentials=lambda candidate: _controller_credentials(
+                                    args, candidate, key_path=key_path,
+                                ),
+                            )
+                    else:
+                        if not previous.verify_resume_proof(resume_proof):
+                            raise controller_backend.LeaseConflict(
+                                "explicit no-ready acknowledgement requires its current protected credential"
+                            )
+                        lease = controller.acquire(
+                            takeover=bool(getattr(args, "takeover", False)),
+                            resume_proof=resume_proof,
+                        )
+                else:
+                    lease = controller.acquire(
+                        takeover=bool(getattr(args, "takeover", False)),
+                        resume_proof=resume_proof,
+                    )
             _, credentials = _controller_credentials(args, lease, key_path=key_path)
             # Internal-only: never serialized into a handoff, command argv,
             # Herdr state, environment variable, checkpoint, or payload.
@@ -2549,6 +3364,21 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             if acknowledge_no_ready:
                 ready_task = _verify_no_ready_ack_candidate(root, workflow_root, controller, lease)
                 controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
+            if continue_cancelled_task:
+                ready_task = continue_ready_task
+                if not continuation_already_selected:
+                    controller.acknowledge_cancelled_preidentity_halt(
+                        workflow_root, continue_cancelled_task, ready_task,
+                        authority_secret=credentials["authority_secret"], lease=lease,
+                    )
+                controller.clear_explicit_continuation(
+                    workflow_root=workflow_root,
+                    cancelled_task=continue_cancelled_task,
+                    ready_task=ready_task,
+                    authority_secret=credentials["authority_secret"],
+                    lease=lease,
+                )
+                args._continuation_task = ready_task
             _bind_current_controller_sessions(root, workflow_root, lease)
 
             # An authenticated resume acknowledges a required safe-boundary
@@ -2735,6 +3565,7 @@ def _authorize_controller_command(
     args: argparse.Namespace,
 ) -> tuple[controller_backend.RootController, Path, controller_backend.Lease]:
     _reject_custom_controller_state_path(args)
+    _reject_custom_controller_checkpoint(args)
     if not str(getattr(args, "workflow_root", "") or "").strip():
         raise ValueError("--workflow-root is required for controller progress and rotation")
     controller, root = _controller_instance(args)
@@ -2868,32 +3699,35 @@ def controller_rotate(args: argparse.Namespace) -> int:
 def controller_stop(args: argparse.Namespace) -> int:
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
         controller, root = _controller_instance(args)
-        state = json.loads(controller.state_path.read_text(encoding="utf-8")) if controller.state_path.exists() else {}
-        lease_data = state.get("lease") if isinstance(state.get("lease"), dict) else None
-        if lease_data is None:
-            payload = {"operation": "stop", "ok": True, "root": str(root), "released": False, "status": "idle"}
-        else:
-            lease = controller_backend.Lease.from_dict(lease_data)
-            if lease.owner_id != controller.owner_id:
-                key_path = _resume_key_path(args)
-                proof = getattr(args, "resume_token", "") or ""
-                if not proof and key_path is not None:
-                    proof = _read_resume_key(key_path)
-                    legacy = _legacy_resume_key_path(args)
-                    if not proof and legacy is not None:
-                        proof = _read_resume_key(legacy)
-                if not proof:
-                    raise controller_backend.DuplicateController(
-                        "stopping a live controller requires --resume-token or --resume-key-file"
-                    )
-                lease = controller.acquire(resume_proof=proof)
-            controller.release(lease)
-            payload = {"operation": "stop", "ok": True, "root": str(root), "released": True, "status": "stopped"}
-        workspace_binding_backend.remove_controller(
-            _workspace_binding_path(), workspace_root=root,
-            workflow_root=str(getattr(args, "workflow_root", "") or ""),
-        )
+        with controller.supervisor_lock():
+            state = json.loads(controller.state_path.read_text(encoding="utf-8")) if controller.state_path.exists() else {}
+            controller_backend.RootController._reject_pending_continuation(state)
+            lease_data = state.get("lease") if isinstance(state.get("lease"), dict) else None
+            if lease_data is None:
+                payload = {"operation": "stop", "ok": True, "root": str(root), "released": False, "status": "idle"}
+            else:
+                lease = controller_backend.Lease.from_dict(lease_data)
+                if lease.owner_id != controller.owner_id:
+                    key_path = _resume_key_path(args)
+                    proof = getattr(args, "resume_token", "") or ""
+                    if not proof and key_path is not None:
+                        proof = _read_resume_key(key_path)
+                        legacy = _legacy_resume_key_path(args)
+                        if not proof and legacy is not None:
+                            proof = _read_resume_key(legacy)
+                    if not proof:
+                        raise controller_backend.DuplicateController(
+                            "stopping a live controller requires --resume-token or --resume-key-file"
+                        )
+                    lease = controller.acquire(resume_proof=proof)
+                controller.release(lease)
+                payload = {"operation": "stop", "ok": True, "root": str(root), "released": True, "status": "stopped"}
+            workspace_binding_backend.remove_controller(
+                _workspace_binding_path(), workspace_root=root,
+                workflow_root=str(getattr(args, "workflow_root", "") or ""),
+            )
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STOP")
         return 0
     except (controller_backend.ControllerError, OSError, ValueError, json.JSONDecodeError) as exc:
@@ -3336,6 +4170,8 @@ def _reserve_execution_attempt(
     root: Path, workflow_root: str, task_id: str, *,
     limits: execution_limits_backend.ExecutionLimits,
     policy_max_attempts: int, authority_secret: str,
+    claim_id: str, lease_id: str, launch_id: str,
+    controller_id: str, continuity_id: str, lease_epoch: int,
 ) -> Mapping[str, Any]:
     path = _execution_limit_ledger_path(root, workflow_root)
     key = _execution_ledger_key(root, workflow_root, task_id)
@@ -3376,6 +4212,15 @@ def _reserve_execution_attempt(
                 "execution_limits": limits.to_dict(), "deadline_epoch": deadline_epoch,
                 "attempt": attempt, "max_attempts": max_attempts, "status": "active",
             }
+        if not error:
+            row["launch_identity"] = {
+                "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+                "task_id": task_id, "claim_id": claim_id, "lease_id": lease_id,
+                "launch_id": launch_id, "controller_id": controller_id,
+                "continuity_id": continuity_id, "lease_epoch": lease_epoch,
+            }
+        elif isinstance(old, Mapping) and isinstance(old.get("launch_identity"), Mapping):
+            row["launch_identity"] = dict(old["launch_identity"])
         row["authority_hmac"] = _authority_mac(
             authority_secret, row, domain="execution-limit-ledger-v1",
         )
@@ -3407,7 +4252,1261 @@ def _verify_execution_snapshot_against_ledger(
         or entry.get("max_attempts") != snapshot.get("max_attempts")
     ):
         raise ValueError("signed execution limits do not match the protected monotonic ledger")
+    identity = entry.get("launch_identity")
+    if isinstance(identity, Mapping):
+        expected_identity = {
+            "workspace_root": str(root.resolve()),
+            "workflow_root": workflow_root, "task_id": task_id,
+            "claim_id": str(snapshot.get("claim_id") or ""),
+            "lease_id": str(snapshot.get("lease_id") or ""),
+            "launch_id": str(snapshot.get("launch_id") or ""),
+            "controller_id": str(snapshot.get("controller_id") or ""),
+            "continuity_id": str(snapshot.get("continuity_id") or ""),
+            "lease_epoch": snapshot.get("lease_epoch"),
+        }
+        if dict(identity) != expected_identity:
+            raise ValueError("protected launch identity does not match the signed execution snapshot")
     return entry
+
+
+def _expired_preidentity_ledger_disposition(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    """Bind an old signed attempt to its launch and durably expire it."""
+    path = _execution_limit_ledger_path(root, workflow_root)
+    key = _execution_ledger_key(root, workflow_root, task_id)
+    identity = {
+        "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    with _execution_limit_ledger_transaction(path) as ledger:
+        entry = ledger["entries"].get(key)
+        entry = dict(_verify_execution_ledger_entry(entry, authority_secret=authority_secret))
+        if (
+            entry.get("attempt") != contract.get("attempt")
+            or entry.get("max_attempts") != contract.get("max_attempts")
+            or entry.get("execution_limits") != contract.get("execution_limits")
+            or entry.get("deadline_epoch") != contract.get("deadline_epoch")
+        ):
+            raise ValueError("protected launch ledger does not match the exact signed attempt")
+        existing_identity = entry.get("launch_identity")
+        if existing_identity is not None and (
+            not isinstance(existing_identity, Mapping)
+            or dict(existing_identity) != identity
+        ):
+            raise ValueError("protected launch ledger identity does not match the signed launch")
+        if time.time() < float(entry["deadline_epoch"]):
+            raise ValueError("task execution deadline has not durably expired")
+        if entry.get("status") not in {"active", "expired"}:
+            raise ValueError("protected launch ledger is not active or expired")
+        entry["launch_identity"] = identity
+        entry["status"] = "expired"
+        entry["authority_hmac"] = _authority_mac(
+            authority_secret, entry, domain="execution-limit-ledger-v1",
+        )
+        ledger["entries"][key] = entry
+    return entry
+
+
+def _verify_unbudgeted_legacy_preidentity(
+    root: Path, workflow_root: str, task_id: str,
+    contract: Mapping[str, Any], record: Mapping[str, Any], *, authority_secret: str,
+) -> None:
+    """Require genuinely legacy signed evidence with no protected budget row."""
+    budget_fields = {
+        "execution_limits", "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+        "max_attempts", "max_retries", "execution_limit_capabilities", "budget",
+    }
+    if any(field in contract for field in budget_fields | {"attempt"}):
+        raise ValueError("legacy-scope retirement requires a signed launch without structured budget metadata")
+    if any(field in record for field in budget_fields):
+        raise ValueError("legacy-scope retirement found budget metadata in the Herdr launch record")
+    ledger_path = _execution_limit_ledger_path(root, workflow_root)
+    if ledger_path.is_symlink() or ledger_path.parent.is_symlink():
+        raise ValueError("legacy-scope retirement found an unsafe execution ledger path")
+    entry = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if entry is not None:
+        raise ValueError("legacy-scope retirement found a protected execution ledger row")
+
+
+def _preidentity_recovery_snapshot(
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    launch_id: str,
+    pane_id: str,
+    *,
+    authority_secret: str,
+    expected_current_epoch: int | None = None,
+    superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
+) -> dict[str, Any]:
+    """Prove the exact halted launch before any lease or state transition."""
+    document = controller._load_checkpoint()
+    expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+    retirement_reason = (
+        "owner_abandoned_epoch" if owner_abandoned_epoch
+        else "superseded_legacy_scope" if superseded_legacy_scope else "expired"
+    )
+    retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
+    rows = controller.active_tasks()
+    already_retired = (
+        not rows and document.get("task") == controller.root
+        and not document.get("active_tasks")
+        and document.get("last_check") == retired_check
+    )
+    retained_draining = (
+        checkpoint_backend.admission_phase(document) == "draining"
+        and checkpoint_backend.resume_state(document) == "draining"
+        and document.get("terminal") is False
+        and str(document.get("task") or "") == controller.root
+        and not document.get("actor") and not document.get("claim_id")
+        and not document.get("session_id")
+        and len(rows) == 1 and rows[0].get("task") == task_id
+        and rows[0].get("state") == "identity_pending"
+        and not rows[0].get("session_id")
+    )
+    terminal_halt = (
+        checkpoint_backend.admission_phase(document) == "terminal"
+        and checkpoint_backend.resume_state(document) == "blocked"
+        and document.get("terminal") is True
+        and str(document.get("terminal_reason") or "").startswith(expected_reason)
+    )
+    if (
+        not ((terminal_halt and not superseded_legacy_scope and not owner_abandoned_epoch)
+             or retained_draining or already_retired)
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != controller.controller
+        or not (
+            already_retired
+            or (len(rows) == 1 and rows[0].get("task") == task_id
+                and rows[0].get("state") == "identity_pending" and not rows[0].get("session_id"))
+        )
+    ):
+        raise ValueError("checkpoint is not the exact expired identity-pending halt")
+
+    raw_state = _read_json_value(str(controller.state_path))
+    raw_lease = raw_state.get("lease") if isinstance(raw_state, Mapping) else None
+    if raw_lease is not None and not isinstance(raw_lease, Mapping):
+        raise ValueError("controller lease state is malformed")
+    stored_epoch = int(raw_state.get("epoch", -1))
+    if stored_epoch != int(document.get("epoch", -2)) and stored_epoch != expected_current_epoch:
+        raise ValueError("checkpoint epoch does not match protected controller state")
+
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    descendant_ids = {str(item.get("id") or "") for item in descendants}
+    if task_id not in descendant_ids:
+        raise ValueError("identity-pending task is not a descendant of the exact workflow root")
+    if any(
+        str(item.get("id") or "") != task_id
+        and str(item.get("status") or "").lower() == "in_progress"
+        for item in descendants
+    ):
+        raise ValueError("another workflow descendant is still claimed in progress")
+    task_issue = beads_backend.get_issue(root, task_id)
+    legacy_scope = superseded_legacy_scope or owner_abandoned_epoch
+    expected_task_status = "blocked" if legacy_scope else "in_progress"
+    if str(task_issue.get("status") or "").lower() != expected_task_status:
+        raise ValueError("exact task no longer has the expected retained claim status")
+    metadata = task_issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    actor = str(agentflow.get("actor") or "")
+    if not claim_token or not actor:
+        raise ValueError("exact live Beads claim is unavailable")
+    if legacy_scope:
+        if (
+            str(task_issue.get("assignee") or "") != controller.controller
+            or actor != controller.controller
+            or str(agentflow.get("root") or "") != workflow_root
+            or str(agentflow.get("task") or "") != task_id
+            or str(task_issue.get("parent") or "") != workflow_root
+        ):
+            raise ValueError("blocked legacy claim no longer matches its exact owner and workflow root")
+    else:
+        beads_backend.verify_task_ancestry_and_ownership(
+            root, task_issue, task=task_id, root=workflow_root, actor=actor,
+        )
+
+    herdr_path = root / ".agentflow/herdr/sessions.json"
+    herdr_state = _load_herdr_state(herdr_path)
+    sessions = herdr_state.get("sessions")
+    record = sessions.get(task_id) if isinstance(sessions, Mapping) else None
+    if not isinstance(record, Mapping):
+        raise ValueError("exact Herdr launch record is unavailable")
+    was_cancelled = record.get("status") == "cancelled_preidentity"
+    if (
+        record.get("status") not in {"identity_pending", "cancelled_preidentity"}
+        or record.get("root") != str(root)
+        or record.get("workflow_root") != workflow_root
+        or record.get("task_id") != task_id
+        or record.get("claim_id") != str(agentflow.get("claim_id") or "")
+        or record.get("pane_id") != pane_id
+        or record.get("launch_id") != launch_id
+        or record.get("attempt") is None
+        or record.get("binding") not in (None, {})
+        or record.get("result") not in (None, {})
+    ):
+        raise ValueError("Herdr record does not match the exact unbound launch")
+    channel = record.get("return_channel")
+    if not isinstance(channel, Mapping) or channel.get("state") != ("revoked" if was_cancelled else "issued"):
+        raise ValueError("identity-pending launch has no issued return channel")
+    raw_contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_contract_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if raw_contract_path.is_symlink() or raw_contract_path.resolve() != expected_contract_path.resolve():
+        raise ValueError("signed launch contract is outside the exact task launch runtime")
+    if not raw_contract_path.is_file() or raw_contract_path.stat().st_size > 32 * 1024:
+        raise ValueError("signed launch contract is unavailable")
+    contract = json.loads(raw_contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("signed launch contract is malformed")
+    binding = _verify_return_contract_binding(
+        contract, expected_contract_path, task_id, record,
+        root=root, authority_secret=authority_secret, require_issued=not was_cancelled,
+    )
+    if was_cancelled:
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract, pane_id=pane_id,
+            authority_secret=authority_secret,
+        )
+        expected_disposition_reason = (
+            "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+            if retirement_reason == "expired" else retirement_reason
+        )
+        if disposition.get("reason") != expected_disposition_reason:
+            raise ValueError("cancelled preidentity launch requires its matching retirement command")
+        if channel.get("revocation") != dict(disposition):
+            raise ValueError("return channel revocation does not match the signed cancellation")
+    expected = {
+        "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": str(agentflow.get("claim_id") or ""),
+        "lease_id": str(record.get("lease_id") or ""), "launch_id": launch_id,
+        "controller_id": controller.controller, "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    actual = {
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+    if actual != expected or (
+        not already_retired and document.get("epoch") != contract.get("lease_epoch")
+    ) or (
+        already_retired and int(document.get("epoch", 0)) < int(contract.get("lease_epoch", 0))
+    ):
+        raise ValueError("checkpoint and signed launch identities do not match exactly")
+    if not already_retired and (
+        rows[0].get("claim_id") != expected["claim_id"] or rows[0].get("actor") != actor
+    ):
+        raise ValueError("checkpoint claim does not match the exact Beads task claim")
+    if hashlib.sha256(claim_token.encode("utf-8")).hexdigest() != contract.get("claim_token_sha256"):
+        raise ValueError("live Beads claim does not match the signed launch")
+    if (
+        str(record.get("provider") or "") != str(contract.get("provider") or "")
+        or (
+            not legacy_scope
+            and int(record.get("attempt") or 0) != int(contract.get("attempt") or 0)
+        )
+        or str(agentflow.get("claim_id") or "") != str(binding.get("claim_id") or "")
+    ):
+        raise ValueError("Herdr identity does not match the signed launch contract")
+    attempts = record.get("attempts")
+    matching_attempts = [
+        item for item in attempts if isinstance(item, Mapping)
+        and (
+            legacy_scope
+            or int(item.get("attempt") or 0) == int(contract.get("attempt") or 0)
+        )
+        and str(item.get("launch_id") or "") == launch_id
+    ] if isinstance(attempts, list) else []
+    if len(matching_attempts) != 1 or matching_attempts[0].get("pane_id") != pane_id or matching_attempts[0].get("status") != "identity_pending":
+        raise ValueError("launch attempt history does not match the exact pending pane")
+    if legacy_scope:
+        _verify_unbudgeted_legacy_preidentity(
+            root, workflow_root, task_id, contract, record,
+            authority_secret=authority_secret,
+        )
+        if (
+            not isinstance(record.get("attempt"), int)
+            or isinstance(record.get("attempt"), bool)
+            or record.get("attempt") < 1
+            or matching_attempts[0].get("attempt") != record.get("attempt")
+        ):
+            raise ValueError("legacy launch attempt history does not match the durable session count")
+    else:
+        execution_entry = _verify_execution_snapshot_against_ledger(
+            root, workflow_root, task_id, contract, authority_secret=authority_secret,
+        )
+        if execution_entry is None:
+            raise ValueError("expired preidentity recovery requires an existing protected execution ledger row")
+        if (
+            time.time() < float(execution_entry.get("deadline_epoch", 0))
+            or execution_entry.get("status") not in {"active", "expired"}
+        ):
+            raise ValueError("protected launch deadline is not durably expired")
+    if was_cancelled and not _authenticated_cancelled_preidentity(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    ):
+        raise ValueError("cancelled preidentity launch is not backed by its authenticated retirement record")
+    for descendant in descendants:
+        descendant_id = str(descendant.get("id") or "")
+        other = sessions.get(descendant_id) if isinstance(sessions, Mapping) else None
+        if descendant_id != task_id and isinstance(other, Mapping) and str(other.get("status") or "") in {
+            "launching", "identity_pending", "launched", "running",
+        }:
+            raise ValueError("another workflow descendant has an active Herdr lifecycle")
+    root_issue = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(root_issue.get("id") or "") != workflow_root
+        or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise ValueError("workflow root is missing, mismatched, or terminal")
+    return {
+        "contract": dict(contract), "binding": dict(binding),
+        "contract_path": expected_contract_path, "record": dict(record),
+        "claim_token": claim_token, "actor": actor,
+    }
+
+
+def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
+    herdr = _provider_command("herdr")
+    if not herdr:
+        raise ValueError("Herdr is unavailable; pane absence is unknown")
+    try:
+        probe = subprocess.run(
+            [herdr, "pane", "get", pane_id], capture_output=True,
+            text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Herdr pane state is unknown") from exc
+    if not launch_recovery_backend.herdr_pane_is_definitively_absent(
+        probe.returncode, probe.stdout or "", probe.stderr or "", pane_id=pane_id,
+    ):
+        raise ValueError("Herdr did not definitively report the exact pane absent")
+
+
+def _preidentity_disposition(
+    contract: Mapping[str, Any], *, pane_id: str, authority_secret: str,
+    superseded_legacy_scope: bool = False, owner_abandoned_epoch: bool = False,
+) -> dict[str, Any]:
+    value = {
+        "schema": "agentflow.preidentity-cancellation@1",
+        "status": "cancelled_preidentity",
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "pane_id": pane_id,
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "recorded_at": _now(),
+        "reason": (
+            "owner_abandoned_epoch" if owner_abandoned_epoch
+            else "superseded_legacy_scope" if superseded_legacy_scope
+            else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+        ),
+    }
+    if superseded_legacy_scope or owner_abandoned_epoch:
+        value["budget_availability"] = "unknown"
+    else:
+        value["attempt"] = contract.get("attempt")
+        value["deadline_epoch"] = contract.get("deadline_epoch")
+    value["authority_key_id"] = _credential_key_id(authority_secret)
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="preidentity-cancellation-v1",
+    )
+    return value
+
+
+def _verify_preidentity_disposition(
+    value: Any,
+    contract: Mapping[str, Any],
+    *,
+    pane_id: str,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or (
+        value.get("schema") != "agentflow.preidentity-cancellation@1"
+        or value.get("status") != "cancelled_preidentity"
+        or value.get("pane_id") != pane_id
+        or value.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, value, domain="preidentity-cancellation-v1",
+        )
+    ):
+        raise ValueError("preidentity cancellation audit disposition is not authenticated")
+    fields = (
+        "workspace_root", "workflow_root", "task_id", "claim_id", "lease_id",
+        "launch_id", "controller_id", "continuity_id", "lease_epoch",
+    )
+    if any(value.get(field) != contract.get(field) for field in fields):
+        raise ValueError("preidentity cancellation does not match the exact signed launch")
+    if value.get("reason") in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
+        if (
+            value.get("budget_availability") != "unknown"
+            or any(field in value for field in (
+                "attempt", "max_attempts", "max_retries", "execution_limits",
+                "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+            ))
+            or any(field in contract for field in (
+                "attempt", "max_attempts", "max_retries", "execution_limits", "deadline_epoch",
+                "deadline_seconds", "expires_at", "issued_at", "execution_limit_capabilities", "budget",
+            ))
+        ):
+            raise ValueError("legacy-scope disposition contains structured budget metadata")
+    else:
+        if value.get("reason") != "expired launch deadline; Herdr definitively reports pane absent before provider identity":
+            raise ValueError("preidentity cancellation reason is not recognized")
+        if any(value.get(field) != contract.get(field) for field in ("attempt", "deadline_epoch")):
+            raise ValueError("preidentity cancellation does not preserve its signed deadline")
+    return value
+
+
+def _commit_preidentity_cancellation(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    launch_id: str,
+    pane_id: str,
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+    superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
+) -> None:
+    """Atomically revoke the late-result channel and retain an audit record."""
+    state_path = root / ".agentflow/herdr/sessions.json"
+    with _herdr_transaction(state_path) as state:
+        record = state.get("sessions", {}).get(task_id)
+        if not isinstance(record, dict):
+            raise ValueError("exact Herdr launch record disappeared during recovery")
+        channel = record.get("return_channel")
+        if not isinstance(channel, dict):
+            raise ValueError("exact Herdr return channel disappeared during recovery")
+        current_contract = channel.get("contract_binding")
+        if not isinstance(current_contract, Mapping) or dict(current_contract) != dict(contract):
+            raise ValueError("signed Herdr launch changed during recovery")
+        if record.get("status") == "cancelled_preidentity":
+            disposition = _verify_preidentity_disposition(
+                record.get("recovery_disposition"), contract,
+                pane_id=pane_id, authority_secret=authority_secret,
+            )
+            expected_reason = (
+                "owner_abandoned_epoch" if owner_abandoned_epoch
+                else "superseded_legacy_scope" if superseded_legacy_scope
+                else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+            )
+            if disposition.get("reason") != expected_reason:
+                raise ValueError("preidentity retirement mode does not match the durable disposition")
+            if channel.get("state") != "revoked" or channel.get("revocation") != dict(disposition):
+                raise ValueError("cancelled Herdr channel is not durably fenced")
+            if superseded_legacy_scope or owner_abandoned_epoch:
+                _verify_unbudgeted_legacy_preidentity(
+                    root, workflow_root, task_id, contract, record,
+                    authority_secret=authority_secret,
+                )
+            else:
+                _expired_preidentity_ledger_disposition(
+                    root, workflow_root, task_id, contract,
+                    authority_secret=authority_secret,
+                )
+            return
+        if (
+            record.get("status") != "identity_pending"
+            or record.get("root") != str(root)
+            or record.get("workflow_root") != workflow_root
+            or record.get("task_id") != task_id
+            or record.get("launch_id") != launch_id
+            or record.get("pane_id") != pane_id
+            or record.get("binding") not in (None, {})
+            or record.get("result") not in (None, {})
+            or channel.get("state") != "issued"
+        ):
+            raise ValueError("Herdr launch is no longer an unbound identity-pending attempt")
+        _require_definitively_absent_herdr_pane(pane_id)
+        if superseded_legacy_scope or owner_abandoned_epoch:
+            _verify_unbudgeted_legacy_preidentity(
+                root, workflow_root, task_id, contract, record,
+                authority_secret=authority_secret,
+            )
+        else:
+            _expired_preidentity_ledger_disposition(
+                root, workflow_root, task_id, contract,
+                authority_secret=authority_secret,
+            )
+        disposition = _preidentity_disposition(
+            contract, pane_id=pane_id, authority_secret=authority_secret,
+            superseded_legacy_scope=superseded_legacy_scope,
+            owner_abandoned_epoch=owner_abandoned_epoch,
+        )
+        # Preserve the attempt list and count. This is a separate lifecycle
+        # disposition; it never fabricates provider output or task failure.
+        record["status"] = "cancelled_preidentity"
+        record["recovery_disposition"] = disposition
+        channel["state"] = "revoked"
+        channel["revoked_at"] = disposition["recorded_at"]
+        channel["revocation"] = disposition
+
+
+def _authenticated_cancelled_preidentity(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    *,
+    authority_secret: str,
+) -> bool:
+    """Return true only for a signed, ledger-backed retired launch."""
+    try:
+        state = _load_herdr_state(root / ".agentflow/herdr/sessions.json")
+        sessions = state.get("sessions")
+        record = sessions.get(task_id) if isinstance(sessions, Mapping) else None
+        if not isinstance(record, Mapping) or record.get("status") != "cancelled_preidentity":
+            return False
+        channel = record.get("return_channel")
+        if not isinstance(channel, Mapping) or channel.get("state") != "revoked":
+            return False
+        contract = channel.get("contract_binding")
+        if not isinstance(contract, Mapping):
+            return False
+        contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+        if contract_path.is_symlink() or not contract_path.is_file():
+            return False
+        binding = _verify_return_contract_binding(
+            contract, contract_path, task_id, record,
+            root=root, authority_secret=authority_secret, require_issued=False,
+        )
+        if (
+            str(binding.get("workflow_root") or "") != workflow_root
+            or str(binding.get("launch_id") or "") != str(record.get("launch_id") or "")
+        ):
+            return False
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract,
+            pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+        )
+        if channel.get("revocation") != dict(disposition) or record.get("result") not in (None, {}):
+            return False
+        if disposition.get("reason") in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
+            _verify_unbudgeted_legacy_preidentity(
+                root, workflow_root, task_id, contract, record,
+                authority_secret=authority_secret,
+            )
+            return True
+        _verify_execution_snapshot_against_ledger(
+            root, workflow_root, task_id, contract, authority_secret=authority_secret,
+        )
+        entry = _read_any_execution_ledger_entry(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        )
+        return bool(
+            entry and entry.get("status") == "expired"
+            and dict(entry.get("launch_identity") or {}) == {
+                "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
+                "task_id": task_id, "claim_id": str(contract.get("claim_id") or ""),
+                "lease_id": str(contract.get("lease_id") or ""),
+                "launch_id": str(contract.get("launch_id") or ""),
+                "controller_id": str(contract.get("controller_id") or ""),
+                "continuity_id": str(contract.get("continuity_id") or ""),
+                "lease_epoch": contract.get("lease_epoch"),
+            }
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
+_BOUND_EXECUTION_EXPIRY_REASON = (
+    "signed execution deadline expired; Herdr definitively reported the exact bound pane absent"
+)
+
+
+def _bound_execution_expiry_disposition(
+    contract: Mapping[str, Any], binding: Mapping[str, Any], *,
+    authority_secret: str,
+) -> dict[str, Any]:
+    value = {
+        "schema": "agentflow.bound-execution-expiry@1",
+        "status": "expired_execution",
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "pane_id": str(binding.get("pane_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "provider": str(contract.get("provider") or ""),
+        "model": str(contract.get("model") or ""),
+        "session_id": str(binding.get("session_id") or ""),
+        "binding_sha256": _canonical_json_digest(dict(binding)),
+        "execution_limits": contract.get("execution_limits"),
+        "attempt": contract.get("attempt"),
+        "max_attempts": contract.get("max_attempts"),
+        "deadline_epoch": contract.get("deadline_epoch"),
+        "recorded_at": _now(),
+        "reason": _BOUND_EXECUTION_EXPIRY_REASON,
+        "authority_key_id": _credential_key_id(authority_secret),
+    }
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="bound-execution-expiry-v1",
+    )
+    return value
+
+
+def _verify_bound_execution_expiry_disposition(
+    value: Any, contract: Mapping[str, Any], binding: Mapping[str, Any], *,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or (
+        value.get("schema") != "agentflow.bound-execution-expiry@1"
+        or value.get("status") != "expired_execution"
+        or value.get("reason") != _BOUND_EXECUTION_EXPIRY_REASON
+        or value.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, value, domain="bound-execution-expiry-v1",
+        )
+    ):
+        raise ValueError("bound execution expiry disposition is not authenticated")
+    expected = {
+        "workspace_root": contract.get("workspace_root"),
+        "workflow_root": contract.get("workflow_root"),
+        "task_id": contract.get("task_id"),
+        "claim_id": contract.get("claim_id"),
+        "lease_id": contract.get("lease_id"),
+        "launch_id": contract.get("launch_id"),
+        "controller_id": contract.get("controller_id"),
+        "continuity_id": contract.get("continuity_id"),
+        "lease_epoch": contract.get("lease_epoch"),
+        "provider": contract.get("provider"),
+        "model": contract.get("model"),
+        "pane_id": binding.get("pane_id"),
+        "session_id": binding.get("session_id"),
+        "binding_sha256": _canonical_json_digest(dict(binding)),
+        "execution_limits": contract.get("execution_limits"),
+        "attempt": contract.get("attempt"),
+        "max_attempts": contract.get("max_attempts"),
+        "deadline_epoch": contract.get("deadline_epoch"),
+    }
+    if any(value.get(key) != expected_value for key, expected_value in expected.items()):
+        raise ValueError("bound execution expiry does not preserve the exact signed identity and budget")
+    return value
+
+
+def _verify_expired_bound_execution_record(
+    root: Path, workflow_root: str, task_id: str, record: Mapping[str, Any], *,
+    authority_secret: str,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    channel = record.get("return_channel")
+    binding = record.get("binding")
+    contract_binding = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    if (
+        record.get("status") != "expired_execution"
+        or not isinstance(channel, Mapping) or channel.get("state") != "revoked"
+        or not isinstance(binding, Mapping) or not binding.get("session_id")
+        or not isinstance(contract_binding, Mapping)
+        or record.get("result") not in (None, {})
+    ):
+        raise ValueError("Herdr record is not an exact expired bound execution")
+    launch_id = str(record.get("launch_id") or "")
+    path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if path.is_symlink() or path.resolve() != expected_path.resolve() or not path.is_file():
+        raise ValueError("expired execution has no canonical signed return contract")
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("expired execution return contract is malformed")
+    verified_contract = _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret, require_issued=False,
+    )
+    if dict(verified_contract) != dict(contract) or dict(contract_binding) != dict(contract):
+        raise ValueError("expired execution identity changed after launch")
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("expired execution provider binding differs from its signed contract")
+    record_pane_id = record.get("pane_id")
+    if record_pane_id not in (None, "") and str(record_pane_id) != str(binding.get("pane_id") or ""):
+        raise ValueError("expired execution pane identity differs from its durable binding")
+    disposition = _verify_bound_execution_expiry_disposition(
+        record.get("execution_disposition"), contract, binding,
+        authority_secret=authority_secret,
+    )
+    if channel.get("revocation") != dict(disposition):
+        raise ValueError("expired execution return channel lacks its exact signed revocation")
+    entry = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if (
+        entry is None or entry.get("status") != "expired"
+        or float(entry.get("deadline_epoch", 0)) != float(contract.get("deadline_epoch", 0))
+    ):
+        raise ValueError("expired execution has no matching protected budget tombstone")
+    return contract, binding
+
+
+def _bound_execution_expiry_snapshot(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    lease: controller_backend.Lease,
+    task_id: str,
+    *,
+    authority_secret: str,
+    require_budget: bool = True,
+    require_pristine: bool = True,
+) -> dict[str, Any]:
+    document = controller._load_checkpoint()
+    rows = controller.active_tasks()
+    if (
+        len(rows) != 1 or rows[0].get("task") != task_id
+        or rows[0].get("state") not in {"launched", "running"}
+        or not rows[0].get("session_id")
+        or document.get("epoch") != lease.epoch
+        or document.get("lease_token") != lease.token
+        or str(document.get("root") or "") != str(root)
+        or str(document.get("controller") or "") != lease.controller
+    ):
+        raise ValueError("checkpoint is not the exact single current bound execution")
+    state = _read_json_value(str(controller.state_path))
+    stored_lease = controller._read_lease(state) if isinstance(state, Mapping) else None
+    if (
+        stored_lease is None or stored_lease.to_dict() != lease.to_dict()
+        or int(state.get("epoch", -1)) != lease.epoch
+    ):
+        raise ValueError("protected controller state no longer carries the current lease")
+    key_path = _resume_key_path(argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file="",
+    ))
+    if key_path.is_symlink() or not key_path.is_file() or key_path.parent.is_symlink():
+        raise ValueError("canonical controller credential is unavailable")
+    credentials = _read_controller_credentials(key_path)
+    if (
+        credentials.get("workspace_root") != str(root.resolve())
+        or credentials.get("workflow_root") != workflow_root
+        or credentials.get("continuity_id") != lease.continuity_id
+        or not credentials.get("resume_secret")
+        or not lease.verify_resume_proof(credentials["resume_secret"])
+        or not hmac.compare_digest(credentials.get("authority_secret", ""), authority_secret)
+    ):
+        raise ValueError("canonical controller credential does not authenticate the current lease")
+
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    claim_id = str(agentflow.get("claim_id") or "")
+    if (
+        str(issue.get("status") or "").lower() != "in_progress"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or not claim_id or not claim_token
+    ):
+        raise ValueError("bound execution no longer has its exact live Beads claim")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, issue, task=task_id, root=workflow_root, actor=lease.controller,
+    )
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    if not any(str(row.get("id") or "") == task_id for row in descendants):
+        raise ValueError("bound execution is not under the exact workflow root")
+    if any(
+        str(row.get("id") or "") != task_id
+        and str(row.get("status") or "").lower() == "in_progress"
+        for row in descendants
+    ):
+        raise ValueError("another workflow task is still claimed in progress")
+
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping):
+        raise ValueError("exact bound Herdr launch record is unavailable")
+    status = str(record.get("status") or "")
+    binding = record.get("binding")
+    channel = record.get("return_channel")
+    if not isinstance(binding, Mapping) or not isinstance(channel, Mapping):
+        raise ValueError("bound execution identity or return channel is unavailable")
+    session_id = str(binding.get("session_id") or "")
+    if (
+        record.get("root") != str(root) or record.get("workflow_root") != workflow_root
+        or record.get("task_id") != task_id or record.get("claim_id") != claim_id
+        or not str(binding.get("pane_id") or "") or not session_id
+        or rows[0].get("claim_id") != claim_id or rows[0].get("session_id") != session_id
+        or status not in {"launched", "running", "expired_execution"}
+        or (status != "expired_execution" and channel.get("state") != "issued")
+        or (status == "expired_execution" and channel.get("state") != "revoked")
+        or (require_pristine and record.get("result") not in (None, {}))
+    ):
+        raise ValueError("Herdr record no longer matches the exact bound active task")
+    if not hmac.compare_digest(
+        hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+        str(channel.get("contract_binding", {}).get("claim_token_sha256") or "")
+        if isinstance(channel.get("contract_binding"), Mapping) else "",
+    ):
+        raise ValueError("Herdr launch is not bound to the current exact claim token")
+    launch_id = str(record.get("launch_id") or "")
+    if not launch_id or not str(binding.get("pane_id") or ""):
+        raise ValueError("bound launch is missing its exact pane or launch ID")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if contract_path.is_symlink() or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file():
+        raise ValueError("bound launch contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("bound launch contract is malformed")
+    verified_contract = _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+        require_issued=(status != "expired_execution"),
+    )
+    if dict(verified_contract) != dict(contract):
+        raise ValueError("return contract changed during bound execution verification")
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("provider session binding differs from the signed return contract")
+    record_pane_id = record.get("pane_id")
+    if record_pane_id not in (None, "") and str(record_pane_id) != str(binding.get("pane_id") or ""):
+        raise ValueError("provider session pane identity differs from its durable binding")
+    if (
+        contract.get("workflow_root") != workflow_root
+        or contract.get("claim_id") != claim_id
+        or contract.get("controller_id") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("lease_epoch") != lease.epoch
+        or contract.get("provider") != record.get("provider")
+        or contract.get("model") != record.get("model")
+    ):
+        raise ValueError("bound launch does not match the current controller incarnation")
+    launch = agentflow.get("launch")
+    launch = launch if isinstance(launch, Mapping) else {}
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None:
+        if require_budget:
+            raise ValueError("bound execution has no signed structured execution limits")
+        return {
+            "contract": dict(contract), "binding": dict(binding), "record": dict(record),
+            "deadline_epoch": None, "ledger": None, "status": status,
+        }
+    if dict(launch.get("execution_limits") or {}) != limits.to_dict():
+        raise ValueError("current task graph no longer matches the signed structured execution limits")
+    ledger = _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    if ledger is None or ledger.get("status") not in {"active", "expired"}:
+        raise ValueError("bound execution has no active protected execution budget")
+    deadline = float(contract.get("deadline_epoch") or 0)
+    if not deadline:
+        raise ValueError("signed bound execution has no absolute deadline")
+    if status == "expired_execution":
+        _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record, authority_secret=authority_secret,
+        )
+    else:
+        if channel.get("state") != "issued":
+            raise ValueError("bound execution return capability is not issued")
+        if require_pristine and _bound_execution_has_pending_result(root, contract):
+            raise ValueError("bound execution already has a result and cannot be expired safely")
+    return {
+        "contract": dict(contract), "binding": dict(binding), "record": dict(record),
+        "deadline_epoch": deadline, "ledger": dict(ledger), "status": status,
+    }
+
+
+def _bound_execution_has_pending_result(root: Path, contract: Mapping[str, Any]) -> bool:
+    """Return true for a signed launch whose result inbox has been touched."""
+    for field in ("result_path", "submission_file"):
+        path = Path(str(contract.get(field) or "")).expanduser()
+        try:
+            path.resolve().relative_to((root / ".agentflow/runtime").resolve())
+        except ValueError as exc:
+            raise ValueError(f"bound execution {field} is outside managed runtime") from exc
+        if path.is_symlink():
+            raise ValueError(f"bound execution {field} is not a regular managed path")
+        if path.exists():
+            return True
+    return False
+
+
+def _commit_expired_bound_execution(
+    root: Path, workflow_root: str, task_id: str,
+    snapshot: Mapping[str, Any], *, authority_secret: str,
+) -> None:
+    contract = snapshot["contract"]
+    binding = snapshot["binding"]
+    if snapshot.get("status") == "expired_execution":
+        record = _herdr_session_record(root, task_id)
+        if not isinstance(record, Mapping):
+            raise ValueError("expired bound execution record disappeared")
+        _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record, authority_secret=authority_secret,
+        )
+        return
+    _require_definitively_absent_herdr_pane(str(binding.get("pane_id") or ""))
+    state_path = root / ".agentflow/herdr/sessions.json"
+    with _herdr_transaction(state_path) as state:
+        record = state.get("sessions", {}).get(task_id)
+        if not isinstance(record, dict):
+            raise ValueError("exact bound Herdr launch record disappeared during expiry")
+        channel = record.get("return_channel")
+        if not isinstance(channel, dict):
+            raise ValueError("exact bound return channel disappeared during expiry")
+        if record.get("status") == "expired_execution":
+            _verify_expired_bound_execution_record(
+                root, workflow_root, task_id, record,
+                authority_secret=authority_secret,
+            )
+            return
+        current_contract = channel.get("contract_binding")
+        if (
+            not isinstance(current_contract, Mapping)
+            or dict(current_contract) != dict(contract)
+            or record.get("binding") != dict(binding)
+            or record.get("result") not in (None, {})
+            or record.get("status") not in {"launched", "running"}
+            or channel.get("state") != "issued"
+        ):
+            raise ValueError("bound launch changed or received a result before expiry committed")
+        submission = Path(str(contract.get("submission_file") or "")).expanduser()
+        if submission.is_symlink() or submission.exists():
+            raise ValueError("a worker submission appeared before expiry could revoke its capability")
+        result = Path(str(contract.get("result_path") or "")).expanduser()
+        if result.is_symlink() or result.exists():
+            raise ValueError("a worker result appeared before expiry could revoke its capability")
+        ledger = _expired_preidentity_ledger_disposition(
+            root, workflow_root, task_id, contract,
+            authority_secret=authority_secret,
+        )
+        if ledger.get("status") != "expired":
+            raise ValueError("protected execution budget did not durably expire")
+        disposition = _bound_execution_expiry_disposition(
+            contract, binding, authority_secret=authority_secret,
+        )
+        record["status"] = "expired_execution"
+        record["execution_disposition"] = disposition
+        channel["state"] = "revoked"
+        channel["revoked_at"] = disposition["recorded_at"]
+        channel["revocation"] = disposition
+
+
+def _authenticated_expired_bound_execution(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> bool:
+    try:
+        record = _herdr_session_record(root, task_id)
+        if not isinstance(record, Mapping):
+            return False
+        contract, _binding = _verify_expired_bound_execution_record(
+            root, workflow_root, task_id, record,
+            authority_secret=authority_secret,
+        )
+        return (
+            contract.get("workspace_root") == str(root.resolve())
+            and contract.get("workflow_root") == workflow_root
+            and contract.get("task_id") == task_id
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _reconcile_pending_bound_execution_identity(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    workflow_root: str,
+    lease: controller_backend.Lease,
+    row: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> bool:
+    """Fence one resolved native binding onto its exact pending checkpoint row."""
+    task_id = str(row.get("task") or "")
+    claim_id = str(row.get("claim_id") or "")
+    if not task_id or not claim_id or row.get("session_id"):
+        raise ValueError("identity-pending checkpoint row is malformed")
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or record.get("status") == "identity_pending":
+        return False
+    if str(record.get("status") or "") not in {"launched", "running"}:
+        raise ValueError("identity-pending task has no reconcilable bound Herdr record")
+    binding = record.get("binding")
+    channel = record.get("return_channel")
+    if not isinstance(binding, Mapping) or not isinstance(channel, Mapping):
+        raise ValueError("resolved bound execution lacks its durable identity")
+    session_id = str(binding.get("session_id") or "")
+    launch_id = str(record.get("launch_id") or "")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if (
+        not launch_id or contract_path.is_symlink()
+        or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file()
+    ):
+        raise ValueError("resolved bound execution contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("resolved bound execution contract is malformed")
+    _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+    )
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": task_id,
+        "claim_id": claim_id,
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": launch_id,
+        "provider": str(contract.get("provider") or ""),
+    }
+    if (
+        not session_id
+        or not str(binding.get("pane_id") or "")
+        or any(not expected or str(binding.get(field) or "") != expected
+               for field, expected in expected_binding.items())
+        or str(record.get("root") or "") != str(root)
+        or str(record.get("workflow_root") or "") != workflow_root
+        or str(record.get("task_id") or "") != task_id
+        or str(record.get("claim_id") or "") != claim_id
+        or str(record.get("launch_id") or "") != launch_id
+        or str(record.get("provider") or "") != str(contract.get("provider") or "")
+        or str(record.get("model") or "") != str(contract.get("model") or "")
+        or contract.get("controller_id") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or contract.get("lease_epoch") != lease.epoch
+        or (
+            str(record.get("pane_id") or "")
+            and str(record.get("pane_id") or "") != str(binding.get("pane_id") or "")
+        )
+    ):
+        raise ValueError("resolved bound execution does not match its exact pending reservation")
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None:
+        return False
+    _verify_execution_snapshot_against_ledger(
+        root, workflow_root, task_id, contract, authority_secret=authority_secret,
+    )
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    if (
+        str(issue.get("status") or "").lower() != "in_progress"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or str(agentflow.get("claim_id") or "") != claim_id
+        or not claim_token
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
+    ):
+        raise ValueError("resolved bound execution no longer has its exact live claim")
+    beads_backend.verify_task_ancestry_and_ownership(
+        root, issue, task=task_id, root=workflow_root, actor=lease.controller,
+    )
+    controller.reconcile_pending_active_task_binding(
+        task_id, claim_id, session_id, lease=lease,
+    )
+    return True
+
+
+def _expire_bound_execution_if_due(
+    args: argparse.Namespace,
+    controller: controller_backend.RootController,
+    root: Path,
+    lease: controller_backend.Lease,
+) -> controller_backend.ResumeResult | None:
+    document = controller._load_checkpoint()
+    rows = controller.active_tasks()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        return None
+    task_id = str(rows[0].get("task") or "")
+    workflow_root = str(getattr(args, "workflow_root", "") or "")
+    authority_secret = str(getattr(args, "_authority_secret", "") or "")
+    if not task_id or not workflow_root or not authority_secret:
+        raise ValueError("bound expiry requires the authenticated controller execution context")
+    if rows[0].get("state") == "identity_pending" and not rows[0].get("session_id"):
+        _reconcile_pending_bound_execution_identity(
+            args, controller, root, workflow_root, lease, rows[0],
+            authority_secret=authority_secret,
+        )
+        rows = controller.active_tasks()
+    if len(rows) != 1 or rows[0].get("state") not in {"launched", "running"}:
+        return None
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
+        # Identity-pending recovery has its own stricter signed path.
+        return None
+    if record.get("status") == "expired_execution":
+        # A crash may happen after the authenticated Herdr/ledger tombstone
+        # commits and before the controller clears its active checkpoint row.
+        # Only the full signed receipt verifier may admit that replay.
+        snapshot = _bound_execution_expiry_snapshot(
+            args, controller, root, workflow_root, lease, task_id,
+            authority_secret=authority_secret,
+        )
+
+        def commit_revoked_replay() -> None:
+            latest = _bound_execution_expiry_snapshot(
+                args, controller, root, workflow_root, lease, task_id,
+                authority_secret=authority_secret,
+            )
+            if (
+                latest.get("contract") != snapshot.get("contract")
+                or latest.get("binding") != snapshot.get("binding")
+                or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+            ):
+                raise ValueError("bound execution changed during expiry disposition")
+            _commit_expired_bound_execution(
+                root, workflow_root, task_id, latest,
+                authority_secret=authority_secret,
+            )
+
+        return controller.expire_bound_execution_task(
+            task_id, str(snapshot["contract"].get("claim_id") or ""),
+            str(snapshot["contract"].get("launch_id") or ""),
+            str(snapshot["binding"].get("session_id") or ""),
+            commit_expiration=commit_revoked_replay, lease=lease,
+        )
+    if (
+        str(record.get("status") or "") not in {"launched", "running"}
+        or record.get("result") not in (None, {})
+    ):
+        return None
+    channel = record.get("return_channel")
+    binding = record.get("binding")
+    if not isinstance(channel, Mapping) or not isinstance(binding, Mapping):
+        raise ValueError("bound execution identity or return channel is unavailable")
+    launch_id = str(record.get("launch_id") or "")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if (
+        not launch_id or contract_path.is_symlink()
+        or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file()
+    ):
+        raise ValueError("bound launch contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if not isinstance(contract, Mapping):
+        raise ValueError("bound launch contract is malformed")
+    _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+    )
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("provider session binding differs from the signed return contract")
+    record_pane_id = record.get("pane_id")
+    if not str(binding.get("pane_id") or "") or (
+        record_pane_id not in (None, "")
+        and str(record_pane_id) != str(binding.get("pane_id") or "")
+    ):
+        raise ValueError("provider session pane identity differs from its durable binding")
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None:
+        return None
+    snapshot = _bound_execution_expiry_snapshot(
+        args, controller, root, workflow_root, lease, task_id,
+        authority_secret=authority_secret,
+        require_budget=False,
+        require_pristine=False,
+    )
+    deadline = snapshot.get("deadline_epoch")
+    # A canonical, signed unbudgeted launch has no expiry disposition.
+    if deadline is None:
+        return None
+    if time.time() < float(deadline):
+        return None
+    if (
+        snapshot.get("status") != "expired_execution"
+        and (
+            snapshot["record"].get("result") not in (None, {})
+            or _bound_execution_has_pending_result(root, snapshot["contract"])
+        )
+    ):
+        # Leave an inbox submission or result to the ordinary ingestion path;
+        # it is never expiry evidence, including after the deadline.
+        return None
+    snapshot = _bound_execution_expiry_snapshot(
+        args, controller, root, workflow_root, lease, task_id,
+        authority_secret=authority_secret,
+    )
+    if snapshot.get("status") != "expired_execution":
+        _require_definitively_absent_herdr_pane(str(snapshot["binding"].get("pane_id") or ""))
+
+    def commit() -> None:
+        latest = _bound_execution_expiry_snapshot(
+            args, controller, root, workflow_root, lease, task_id,
+            authority_secret=authority_secret,
+        )
+        if (
+            latest.get("contract") != snapshot.get("contract")
+            or latest.get("binding") != snapshot.get("binding")
+            or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+        ):
+            raise ValueError("bound execution changed during expiry disposition")
+        _commit_expired_bound_execution(
+            root, workflow_root, task_id, latest,
+            authority_secret=authority_secret,
+        )
+
+    return controller.expire_bound_execution_task(
+        task_id, str(snapshot["contract"].get("claim_id") or ""),
+        str(snapshot["contract"].get("launch_id") or ""),
+        str(snapshot["binding"].get("session_id") or ""),
+        commit_expiration=commit, lease=lease,
+    )
 
 
 def _mint_return_channel(
@@ -3477,7 +5576,7 @@ def _mint_return_channel(
         "contract_path": str(contract_path),
         "result_path": str(result_path),
         "submission_file": str(submission_path),
-        "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+        "submit_command": provider_argv_backend.fixed_submit_command(),
     }
     if execution_limits is not None:
         contract.update({
@@ -3952,6 +6051,11 @@ def _verify_launch_authority(
         metadata = issue.get("metadata")
         agentflow_meta = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
         agentflow_meta = agentflow_meta if isinstance(agentflow_meta, Mapping) else {}
+        launch_meta = agentflow_meta.get("launch")
+        launch_meta = launch_meta if isinstance(launch_meta, Mapping) else {}
+        graph_execution_limits = launch_meta.get(
+            "execution_limits", agentflow_meta.get("execution_limits"),
+        )
         stored_root = str(agentflow_meta.get("root") or "")
         stored_task = str(agentflow_meta.get("task") or "")
         stored_actor = str(agentflow_meta.get("actor") or "")
@@ -3984,6 +6088,10 @@ def _verify_launch_authority(
             "claim_id": stored_claim_id or claim,
             "claim_token": stored_claim_token,
             "actor": str(issue.get("assignee") or actor or ""),
+            # Return the current graph policy from the same exact Beads
+            # snapshot that authenticated this task claim. Launch callers
+            # compare it with their pinned typed handoff at protected fences.
+            "_graph_execution_limits": graph_execution_limits,
         }
 
     # No durable workflow root: fall back to the local claim cache alone,
@@ -4879,6 +6987,35 @@ def herdr_launch(args: argparse.Namespace) -> int:
             )
         except execution_limits_backend.ExecutionLimitError as exc:
             raise ValueError(f"invalid structured execution limits: {exc}") from exc
+        requested_limits_present = hasattr(args, "execution_limits")
+        try:
+            requested_execution_limits = (
+                execution_limits_backend.parse_limits(getattr(args, "execution_limits"))
+                if requested_limits_present else None
+            )
+        except execution_limits_backend.ExecutionLimitError as exc:
+            raise ValueError(f"invalid requested graph execution limits: {exc}") from exc
+
+        def _require_requested_limits_match(handoff: provider_argv_backend.ConfinedHandoff) -> None:
+            if not requested_limits_present:
+                return
+            try:
+                current_limits = execution_limits_backend.parse_limits(
+                    handoff.manifest.get("execution_limits")
+                )
+            except execution_limits_backend.ExecutionLimitError as exc:
+                raise ValueError(f"invalid structured execution limits: {exc}") from exc
+            expected = (
+                requested_execution_limits.to_dict()
+                if requested_execution_limits is not None else None
+            )
+            actual = current_limits.to_dict() if current_limits is not None else None
+            if actual != expected:
+                raise ValueError(
+                    "typed handoff execution limits do not match the requested graph policy"
+                )
+
+        _require_requested_limits_match(typed_handoff)
         policy_attempt_cap = (
             _controller_execution_policy(root, root, workflow_root).max_attempts_per_task
             if execution_limits is not None else None
@@ -4904,6 +7041,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 expected_manifest_sha256=typed_handoff.manifest_sha256,
                 expected_preflight_sha256=typed_handoff.preflight_sha256,
             )
+            _require_requested_limits_match(typed_handoff)
             _require_supported_launch_isolation(
                 typed_handoff, transport="Codex App Server" if transport == "app-server" else "Herdr"
             )
@@ -4939,10 +7077,44 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 raise ValueError("authenticated root preflight digest changed before launch")
 
         def _authorize() -> dict[str, Any]:
-            return _verify_launch_authority(
+            identity = _verify_launch_authority(
                 root, task_id, claim_id, lease_id,
                 workflow_root=workflow_root, beads_cwd=root, actor=actor,
             )
+            if workflow_root:
+                try:
+                    current_graph_limits = execution_limits_backend.parse_limits(
+                        identity.get("_graph_execution_limits")
+                    )
+                    current_handoff_limits = execution_limits_backend.parse_limits(
+                        typed_handoff.manifest.get("execution_limits")
+                    )
+                except execution_limits_backend.ExecutionLimitError as exc:
+                    raise ValueError(f"invalid current graph execution limits: {exc}") from exc
+                graph_value = (
+                    current_graph_limits.to_dict()
+                    if current_graph_limits is not None else None
+                )
+                handoff_value = (
+                    current_handoff_limits.to_dict()
+                    if current_handoff_limits is not None else None
+                )
+                requested_value = (
+                    requested_execution_limits.to_dict()
+                    if requested_execution_limits is not None else None
+                )
+                if (
+                    requested_limits_present
+                    and (graph_value != handoff_value or graph_value != requested_value)
+                ) or (
+                    not requested_limits_present
+                    and graph_value is not None
+                    and graph_value != handoff_value
+                ):
+                    raise ValueError(
+                        "current Beads execution limits do not match the requested pinned launch policy"
+                    )
+            return identity
 
         identity = _authorize()
         _revalidate_contract()
@@ -5091,12 +7263,20 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 )
                 limit_entry: Mapping[str, Any] | None = None
                 if execution_limits is not None:
+                    # Beads is external to the controller lock and may change
+                    # after the earlier authorization/preflight. Re-read the
+                    # exact claim and its current graph budget immediately
+                    # before consuming the protected attempt.
+                    identity = _authorize()
                     assert policy_attempt_cap is not None
                     limit_entry = _reserve_execution_attempt(
                         root, workflow_root, task_id,
                         limits=execution_limits,
                         policy_max_attempts=policy_attempt_cap,
                         authority_secret=authority_secret,
+                        claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                        launch_id=launch_id, controller_id=lease.controller,
+                        continuity_id=lease.continuity_id, lease_epoch=lease.epoch,
                     )
                     attempt = int(limit_entry["attempt"])
                 elif prior_limit_entry is not None:
@@ -5293,6 +7473,10 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         "--", *provider_tail,
                     ]
                     try:
+                        # Root preflight and argv construction can take time.
+                        # Re-read the current Beads claim/policy after those
+                        # checks and immediately before the provider spawn.
+                        _authorize()
                         launched = subprocess.run(
                             argv, capture_output=True, text=True, timeout=30, check=False,
                         )
@@ -5656,7 +7840,7 @@ def herdr_result(args: argparse.Namespace) -> int:
     try:
         if not bool(getattr(args, "_controller_ingest", False)):
             raise ValueError(
-                "direct result ingestion is controller-owned; providers must use `agentflow herdr submit`"
+                "direct result ingestion is controller-owned; providers must use the fixed submit command in the handoff"
             )
         contract_arg = str(getattr(args, "contract", "") or "")
         if contract_arg:
@@ -7053,60 +9237,6 @@ def install(args: argparse.Namespace) -> int:
     return 0
 
 
-def migrate_legacy(args: argparse.Namespace) -> int:
-    """Preview, apply, or roll back a private legacy-install cutover."""
-
-    try:
-        if args.rollback:
-            result = migration_backend.rollback(args.rollback)
-            operation = "rollback"
-        else:
-            if not args.legacy_root:
-                raise migration_backend.MigrationError("--from is required for dry-run and apply")
-            legacy_root = Path(args.legacy_root).expanduser()
-            if args.dry_run:
-                command = Path(args.new_command).expanduser() if args.new_command else None
-                result = migration_backend.plan(legacy_root, new_command=command)
-                operation = "dry-run"
-            else:
-                raw_command = args.new_command or sys.argv[0]
-                if not Path(raw_command).is_absolute():
-                    raw_command = shutil.which(raw_command) or raw_command
-                result = migration_backend.apply(
-                    legacy_root,
-                    new_command=Path(raw_command).expanduser(),
-                )
-                operation = "apply"
-    except (migration_backend.MigrationError, OSError) as exc:
-        print(f"Legacy migration refused: {exc}", file=sys.stderr)
-        return 2
-
-    if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
-    operations = result.get("operations", [])
-    changed = sum(
-        1
-        for item in operations
-        if item.get("status") in {"planned", "applied", "rolled-back"}
-    )
-    if operation == "dry-run":
-        print(f"DRY_RUN: {changed} exact legacy-owned integration link(s) would be replaced.")
-        print(
-            f"Preserved unmanaged entries discovered: "
-            f"{len(result.get('preserved_unmanaged_entries', []))}."
-        )
-        print("No files were changed. Review the plan, stop active legacy work, then use --apply.")
-    elif operation == "apply":
-        print(f"MIGRATION_APPLIED: {changed} integration(s) replaced transactionally.")
-        print(f"Migration ID: {result['id']}")
-        print(f"Rollback: agentflow migrate legacy --rollback {result['id']}")
-    else:
-        print(f"MIGRATION_ROLLED_BACK: {changed} integration(s) restored.")
-        print(f"Migration ID: {result['id']}")
-    return 0
-
-
 def _parse_acceptance_row(value: str) -> dict[str, str]:
     parts = [part.strip() for part in value.split("::", 4)]
     if len(parts) != 5 or not all(parts):
@@ -7305,6 +9435,283 @@ def acceptance_set(args: argparse.Namespace) -> int:
         return 2
     print(f"UPDATED {label} {args.id}={args.status}")
     return 0
+
+
+def _safe_feedback_text(value: Any, field: str, *, required: bool = True) -> str:
+    text = str(value or "")
+    if required and not text.strip():
+        raise ValueError(f"feedback {field} is required")
+    if len(text.encode("utf-8")) > 8_000 or any(
+        ord(char) < 32 and char not in "\n\r\t" for char in text
+    ):
+        raise ValueError(f"feedback {field} is malformed or too large")
+    if _rejects_secret(text):
+        raise ValueError(f"feedback {field} contains secret-like content")
+    return text
+
+
+def _load_feedback_target(args: argparse.Namespace):
+    cwd = _task_cwd(args)
+    bead_id = str(getattr(args, "bead", "") or "")
+    if not bead_id:
+        raise feedback_backend.FeedbackError("--bead is required")
+    issue = beads_backend.get_issue(cwd, bead_id)
+    task_id = str(issue.get("id") or "")
+    if not task_id or task_id != bead_id:
+        raise feedback_backend.FeedbackError("feedback target did not resolve to the requested task Bead")
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    stored = agentflow.get("feedback") if isinstance(agentflow, Mapping) else None
+    if stored is None:
+        ledger = feedback_backend.empty_ledger(task_id)
+    else:
+        errors = feedback_backend.validate_ledger(stored, task_id=task_id)
+        if errors:
+            raise feedback_backend.FeedbackError("; ".join(errors))
+        ledger = dict(stored)
+    acceptance = agentflow.get("acceptance") if isinstance(agentflow, Mapping) else None
+    return cwd, bead_id, task_id, ledger, acceptance
+
+
+def feedback_intake(args: argparse.Namespace) -> int:
+    try:
+        cwd, bead_id, task_id, ledger, _ = _load_feedback_target(args)
+        source = _safe_feedback_text(args.source, "source")
+        source_ref = _safe_feedback_text(getattr(args, "source_ref", ""), "source reference", required=False)
+        artifacts = list(getattr(args, "artifact", []) or [])
+        if getattr(args, "input", ""):
+            if getattr(args, "key", ""):
+                raise feedback_backend.FeedbackError("--key applies to a single --text item; put keys on JSON input items")
+            input_path = Path(args.input).expanduser().resolve(strict=True)
+            if not input_path.is_file():
+                raise feedback_backend.FeedbackError("feedback input must be a regular JSON file")
+            input_text = input_path.read_text(encoding="utf-8")
+            if len(input_text.encode("utf-8")) > 1_000_000:
+                raise feedback_backend.FeedbackError("feedback input exceeds 1 MB")
+            try:
+                payload = json.loads(input_text)
+            except json.JSONDecodeError as exc:
+                raise feedback_backend.FeedbackError(f"feedback input is not valid JSON: {exc}") from exc
+            rows = payload.get("items") if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
+                raise feedback_backend.FeedbackError("feedback input must contain an items list")
+            for index, row in enumerate(rows, 1):
+                if not isinstance(row, Mapping):
+                    raise feedback_backend.FeedbackError(f"feedback input item {index} must be an object")
+                _safe_feedback_text(row.get("text"), f"item {index} text")
+                if "source_ref" in row:
+                    _safe_feedback_text(row.get("source_ref"), f"item {index} source reference", required=False)
+        else:
+            text_value = _safe_feedback_text(getattr(args, "text", ""), "text")
+            payload = [{
+                "text": text_value,
+                "key": str(getattr(args, "key", "") or ""),
+                "source_ref": source_ref,
+                "artifacts": artifacts,
+            }]
+        updated, item_ids, added = feedback_backend.import_items(
+            payload,
+            ledger,
+            task_id=task_id,
+            root=cwd,
+            source=source,
+            source_ref=source_ref,
+            artifacts=artifacts,
+            timestamp=_now(),
+        )
+        beads_backend.update_agentflow_metadata(cwd, bead_id, {"feedback": updated})
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot record feedback: {exc}", file=sys.stderr)
+        return 2
+    print(f"RECORDED {added} new feedback item(s) on bead:{bead_id}: {', '.join(item_ids)}")
+    print("All imported items remain pending controller disposition.")
+    return 0
+
+
+def feedback_disposition(args: argparse.Namespace) -> int:
+    try:
+        cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
+        note = _safe_feedback_text(getattr(args, "note", ""), "disposition reason", required=False)
+        by = _safe_feedback_text(args.by, "disposition author")
+        acceptance_id = str(getattr(args, "acceptance_id", "") or "")
+        if args.status == "accepted" and isinstance(acceptance, Mapping):
+            errors = _validate_acceptance_data(dict(acceptance))
+            if errors:
+                raise feedback_backend.FeedbackError("acceptance matrix is invalid: " + "; ".join(errors))
+        updated, updated_acceptance = feedback_backend.disposition_item(
+            ledger,
+            task_id=task_id,
+            item_id=args.id,
+            status=args.status,
+            by=by,
+            note=note,
+            acceptance=acceptance if isinstance(acceptance, Mapping) else None,
+            acceptance_id=acceptance_id,
+            related_id=str(getattr(args, "related", "") or ""),
+            root=cwd,
+            timestamp=_now(),
+        )
+        updates: dict[str, Any] = {"feedback": updated}
+        if updated_acceptance is not None:
+            updates["acceptance"] = updated_acceptance
+        beads_backend.update_agentflow_metadata(cwd, bead_id, updates)
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot disposition feedback: {exc}", file=sys.stderr)
+        return 2
+    print(f"DISPOSITIONED bead:{bead_id} {args.id}={args.status}")
+    return 0
+
+
+def feedback_report(args: argparse.Namespace) -> int:
+    try:
+        cwd = _task_cwd(args)
+        root_id = str(getattr(args, "root", "") or "")
+        if root_id:
+            result = _feedback_root_report(cwd, root_id)
+            label = f"root:{root_id}"
+        else:
+            cwd, bead_id, task_id, ledger, acceptance = _load_feedback_target(args)
+            result = _feedback_issue_report(
+                {"id": task_id, "metadata": {"agentflow": {"feedback": ledger, "acceptance": acceptance}}},
+                cwd=cwd,
+                expected_task_id=task_id,
+            )
+            label = f"bead:{bead_id}"
+    except (feedback_backend.FeedbackError, beads_backend.BeadsError, OSError, ValueError) as exc:
+        print(f"Cannot report feedback: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        state = "CLEAR" if result["ok"] else "UNRESOLVED"
+        print(f"{state} {label}: {result['unresolved_count']} unresolved feedback item(s)")
+        task_reports = result.get("tasks")
+        if isinstance(task_reports, list):
+            for task in task_reports:
+                task_state = "CLEAR" if task["ok"] else "UNRESOLVED"
+                print(f"Task {task['task_id']}: {task_state}")
+                _print_feedback_items(task["items"])
+                for error in task["errors"]:
+                    print(f"  ERROR {error}")
+            for error in result.get("errors", []):
+                print(f"ERROR {error}")
+        else:
+            _print_feedback_items(result["items"])
+            for error in result["errors"]:
+                print(f"ERROR {error}")
+    return 0 if result["ok"] else 1
+
+
+def _print_feedback_items(items: list[Mapping[str, Any]]) -> None:
+    for item in items:
+        text_value = json.dumps(item.get("text", ""), ensure_ascii=False)
+        print(f"{item['id']} [{item['status']}] {item['state']}: {text_value}")
+        for reason in item["reasons"]:
+            print(f"  - {reason}")
+
+
+def _feedback_issue_report(
+    issue: Mapping[str, Any], *, cwd: Path, expected_task_id: str
+) -> dict[str, Any]:
+    task_id = str(issue.get("id") or "")
+    if not task_id or task_id != expected_task_id:
+        return {
+            "task_id": expected_task_id,
+            "ok": False,
+            "unresolved_count": 1,
+            "items": [],
+            "errors": ["Bead ID is missing or does not match the selected task"],
+        }
+    metadata = issue.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, Mapping):
+        return {
+            "task_id": task_id, "ok": False, "unresolved_count": 1,
+            "items": [], "errors": ["Bead metadata is malformed"],
+        }
+    agentflow = metadata.get("agentflow", {})
+    if not isinstance(agentflow, Mapping):
+        return {
+            "task_id": task_id, "ok": False, "unresolved_count": 1,
+            "items": [], "errors": ["Bead Agentflow metadata is malformed"],
+        }
+    if "feedback" in agentflow:
+        ledger = agentflow["feedback"]
+        if not isinstance(ledger, Mapping):
+            return {
+                "task_id": task_id, "ok": False, "unresolved_count": 1,
+                "items": [], "errors": ["feedback ledger is unreadable or malformed"],
+            }
+        ledger = dict(ledger)
+    else:
+        ledger = feedback_backend.empty_ledger(task_id)
+    acceptance = agentflow.get("acceptance")
+    result = feedback_backend.report(
+        ledger, task_id=task_id, root=cwd, acceptance=acceptance
+    )
+    if isinstance(acceptance, Mapping):
+        matrix_errors = _validate_acceptance_data(dict(acceptance))
+        if matrix_errors:
+            result["errors"] = [
+                *result["errors"],
+                *[f"acceptance matrix: {error}" for error in matrix_errors],
+            ]
+            result["ok"] = False
+            result["unresolved_count"] = max(1, int(result["unresolved_count"]))
+    return result
+
+
+def _feedback_root_report(cwd: Path, root_id: str) -> dict[str, Any]:
+    errors: list[str] = []
+    try:
+        root_issue = beads_backend.get_issue(cwd, root_id)
+        if str(root_issue.get("id") or "") != root_id:
+            raise beads_backend.BeadsError("root Bead ID did not match the requested workflow root")
+        descendants = beads_backend.root_descendants(cwd, root_id)
+    except beads_backend.BeadsError as exc:
+        return {
+            "root_id": root_id,
+            "ok": False,
+            "unresolved_count": 1,
+            "task_count": 0,
+            "tasks": [],
+            "errors": [f"cannot enumerate feedback workflow: {exc}"],
+        }
+
+    issues: list[Mapping[str, Any]] = [root_issue]
+    seen = {root_id}
+    for descendant in descendants:
+        if not isinstance(descendant, Mapping):
+            errors.append("workflow descendant record is unreadable or malformed")
+            continue
+        descendant_id = str(descendant.get("id") or "")
+        if not descendant_id or descendant_id in seen:
+            errors.append(f"workflow descendant has a missing or duplicate Bead ID: {descendant_id or '(empty)'}")
+            continue
+        seen.add(descendant_id)
+        issues.append(descendant)
+
+    tasks: list[dict[str, Any]] = []
+    unresolved_count = len(errors)
+    for issue in issues:
+        task_id = str(issue.get("id") or "")
+        task_result = _feedback_issue_report(
+            issue, cwd=cwd, expected_task_id=task_id
+        )
+        tasks.append(task_result)
+        unresolved_count += int(task_result.get("unresolved_count") or 0)
+        errors.extend(
+            f"{task_id}: {error}" for error in task_result.get("errors", [])
+        )
+    return {
+        "root_id": root_id,
+        "ok": not errors and all(task["ok"] for task in tasks),
+        "unresolved_count": unresolved_count,
+        "task_count": len(tasks),
+        "tasks": tasks,
+        "errors": errors,
+    }
 
 
 def usage_record(args: argparse.Namespace) -> int:
@@ -8795,7 +11202,7 @@ def handoff_create(args: argparse.Namespace) -> int:
                 "$AGENTFLOW_RESULT_CONTRACT",
                 "$AGENTFLOW_RESULT_FILE",
             ],
-            "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+            "submit_command": provider_argv_backend.fixed_submit_command(),
         }
         if lane == "external"
         else None
@@ -10423,6 +12830,12 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         hook_destination.write_bytes(hook_contents)
 
     output = stage / ".agentflow/tmp/handoffs" / source_handoff.name
+    try:
+        execution_limits = execution_limits_backend.parse_limits(
+            manifest.get("execution_limits")
+        )
+    except execution_limits_backend.ExecutionLimitError as exc:
+        raise ValueError(f"sterile source handoff has invalid execution limits: {exc}") from exc
     create_args = argparse.Namespace(
         to=str(manifest.get("provider")), title=source_handoff.stem,
         goal=str(manifest.get("goal") or ""), task_id=str(manifest.get("task_id") or ""),
@@ -10435,6 +12848,8 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         allow_delegation=bool(manifest.get("delegation_allowed")),
         return_type=str(manifest.get("return_type") or "result"),
         max_ai_credits=manifest.get("max_ai_credits"), acceptance_matrix=copied_acceptance,
+        deadline_seconds=execution_limits.deadline_seconds if execution_limits else None,
+        max_retries=execution_limits.max_retries if execution_limits else None,
         # The package is a fresh directory, not the source workspace. Create
         # it with a directory-local temporary identity, then restore the
         # typed source-workspace contract below before final preflight.
@@ -11036,6 +13451,7 @@ def controller_approve_waiver(args: argparse.Namespace) -> int:
     """Record an exact waiver authorization through the controller lease."""
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
         controller, root = _controller_instance(args)
         key_path = _resume_key_path(args)
         proof = str(getattr(args, "resume_token", "") or "") or _read_resume_key(key_path)
@@ -11131,7 +13547,75 @@ def build_parser() -> argparse.ArgumentParser:
         "--acknowledge-no-ready-halt", action="store_true",
         help="explicitly acknowledge a recognized no-ready-work halt after a fresh safe-boundary check",
     )
+    controller_resume_parser.add_argument(
+        "--continue-after-cancelled-preidentity", metavar="CANCELLED_TASK",
+        help="explicitly continue a signed cancelled preidentity halt; requires --continue-task",
+    )
+    controller_resume_parser.add_argument(
+        "--continue-after-expired-task", metavar="EXPIRED_TASK",
+        help="explicitly continue a signed expired bound-task halt; requires --continue-task",
+    )
+    controller_resume_parser.add_argument(
+        "--continue-task", metavar="READY_TASK",
+        help="exact distinct ready descendant to claim after cancelled preidentity recovery",
+    )
     controller_resume_parser.set_defaults(func=controller_resume)
+    controller_recover_parser = controller_sub.add_parser(
+        "recover-preidentity",
+        help="Retire one expired identity-pending launch only after Herdr confirms its exact pane is absent",
+    )
+    controller_recover_parser.add_argument("--root", required=True)
+    controller_recover_parser.add_argument("--workflow-root", required=True)
+    controller_recover_parser.add_argument("--controller", default="agentflow-controller")
+    controller_recover_parser.add_argument("--task", required=True)
+    controller_recover_parser.add_argument("--launch-id", required=True)
+    controller_recover_parser.add_argument("--pane-id", required=True)
+    controller_recover_parser.add_argument("--state-path", default="")
+    controller_recover_parser.add_argument("--checkpoint-path", default="")
+    controller_recover_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_recover_parser.add_argument("--json", action="store_true")
+    controller_recover_parser.set_defaults(func=controller_recover_preidentity)
+    controller_legacy_retire_parser = controller_sub.add_parser(
+        "retire-superseded-legacy-preidentity",
+        help="Retire an unbudgeted legacy identity-pending launch after its owning scope is superseded",
+    )
+    controller_legacy_retire_parser.add_argument("--root", required=True)
+    controller_legacy_retire_parser.add_argument("--workflow-root", required=True)
+    controller_legacy_retire_parser.add_argument("--controller", default="agentflow-controller")
+    controller_legacy_retire_parser.add_argument("--task", required=True)
+    controller_legacy_retire_parser.add_argument("--launch-id", required=True)
+    controller_legacy_retire_parser.add_argument("--pane-id", required=True)
+    controller_legacy_retire_parser.add_argument("--state-path", default="")
+    controller_legacy_retire_parser.add_argument("--checkpoint-path", default="")
+    controller_legacy_retire_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_legacy_retire_parser.add_argument("--json", action="store_true")
+    controller_legacy_retire_parser.set_defaults(func=controller_retire_superseded_legacy_preidentity)
+    controller_epoch_repair_parser = controller_sub.add_parser(
+        "repair-abandoned-epoch",
+        help=(
+            "Repair one explicitly acknowledged unowned epoch gap from exact protected snapshots; "
+            "does not dispatch a task"
+        ),
+    )
+    controller_epoch_repair_parser.add_argument("--root", required=True)
+    controller_epoch_repair_parser.add_argument("--workflow-root", required=True)
+    controller_epoch_repair_parser.add_argument("--controller", default="agentflow-controller")
+    controller_epoch_repair_parser.add_argument("--task", required=True)
+    controller_epoch_repair_parser.add_argument("--launch-id", required=True)
+    controller_epoch_repair_parser.add_argument("--pane-id", required=True)
+    controller_epoch_repair_parser.add_argument("--state-path", default="")
+    controller_epoch_repair_parser.add_argument("--checkpoint-path", default="")
+    controller_epoch_repair_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_epoch_repair_parser.add_argument(
+        "--acknowledge-abandoned-epoch", action="store_true", required=True,
+        help="owner acknowledgement for this exact single abandoned epoch snapshot",
+    )
+    controller_epoch_repair_parser.add_argument("--abandoned-epoch", type=int, required=True)
+    controller_epoch_repair_parser.add_argument("--expected-state-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--expected-checkpoint-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--expected-contract-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--json", action="store_true")
+    controller_epoch_repair_parser.set_defaults(func=controller_repair_abandoned_epoch)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",
         help="Run one protected root supervisor in a separate terminal; explicitly rerun it after a crash",
@@ -11433,28 +13917,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     install_parser.set_defaults(func=install)
-
-    migrate_parser = sub.add_parser(
-        "migrate", help="Run an explicit, reversible installation migration"
-    )
-    migrate_sub = migrate_parser.add_subparsers(dest="migrate_command", required=True)
-    migrate_legacy_parser = migrate_sub.add_parser(
-        "legacy", help="Replace only integrations provably owned by a legacy checkout"
-    )
-    migrate_legacy_parser.add_argument(
-        "--from", dest="legacy_root", default="",
-        help="legacy Agentflow checkout; required except with --rollback",
-    )
-    migrate_action = migrate_legacy_parser.add_mutually_exclusive_group(required=True)
-    migrate_action.add_argument("--dry-run", action="store_true")
-    migrate_action.add_argument("--apply", action="store_true")
-    migrate_action.add_argument("--rollback", metavar="MIGRATION_ID", default="")
-    migrate_legacy_parser.add_argument(
-        "--new-command", default="",
-        help="packaged Agentflow executable; defaults to the command running this migration",
-    )
-    migrate_legacy_parser.add_argument("--json", action="store_true")
-    migrate_legacy_parser.set_defaults(func=migrate_legacy)
 
     config_commands_backend.register_parser(
         sub,
@@ -11855,6 +14317,39 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_set_parser.add_argument("--note", default="")
     acceptance_set_parser.add_argument("--cwd", default="")
     acceptance_set_parser.set_defaults(func=acceptance_set)
+
+    feedback_parser = sub.add_parser("feedback", help="Track human feedback against Beads tasks and acceptance evidence")
+    feedback_sub = feedback_parser.add_subparsers(dest="feedback_command", required=True)
+    feedback_intake_parser = feedback_sub.add_parser("intake", help="Import feedback as pending, unapproved items")
+    feedback_intake_parser.add_argument("--bead", required=True, help="Task Bead that owns the feedback obligations")
+    feedback_intake_parser.add_argument("--source", required=True, help="Human-readable origin of this feedback")
+    feedback_input = feedback_intake_parser.add_mutually_exclusive_group(required=True)
+    feedback_input.add_argument("--text", default="", help="One distilled feedback item")
+    feedback_input.add_argument("--input", default="", help="JSON array or {\"items\": [...]} of distilled feedback items")
+    feedback_intake_parser.add_argument("--source-ref", default="")
+    feedback_intake_parser.add_argument("--key", default="", help="Validated stable key for a single --text item")
+    feedback_intake_parser.add_argument("--artifact", action="append", default=[], help="Workspace-relative artifact affected by the feedback")
+    feedback_intake_parser.add_argument("--cwd", default="")
+    feedback_intake_parser.set_defaults(func=feedback_intake)
+
+    feedback_disposition_parser = feedback_sub.add_parser("disposition", help="Record an explicit controller disposition")
+    feedback_disposition_parser.add_argument("--bead", required=True)
+    feedback_disposition_parser.add_argument("--id", required=True)
+    feedback_disposition_parser.add_argument("--status", choices=feedback_backend.DISPOSITIONS, required=True)
+    feedback_disposition_parser.add_argument("--by", required=True, help="Controller or human making this disposition")
+    feedback_disposition_parser.add_argument("--note", default="")
+    feedback_disposition_parser.add_argument("--acceptance-id", default="")
+    feedback_disposition_parser.add_argument("--related", default="", help="Existing feedback ID for duplicate/superseded relations")
+    feedback_disposition_parser.add_argument("--cwd", default="")
+    feedback_disposition_parser.set_defaults(func=feedback_disposition)
+
+    feedback_report_parser = feedback_sub.add_parser("report", help="Report unresolved feedback and verify current linked evidence")
+    feedback_target = feedback_report_parser.add_mutually_exclusive_group(required=True)
+    feedback_target.add_argument("--bead", help="Report one task Bead")
+    feedback_target.add_argument("--root", help="Report the workflow root and its exact Beads descendants")
+    feedback_report_parser.add_argument("--cwd", default="")
+    feedback_report_parser.add_argument("--json", action="store_true")
+    feedback_report_parser.set_defaults(func=feedback_report)
 
     review_parser = sub.add_parser("review", help="Record structured review finding dispositions")
     review_sub = review_parser.add_subparsers(dest="review_command", required=True)

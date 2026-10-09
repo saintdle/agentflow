@@ -347,6 +347,21 @@ class RootController:
         state["version"] = 1
         _atomic_json(self.state_path, state)
 
+    @staticmethod
+    def _reject_pending_continuation(state: Mapping[str, Any]) -> None:
+        if "continuation_reattach" in state:
+            raise LeaseConflict(
+                "an authenticated explicit continuation is pending; retry that exact continuation"
+            )
+        if "abandoned_epoch_repair" in state:
+            raise LeaseConflict(
+                "an authenticated abandoned-epoch repair is pending; retry that exact repair"
+            )
+        if "abandoned_epoch_repair_receipt" in state:
+            raise LeaseConflict(
+                "an abandoned-epoch repair halt is pending; explicitly continue with one distinct ready task"
+            )
+
     def _current_lease(self) -> Lease:
         with self._locked():
             lease = self._read_lease(_read_json(self.state_path))
@@ -358,6 +373,7 @@ class RootController:
         now = float(self.clock())
         with self._locked():
             state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
             previous = self._read_lease(state)
             if previous is not None:
                 age = max(0.0, now - previous.heartbeat_at)
@@ -403,6 +419,7 @@ class RootController:
                     )
                     state["epoch"] = epoch
                     state["lease"] = lease.to_storage_dict()
+                    state.pop("dormant_lease", None)
                     self._write_state(state)
                     self._lease = lease
                     return lease
@@ -423,6 +440,40 @@ class RootController:
                     )
                 epoch = previous.epoch + 1
             else:
+                dormant_value = state.get("dormant_lease")
+                dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+                if dormant_value is not None and dormant is None:
+                    raise ControllerError("released controller incarnation record is malformed")
+                if dormant is not None:
+                    if (
+                        dormant.root != self.root
+                        or dormant.epoch != int(state.get("epoch", 0))
+                        or not dormant.continuity_id
+                    ):
+                        raise ControllerError("released controller incarnation does not match root state")
+                    if (
+                        dormant.controller == self.controller
+                        and dormant.verify_resume_proof(resume_proof)
+                    ):
+                        epoch = dormant.epoch + 1
+                        new_secret = secrets.token_urlsafe(32)
+                        lease = Lease(
+                            dormant.root, dormant.controller, epoch,
+                            f"{self.root}/{self.controller}/{epoch}",
+                            dormant.acquired_at, now, self.owner_id,
+                            new_secret, _hash_secret(new_secret),
+                            continuity_id=dormant.continuity_id,
+                        )
+                        state["epoch"] = epoch
+                        state["lease"] = lease.to_storage_dict()
+                        state.pop("dormant_lease", None)
+                        self._write_state(state)
+                        self._lease = lease
+                        return lease
+                    if not takeover:
+                        raise LeaseConflict(
+                            "released controller incarnation requires its protected resume proof"
+                        )
                 epoch = int(state.get("epoch", 0)) + 1
             token = f"{self.root}/{self.controller}/{epoch}"
             # A fresh, cryptographically random resume secret is minted for
@@ -441,9 +492,1039 @@ class RootController:
             )
             state["epoch"] = epoch
             state["lease"] = lease.to_storage_dict()
+            state.pop("dormant_lease", None)
             self._write_state(state)
             self._lease = lease
             return lease
+
+    def recover_released_incarnation(
+        self,
+        *,
+        workflow_root: str,
+        contract: Mapping[str, Any],
+        authority_secret: str,
+        resume_proof: str,
+        persist_credentials: Callable[[Lease], Any] | None = None,
+        superseded_legacy_scope: bool = False,
+    ) -> Lease:
+        """Restore a released lease only from its exact signed launch.
+
+        Older released state discarded the resume-proof hash. This narrow
+        migration accepts no caller-supplied continuity value: it derives the
+        incarnation from a controller-signed return contract and requires the
+        matching protected controller credential. The default path still
+        requires an expired structured deadline. The explicit legacy-scope
+        path accepts only a signed contract with no structured-budget fields;
+        callers must additionally authenticate the missing ledger, task
+        claim, checkpoint, and absent provider pane before invoking it.
+        """
+
+        if not resume_proof:
+            raise LeaseConflict("protected controller resume proof is required")
+        if (
+            not isinstance(contract, Mapping)
+            or contract.get("schema") != "agentflow.return@1"
+            or contract.get("workspace_root") != self.root
+            or contract.get("workflow_root") != workflow_root
+            or contract.get("controller_id") != self.controller
+            or not str(contract.get("task_id") or "")
+            or not str(contract.get("claim_id") or "")
+            or not str(contract.get("launch_id") or "")
+            or not str(contract.get("continuity_id") or "")
+            or not authority_secret
+            or not hmac.compare_digest(
+                str(contract.get("authority_key_id") or ""),
+                hashlib.sha256(authority_secret.encode("utf-8")).hexdigest()[:24],
+            )
+            or not hmac.compare_digest(
+                str(contract.get("authority_hmac") or ""),
+                _authority_mac(authority_secret, contract, domain="return-contract-v1"),
+            )
+        ):
+            raise LeaseConflict("signed launch does not authenticate this released controller incarnation")
+        deadline = contract.get("deadline_epoch")
+        epoch = contract.get("lease_epoch")
+        budget_fields = {
+            "execution_limits", "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+            "attempt", "max_attempts", "max_retries", "execution_limit_capabilities", "budget",
+        }
+        if superseded_legacy_scope:
+            if any(field in contract for field in budget_fields):
+                raise LeaseConflict("legacy-scope recovery requires a signed contract without budget metadata")
+        elif (
+            isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+            or float(self.clock()) < float(deadline)
+        ):
+            raise LeaseConflict("signed launch is not an expired, epoch-bound recovery contract")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise LeaseConflict("signed launch does not carry a valid controller epoch")
+
+        with self._locked():
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            active = self._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = (
+                self._read_lease({"lease": dormant_value})
+                if isinstance(dormant_value, Mapping) else None
+            )
+            if dormant_value is not None and dormant is None:
+                raise LeaseConflict("released controller incarnation record is malformed")
+            old_epoch = int(state.get("epoch", 0))
+            now = float(self.clock())
+            contract_digest = hashlib.sha256(
+                json.dumps(dict(contract), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+
+            # A legacy release discarded the resume-proof hash. Its exact
+            # signed, expired launch and canonical external credential are
+            # the remaining authority, so persist the credential first. A
+            # crash leaves the null-lease state retryable with that credential.
+            if active is None and dormant is None:
+                if old_epoch != epoch:
+                    raise LeaseConflict("signed launch epoch no longer matches released controller state")
+                new_epoch = old_epoch + 1
+                secret = secrets.token_urlsafe(32)
+                lease = Lease(
+                    self.root, self.controller, new_epoch,
+                    f"{self.root}/{self.controller}/{new_epoch}", now, now,
+                    self.owner_id, secret, _hash_secret(secret),
+                    continuity_id=str(contract["continuity_id"]),
+                )
+                if persist_credentials is not None:
+                    persist_credentials(lease)
+                state["epoch"] = new_epoch
+                state["lease"] = lease.to_storage_dict()
+                self._write_state(state)
+                self._lease = lease
+                return lease
+
+            if active is not None or dormant is None:
+                raise LeaseConflict("released controller state is no longer eligible for recovery")
+            if (
+                dormant.root != self.root or dormant.controller != self.controller
+                or dormant.continuity_id != contract.get("continuity_id")
+                or dormant.epoch != old_epoch or dormant.epoch < epoch
+            ):
+                raise LeaseConflict("released controller incarnation does not match signed launch")
+
+            pending = state.get("recovery_reattach")
+            if isinstance(pending, Mapping):
+                pending_payload = dict(pending)
+                pending_mac = str(pending_payload.pop("authority_hmac", ""))
+                expected_fields = {
+                    "schema": "agentflow.recovery_reattach@1",
+                    "root": self.root,
+                    "controller": self.controller,
+                    "workflow_root": workflow_root,
+                    "task_id": str(contract.get("task_id") or ""),
+                    "claim_id": str(contract.get("claim_id") or ""),
+                    "launch_id": str(contract.get("launch_id") or ""),
+                    "continuity_id": str(contract.get("continuity_id") or ""),
+                    "contract_sha256": contract_digest,
+                    "previous_epoch": old_epoch,
+                }
+                if (
+                    any(pending_payload.get(key) != value for key, value in expected_fields.items())
+                    or not hmac.compare_digest(
+                        pending_mac,
+                        _authority_mac(authority_secret, pending_payload, domain="recovery-reattach-v1"),
+                    )
+                ):
+                    raise LeaseConflict("pending released-controller reattach proof is invalid")
+                pending_hash = str(pending_payload.get("resume_secret_hash") or "")
+                if pending_hash and hmac.compare_digest(_hash_secret(resume_proof), pending_hash):
+                    new_epoch = int(pending_payload.get("epoch", 0))
+                    if new_epoch != old_epoch + 1:
+                        raise LeaseConflict("pending released-controller epoch is invalid")
+                    lease = Lease(
+                        self.root, self.controller, new_epoch,
+                        str(pending_payload.get("token") or ""),
+                        float(pending_payload.get("acquired_at", 0)),
+                        float(pending_payload.get("heartbeat_at", 0)),
+                        str(pending_payload.get("owner_id") or ""),
+                        resume_proof, pending_hash,
+                        continuity_id=dormant.continuity_id,
+                    )
+                    state["epoch"] = new_epoch
+                    state["lease"] = lease.to_storage_dict()
+                    state.pop("dormant_lease", None)
+                    state.pop("recovery_reattach", None)
+                    self._write_state(state)
+                    self._lease = lease
+                    return lease
+
+            if not dormant.verify_resume_proof(resume_proof):
+                raise LeaseConflict("released controller incarnation requires its protected resume proof")
+            new_epoch = old_epoch + 1
+            secret = secrets.token_urlsafe(32)
+            lease = Lease(
+                self.root, self.controller, new_epoch,
+                f"{self.root}/{self.controller}/{new_epoch}",
+                dormant.acquired_at, now, self.owner_id, secret, _hash_secret(secret),
+                continuity_id=dormant.continuity_id,
+            )
+            if persist_credentials is not None:
+                payload = {
+                    "schema": "agentflow.recovery_reattach@1",
+                    "root": self.root,
+                    "controller": self.controller,
+                    "workflow_root": workflow_root,
+                    "task_id": str(contract.get("task_id") or ""),
+                    "claim_id": str(contract.get("claim_id") or ""),
+                    "launch_id": str(contract.get("launch_id") or ""),
+                    "continuity_id": dormant.continuity_id,
+                    "contract_sha256": contract_digest,
+                    "previous_epoch": old_epoch,
+                    "epoch": new_epoch,
+                    "token": lease.token,
+                    "acquired_at": lease.acquired_at,
+                    "heartbeat_at": lease.heartbeat_at,
+                    "owner_id": lease.owner_id,
+                    "resume_secret_hash": lease.resume_secret_hash,
+                }
+                payload["authority_hmac"] = _authority_mac(
+                    authority_secret, payload, domain="recovery-reattach-v1",
+                )
+                # Keep the prior dormant proof until the new canonical
+                # credential is durable. The signed intent lets a retry
+                # finish this exact epoch if the process stops after writing
+                # the credential but before committing the active lease.
+                state["recovery_reattach"] = payload
+                self._write_state(state)
+                persist_credentials(lease)
+            state["epoch"] = new_epoch
+            state["lease"] = lease.to_storage_dict()
+            state.pop("dormant_lease", None)
+            state.pop("recovery_reattach", None)
+            self._write_state(state)
+            self._lease = lease
+            return lease
+
+    def repair_abandoned_epoch(
+        self,
+        *,
+        workflow_root: str,
+        contract: Mapping[str, Any],
+        authority_secret: str,
+        resume_proof: str,
+        abandoned_epoch: int,
+        acknowledge_abandoned_epoch: bool,
+        state_sha256: str,
+        checkpoint_sha256: str,
+        contract_sha256: str,
+        persist_credentials: Callable[[Lease], Any],
+    ) -> Lease:
+        """Repair one explicitly acknowledged, unowned legacy epoch gap.
+
+        This is deliberately separate from ordinary released-incarnation
+        recovery.  Its signed intent is bound to one exact state/checkpoint/
+        contract snapshot and remains in controller state until the matching
+        preidentity cancellation has revoked the old return channel and
+        retired the checkpoint pointer.
+        """
+        if not acknowledge_abandoned_epoch:
+            raise LeaseConflict("explicit abandoned-epoch acknowledgement is required")
+        if not callable(persist_credentials) or not resume_proof:
+            raise LeaseConflict("canonical controller credential and protected writer are required")
+        for name, digest in (
+            ("state", state_sha256), ("checkpoint", checkpoint_sha256),
+            ("contract", contract_sha256),
+        ):
+            if not isinstance(digest, str) or len(digest) != 64 or any(
+                char not in "0123456789abcdef" for char in digest
+            ):
+                raise LeaseConflict(f"expected {name} snapshot SHA-256 is malformed")
+        if (
+            not isinstance(contract, Mapping)
+            or contract.get("schema") != "agentflow.return@1"
+            or contract.get("workspace_root") != self.root
+            or contract.get("workflow_root") != workflow_root
+            or contract.get("controller_id") != self.controller
+            or not str(contract.get("task_id") or "")
+            or not str(contract.get("claim_id") or "")
+            or not str(contract.get("launch_id") or "")
+            or not str(contract.get("continuity_id") or "")
+            or not authority_secret
+            or not hmac.compare_digest(
+                str(contract.get("authority_key_id") or ""),
+                hashlib.sha256(authority_secret.encode("utf-8")).hexdigest()[:24],
+            )
+            or not hmac.compare_digest(
+                str(contract.get("authority_hmac") or ""),
+                _authority_mac(authority_secret, contract, domain="return-contract-v1"),
+            )
+        ):
+            raise LeaseConflict("signed launch does not authenticate this abandoned controller incarnation")
+        budget_fields = {
+            "execution_limits", "deadline_epoch", "deadline_seconds", "expires_at", "issued_at",
+            "attempt", "max_attempts", "max_retries", "execution_limit_capabilities", "budget",
+        }
+        if any(field in contract for field in budget_fields):
+            raise LeaseConflict("abandoned legacy repair cannot invent or replace execution-budget evidence")
+        previous_epoch = contract.get("lease_epoch")
+        if (
+            isinstance(previous_epoch, bool) or not isinstance(previous_epoch, int)
+            or previous_epoch < 1 or isinstance(abandoned_epoch, bool)
+            or not isinstance(abandoned_epoch, int) or abandoned_epoch != previous_epoch + 1
+        ):
+            raise LeaseConflict("abandoned epoch must be the exact single gap after the signed launch")
+        canonical_contract_digest = hashlib.sha256(
+            json.dumps(dict(contract), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        expected = {
+            "schema": "agentflow.abandoned_epoch_repair@1",
+            "root": self.root,
+            "controller": self.controller,
+            "workflow_root": workflow_root,
+            "task_id": str(contract["task_id"]),
+            "claim_id": str(contract["claim_id"]),
+            "launch_id": str(contract["launch_id"]),
+            "continuity_id": str(contract["continuity_id"]),
+            "previous_epoch": previous_epoch,
+            "abandoned_epoch": abandoned_epoch,
+            "new_epoch": abandoned_epoch + 1,
+            "state_sha256": state_sha256,
+            "checkpoint_sha256": checkpoint_sha256,
+            "contract_sha256": contract_sha256,
+            "contract_json_sha256": canonical_contract_digest,
+        }
+        now = float(self.clock())
+        with self._locked():
+            state = _read_json(self.state_path)
+            pending_value = state.get("abandoned_epoch_repair")
+            receipt_value = state.get("abandoned_epoch_repair_receipt")
+            completed_receipt = pending_value is None and receipt_value is not None
+            if pending_value is None and receipt_value is None:
+                self._reject_pending_continuation(state)
+                if not self.state_path.is_file() or not self.checkpoint_path.is_file():
+                    raise LeaseConflict("exact protected state and checkpoint snapshots are required")
+                if hashlib.sha256(self.state_path.read_bytes()).hexdigest() != state_sha256:
+                    raise LeaseConflict("controller state changed from the explicitly acknowledged snapshot")
+                if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != checkpoint_sha256:
+                    raise LeaseConflict("controller checkpoint changed from the explicitly acknowledged snapshot")
+                current_epoch = state.get("epoch")
+                if (
+                    isinstance(current_epoch, bool) or not isinstance(current_epoch, int)
+                    or current_epoch != abandoned_epoch
+                    or state.get("lease") is not None
+                    or state.get("dormant_lease") is not None
+                    or "recovery_reattach" in state
+                ):
+                    raise LeaseConflict("only the exact unowned abandoned epoch with no dormant lease can be repaired")
+                document = self._load_checkpoint()
+                rows = _active_tasks_from_checkpoint(document, self.root)
+                if (
+                    checkpoint.admission_phase(document) != "draining"
+                    or checkpoint.resume_state(document) != "draining"
+                    or document.get("terminal") is not False
+                    or document.get("task") != self.root
+                    or document.get("root") != self.root
+                    or document.get("controller") != self.controller
+                    or document.get("epoch") != previous_epoch
+                    or document.get("actor") or document.get("claim_id")
+                    or document.get("session_id") or len(rows) != 1
+                    or rows[0].get("task") != contract["task_id"]
+                    or rows[0].get("claim_id") != contract["claim_id"]
+                    or rows[0].get("state") != "identity_pending"
+                    or rows[0].get("session_id")
+                ):
+                    raise LeaseConflict("checkpoint is not the exact retained unbound legacy launch")
+                nonce = secrets.token_urlsafe(24)
+                candidate_secret = hmac.new(
+                    authority_secret.encode("utf-8"),
+                    f"agentflow:abandoned-epoch-candidate:{nonce}:{resume_proof}".encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                candidate = Lease(
+                    self.root, self.controller, abandoned_epoch + 1,
+                    f"{self.root}/{self.controller}/{abandoned_epoch + 1}",
+                    now, now, self.owner_id, candidate_secret, _hash_secret(candidate_secret),
+                    continuity_id=str(contract["continuity_id"]),
+                )
+                payload = {
+                    **expected,
+                    "nonce": nonce,
+                    "previous_resume_secret_hash": _hash_secret(resume_proof),
+                    "candidate_resume_secret_hash": candidate.resume_secret_hash,
+                    "token": candidate.token,
+                    "acquired_at": candidate.acquired_at,
+                    "heartbeat_at": candidate.heartbeat_at,
+                    "owner_id": candidate.owner_id,
+                }
+                payload["authority_hmac"] = _authority_mac(
+                    authority_secret, payload, domain="abandoned-epoch-repair-v1",
+                )
+                state["abandoned_epoch_repair"] = payload
+                self._write_state(state)
+            else:
+                if pending_value is not None and receipt_value is not None:
+                    raise LeaseConflict("abandoned-epoch repair has conflicting intent and completion records")
+                if completed_receipt:
+                    pending_value = receipt_value
+                if not isinstance(pending_value, Mapping):
+                    raise LeaseConflict("pending abandoned-epoch repair intent is malformed")
+                payload = dict(pending_value)
+                supplied = str(payload.pop("authority_hmac", ""))
+                if (
+                    any(payload.get(key) != value for key, value in expected.items())
+                    or not hmac.compare_digest(
+                        supplied,
+                        _authority_mac(authority_secret, payload, domain="abandoned-epoch-repair-v1"),
+                    )
+                ):
+                    raise LeaseConflict("pending abandoned-epoch repair does not match this exact owner request")
+                if not isinstance(payload.get("nonce"), str) or not payload.get("nonce"):
+                    raise LeaseConflict("pending abandoned-epoch repair nonce is malformed")
+                current_checkpoint_digest = hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+                allowed_checkpoint_digests = {str(payload.get("checkpoint_sha256") or "")}
+                retired_checkpoint_digest = str(payload.get("retired_checkpoint_sha256") or "")
+                if retired_checkpoint_digest:
+                    allowed_checkpoint_digests.add(retired_checkpoint_digest)
+                if current_checkpoint_digest not in allowed_checkpoint_digests:
+                    raise LeaseConflict("checkpoint changed from the exact staged owner-repair transaction")
+                stored_epoch = state.get("epoch")
+                active = self._read_lease(state)
+                if stored_epoch == abandoned_epoch:
+                    if active is not None or state.get("dormant_lease") is not None:
+                        raise LeaseConflict("pending abandoned-epoch repair found a changed lease")
+                elif stored_epoch == abandoned_epoch + 1:
+                    if (
+                        active is None or state.get("dormant_lease") is not None
+                        or active.controller != self.controller or active.root != self.root
+                        or active.epoch != abandoned_epoch + 1
+                        or active.continuity_id != contract.get("continuity_id")
+                        or active.resume_secret_hash != payload.get("candidate_resume_secret_hash")
+                    ):
+                        raise LeaseConflict("pending abandoned-epoch repair lease changed")
+                else:
+                    raise LeaseConflict("pending abandoned-epoch repair state epoch changed")
+                old_hash = str(payload.get("previous_resume_secret_hash") or "")
+                candidate_hash = str(payload.get("candidate_resume_secret_hash") or "")
+                if hmac.compare_digest(_hash_secret(resume_proof), candidate_hash):
+                    candidate_secret = resume_proof
+                elif hmac.compare_digest(_hash_secret(resume_proof), old_hash):
+                    candidate_secret = hmac.new(
+                        authority_secret.encode("utf-8"),
+                        f"agentflow:abandoned-epoch-candidate:{payload['nonce']}:{resume_proof}".encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                else:
+                    raise LeaseConflict("canonical controller credential does not match the staged repair")
+                if not hmac.compare_digest(_hash_secret(candidate_secret), candidate_hash):
+                    raise LeaseConflict("pending abandoned-epoch candidate credential is invalid")
+                candidate = Lease(
+                    self.root, self.controller, abandoned_epoch + 1,
+                    str(payload.get("token") or ""),
+                    float(payload.get("acquired_at", 0)),
+                    float(payload.get("heartbeat_at", 0)),
+                    str(payload.get("owner_id") or ""), candidate_secret,
+                    candidate_hash, continuity_id=str(contract["continuity_id"]),
+                )
+                if not candidate.token or not candidate.owner_id:
+                    raise LeaseConflict("pending abandoned-epoch candidate lease is malformed")
+                if completed_receipt:
+                    current = self._read_lease(state)
+                    document = self._load_checkpoint()
+                    retired_check = (
+                        f"cancelled owner_abandoned_epoch preidentity launch "
+                        f"{contract['launch_id']} for {contract['task_id']}"
+                    )
+                    if (
+                        current is None or state.get("epoch") != candidate.epoch
+                        or state.get("dormant_lease") is not None
+                        or current.epoch != candidate.epoch or current.token != candidate.token
+                        or current.owner_id != candidate.owner_id
+                        or current.continuity_id != candidate.continuity_id
+                        or current.resume_secret_hash != candidate.resume_secret_hash
+                        or not current.verify_resume_proof(resume_proof)
+                        or hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+                            != payload.get("retired_checkpoint_sha256")
+                        or checkpoint.admission_phase(document) != "terminal"
+                        or checkpoint.resume_state(document) != "blocked"
+                        or document.get("terminal") is not True
+                        or document.get("root") != self.root
+                        or document.get("controller") != self.controller
+                        or document.get("epoch") != candidate.epoch
+                        or document.get("task") != self.root
+                        or document.get("last_check") != retired_check
+                        or _active_tasks_from_checkpoint(document, self.root)
+                    ):
+                        raise LeaseConflict("completed abandoned-epoch repair receipt no longer matches its retired halt")
+                    self._lease = candidate
+                    return candidate
+
+            # Persisting the protected credential follows the durable intent.
+            # If either write fails, the exact command can reconstruct and
+            # finish this candidate without accepting a different snapshot.
+            persist_credentials(candidate)
+            state = _read_json(self.state_path)
+            if state.get("abandoned_epoch_repair") != pending_value and pending_value is not None:
+                raise LeaseConflict("pending abandoned-epoch repair changed during credential persistence")
+            pending = state.get("abandoned_epoch_repair")
+            if not isinstance(pending, Mapping):
+                raise LeaseConflict("abandoned-epoch repair intent disappeared before lease commit")
+            current = self._read_lease(state)
+            if current is None:
+                state["epoch"] = candidate.epoch
+                state["lease"] = candidate.to_storage_dict()
+                state.pop("dormant_lease", None)
+                self._write_state(state)
+            elif (
+                current.epoch != candidate.epoch or current.token != candidate.token
+                or current.owner_id != candidate.owner_id
+                or current.resume_secret_hash != candidate.resume_secret_hash
+                or current.continuity_id != candidate.continuity_id
+            ):
+                raise LeaseConflict("abandoned-epoch repair lease changed before commit")
+            self._lease = candidate
+            return candidate
+
+    @staticmethod
+    def _verify_abandoned_epoch_fence_authority(
+        state: Mapping[str, Any], expected: Lease, authority: Mapping[str, Any],
+        *, root: str, controller: str,
+    ) -> None:
+        pending = state.get("abandoned_epoch_repair")
+        if pending is None:
+            pending = state.get("abandoned_epoch_repair_receipt")
+        if not isinstance(pending, Mapping):
+            raise LeaseConflict("abandoned-epoch repair authority has no matching durable intent")
+        payload = dict(pending)
+        supplied = str(payload.pop("authority_hmac", ""))
+        secret = str(authority.get("authority_secret") or "")
+        if (
+            payload.get("root") != root or payload.get("controller") != controller
+            or payload.get("workflow_root") != authority.get("workflow_root")
+            or payload.get("task_id") != authority.get("task_id")
+            or payload.get("claim_id") != authority.get("claim_id")
+            or payload.get("launch_id") != authority.get("launch_id")
+            or payload.get("contract_sha256") != authority.get("contract_sha256")
+            or payload.get("new_epoch") != expected.epoch
+            or payload.get("continuity_id") != expected.continuity_id
+            or payload.get("candidate_resume_secret_hash") != expected.resume_secret_hash
+            or not secret
+            or not hmac.compare_digest(
+                supplied, _authority_mac(secret, payload, domain="abandoned-epoch-repair-v1"),
+            )
+        ):
+            raise LeaseConflict("abandoned-epoch repair authority does not match the staged exact launch")
+
+    @staticmethod
+    def _signed_owner_receipt_payload(
+        state: Mapping[str, Any], *, root: str, controller: str,
+        workflow_root: str, cancelled_task: str, authority_secret: str,
+    ) -> dict[str, Any] | None:
+        receipt = state.get("abandoned_epoch_repair_receipt")
+        if receipt is None:
+            return None
+        if not isinstance(receipt, Mapping):
+            raise LeaseConflict("abandoned-epoch repair completion receipt is malformed")
+        payload = dict(receipt)
+        supplied = str(payload.pop("authority_hmac", ""))
+        if (
+            payload.get("schema") != "agentflow.abandoned_epoch_repair@1"
+            or payload.get("root") != root
+            or payload.get("controller") != controller
+            or payload.get("workflow_root") != workflow_root
+            or payload.get("task_id") != cancelled_task
+            or payload.get("continuity_id") == ""
+            or not authority_secret
+            or not hmac.compare_digest(
+                supplied,
+                _authority_mac(authority_secret, payload, domain="abandoned-epoch-repair-v1"),
+            )
+        ):
+            raise LeaseConflict("abandoned-epoch repair receipt does not authenticate this exact cancelled launch")
+        return payload
+
+    def _verify_owner_receipt_for_new_continuation(
+        self, state: Mapping[str, Any], *, workflow_root: str,
+        cancelled_task: str, ready_task: str, authority_secret: str,
+        resume_proof: str,
+    ) -> dict[str, Any] | None:
+        payload = self._signed_owner_receipt_payload(
+            state, root=self.root, controller=self.controller,
+            workflow_root=workflow_root, cancelled_task=cancelled_task,
+            authority_secret=authority_secret,
+        )
+        if payload is None:
+            return None
+        current = self._read_lease(state)
+        try:
+            expected_epoch = int(payload["new_epoch"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("abandoned-epoch receipt epoch is malformed") from exc
+        document = self._load_checkpoint()
+        retired_check = (
+            f"cancelled owner_abandoned_epoch preidentity launch "
+            f"{payload.get('launch_id')} for {cancelled_task}"
+        )
+        checkpoint_digest = hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+        if (
+            ready_task == cancelled_task
+            or current is None or state.get("epoch") != expected_epoch
+            or current.epoch != expected_epoch or current.root != self.root
+            or current.controller != self.controller
+            or current.continuity_id != payload.get("continuity_id")
+            or current.resume_secret_hash != payload.get("candidate_resume_secret_hash")
+            or not current.verify_resume_proof(resume_proof)
+            or payload.get("retired_checkpoint_sha256") != checkpoint_digest
+            or checkpoint.admission_phase(document) != "terminal"
+            or checkpoint.resume_state(document) != "blocked"
+            or document.get("terminal") is not True
+            or document.get("root") != self.root
+            or document.get("controller") != self.controller
+            or document.get("epoch") != expected_epoch
+            or document.get("task") != self.root
+            or document.get("last_check") != retired_check
+            or _active_tasks_from_checkpoint(document, self.root)
+        ):
+            raise LeaseConflict("owner-repair receipt is not an unconsumed exact cancelled-preidentity halt")
+        return payload
+
+    def _verify_staged_owner_receipt_link(
+        self, state: Mapping[str, Any], pending: Mapping[str, Any], *,
+        workflow_root: str, cancelled_task: str, authority_secret: str,
+    ) -> None:
+        receipt = self._signed_owner_receipt_payload(
+            state, root=self.root, controller=self.controller,
+            workflow_root=workflow_root, cancelled_task=cancelled_task,
+            authority_secret=authority_secret,
+        )
+        receipt_hash = ""
+        if receipt is not None:
+            raw = state.get("abandoned_epoch_repair_receipt")
+            receipt_hash = hashlib.sha256(
+                json.dumps(dict(raw), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        supplied_hash = str(pending.get("owner_repair_receipt_sha256") or "")
+        if receipt_hash != supplied_hash:
+            raise LeaseConflict("staged continuation does not consume the exact owner-repair receipt")
+        if receipt is not None and (
+            pending.get("previous_epoch") != receipt.get("new_epoch")
+            or pending.get("continuity_id") != receipt.get("continuity_id")
+        ):
+            raise LeaseConflict("staged continuation does not follow the repaired controller incarnation")
+
+    def pending_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Mapping[str, Any] | None:
+        """Authenticate a staged exact-target continuation, if one exists."""
+        with self._locked():
+            state = _read_json(self.state_path)
+            if "continuation_reattach" not in state:
+                self._verify_owner_receipt_for_new_continuation(
+                    state, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, ready_task=ready_task,
+                    authority_secret=authority_secret, resume_proof=resume_proof,
+                )
+                return None
+            pending = state["continuation_reattach"]
+            if not isinstance(pending, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
+            payload = dict(pending)
+            supplied = str(payload.pop("authority_hmac", ""))
+            expected = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root,
+                "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task,
+                "ready_task": ready_task,
+            }
+            if (
+                any(payload.get(key) != value for key, value in expected.items())
+                or not hmac.compare_digest(
+                    supplied,
+                    _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+                )
+            ):
+                raise LeaseConflict("staged continuation does not authenticate this exact target")
+            self._verify_staged_owner_receipt_link(
+                state, pending, workflow_root=workflow_root,
+                cancelled_task=cancelled_task, authority_secret=authority_secret,
+            )
+            try:
+                previous_epoch = int(payload["previous_epoch"])
+                candidate_epoch = int(payload["epoch"])
+                state_epoch = int(state.get("epoch", -1))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LeaseConflict("staged continuation epochs are malformed") from exc
+            if (
+                candidate_epoch != previous_epoch + 1
+                or state_epoch not in {previous_epoch, candidate_epoch}
+                or payload.get("continuity_id") != self._continuity_for_staged_state(state, previous_epoch, candidate_epoch)
+                or payload.get("token") != f"{self.root}/{self.controller}/{candidate_epoch}"
+            ):
+                raise LeaseConflict("staged continuation no longer matches its protected incarnation")
+            active = self._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            candidate_hash = str(payload.get("resume_secret_hash") or "")
+            candidate_proof = bool(
+                resume_proof and candidate_hash
+                and hmac.compare_digest(_hash_secret(resume_proof), candidate_hash)
+            )
+            if state_epoch == previous_epoch:
+                previous = active or dormant
+                if (
+                    previous is None or previous.epoch != previous_epoch
+                    or previous.root != self.root or previous.controller != self.controller
+                    or previous.continuity_id != payload.get("continuity_id")
+                    or (not candidate_proof and not previous.verify_resume_proof(resume_proof))
+                ):
+                    raise LeaseConflict("staged continuation requires its exact current or rotated credential")
+            else:
+                candidate = active
+                if (
+                    candidate is None or candidate.epoch != candidate_epoch
+                    or candidate.root != self.root or candidate.controller != self.controller
+                    or candidate.continuity_id != payload.get("continuity_id")
+                    or candidate.token != payload.get("token")
+                    or candidate.resume_secret_hash != candidate_hash
+                    or not candidate_proof or not candidate.verify_resume_proof(resume_proof)
+                ):
+                    raise LeaseConflict("staged continuation requires its exact committed credential")
+            return dict(pending)
+
+    def _continuity_for_staged_state(
+        self, state: Mapping[str, Any], previous_epoch: int, candidate_epoch: int,
+    ) -> str:
+        active = self._read_lease(state)
+        dormant_value = state.get("dormant_lease")
+        dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+        expected_epoch = int(state.get("epoch", -1))
+        expected = candidate_epoch if expected_epoch == candidate_epoch else previous_epoch
+        lease = active if active is not None and active.epoch == expected else dormant
+        if lease is None or lease.epoch != expected or lease.root != self.root or lease.controller != self.controller:
+            return ""
+        return lease.continuity_id
+
+    def _authenticated_pending_candidate(
+        self,
+        state: Mapping[str, Any],
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Lease:
+        """Verify the only lease allowed to mutate a staged continuation."""
+        pending = state.get("continuation_reattach")
+        if not isinstance(pending, Mapping):
+            raise LeaseConflict("staged continuation record is missing or malformed")
+        payload = dict(pending)
+        supplied = str(payload.pop("authority_hmac", ""))
+        expected = {
+            "schema": "agentflow.continuation-reattach@1",
+            "root": self.root,
+            "controller": self.controller,
+            "workflow_root": workflow_root,
+            "cancelled_task": cancelled_task,
+            "ready_task": ready_task,
+        }
+        if (
+            not authority_secret
+            or any(payload.get(key) != value for key, value in expected.items())
+            or not hmac.compare_digest(
+                supplied, _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+            )
+        ):
+            raise LeaseConflict("staged continuation does not authenticate this exact target")
+        self._verify_staged_owner_receipt_link(
+            state, pending, workflow_root=workflow_root,
+            cancelled_task=cancelled_task, authority_secret=authority_secret,
+        )
+        try:
+            previous_epoch = int(payload["previous_epoch"])
+            candidate_epoch = int(payload["epoch"])
+            state_epoch = int(state.get("epoch", -1))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("staged continuation epochs are malformed") from exc
+        active = self._read_lease(state)
+        candidate_hash = str(payload.get("resume_secret_hash") or "")
+        if (
+            candidate_epoch != previous_epoch + 1
+            or state_epoch != candidate_epoch
+            or active is None
+            or active.root != self.root
+            or active.controller != self.controller
+            or active.epoch != candidate_epoch
+            or active.token != payload.get("token")
+            or active.continuity_id != payload.get("continuity_id")
+            or active.resume_secret_hash != candidate_hash
+            or not hmac.compare_digest(_hash_secret(resume_proof), candidate_hash)
+        ):
+            raise LeaseConflict("staged continuation requires its exact committed credential")
+        candidate = self._continuation_lease_from_record(pending, resume_proof)
+        if not self._lease_matches(active, candidate):
+            raise LeaseConflict("staged continuation lease no longer matches protected state")
+        return candidate
+
+    def authorize_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Lease:
+        """Authorize only the exact candidate lease saved in a continuation intent."""
+        with self._locked():
+            state = _read_json(self.state_path)
+            candidate = self._authenticated_pending_candidate(
+                state, workflow_root=workflow_root, cancelled_task=cancelled_task,
+                ready_task=ready_task, authority_secret=authority_secret,
+                resume_proof=resume_proof,
+            )
+            self._lease = candidate
+            return candidate
+
+    def reattach_for_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        checkpoint_epoch: int,
+        authority_secret: str,
+        resume_proof: str,
+        persist_credentials: Callable[[Lease], Any],
+    ) -> Lease:
+        """Rotate credentials under a signed, exact-target retry intent."""
+        if not all((workflow_root, cancelled_task, ready_task, authority_secret, resume_proof)):
+            raise LeaseConflict("explicit continuation reattach is missing an authenticated identity")
+        if cancelled_task == ready_task:
+            raise LeaseConflict("continuation target must differ from the cancelled task")
+        with self._locked():
+            state = _read_json(self.state_path)
+            active = self._read_lease(state)
+            dormant_value = state.get("dormant_lease")
+            dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
+            if dormant_value is not None and dormant is None:
+                raise LeaseConflict("dormant controller lease is malformed")
+            pending_value = state.get("continuation_reattach")
+            if "continuation_reattach" in state and not isinstance(pending_value, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
+            pending: dict[str, Any] | None = None
+            owner_receipt_hash = ""
+            if pending_value is not None:
+                if not isinstance(pending_value, Mapping):
+                    raise LeaseConflict("staged continuation reattach record is malformed")
+                pending = dict(pending_value)
+                supplied = str(pending.pop("authority_hmac", ""))
+                expected = {
+                    "schema": "agentflow.continuation-reattach@1",
+                    "root": self.root, "controller": self.controller,
+                    "workflow_root": workflow_root,
+                    "cancelled_task": cancelled_task, "ready_task": ready_task,
+                }
+                if (
+                    any(pending.get(key) != value for key, value in expected.items())
+                    or not hmac.compare_digest(
+                        supplied,
+                        _authority_mac(authority_secret, pending, domain="continuation-reattach-v1"),
+                    )
+                ):
+                    raise LeaseConflict("staged continuation does not authenticate this exact target")
+                self._verify_staged_owner_receipt_link(
+                    state, pending_value, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, authority_secret=authority_secret,
+                )
+                if checkpoint_epoch not in {pending.get("previous_epoch"), pending.get("epoch")}:
+                    raise LeaseConflict("staged continuation checkpoint epoch changed")
+                candidate_hash = str(pending.get("resume_secret_hash") or "")
+                try:
+                    previous_epoch = int(pending["previous_epoch"])
+                    candidate_epoch = int(pending["epoch"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise LeaseConflict("staged continuation epochs are malformed") from exc
+                if candidate_epoch != previous_epoch + 1 or int(state.get("epoch", -1)) not in {
+                    previous_epoch, candidate_epoch,
+                }:
+                    raise LeaseConflict("staged continuation epochs no longer match the protected lease")
+                if (
+                    active is not None and active.epoch == candidate_epoch
+                    and active.root == self.root and active.controller == self.controller
+                    and active.continuity_id == pending.get("continuity_id")
+                    and active.token == pending.get("token")
+                    and active.resume_secret_hash == candidate_hash
+                    and int(state.get("epoch", -1)) == candidate_epoch
+                    and active.verify_resume_proof(resume_proof)
+                ):
+                    candidate = self._continuation_lease_from_record(pending_value, resume_proof)
+                    if not self._lease_matches(active, candidate):
+                        raise LeaseConflict("staged continuation lease no longer matches protected state")
+                    self._lease = candidate
+                    return candidate
+                if candidate_hash and hmac.compare_digest(
+                    hashlib.sha256(resume_proof.encode("utf-8")).hexdigest(), candidate_hash,
+                ):
+                    previous = active or dormant
+                    if (
+                        previous is None or previous.root != self.root
+                        or previous.controller != self.controller
+                        or previous.epoch != previous_epoch
+                        or previous.continuity_id != pending.get("continuity_id")
+                    ):
+                        raise LeaseConflict("staged continuation no longer matches its original incarnation")
+                    candidate = self._continuation_lease_from_record(pending, resume_proof)
+                    state["epoch"] = candidate.epoch
+                    state["lease"] = candidate.to_storage_dict()
+                    state.pop("dormant_lease", None)
+                    self._write_state(state)
+                    self._lease = candidate
+                    return candidate
+            else:
+                receipt = self._verify_owner_receipt_for_new_continuation(
+                    state, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, ready_task=ready_task,
+                    authority_secret=authority_secret, resume_proof=resume_proof,
+                )
+                if receipt is not None:
+                    raw_receipt = state.get("abandoned_epoch_repair_receipt")
+                    owner_receipt_hash = hashlib.sha256(
+                        json.dumps(dict(raw_receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest()
+            previous = active or dormant
+            if (
+                previous is None or previous.root != self.root
+                or previous.controller != self.controller
+                or previous.epoch != int(state.get("epoch", -1))
+                or previous.epoch != checkpoint_epoch
+                or not previous.verify_resume_proof(resume_proof)
+                or not previous.continuity_id
+            ):
+                raise LeaseConflict("explicit continuation requires its exact current protected credential")
+            now = float(self.clock())
+            epoch = previous.epoch + 1
+            secret = secrets.token_urlsafe(32)
+            candidate = Lease(
+                self.root, self.controller, epoch, f"{self.root}/{self.controller}/{epoch}",
+                previous.acquired_at, now, self.owner_id, secret, _hash_secret(secret),
+                continuity_id=previous.continuity_id,
+            )
+            payload = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root, "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task, "ready_task": ready_task,
+                "continuity_id": previous.continuity_id,
+                "previous_epoch": previous.epoch, "epoch": epoch,
+                "token": candidate.token, "acquired_at": candidate.acquired_at,
+                "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
+                "resume_secret_hash": candidate.resume_secret_hash,
+            }
+            if owner_receipt_hash:
+                payload["owner_repair_receipt_sha256"] = owner_receipt_hash
+            payload["authority_hmac"] = _authority_mac(
+                authority_secret, payload, domain="continuation-reattach-v1",
+            )
+            state["continuation_reattach"] = payload
+            self._write_state(state)
+            persist_credentials(candidate)
+            state["epoch"] = candidate.epoch
+            state["lease"] = candidate.to_storage_dict()
+            state.pop("dormant_lease", None)
+            self._write_state(state)
+            self._lease = candidate
+            return candidate
+
+    def clear_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        lease: Lease | str,
+    ) -> None:
+        """Clear a staged continuation only after its target is checkpointed."""
+        with self.fence(
+            lease,
+            _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
+        ) as current:
+            state = _read_json(self.state_path)
+            pending = state.get("continuation_reattach")
+            if "continuation_reattach" not in state:
+                return
+            if not isinstance(pending, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
+            payload = dict(pending)
+            supplied = str(payload.pop("authority_hmac", ""))
+            expected = {
+                "schema": "agentflow.continuation-reattach@1",
+                "root": self.root, "controller": self.controller,
+                "workflow_root": workflow_root,
+                "cancelled_task": cancelled_task, "ready_task": ready_task,
+                "epoch": current.epoch, "continuity_id": current.continuity_id,
+            }
+            checkpoint = self._load_checkpoint()
+            expected_check = (
+                f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+                f"ready descendant {ready_task} after {cancelled_task}"
+            )
+            if (
+                any(payload.get(key) != value for key, value in expected.items())
+                or not hmac.compare_digest(
+                    supplied,
+                    _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+                )
+                or int(state.get("epoch", -1)) != current.epoch
+                or payload.get("previous_epoch") != current.epoch - 1
+                or payload.get("token") != current.token
+                or payload.get("resume_secret_hash") != current.resume_secret_hash
+                or checkpoint.get("root") != self.root
+                or checkpoint.get("controller") != self.controller
+                or checkpoint.get("task") != self.root
+                or checkpoint.get("phase") != "controller"
+                or checkpoint.get("state") != "advancing"
+                or checkpoint.get("terminal") is not False
+                or checkpoint.get("active_tasks")
+                or checkpoint.get("actor") or checkpoint.get("claim_id") or checkpoint.get("session_id")
+                or checkpoint.get("last_check") != expected_check
+                or checkpoint.get("pending_continuation_task") != ready_task
+                or checkpoint.get("epoch") != current.epoch
+                or checkpoint.get("lease_token") != current.token
+            ):
+                raise LeaseConflict("staged continuation cannot be cleared before its exact target is durable")
+            state.pop("continuation_reattach", None)
+            receipt_hash = str(payload.get("owner_repair_receipt_sha256") or "")
+            if receipt_hash:
+                receipt = state.get("abandoned_epoch_repair_receipt")
+                actual_receipt_hash = hashlib.sha256(
+                    json.dumps(dict(receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest() if isinstance(receipt, Mapping) else ""
+                if actual_receipt_hash != receipt_hash:
+                    raise LeaseConflict("owner-repair receipt changed before exact continuation consumption")
+                state.pop("abandoned_epoch_repair_receipt", None)
+            self._write_state(state)
+
+    @staticmethod
+    def _continuation_lease_from_record(value: Mapping[str, Any], resume_proof: str) -> Lease:
+        try:
+            epoch = int(value["epoch"])
+            resume_hash = str(value["resume_secret_hash"])
+            if not hmac.compare_digest(_hash_secret(resume_proof), resume_hash):
+                raise ValueError("staged credential does not match")
+            return Lease(
+                root=str(value["root"]), controller=str(value["controller"]),
+                epoch=epoch, token=str(value["token"]),
+                acquired_at=float(value["acquired_at"]), heartbeat_at=float(value["heartbeat_at"]),
+                owner_id=str(value.get("owner_id") or ""), resume_secret=resume_proof,
+                resume_secret_hash=resume_hash, continuity_id=str(value["continuity_id"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("staged continuation lease is malformed") from exc
 
     def _lease_matches(self, current: Lease, expected: Lease | str) -> bool:
         if isinstance(expected, str):
@@ -485,7 +1566,9 @@ class RootController:
         if not resume_proof:
             raise LeaseConflict("controller resume proof is required")
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
         if (
             current is None
             or current.root != self.root
@@ -510,7 +1593,9 @@ class RootController:
             raise FencedLease("controller lease is required")
         now = float(self.clock())
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
             state = _read_json(self.state_path)
@@ -537,17 +1622,30 @@ class RootController:
         if expected is None:
             raise FencedLease("controller lease is required")
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
             state = _read_json(self.state_path)
             state["epoch"] = current.epoch
+            # Keep the private proof hash and incarnation identity across a
+            # clean release so an authenticated later resume does not become
+            # a different result-owning controller. The next acquisition
+            # consumes this record and rotates the proof as usual.
+            state["dormant_lease"] = current.to_storage_dict()
             state["lease"] = None
             self._write_state(state)
             self._lease = None
 
     @contextmanager
-    def fence(self, lease: Lease | str | None = None):
+    def fence(
+        self,
+        lease: Lease | str | None = None,
+        *,
+        _continuation_authority: tuple[str, str, str, str] | None = None,
+        _abandoned_epoch_repair_authority: Mapping[str, Any] | None = None,
+    ):
         """Hold the controller lock across an external critical section.
 
         Re-verifies ``lease`` (or the retained lease) at entry, exactly like
@@ -568,9 +1666,42 @@ class RootController:
         handle = self.lock_path.open("a+", encoding="utf-8")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
+            if "continuation_reattach" in state:
+                if _continuation_authority is None or not isinstance(expected, Lease):
+                    self._reject_pending_continuation(state)
+                workflow_root, cancelled_task, ready_task, authority_secret = _continuation_authority
+                self._authenticated_pending_candidate(
+                    state, workflow_root=workflow_root, cancelled_task=cancelled_task,
+                    ready_task=ready_task, authority_secret=authority_secret,
+                    resume_proof=expected.resume_secret,
+                )
+            if "abandoned_epoch_repair" in state:
+                if _abandoned_epoch_repair_authority is None or not isinstance(expected, Lease):
+                    self._reject_pending_continuation(state)
+                self._verify_abandoned_epoch_fence_authority(
+                    state, expected, _abandoned_epoch_repair_authority,
+                    root=self.root, controller=self.controller,
+                )
+            elif _abandoned_epoch_repair_authority is not None:
+                if not isinstance(expected, Lease):
+                    raise FencedLease("owner repair requires the exact candidate lease")
+                self._verify_abandoned_epoch_fence_authority(
+                    state, expected, _abandoned_epoch_repair_authority,
+                    root=self.root, controller=self.controller,
+                )
+            if "abandoned_epoch_repair_receipt" in state:
+                if "continuation_reattach" in state:
+                    if _abandoned_epoch_repair_authority is not None:
+                        raise LeaseConflict("owner-repair receipt is already being consumed by its exact continuation")
+                elif (
+                    _abandoned_epoch_repair_authority is None
+                    or _continuation_authority is not None
+                ):
+                    self._reject_pending_continuation(state)
             self._lease = current
             yield current
         finally:
@@ -651,6 +1782,19 @@ class RootController:
             raise ControllerError(f"task {task_id} is not ready")
         return task_id
 
+    @staticmethod
+    def _require_pending_continuation_target(document: Mapping[str, Any], task_id: str) -> str:
+        pending = document.get("pending_continuation_task")
+        if pending in (None, ""):
+            return ""
+        if not isinstance(pending, str) or not pending.strip():
+            raise ControllerError("durable continuation target is malformed")
+        if task_id != pending:
+            raise ControllerError(
+                f"task {task_id} does not match durable continuation target {pending}"
+            )
+        return pending
+
     def _base_checkpoint(self) -> dict[str, Any]:
         return checkpoint.build_checkpoint(
             {
@@ -683,7 +1827,10 @@ class RootController:
         same lock instead of racing it.
         """
         if lease is None:
-            return checkpoint.write_checkpoint(self.checkpoint_path, document)
+            with self._locked():
+                state = _read_json(self.state_path)
+                self._reject_pending_continuation(state)
+                return checkpoint.write_checkpoint(self.checkpoint_path, document)
         with self.fence(lease):
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
 
@@ -744,6 +1891,7 @@ class RootController:
         task_id = self._assert_task_root(task)
         with self.fence(lease) as current:
             document = self._load_checkpoint()
+            self._require_pending_continuation_target(document, task_id)
             rows = _active_tasks_from_checkpoint(document, self.root)
             if any(item["task"] == task_id for item in rows):
                 raise ControllerError(f"task {task_id} is already present in the active task set")
@@ -758,6 +1906,11 @@ class RootController:
                 "state": "claimed_no_session",
             }
             rows.append(row)
+            if document.get("pending_continuation_task") == task_id:
+                # The active pointer replaces the pending selection in the
+                # same atomic checkpoint write. Before it, retries retain the
+                # exact target; after it, claimed_no_session fences dispatch.
+                document["pending_continuation_task"] = ""
             return self._result(self._checkpoint_active_tasks(document, rows, current), resumed=False)
 
     def bind_active_task(
@@ -782,6 +1935,33 @@ class RootController:
             matches[0]["session_id"] = session_id
             matches[0]["state"] = state
             return self._result(self._checkpoint_active_tasks(document, rows, current), dispatched=True)
+
+    def reconcile_pending_active_task_binding(
+        self,
+        task_id: str,
+        claim_id: str,
+        session_id: str,
+        *,
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fence a resolved native identity onto its exact pending reservation."""
+        if not task_id or not claim_id or not session_id:
+            raise ControllerError("resolved task, claim, and session identity are required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            matches = [item for item in rows if item["task"] == task_id]
+            if (
+                len(matches) != 1
+                or matches[0]["state"] != "identity_pending"
+                or matches[0]["claim_id"] != claim_id
+                or matches[0]["actor"] != current.controller
+                or matches[0]["session_id"]
+            ):
+                raise ControllerError("task has no exact unresolved identity-pending reservation")
+            matches[0]["session_id"] = session_id
+            matches[0]["state"] = "running"
+            return self._result(self._checkpoint_active_tasks(document, rows, current), resumed=True)
 
     def complete_active_task(
         self, task_id: str, *, lease: Lease | str | None = None,
@@ -831,12 +2011,20 @@ class RootController:
             saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
             return self._result(saved, resumed=True)
 
-    def _result(self, document: Mapping[str, Any], *, dispatched: bool = False, resumed: bool = False) -> ResumeResult:
+    def _result(
+        self,
+        document: Mapping[str, Any],
+        *,
+        dispatched: bool = False,
+        resumed: bool = False,
+        task: str | None = None,
+        session_id: str | None = None,
+    ) -> ResumeResult:
         state = checkpoint.resume_state(dict(document))
         return ResumeResult(
             state=state,
-            task=str(document.get("task") or ""),
-            session_id=str(document.get("session_id") or ""),
+            task=str(document.get("task") or "") if task is None else task,
+            session_id=str(document.get("session_id") or "") if session_id is None else session_id,
             dispatched=dispatched,
             halted=state in TERMINAL_STATES,
             resumed=resumed,
@@ -857,52 +2045,68 @@ class RootController:
         leaves an auditable halt for an operator instead of an implicit retry.
         """
 
-        current_lease = self.assert_lease(lease)
-        document = self._load_checkpoint()
-        phase = checkpoint.admission_phase(document)
-        state = checkpoint.resume_state(document)
-        if phase == "terminal":
-            return self._result(document, resumed=True)
-        if phase == "draining":
-            # A resumable deadline status can coexist with a durable drain.
-            # Reconciliation may continue elsewhere, but this admission API
-            # must never turn it into permission to select a fresh candidate.
-            return self._result(document, resumed=True)
-        if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
-            return self._result(document, resumed=True)
+        # Keep selection and the pending-target check in the same lease-fenced
+        # transaction as the durable pre-launch reservation. Once the exact
+        # target is reserved, claimed_no_session replaces the pending pointer
+        # atomically; a competing scheduler then observes that reservation.
+        with self.fence(lease) as current_lease:
+            document = self._load_checkpoint()
+            phase = checkpoint.admission_phase(document)
+            state = checkpoint.resume_state(document)
+            if phase == "terminal":
+                return self._result(document, resumed=True)
+            if phase == "draining":
+                # A resumable deadline status can coexist with a durable drain.
+                # Reconciliation may continue elsewhere, but this admission API
+                # must never turn it into permission to select a fresh candidate.
+                return self._result(document, resumed=True)
+            if state in {"claimed", "claimed_no_session", "running", "launched", "identity_pending"}:
+                return self._result(document, resumed=True)
+            candidate_rows = [dict(task) for task in tasks]
+            for candidate in candidate_rows:
+                self._assert_task_root(candidate)
+            candidates = sorted(
+                candidate_rows,
+                key=lambda item: str(item.get("task") or item.get("task_id") or item.get("id") or ""),
+            )
+            if not candidates:
+                return self._result(document, resumed=True)
 
-        candidate_rows = [dict(task) for task in tasks]
-        for candidate in candidate_rows:
-            self._assert_task_root(candidate)
-        candidates = sorted(
-            candidate_rows,
-            key=lambda item: str(item.get("task") or item.get("task_id") or item.get("id") or ""),
-        )
-        if not candidates:
-            return self._result(document, resumed=True)
-        selected = candidates[0]
-        task_id = self._assert_task_root(selected)
-        claim = selected.get("claim_id") or selected.get("claim") or ""
-        actor = str(selected.get("actor") or selected.get("assignee") or "")
-        before_launch = dict(document)
-        before_launch.update(
-            {
-                "task": task_id,
-                "phase": str(selected.get("phase") or "dispatch"),
-                "next_action": "resume claimed task",
-                "root": self.root,
-                "controller": self.controller,
-                "actor": actor,
-                "claim_id": str(claim),
-                "epoch": current_lease.epoch,
-                "lease_token": current_lease.token,
-                "session_id": "",
-                "state": "claimed_no_session",
-                "status": "claimed_no_session",
-                "terminal": False,
-            }
-        )
-        document = self._save_checkpoint(before_launch, lease=current_lease)
+            pending_target = str(document.get("pending_continuation_task") or "")
+            if pending_target:
+                matching = [candidate for candidate in candidates if self._assert_task_root(candidate) == pending_target]
+                if len(matching) != 1:
+                    raise ControllerError(
+                        f"resume candidates must contain exactly one durable continuation target {pending_target}"
+                    )
+                selected = matching[0]
+            else:
+                selected = candidates[0]
+            task_id = self._assert_task_root(selected)
+            self._require_pending_continuation_target(document, task_id)
+            claim = selected.get("claim_id") or selected.get("claim") or ""
+            actor = str(selected.get("actor") or selected.get("assignee") or "")
+            before_launch = dict(document)
+            before_launch.update(
+                {
+                    "task": task_id,
+                    "phase": str(selected.get("phase") or "dispatch"),
+                    "next_action": "resume claimed task",
+                    "root": self.root,
+                    "controller": self.controller,
+                    "actor": actor,
+                    "claim_id": str(claim),
+                    "epoch": current_lease.epoch,
+                    "lease_token": current_lease.token,
+                    "session_id": "",
+                    "state": "claimed_no_session",
+                    "status": "claimed_no_session",
+                    "terminal": False,
+                }
+            )
+            if pending_target:
+                before_launch["pending_continuation_task"] = ""
+            document = checkpoint.write_checkpoint(self.checkpoint_path, before_launch)
         if dispatch is None:
             return self._result(document, resumed=False)
 
@@ -918,17 +2122,71 @@ class RootController:
         else:
             session_id = str(outcome or "")
             outcome_state = ""
-        # Dispatch may have taken long enough for an explicit takeover.  The
-        # old epoch must never be allowed to write a post-dispatch checkpoint.
-        current_lease = self.assert_lease(current_lease)
-        after_launch = dict(document)
-        after_launch["session_id"] = session_id
-        after_launch["state"] = outcome_state or ("running" if session_id else "claimed_no_session")
-        after_launch["status"] = after_launch["state"]
-        after_launch["next_action"] = "await session" if session_id else "inspect claimed task"
-        after_launch["terminal"] = after_launch["state"] in TERMINAL_STATES
-        saved = self._save_checkpoint(after_launch, lease=current_lease)
-        return self._result(saved, dispatched=True)
+        launch_state = outcome_state or ("running" if session_id else "claimed_no_session")
+        selected_claim_id = str(claim)
+        # The callback runs without the controller lock. Another worker may
+        # reserve a sibling while it is in progress, so bind only our exact
+        # reservation against the latest checkpoint instead of replacing it
+        # with the stale pre-dispatch snapshot.
+        with self.fence(current_lease) as current_lease:
+            latest = self._load_checkpoint()
+            if checkpoint.admission_phase(latest) == "terminal":
+                raise ControllerError("controller checkpoint became terminal during task dispatch")
+            rows = _active_tasks_from_checkpoint(latest, self.root)
+            matches = [row for row in rows if row.get("task") == task_id]
+            if len(matches) != 1 or matches[0].get("claim_id") != selected_claim_id:
+                raise ControllerError(
+                    f"task {task_id} no longer has its exact pending dispatch reservation"
+                )
+            selected_row = matches[0]
+            if selected_row.get("state") != "claimed_no_session" or selected_row.get("session_id"):
+                if (
+                    selected_row.get("state") != "claimed_no_session"
+                    and selected_row.get("state") == launch_state
+                    and selected_row.get("session_id") == session_id
+                ):
+                    return self._result(
+                        latest, dispatched=True, task=task_id, session_id=session_id,
+                    )
+                raise ControllerError(f"task {task_id} dispatch reservation was already changed")
+
+            after_launch = dict(latest)
+            after_launch.update({
+                "task": task_id,
+                "phase": str(selected.get("phase") or "dispatch"),
+                "root": self.root,
+                "controller": self.controller,
+                "actor": actor,
+                "claim_id": selected_claim_id,
+                "epoch": current_lease.epoch,
+                "lease_token": current_lease.token,
+                "session_id": session_id,
+                "state": launch_state,
+                "status": launch_state,
+                "next_action": "await session" if session_id else "inspect claimed task",
+                "terminal": launch_state in TERMINAL_STATES,
+            })
+            has_active_rows = bool(latest.get("active_tasks"))
+            if has_active_rows and launch_state not in TERMINAL_STATES:
+                if launch_state not in checkpoint.ACTIVE_TASK_STATES:
+                    raise ControllerError(
+                        f"dispatch returned unsupported active task state {launch_state!r}"
+                    )
+                selected_row["session_id"] = session_id
+                selected_row["state"] = launch_state
+                saved = self._checkpoint_active_tasks(latest, rows, current_lease)
+                return self._result(
+                    saved, dispatched=True, task=task_id, session_id=session_id,
+                )
+
+            if has_active_rows and len(rows) > 1:
+                raise ControllerError(
+                    "cannot commit a terminal dispatch outcome while sibling tasks are active"
+                )
+            if has_active_rows:
+                after_launch["active_tasks"] = []
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, after_launch)
+            return self._result(saved, dispatched=True, task=task_id, session_id=session_id)
 
     schedule = resume
 
@@ -1010,6 +2268,345 @@ class RootController:
                 "terminal": False,
                 "next_action": "select next ready descendant",
                 "last_check": last_check,
+            })
+            return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+
+    def cancel_expired_preidentity_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        *,
+        commit_cancellation: Callable[[], None],
+        lease: Lease | str | None = None,
+        retirement_reason: str = "expired",
+        _abandoned_epoch_repair_authority: Mapping[str, Any] | None = None,
+    ) -> ResumeResult:
+        """Fence a proved-expired identity-pending launch before clearing it.
+
+        ``commit_cancellation`` must atomically persist the signed Herdr audit
+        disposition and revoke its result channel. If checkpoint persistence
+        then fails, a retry can finish clearing the pointer from that durable
+        disposition without accepting a late result.
+        """
+
+        if retirement_reason not in {"expired", "superseded_legacy_scope", "owner_abandoned_epoch"}:
+            raise ControllerError("unsupported preidentity retirement reason")
+        if (retirement_reason == "owner_abandoned_epoch") != (
+            _abandoned_epoch_repair_authority is not None
+        ):
+            raise ControllerError("owner-abandoned retirement requires its exact staged repair authority")
+        for name, value in (("task", task_id), ("claim", claim_id), ("launch", launch_id)):
+            if not value:
+                raise ControllerError(f"preidentity cancellation {name} is required")
+        with self.fence(
+            lease, _abandoned_epoch_repair_authority=_abandoned_epoch_repair_authority,
+        ) as current:
+            document = self._load_checkpoint()
+            expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
+            reason = str(document.get("terminal_reason") or "")
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
+            terminal_halt = (
+                checkpoint.admission_phase(document) == "terminal"
+                and checkpoint.resume_state(document) == "blocked"
+                and document.get("terminal") is True
+            )
+            retained_draining = (
+                checkpoint.admission_phase(document) == "draining"
+                and checkpoint.resume_state(document) == "draining"
+                and document.get("terminal") is False
+                and str(document.get("task") or "") == self.root
+                and not document.get("actor") and not document.get("claim_id")
+                and not document.get("session_id")
+                and len(rows) == 1
+                and rows[0].get("task") == task_id
+                and rows[0].get("state") == "identity_pending"
+                and not rows[0].get("session_id")
+            )
+            if (
+                terminal_halt
+                and str(document.get("root") or "") == self.root
+                and str(document.get("controller") or "") == self.controller
+                and not rows and document.get("task") == self.root
+                and not document.get("active_tasks")
+                and document.get("last_check") == retired_check
+            ):
+                if retirement_reason == "owner_abandoned_epoch":
+                    self._verify_owner_retired_checkpoint_digest(
+                        state=_read_json(self.state_path), authority=_abandoned_epoch_repair_authority,
+                    )
+                commit_cancellation()
+                if retirement_reason == "owner_abandoned_epoch":
+                    state = _read_json(self.state_path)
+                    pending = state.pop("abandoned_epoch_repair", None)
+                    if isinstance(pending, Mapping):
+                        state["abandoned_epoch_repair_receipt"] = dict(pending)
+                        self._write_state(state)
+                    elif not isinstance(state.get("abandoned_epoch_repair_receipt"), Mapping):
+                        raise LeaseConflict("completed abandoned-epoch repair lost its signed intent")
+                return self._result(document, resumed=True)
+            eligible = (
+                ((terminal_halt and reason.startswith(expected_reason)) or retained_draining)
+                and (retirement_reason == "expired" or retained_draining)
+                and str(document.get("root") or "") == self.root
+                and str(document.get("controller") or "") == self.controller
+                and len(rows) == 1
+                and rows[0].get("task") == task_id
+                and rows[0].get("claim_id") == claim_id
+                and rows[0].get("state") == "identity_pending"
+                and not rows[0].get("session_id")
+            )
+            if not eligible:
+                raise ControllerError("checkpoint is not the exact eligible identity-pending task halt")
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "root": self.root,
+                "controller": self.controller,
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "blocked",
+                "status": "blocked",
+                "terminal": True,
+                "active_tasks": [],
+                "next_action": "explicitly continue with a distinct ready task",
+                "last_check": retired_check,
+            })
+            retired_digest = ""
+            if retirement_reason == "owner_abandoned_epoch":
+                state = _read_json(self.state_path)
+                intent = state.get("abandoned_epoch_repair")
+                if not isinstance(intent, Mapping):
+                    raise LeaseConflict("owner-repair cancellation has no signed durable intent")
+                if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != intent.get("checkpoint_sha256"):
+                    raise LeaseConflict("unretired checkpoint changed from the exact owner-approved snapshot")
+                retired_document = checkpoint.build_checkpoint(document)
+                retired_bytes = (json.dumps(retired_document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                retired_digest = hashlib.sha256(retired_bytes).hexdigest()
+                old_digest = str(intent.get("retired_checkpoint_sha256") or "")
+                if old_digest and old_digest != retired_digest:
+                    raise LeaseConflict("owner-repair retired checkpoint does not match its staged transaction")
+                payload = dict(intent)
+                payload.pop("authority_hmac", None)
+                payload["retired_checkpoint_sha256"] = retired_digest
+                payload["authority_hmac"] = _authority_mac(
+                    str(_abandoned_epoch_repair_authority.get("authority_secret") or ""),
+                    payload, domain="abandoned-epoch-repair-v1",
+                )
+                state["abandoned_epoch_repair"] = payload
+                self._write_state(state)
+            # Cross-file crash semantics are deliberate: the exact checkpoint
+            # output is signed into the protected intent first, then Herdr is
+            # atomically fenced, and only then is the checkpoint pointer cleared.
+            commit_cancellation()
+            result = self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+            if retirement_reason == "owner_abandoned_epoch":
+                if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != retired_digest:
+                    raise LeaseConflict("retired checkpoint bytes do not match the signed owner-repair output")
+                state = _read_json(self.state_path)
+                pending = state.pop("abandoned_epoch_repair", None)
+                if isinstance(pending, Mapping):
+                    state["abandoned_epoch_repair_receipt"] = dict(pending)
+                    self._write_state(state)
+                elif not isinstance(state.get("abandoned_epoch_repair_receipt"), Mapping):
+                    raise LeaseConflict("completed abandoned-epoch repair lost its signed intent")
+            return result
+
+    def _verify_owner_retired_checkpoint_digest(
+        self, *, state: Mapping[str, Any], authority: Mapping[str, Any] | None,
+    ) -> None:
+        if authority is None:
+            raise LeaseConflict("owner-repair checkpoint requires its exact signed authority")
+        expected = self._read_lease(state) or self._lease
+        if not isinstance(expected, Lease):
+            raise LeaseConflict("owner-repair checkpoint has no exact candidate lease")
+        self._verify_abandoned_epoch_fence_authority(
+            state, expected,
+            authority, root=self.root, controller=self.controller,
+        )
+        pending = state.get("abandoned_epoch_repair")
+        if pending is None:
+            pending = state.get("abandoned_epoch_repair_receipt")
+        if not isinstance(pending, Mapping):
+            raise LeaseConflict("owner-repair checkpoint has no signed transaction record")
+        expected_digest = str(pending.get("retired_checkpoint_sha256") or "")
+        if (
+            len(expected_digest) != 64
+            or hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != expected_digest
+        ):
+            raise LeaseConflict("retired checkpoint is not the exact transaction-produced output")
+
+    def cancel_superseded_legacy_preidentity_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        *,
+        commit_cancellation: Callable[[], None],
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Retire an authenticated legacy launch after its owning scope ends."""
+        return self.cancel_expired_preidentity_task(
+            task_id, claim_id, launch_id,
+            commit_cancellation=commit_cancellation, lease=lease,
+            retirement_reason="superseded_legacy_scope",
+        )
+
+    def expire_bound_execution_task(
+        self,
+        task_id: str,
+        claim_id: str,
+        launch_id: str,
+        session_id: str,
+        *,
+        commit_expiration: Callable[[], None],
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Fence one signed-deadline-expired bound task before retiring its slot."""
+        for name, value in (
+            ("task", task_id), ("claim", claim_id), ("launch", launch_id),
+            ("session", session_id),
+        ):
+            if not value:
+                raise ControllerError(f"expired bound execution {name} is required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            marker = f"expired bound execution launch {launch_id} for {task_id}"
+            already_retired = (
+                checkpoint.admission_phase(document) == "terminal"
+                and checkpoint.resume_state(document) == "blocked"
+                and document.get("terminal") is True
+                and document.get("root") == self.root
+                and document.get("controller") == self.controller
+                and document.get("epoch") == current.epoch
+                and document.get("lease_token") == current.token
+                and document.get("task") == self.root
+                and not rows and not document.get("active_tasks")
+                and document.get("last_check") == marker
+            )
+            if already_retired:
+                commit_expiration()
+                return self._result(document, resumed=True)
+
+            active = (
+                checkpoint.admission_phase(document) == "open"
+                and document.get("terminal") is False
+                and document.get("root") == self.root
+                and document.get("controller") == self.controller
+                and document.get("epoch") == current.epoch
+                and document.get("lease_token") == current.token
+                and document.get("task") in {self.root, task_id}
+                and len(rows) == 1
+                and rows[0].get("task") == task_id
+                and rows[0].get("claim_id") == claim_id
+                and rows[0].get("actor") == self.controller
+                and rows[0].get("state") in {"launched", "running"}
+                and rows[0].get("session_id") == session_id
+                and (
+                    document.get("task") == self.root
+                    and not document.get("actor")
+                    and not document.get("claim_id")
+                    and not document.get("session_id")
+                    or document.get("task") == task_id
+                    and document.get("actor") == self.controller
+                    and document.get("claim_id") == claim_id
+                    and document.get("session_id") == session_id
+                )
+            )
+            if not active:
+                raise ControllerError(
+                    "checkpoint is not the exact current single bound-task reservation"
+                )
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "root": self.root,
+                "controller": self.controller,
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "blocked",
+                "status": "blocked",
+                "terminal": True,
+                "terminal_reason": (
+                    f"USER_ACTION_REQUIRED: task {task_id} reached its signed execution deadline "
+                    "with no authenticated result; its exact Herdr pane is absent"
+                ),
+                "active_tasks": [],
+                "last_check": marker,
+                "next_action": "explicitly continue with a distinct ready task",
+            })
+            commit_expiration()
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
+            return self._result(saved, resumed=True)
+
+    def acknowledge_cancelled_preidentity_halt(
+        self,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        *,
+        authority_secret: str = "",
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Reopen only a signed cancelled-preidentity halt for distinct ready work."""
+
+        if not workflow_root or not cancelled_task or not ready_task:
+            raise ControllerError("workflow root, cancelled task, and ready descendant are required")
+        if ready_task == cancelled_task:
+            raise ControllerError("continuation must select a task distinct from the cancelled launch")
+        with self.fence(
+            lease,
+            _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
+        ) as current:
+            document = self._load_checkpoint()
+            reason = str(document.get("terminal_reason") or "")
+            retired_check = str(document.get("last_check") or "")
+            recognized = (
+                retired_check.startswith("cancelled expired preidentity launch ")
+                or retired_check.startswith("cancelled superseded_legacy_scope preidentity launch ")
+                or retired_check.startswith("cancelled owner_abandoned_epoch preidentity launch ")
+                or retired_check.startswith("expired bound execution launch ")
+            ) and retired_check.endswith(f" for {cancelled_task}")
+            if (
+                checkpoint.admission_phase(document) != "terminal"
+                or checkpoint.resume_state(document) != "blocked"
+                or not document.get("terminal")
+                or not recognized
+                or str(document.get("root") or "") != self.root
+                or str(document.get("controller") or "") != self.controller
+                or document.get("active_tasks")
+                or document.get("actor")
+                or document.get("claim_id")
+                or document.get("session_id")
+            ):
+                raise ControllerError("checkpoint is not an eligible cancelled preidentity halt")
+            acknowledgement = (
+                f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+                f"ready descendant {ready_task} after {cancelled_task}"
+            )
+            if len(acknowledgement) > checkpoint.FIELD_MAX:
+                raise ControllerError("workflow and task IDs are too long to acknowledge safely")
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "root": self.root,
+                "controller": self.controller,
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "advancing",
+                "status": "advancing",
+                "terminal": False,
+                "next_action": "select explicitly verified ready descendant",
+                "last_check": acknowledgement,
+                "pending_continuation_task": ready_task,
             })
             return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
 

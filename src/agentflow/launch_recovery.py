@@ -9,6 +9,7 @@ instead of authorizing another launch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Mapping
 
 
@@ -24,6 +25,51 @@ class LaunchRecoveryDecision:
     reason: str = ""
     session_id: str = ""
     provider_terminal: bool = False
+
+
+def herdr_pane_is_definitively_absent(
+    returncode: int, stdout: str, stderr: str = "", *, pane_id: str,
+) -> bool:
+    """Recognize only Herdr's structured ``pane_not_found`` response.
+
+    A nonzero command status by itself is ambiguous: daemon, transport, and
+    parse failures must never authorize retiring a launch. Exactly one output
+    stream must contain the structured error for this exact pane; success,
+    conflicting, duplicate, or noisy output remains ambiguous. Herdr identifies
+    ``pane get`` responses with a fixed CLI request id.
+    """
+
+    if returncode != 1 or not pane_id or not isinstance(stdout, str) or not isinstance(stderr, str):
+        return False
+    outputs = [value.strip() for value in (stdout, stderr) if value.strip()]
+    if len(outputs) != 1:
+        return False
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        response = json.loads(outputs[0], object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if (
+        not isinstance(response, Mapping)
+        or set(response) != {"error", "id"}
+        or response.get("id") != "cli:pane:get"
+    ):
+        return False
+    error = response.get("error")
+    return (
+        isinstance(error, Mapping)
+        and set(error) == {"code", "message"}
+        and error.get("code") == "pane_not_found"
+        and error.get("message") == f"pane {pane_id} not found"
+    )
 
 
 def _operator_required(
@@ -62,6 +108,22 @@ def reduce_incomplete_launch(
     binding = binding if isinstance(binding, Mapping) else {}
     session_id = str(binding.get("session_id") or "")
     pane_id = str(record.get("pane_id") or "") if record else ""
+
+    if lifecycle == "cancelled_preidentity":
+        return _operator_required(
+            task_id,
+            "has an authenticated cancelled preidentity launch. Continue only through the "
+            "explicit controller continuation flow with a distinct ready descendant",
+            provider_terminal=True,
+        )
+
+    if lifecycle == "expired_execution":
+        return _operator_required(
+            task_id,
+            "has a signed expired bound-execution disposition. Continue only through the "
+            "explicit controller continuation flow with a distinct ready descendant",
+            provider_terminal=True,
+        )
 
     if lifecycle == "launching":
         if record and str(record.get("launch_outcome") or "").lower() == "ambiguous":

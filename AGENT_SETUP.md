@@ -26,12 +26,7 @@ indexes are unrelated projects and must not be installed.
    only new or Agentflow-managed assets. Preserve unrelated files, directories,
    hooks, profiles, and skill links. Never use a force option merely to make a
    health check green.
-5. If the current command or provider assets point into an older Agentflow
-   source checkout, stop the generic installation path and follow
-   [the transactional legacy migration](docs/MIGRATION.md). Preview exact
-   ownership first, require a quiet controller/worker state, retain the legacy
-   checkout, and return the rollback ID after applying.
-6. Initialize a target workspace only when the user asked to configure that
+5. Initialize a target workspace only when the user asked to configure that
    workspace. `agentflow init <path> --beads` is non-overwriting, but inspect
    its result and repository status. A newly created project config enables
    metadata-only memory by default while keeping prompt recall (`on_prompt`)
@@ -39,20 +34,19 @@ indexes are unrelated projects and must not be installed.
    disabled. Existing shared settings, legacy configs without `memory`, and
    local overrides are preserved. Do not silently change Beads from local
    state to a tracked or shared-server mode.
-7. Discover repository-local instructions and domain skills. Register external
+6. Discover repository-local instructions and domain skills. Register external
    or machine-specific skills in ignored local configuration; use shareable
    configuration only for repository-relative skill sources intended for the
    team. Agentflow routes these skills but does not replace them.
-8. Finish with the installed version, executable path, configured providers,
-   preserved conflicts, workspace/Beads status, checks run, anything not
-   configured, and the rollback command when a migration occurred.
+7. Finish with the installed version, executable path, configured providers,
+   preserved conflicts, workspace/Beads status, checks run, and anything not
+   configured.
 
 ## Halt conditions
 
 Stop and ask for a decision instead of guessing when:
 
 - an existing destination is not provably Agentflow-managed;
-- a legacy migration finds active Agentflow controllers or external workers;
 - installation would modify a repository with unrelated changes;
 - the selected release, package identity, or artifact provenance is unclear;
 - a prerequisite needs privileged installation that the user did not approve;
@@ -75,13 +69,11 @@ the installation guide, the security guide, and the workspace's own agent
 instructions before acting. Use the latest reviewed tagged release, verify the
 package identity, install it in an isolated environment, preview provider asset
 changes, preserve every unmanaged file and skill, and initialize this workspace
-with local Beads state only if it is not already initialized. If you detect a
-legacy source-checkout installation, use Agentflow's transactional dry-run and
-rollback-capable migration instead of overwriting it. Do not expose credentials
-or transcript content. Work through safe setup and verification autonomously;
-stop only for an unmanaged conflict, active worker, unclear release provenance,
-or permission decision. Return the version, command path, provider and Beads
-health, preserved items, checks, and rollback command if applicable.
+with local Beads state only if it is not already initialized. Do not expose
+credentials or transcript content. Work through safe setup and verification
+autonomously; stop only for an unmanaged conflict, active worker, unclear
+release provenance, or permission decision. Return the version, command path,
+provider and Beads health, preserved items, and checks.
 ```
 
 For operation after setup, continue with the

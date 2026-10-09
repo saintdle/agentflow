@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- The obsolete `agentflow migrate legacy` dry-run/apply/rollback cutover and
+  its `agentflow.migration` module, now that the original local coding-agent
+  to Agentflow transition is complete. Ordinary install, upgrade, and policy
+  migration paths are unaffected.
+
 ## [0.0.9] - 2026-10-07
 
 ### Added

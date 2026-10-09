@@ -22,6 +22,26 @@ from tests.test_cli import ValidLaunch
 
 
 class StructuredLimitTests(unittest.TestCase):
+    @staticmethod
+    def _launch_identity(launch_id: str) -> dict[str, object]:
+        """Supply one complete synthetic identity for the signed ledger row."""
+        return {
+            "claim_id": "claim-task",
+            "lease_id": "lease-controller-7",
+            "launch_id": launch_id,
+            "controller_id": "controller",
+            "continuity_id": "continuity-abc",
+            "lease_epoch": 7,
+        }
+
+    def _reserve_attempt(self, root, workflow, task, *, limits, policy_max_attempts, launch_id):
+        return cli._reserve_execution_attempt(
+            root, workflow, task, limits=limits,
+            policy_max_attempts=policy_max_attempts,
+            authority_secret="controller-secret",
+            **self._launch_identity(launch_id),
+        )
+
     def test_complete_fields_and_policy_limits(self) -> None:
         limits = execution_limits.parse_limits({"deadline_seconds": 90, "max_retries": 20})
         self.assertEqual(limits.to_dict(), {"deadline_seconds": 90, "max_retries": 20})
@@ -40,15 +60,17 @@ class StructuredLimitTests(unittest.TestCase):
             state_home = root.parent / f"{root.name}-external-state"
             limits = execution_limits.ExecutionLimits(deadline_seconds=30, max_retries=1)
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}):
-                entry = cli._reserve_execution_attempt(
+                identity = self._launch_identity("launch-1")
+                entry = self._reserve_attempt(
                     root, "workflow", "task", limits=limits,
-                    policy_max_attempts=2, authority_secret="controller-secret",
+                    policy_max_attempts=2, launch_id=identity["launch_id"],
                 )
                 structured = {
                     "execution_limits": limits.to_dict(),
                     "deadline_epoch": entry["deadline_epoch"],
                     "attempt": entry["attempt"],
                     "max_attempts": entry["max_attempts"],
+                    **identity,
                 }
                 self.assertEqual(
                     cli._verify_execution_snapshot_against_ledger(
@@ -57,6 +79,12 @@ class StructuredLimitTests(unittest.TestCase):
                     ),
                     entry,
                 )
+                wrong_identity = {**structured, "claim_id": "foreign-claim"}
+                with self.assertRaisesRegex(ValueError, "launch identity"):
+                    cli._verify_execution_snapshot_against_ledger(
+                        root, "workflow", "task", wrong_identity,
+                        authority_secret="controller-secret",
+                    )
                 with self.assertRaisesRegex(ValueError, "cannot remove limits"):
                     cli._verify_execution_snapshot_against_ledger(
                         root, "workflow", "task", {"execution_limits": None},
@@ -80,22 +108,22 @@ class StructuredLimitTests(unittest.TestCase):
             clock = {"now": 1_000.0}
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
                  mock.patch.object(cli.time, "time", side_effect=lambda: clock["now"]):
-                first = cli._reserve_execution_attempt(
+                first = self._reserve_attempt(
                     root, "workflow", "task", limits=limits,
-                    policy_max_attempts=4, authority_secret="controller-secret",
+                    policy_max_attempts=4, launch_id="launch-1",
                 )
                 clock["now"] += 20
-                second = cli._reserve_execution_attempt(
+                second = self._reserve_attempt(
                     root, "workflow", "task", limits=limits,
-                    policy_max_attempts=4, authority_secret="controller-secret",
+                    policy_max_attempts=4, launch_id="launch-2",
                 )
                 self.assertEqual(second["deadline_epoch"], first["deadline_epoch"])
                 self.assertEqual(second["attempt"], 2)
                 clock["now"] = first["deadline_epoch"] + 1
                 with self.assertRaisesRegex(ValueError, "deadline expired"):
-                    cli._reserve_execution_attempt(
+                    self._reserve_attempt(
                         root, "workflow", "task", limits=limits,
-                        policy_max_attempts=4, authority_secret="controller-secret",
+                        policy_max_attempts=4, launch_id="launch-3",
                     )
 
     def test_partial_or_invalid_fields_rejected(self) -> None:

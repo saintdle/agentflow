@@ -7,7 +7,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -71,6 +70,29 @@ def run(wheel: Path, expected_version: str) -> None:
         if any(raw in metadata_text for raw in ("/tmp/top-id", "/tmp/top-name", "/tmp/nested-id", "/tmp/nested-name", "toolid", "toolname")):
             raise RuntimeError("installed provider alias privacy probe retained raw tool metadata")
         subprocess.run([str(agentflow), "--help"], cwd=root, env=clean_env, check=True)
+        removed_command = subprocess.run(
+            [str(agentflow), "migrate", "legacy", "--help"],
+            cwd=root,
+            env=clean_env,
+            text=True,
+            capture_output=True,
+        )
+        if removed_command.returncode == 0:
+            raise RuntimeError("installed CLI still exposes the removed legacy migration command")
+        removed_module = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "import importlib.util; "
+                "raise SystemExit(importlib.util.find_spec('agentflow.migration') is not None)",
+            ],
+            cwd=root,
+            env=clean_env,
+            text=True,
+            capture_output=True,
+        )
+        if removed_module.returncode != 0:
+            raise RuntimeError("installed wheel still contains the removed agentflow.migration module")
         manifest_result = subprocess.run(
             [
                 str(python), "-c",
@@ -143,65 +165,6 @@ def run(wheel: Path, expected_version: str) -> None:
                 "install --dry-run changed the isolated home: "
                 f"added={added!r}, removed={removed!r}"
             )
-
-        # Exercise the packaged migration itself against a synthetic legacy
-        # layout before installing the ordinary bundle. The real user home and
-        # any project state remain outside this temporary environment.
-        legacy = root / "legacy-agentflow"
-        legacy_command = legacy / "bin/agentflow"
-        legacy_skill = legacy / ".agents/skills/to-tickets"
-        legacy_profile = legacy / ".codex/agents/agentflow-controller.toml"
-        legacy_hook = legacy / "templates/user/codex-hooks.json"
-        for path, payload in (
-            (legacy_command, "#!/bin/sh\n"),
-            (legacy_skill / "SKILL.md", "legacy\n"),
-            (legacy_profile, "legacy\n"),
-            (legacy_hook, "{}\n"),
-        ):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(payload, encoding="utf-8")
-        legacy_command.chmod(0o755)
-        legacy_links = {
-            isolated_home / ".local/bin/agentflow": legacy_command,
-            isolated_home / ".agents/skills/to-tickets": legacy_skill,
-            isolated_home / ".codex/agents/agentflow-controller.toml": legacy_profile,
-            isolated_home / ".codex/hooks.json": legacy_hook,
-        }
-        for destination, source in legacy_links.items():
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.symlink_to(source, target_is_directory=source.is_dir())
-        migration_base = [
-            str(agentflow), "migrate", "legacy", "--from", str(legacy),
-            "--new-command", str(agentflow),
-        ]
-        migration_dry_run = subprocess.run(
-            [*migration_base, "--dry-run"], cwd=root, env=clean_env,
-            text=True, capture_output=True, check=True,
-        )
-        if "DRY_RUN: 4 exact legacy-owned integration link(s)" not in migration_dry_run.stdout:
-            raise RuntimeError(f"unexpected packaged migration plan: {migration_dry_run.stdout!r}")
-        migration_apply = subprocess.run(
-            [*migration_base, "--apply"], cwd=root, env=clean_env,
-            text=True, capture_output=True, check=True,
-        )
-        migration_id = next(
-            (line.partition(":")[2].strip() for line in migration_apply.stdout.splitlines()
-             if line.startswith("Migration ID:")),
-            "",
-        )
-        if not migration_id:
-            raise RuntimeError(f"packaged migration did not return an ID: {migration_apply.stdout!r}")
-        if (isolated_home / ".agents/skills/to-tickets").is_symlink():
-            raise RuntimeError("packaged migration did not replace the legacy skill link")
-        subprocess.run(
-            [str(agentflow), "migrate", "legacy", "--rollback", migration_id],
-            cwd=root, env=clean_env, text=True, capture_output=True, check=True,
-        )
-        for destination, source in legacy_links.items():
-            if not destination.is_symlink() or destination.resolve() != source.resolve():
-                raise RuntimeError(f"packaged migration did not restore {destination}")
-            destination.unlink()
-        shutil.rmtree(legacy)
 
         subprocess.run(
             [str(agentflow), "install"],

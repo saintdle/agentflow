@@ -16,6 +16,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import sys
 
 PROVIDERS = ("codex", "claude", "copilot")
 
@@ -47,7 +49,18 @@ class ConfinedHandoff:
 _MAX_HANDOFF_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 64 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FIXED_SUBMIT_COMMAND = 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"'
+
+
+def fixed_submit_command() -> str:
+    """Return the protected result command bound to this installed runtime."""
+    # Preserve a virtual-environment interpreter path even when it is a
+    # symlink to the base Python; resolving it can discard the venv prefix.
+    interpreter_path = Path(sys.executable).absolute()
+    interpreter = shlex.quote(str(interpreter_path))
+    return (
+        f'{interpreter} -I -m agentflow herdr submit '
+        '--contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"'
+    )
 
 
 def handoff_report_digest(manifest: dict[str, object]) -> str:
@@ -145,7 +158,7 @@ def validate_confined_handoff(
     if lane == "external":
         if not isinstance(machine_contract, dict) or machine_contract.get("schema") != "agentflow.return@1":
             raise ProviderArgvError("external handoff machine return contract is required")
-        if machine_contract.get("submit_command") != _FIXED_SUBMIT_COMMAND:
+        if machine_contract.get("submit_command") != fixed_submit_command():
             raise ProviderArgvError("handoff submit command is not the fixed return command")
     elif lane == "native":
         if machine_contract is not None:
