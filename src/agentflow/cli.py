@@ -4847,7 +4847,7 @@ def _mint_return_channel(
         "contract_path": str(contract_path),
         "result_path": str(result_path),
         "submission_file": str(submission_path),
-        "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+        "submit_command": provider_argv_backend.fixed_submit_command(),
     }
     if execution_limits is not None:
         contract.update({
@@ -7111,7 +7111,7 @@ def herdr_result(args: argparse.Namespace) -> int:
     try:
         if not bool(getattr(args, "_controller_ingest", False)):
             raise ValueError(
-                "direct result ingestion is controller-owned; providers must use `agentflow herdr submit`"
+                "direct result ingestion is controller-owned; providers must use the fixed submit command in the handoff"
             )
         contract_arg = str(getattr(args, "contract", "") or "")
         if contract_arg:
@@ -10473,7 +10473,7 @@ def handoff_create(args: argparse.Namespace) -> int:
                 "$AGENTFLOW_RESULT_CONTRACT",
                 "$AGENTFLOW_RESULT_FILE",
             ],
-            "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+            "submit_command": provider_argv_backend.fixed_submit_command(),
         }
         if lane == "external"
         else None

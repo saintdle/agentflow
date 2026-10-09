@@ -7210,6 +7210,18 @@ class GenuineLifecycleTests(unittest.TestCase):
                 _controller_ingest=True,
                 _capability_file=channel["capability_file"],
                 _authority_secret=fixture.authority_secret)
+            capability_path = Path(channel["capability_file"])
+            capability_bytes = capability_path.read_bytes()
+            capability_path.write_text("wrong-return-capability", encoding="utf-8")
+            rejected_payloads: list[dict] = []
+            with fixture.beads_patches(), \
+                 mock.patch.object(
+                     cli, "_json_or_status",
+                     side_effect=lambda payload, **_: rejected_payloads.append(payload),
+                 ):
+                self.assertEqual(cli.herdr_result(report_args), 2)
+            self.assertIn("return capability is invalid", rejected_payloads[-1]["error"])
+            capability_path.write_bytes(capability_bytes)
             with fixture.beads_patches():
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cli.herdr_result(report_args), 0)

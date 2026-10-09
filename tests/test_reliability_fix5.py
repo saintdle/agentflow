@@ -5,12 +5,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import shlex
 import sys
 import tempfile
 import threading
 import unittest
+import venv
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -70,7 +72,7 @@ class ReliabilityFix5Tests(unittest.TestCase):
                         "schema": "agentflow.return@1",
                         "acceptance_ids": ["AFREL-SMOKE-1"],
                         "approved_waivers": [],
-                        "submit_command": 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"',
+                        "submit_command": provider_argv.fixed_submit_command(),
                     },
                     "preflight": {
                         "report": report,
@@ -455,11 +457,98 @@ class ReliabilityFix5Tests(unittest.TestCase):
             self.assertEqual(result, 2)
 
     def test_emitted_submit_command_parses_without_a_task_argument(self) -> None:
-        command = 'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" --file "$AGENTFLOW_RESULT_FILE"'
-        parsed = cli.build_parser().parse_args(shlex.split(command)[1:])
+        command = shlex.split(provider_argv.fixed_submit_command())
+        self.assertTrue(Path(command[0]).is_absolute())
+        self.assertEqual(command[1:4], ["-I", "-m", "agentflow"])
+        parsed = cli.build_parser().parse_args(command[4:])
         self.assertEqual(parsed.herdr_command, "submit")
         self.assertFalse(hasattr(parsed, "task"))
         self.assertEqual(parsed.contract, "$AGENTFLOW_RESULT_CONTRACT")
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX shell expansion")
+    def test_installed_submit_command_runs_with_sparse_daemon_path(self) -> None:
+        """The signed handoff uses its installed interpreter, not daemon PATH."""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            environment = base / "installed-env"
+            venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
+            python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            site_probe = subprocess.run(
+                [str(python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                capture_output=True, text=True, check=True,
+            )
+            installed_package = Path(site_probe.stdout.strip()) / "agentflow"
+            shutil.copytree(Path(__file__).resolve().parents[1] / "src/agentflow", installed_package)
+
+            sparse_path = base / "sparse-path"
+            sparse_path.mkdir()
+            stale_import = base / "stale-import"
+            stale_package = stale_import / "agentflow"
+            stale_package.mkdir(parents=True)
+            (stale_package / "__init__.py").write_text("raise RuntimeError('stale import')\n", encoding="utf-8")
+            worker_env = {key: value for key, value in os.environ.items()
+                          if key not in {"PYTHONPATH", "PYTHONHOME"}}
+            worker_env.update({
+                "PATH": str(sparse_path), "PYTHONPATH": str(stale_import),
+                "HOME": str(base / "home"),
+                "AGENTFLOW_STATE_HOME": str(base / "state-home"),
+            })
+            Path(worker_env["HOME"]).mkdir()
+            handoff_path = workspace / ".agentflow/tmp/handoffs/sparse-task.md"
+            generated = subprocess.run(
+                [
+                    str(python), "-I", "-m", "agentflow", "handoff", "create",
+                    "--to", "claude", "--title", "Sparse path return",
+                    "--goal", "Submit a bounded result", "--task-id", "sparse-task",
+                    "--lane", "external", "--tool-profile", "shell-write",
+                    "--out", str(handoff_path), "--cwd", str(workspace),
+                ],
+                cwd=workspace, env=worker_env, capture_output=True, text=True,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            manifest = json.loads(handoff_path.with_suffix(".json").read_text(encoding="utf-8"))
+            command = manifest["machine_return_contract"]["submit_command"]
+            command_argv = shlex.split(command)
+            self.assertEqual(command_argv[0], str(python.absolute()))
+            self.assertEqual(command_argv[1:4], ["-I", "-m", "agentflow"])
+
+            launch_dir = workspace / ".agentflow/runtime" / ("a" * 32) / "sparse-launch"
+            launch_dir.mkdir(parents=True)
+            contract_path = launch_dir / "return.contract.json"
+            result_path = launch_dir / "result.json"
+            submission_path = launch_dir / "submitted.json"
+            contract_path.write_text(json.dumps({
+                "schema": "agentflow.return@1", "task_id": "sparse-task",
+                "result_path": str(result_path), "submission_file": str(submission_path),
+            }), encoding="utf-8")
+            result_path.write_text(json.dumps({
+                "outcome": "completed", "acceptance_results": [],
+            }), encoding="utf-8")
+            submit_env = {
+                **worker_env,
+                "AGENTFLOW_RESULT_CONTRACT": str(contract_path),
+                "AGENTFLOW_RESULT_FILE": str(result_path),
+            }
+            old_command = (
+                'agentflow herdr submit --contract "$AGENTFLOW_RESULT_CONTRACT" '
+                '--file "$AGENTFLOW_RESULT_FILE"'
+            )
+            before_fix = subprocess.run(
+                ["/bin/sh", "-c", old_command], cwd=workspace, env=submit_env,
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(before_fix.returncode, 0)
+            self.assertFalse(submission_path.exists())
+            submitted = subprocess.run(
+                ["/bin/sh", "-c", command], cwd=workspace, env=submit_env,
+                capture_output=True, text=True,
+            )
+            self.assertEqual(submitted.returncode, 0, submitted.stderr)
+            marker = json.loads(submission_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker["schema"], "agentflow.result-submission@1")
+            self.assertEqual(marker["contract_sha256"], hashlib.sha256(contract_path.read_bytes()).hexdigest())
 
 
 if __name__ == "__main__":
