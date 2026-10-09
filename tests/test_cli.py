@@ -5657,6 +5657,207 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["return_channel"]["state"], "issued")
 
+    def test_sterile_controller_dispatch_preserves_graph_execution_limits(self) -> None:
+        """The complete controller route keeps the graph budget in the
+        sterile handoff, protected launch ledger, signed result contract, and
+        supervisor command that Herdr receives."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            launch = fixture.task_issue["metadata"]["agentflow"]["launch"]
+            launch.update(
+                execution_limits={"deadline_seconds": 1800, "max_retries": 0},
+                sterile=True,
+            )
+            fixture.task_issue["metadata"]["agentflow"]["tool_profile"] = "shell-readonly"
+            fixture.task_issue["metadata"]["agentflow"]["output_boundary"] = "."
+            args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+            capture: dict = {}
+            state_home = base / "protected-state"
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue]), \
+                 mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                 mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                payload = _run_controller_json(cli.controller_resume, args)
+
+            self.assertTrue(payload["ok"], payload)
+            self.assertEqual(payload["result"]["state"], "running")
+            record = json.loads(
+                (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+            )["sessions"][fixture.task_id]
+            limits = {"deadline_seconds": 1800, "max_retries": 0}
+            self.assertEqual(record["execution_limits"], limits)
+            self.assertEqual(record["max_attempts"], 1)
+            self.assertEqual(record["attempt"], 1)
+
+            execution_root = Path(record["execution_root"])
+            packaged = cli.provider_argv_backend.validate_confined_handoff(
+                Path(record["handoff"]["path"]), root=execution_root,
+                provider=fixture.provider, task_id=fixture.task_id,
+            )
+            self.assertEqual(packaged.manifest["execution_limits"], limits)
+            self.assertTrue((execution_root / ".agentflow/sterile-manifest.json").is_file())
+
+            contract = json.loads(
+                Path(record["return_channel"]["contract_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(contract["execution_limits"], limits)
+            self.assertEqual(contract["deadline_epoch"], record["deadline_epoch"])
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}):
+                secret = cli._accounting_authority_secret(
+                    fixture.root, fixture.workflow_root,
+                    continuity_id=contract["continuity_id"],
+                    authority_key_id=contract["authority_key_id"],
+                )
+                self.assertTrue(cli._verify_authority_mac(secret, contract, domain="return-contract-v1"))
+                ledger = cli._read_any_execution_ledger_entry(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=secret,
+                )
+            self.assertEqual(ledger["execution_limits"], limits)
+            self.assertEqual(ledger["deadline_epoch"], record["deadline_epoch"])
+            self.assertEqual(ledger["max_attempts"], 1)
+
+            argv = capture["argv"]
+            self.assertEqual(argv[argv.index("--cwd") + 1], str(execution_root))
+            provider_tail = argv[argv.index("--") + 1:]
+            self.assertEqual(Path(provider_tail[1]).name, "execution_limits.py")
+            self.assertEqual(provider_tail[2], "--deadline-epoch")
+            self.assertEqual(float(provider_tail[3]), record["deadline_epoch"])
+
+    def test_dispatch_blocks_handoff_limit_mismatch_before_reservation_or_preflight(self) -> None:
+        """A graph budget missing from the materialized sterile contract is
+        rejected before root preflight, protected attempt accounting, or spawn."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            launch = fixture.task_issue["metadata"]["agentflow"]["launch"]
+            launch.update(
+                execution_limits={"deadline_seconds": 1800, "max_retries": 0},
+                sterile=True,
+            )
+            fixture.task_issue["metadata"]["agentflow"]["tool_profile"] = "shell-readonly"
+            fixture.task_issue["metadata"]["agentflow"]["output_boundary"] = "."
+            state_home = base / "protected-state"
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 fixture.beads_patches(), \
+                 mock.patch.object(cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"):
+                lease = fixture._seed_lease()
+                fixture._persist_claim()
+                # Model the typed from-bead handoff reaching a fence without
+                # the graph's structured budget; restore graph authority
+                # before dispatch captures and checks that requested policy.
+                limits = launch.pop("execution_limits")
+                try:
+                    source_handoff = cli._materialize_launch_handoff(
+                        fixture.root, fixture.task_id, fixture.provider,
+                        role=fixture.role,
+                    )
+                finally:
+                    launch["execution_limits"] = limits
+                source_manifest, errors = cli._handoff_manifest(source_handoff)
+                self.assertFalse(errors, errors)
+                self.assertIsNone(source_manifest.get("execution_limits"))
+
+                selected = dict(fixture.task_issue)
+                selected.update(
+                    task=fixture.task_id, claim_id="claim-1",
+                    claim_token=fixture.claim_token, actor=fixture.actor,
+                )
+                args = argparse.Namespace(
+                    workflow_root=fixture.workflow_root,
+                    _authority_secret=fixture.authority_secret,
+                )
+                with mock.patch.object(
+                    cli, "_materialize_launch_handoff", return_value=source_handoff,
+                ), mock.patch.object(cli, "_run_actual_root_preflight") as root_preflight, \
+                     mock.patch.object(cli, "herdr_launch") as launch_call:
+                    dispatch = cli._dispatch_via_herdr(
+                        args, fixture.root, fixture.root, fixture.workflow_root, lease,
+                    )
+                    outcome = dispatch(selected)
+
+            self.assertEqual(outcome["state"], "blocked")
+            root_preflight.assert_not_called()
+            launch_call.assert_not_called()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}):
+                self.assertFalse(
+                    cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root).exists()
+                )
+
+            # A complete but different graph policy is equally untrusted at
+            # the fence. Exercise it through a second genuine from-bead
+            # artifact rather than editing a digest-pinned sidecar by hand.
+            mismatched_limits = {"deadline_seconds": 1800, "max_retries": 1}
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}), \
+                 fixture.beads_patches(), \
+                 mock.patch.object(cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"):
+                launch["execution_limits"] = mismatched_limits
+                try:
+                    mismatched_handoff = cli._materialize_launch_handoff(
+                        fixture.root, fixture.task_id, fixture.provider,
+                        role=fixture.role,
+                    )
+                finally:
+                    launch["execution_limits"] = {"deadline_seconds": 1800, "max_retries": 0}
+                mismatch_dispatch = cli._dispatch_via_herdr(
+                    args, fixture.root, fixture.root, fixture.workflow_root, lease,
+                )
+                with mock.patch.object(
+                    cli, "_materialize_launch_handoff", return_value=mismatched_handoff,
+                ), mock.patch.object(cli, "_run_actual_root_preflight") as root_preflight, \
+                     mock.patch.object(cli, "herdr_launch") as launch_call:
+                    outcome = mismatch_dispatch(selected)
+                self.assertEqual(outcome["state"], "blocked")
+                root_preflight.assert_not_called()
+                launch_call.assert_not_called()
+                self.assertFalse(
+                    cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root).exists()
+                )
+
+    def test_herdr_launch_rechecks_requested_limits_before_reservation(self) -> None:
+        """The signed-launch boundary independently fences a mismatched
+        controller request against its pinned typed handoff."""
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            fixture.task_issue["metadata"]["agentflow"]["launch"]["execution_limits"] = {
+                "deadline_seconds": 60, "max_retries": 0,
+            }
+            external_state = base / "protected-state"
+            capture: dict = {}
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(external_state)}), \
+                 fixture.beads_patches(), \
+                 mock.patch.object(cli.shutil, "which", side_effect=lambda command: f"/fake/{command}"):
+                fixture.lease = fixture._seed_lease()
+                fixture.authority_secret = cli._controller_credentials(
+                    argparse.Namespace(
+                        root=str(fixture.root), workflow_root=fixture.workflow_root,
+                        resume_key_file="",
+                    ),
+                    fixture.lease,
+                )[1]["authority_secret"]
+                fixture._persist_claim()
+                fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
+                with mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)), \
+                     mock.patch.object(cli, "_json_or_status"):
+                    result = cli.herdr_launch(fixture.launch_args(
+                        execution_limits={"deadline_seconds": 60, "max_retries": 1},
+                    ))
+
+            self.assertEqual(result, 2)
+            self.assertEqual(capture, {})
+            self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(external_state)}):
+                self.assertFalse(
+                    cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root).exists()
+                )
+
     def test_codex_app_server_guard_returns_durable_task_block_without_starting_worker(self) -> None:
         """A permission guard is a typed launch failure, not a controller crash."""
         with tempfile.TemporaryDirectory() as temp:

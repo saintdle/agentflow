@@ -1371,6 +1371,20 @@ def _dispatch_via_herdr(
             manifest = handoff.manifest
         except provider_argv_backend.ProviderArgvError:
             return {"state": "blocked", "session_id": ""}
+        # The graph is the authority for requested limits. Packaging and
+        # provider launch consume the typed handoff, so verify that the
+        # materialized contract carried the exact graph policy before root
+        # preflight or any protected attempt reservation can occur.
+        expected_limits = execution_limits.to_dict() if execution_limits else None
+        try:
+            materialized_limits = execution_limits_backend.parse_limits(
+                manifest.get("execution_limits")
+            )
+        except execution_limits_backend.ExecutionLimitError:
+            return {"state": "blocked", "session_id": ""}
+        actual_limits = materialized_limits.to_dict() if materialized_limits else None
+        if actual_limits != expected_limits:
+            return {"state": "blocked", "session_id": ""}
         session_name = f"agentflow-{_slug(task_id)}"
         context_values = tuple(
             str(value) for value in manifest.get("context", [])
@@ -6157,6 +6171,35 @@ def herdr_launch(args: argparse.Namespace) -> int:
             )
         except execution_limits_backend.ExecutionLimitError as exc:
             raise ValueError(f"invalid structured execution limits: {exc}") from exc
+        requested_limits_present = hasattr(args, "execution_limits")
+        try:
+            requested_execution_limits = (
+                execution_limits_backend.parse_limits(getattr(args, "execution_limits"))
+                if requested_limits_present else None
+            )
+        except execution_limits_backend.ExecutionLimitError as exc:
+            raise ValueError(f"invalid requested graph execution limits: {exc}") from exc
+
+        def _require_requested_limits_match(handoff: provider_argv_backend.ConfinedHandoff) -> None:
+            if not requested_limits_present:
+                return
+            try:
+                current_limits = execution_limits_backend.parse_limits(
+                    handoff.manifest.get("execution_limits")
+                )
+            except execution_limits_backend.ExecutionLimitError as exc:
+                raise ValueError(f"invalid structured execution limits: {exc}") from exc
+            expected = (
+                requested_execution_limits.to_dict()
+                if requested_execution_limits is not None else None
+            )
+            actual = current_limits.to_dict() if current_limits is not None else None
+            if actual != expected:
+                raise ValueError(
+                    "typed handoff execution limits do not match the requested graph policy"
+                )
+
+        _require_requested_limits_match(typed_handoff)
         policy_attempt_cap = (
             _controller_execution_policy(root, root, workflow_root).max_attempts_per_task
             if execution_limits is not None else None
@@ -6182,6 +6225,7 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 expected_manifest_sha256=typed_handoff.manifest_sha256,
                 expected_preflight_sha256=typed_handoff.preflight_sha256,
             )
+            _require_requested_limits_match(typed_handoff)
             _require_supported_launch_isolation(
                 typed_handoff, transport="Codex App Server" if transport == "app-server" else "Herdr"
             )
@@ -11981,6 +12025,12 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         hook_destination.write_bytes(hook_contents)
 
     output = stage / ".agentflow/tmp/handoffs" / source_handoff.name
+    try:
+        execution_limits = execution_limits_backend.parse_limits(
+            manifest.get("execution_limits")
+        )
+    except execution_limits_backend.ExecutionLimitError as exc:
+        raise ValueError(f"sterile source handoff has invalid execution limits: {exc}") from exc
     create_args = argparse.Namespace(
         to=str(manifest.get("provider")), title=source_handoff.stem,
         goal=str(manifest.get("goal") or ""), task_id=str(manifest.get("task_id") or ""),
@@ -11993,6 +12043,8 @@ def _package_handoff_sterile(source_handoff: Path, stage: Path) -> Path:
         allow_delegation=bool(manifest.get("delegation_allowed")),
         return_type=str(manifest.get("return_type") or "result"),
         max_ai_credits=manifest.get("max_ai_credits"), acceptance_matrix=copied_acceptance,
+        deadline_seconds=execution_limits.deadline_seconds if execution_limits else None,
+        max_retries=execution_limits.max_retries if execution_limits else None,
         # The package is a fresh directory, not the source workspace. Create
         # it with a directory-local temporary identity, then restore the
         # typed source-workspace contract below before final preflight.
