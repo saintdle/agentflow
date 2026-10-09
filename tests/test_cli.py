@@ -5945,6 +5945,14 @@ class ControllerRunTests(unittest.TestCase):
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
                 payload = _run_controller_json(cli.controller_resume, args)
+                fixture.task_issue["status"] = "in_progress"
+                fixture.task_issue["assignee"] = fixture.controller
+                controller, _ = cli._controller_instance(args)
+                snapshot = cli._bound_execution_expiry_snapshot(
+                    args, controller, fixture.root, fixture.workflow_root,
+                    controller._current_lease(), fixture.task_id,
+                    authority_secret=args._authority_secret,
+                )
 
             self.assertTrue(payload["ok"], payload)
             self.assertEqual(payload["result"]["state"], "running")
@@ -5954,6 +5962,9 @@ class ControllerRunTests(unittest.TestCase):
             limits = {"deadline_seconds": 1800, "max_retries": 0}
             self.assertEqual(record["execution_limits"], limits)
             self.assertEqual(record["max_attempts"], 1)
+            self.assertEqual(snapshot["binding"]["root"], str(fixture.root))
+            self.assertNotIn("root", snapshot["contract"])
+            self.assertNotIn("pane_id", snapshot["contract"])
             self.assertEqual(record["attempt"], 1)
 
             execution_root = Path(record["execution_root"])
@@ -5990,6 +6001,22 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(Path(provider_tail[1]).name, "execution_limits.py")
             self.assertEqual(provider_tail[2], "--deadline-epoch")
             self.assertEqual(float(provider_tail[3]), record["deadline_epoch"])
+
+    def test_explicit_continuation_rejects_mixed_retirement_kinds(self) -> None:
+        """The two signed retirement protocols cannot be coalesced by a resume."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            args = _controller_args(
+                root,
+                continue_after_cancelled_preidentity="old-task",
+                continue_after_expired_task="old-task",
+                continue_task="ready-task",
+            )
+            payloads: list[dict] = []
+            with mock.patch.object(cli, "_controller_instance", return_value=(mock.Mock(), root)), \
+                 mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value)):
+                self.assertEqual(cli.controller_resume(args), 2)
+            self.assertIn("exactly one explicit continuation kind", payloads[-1]["error"])
 
     def test_tightened_graph_limits_before_reservation_block_dispatch(self) -> None:
         """A graph update between dispatch materialization and the

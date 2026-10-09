@@ -2576,6 +2576,7 @@ def _verify_cancelled_preidentity_continuation(
     *,
     authority_secret: str,
     allow_staged_selection: bool = False,
+    expected_retirement_kind: str = "cancelled_preidentity",
 ) -> str:
     """Prove a signed retired launch and one distinct, currently ready child."""
     if not cancelled_task or not ready_task or ready_task == cancelled_task:
@@ -2587,6 +2588,11 @@ def _verify_cancelled_preidentity_continuation(
     bound_expired = bool(
         isinstance(record, Mapping) and record.get("status") == "expired_execution"
     )
+    actual_retirement_kind = "expired_execution" if bound_expired else "cancelled_preidentity"
+    if expected_retirement_kind not in {"cancelled_preidentity", "expired_execution"}:
+        raise controller_backend.ControllerError("continuation retirement kind is invalid")
+    if actual_retirement_kind != expected_retirement_kind:
+        raise controller_backend.ControllerError("continuation flag does not match the retired task kind")
     disposition = (
         record.get("execution_disposition") if bound_expired
         else record.get("recovery_disposition") if isinstance(record, Mapping) else None
@@ -3162,8 +3168,11 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         continue_after_expired = str(
             getattr(args, "continue_after_expired_task", "") or ""
         ) if operation == "resume" else ""
-        if continue_after_preidentity and continue_after_expired and continue_after_preidentity != continue_after_expired:
-            raise ValueError("choose one exact task for explicit continuation")
+        if continue_after_preidentity and continue_after_expired:
+            raise ValueError("choose exactly one explicit continuation kind")
+        continuation_kind = (
+            "expired_execution" if continue_after_expired else "cancelled_preidentity"
+        )
         continue_cancelled_task = continue_after_expired or continue_after_preidentity
         continue_ready_task = str(getattr(args, "continue_task", "") or "") if operation == "resume" else ""
         if bool(continue_cancelled_task) != bool(continue_ready_task):
@@ -3312,6 +3321,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                             continue_ready_task, controller, previous,
                             authority_secret=credentials["authority_secret"],
                             allow_staged_selection=continuation_already_selected,
+                            expected_retirement_kind=continuation_kind,
                         )
                         if continuation_already_selected:
                             lease = controller.authorize_explicit_continuation(
@@ -4935,10 +4945,20 @@ def _verify_expired_bound_execution_record(
     )
     if dict(verified_contract) != dict(contract) or dict(contract_binding) != dict(contract):
         raise ValueError("expired execution identity changed after launch")
-    for field in ("root", "task_id", "claim_id", "lease_id", "launch_id", "pane_id", "provider"):
-        expected = str(contract.get(field) or "")
-        if not expected or str(binding.get(field) or "") != expected:
-            raise ValueError("expired execution provider binding differs from its signed contract")
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("expired execution provider binding differs from its signed contract")
+    record_pane_id = record.get("pane_id")
+    if record_pane_id not in (None, "") and str(record_pane_id) != str(binding.get("pane_id") or ""):
+        raise ValueError("expired execution pane identity differs from its durable binding")
     disposition = _verify_bound_execution_expiry_disposition(
         record.get("execution_disposition"), contract, binding,
         authority_secret=authority_secret,
@@ -5041,7 +5061,7 @@ def _bound_execution_expiry_snapshot(
     if (
         record.get("root") != str(root) or record.get("workflow_root") != workflow_root
         or record.get("task_id") != task_id or record.get("claim_id") != claim_id
-        or record.get("pane_id") == "" or not session_id
+        or not str(binding.get("pane_id") or "") or not session_id
         or rows[0].get("claim_id") != claim_id or rows[0].get("session_id") != session_id
         or status not in {"launched", "running", "expired_execution"}
         or (status != "expired_execution" and channel.get("state") != "issued")
@@ -5056,7 +5076,7 @@ def _bound_execution_expiry_snapshot(
     ):
         raise ValueError("Herdr launch is not bound to the current exact claim token")
     launch_id = str(record.get("launch_id") or "")
-    if not launch_id or not str(record.get("pane_id") or ""):
+    if not launch_id or not str(binding.get("pane_id") or ""):
         raise ValueError("bound launch is missing its exact pane or launch ID")
     contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
     expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
@@ -5072,10 +5092,20 @@ def _bound_execution_expiry_snapshot(
     )
     if dict(verified_contract) != dict(contract):
         raise ValueError("return contract changed during bound execution verification")
-    for field in ("root", "task_id", "claim_id", "lease_id", "launch_id", "pane_id", "provider"):
-        expected = str(contract.get(field) or "")
-        if not expected or str(binding.get(field) or "") != expected:
-            raise ValueError("provider session binding differs from the signed return contract")
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("provider session binding differs from the signed return contract")
+    record_pane_id = record.get("pane_id")
+    if record_pane_id not in (None, "") and str(record_pane_id) != str(binding.get("pane_id") or ""):
+        raise ValueError("provider session pane identity differs from its durable binding")
     if (
         contract.get("workflow_root") != workflow_root
         or contract.get("claim_id") != claim_id
@@ -5159,7 +5189,7 @@ def _commit_expired_bound_execution(
             or channel.get("state") != "issued"
         ):
             raise ValueError("bound launch changed or received a result before expiry committed")
-        submission = Path(str(binding.get("submission_file") or "")).expanduser()
+        submission = Path(str(contract.get("submission_file") or "")).expanduser()
         if submission.is_symlink() or submission.exists():
             raise ValueError("a worker submission appeared before expiry could revoke its capability")
         ledger = _expired_preidentity_ledger_disposition(
@@ -5218,6 +5248,19 @@ def _expire_bound_execution_if_due(
     record = _herdr_session_record(root, task_id)
     if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
         # Identity-pending recovery has its own stricter signed path.
+        return None
+    channel = record.get("return_channel")
+    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    if not isinstance(contract, Mapping):
+        return None
+    try:
+        limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+        deadline = float(contract.get("deadline_epoch"))
+    except (TypeError, ValueError, execution_limits_backend.ExecutionLimitError):
+        return None
+    # Ordinary unbudgeted launches have no expiry disposition.  Do not run
+    # expiry-only snapshot checks before their normal result ingestion path.
+    if limits is None or deadline <= 0:
         return None
     snapshot = _bound_execution_expiry_snapshot(
         args, controller, root, workflow_root, lease, task_id,

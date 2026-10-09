@@ -2467,7 +2467,7 @@ class RootController:
                 return self._result(document, resumed=True)
 
             active = (
-                checkpoint.admission_phase(document) == "controller"
+                checkpoint.admission_phase(document) == "open"
                 and document.get("terminal") is False
                 and document.get("root") == self.root
                 and document.get("controller") == self.controller
