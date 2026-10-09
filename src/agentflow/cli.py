@@ -2623,7 +2623,7 @@ def _verify_cancelled_preidentity_continuation(
     staged_selection = bool(
         allow_staged_selection
         and checkpoint_backend.resume_state(document) == "advancing"
-        and checkpoint_backend.admission_phase(document) == "controller"
+        and checkpoint_backend.admission_phase(document) == "open"
         and document.get("terminal") is False
         and document.get("pending_continuation_task") == ready_task
         and document.get("last_check") == selected_check
@@ -4985,6 +4985,8 @@ def _bound_execution_expiry_snapshot(
     task_id: str,
     *,
     authority_secret: str,
+    require_budget: bool = True,
+    require_pristine: bool = True,
 ) -> dict[str, Any]:
     document = controller._load_checkpoint()
     rows = controller.active_tasks()
@@ -5066,7 +5068,7 @@ def _bound_execution_expiry_snapshot(
         or status not in {"launched", "running", "expired_execution"}
         or (status != "expired_execution" and channel.get("state") != "issued")
         or (status == "expired_execution" and channel.get("state") != "revoked")
-        or record.get("result") not in (None, {})
+        or (require_pristine and record.get("result") not in (None, {}))
     ):
         raise ValueError("Herdr record no longer matches the exact bound active task")
     if not hmac.compare_digest(
@@ -5119,7 +5121,14 @@ def _bound_execution_expiry_snapshot(
     launch = agentflow.get("launch")
     launch = launch if isinstance(launch, Mapping) else {}
     limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
-    if limits is None or dict(launch.get("execution_limits") or {}) != limits.to_dict():
+    if limits is None:
+        if require_budget:
+            raise ValueError("bound execution has no signed structured execution limits")
+        return {
+            "contract": dict(contract), "binding": dict(binding), "record": dict(record),
+            "deadline_epoch": None, "ledger": None, "status": status,
+        }
+    if dict(launch.get("execution_limits") or {}) != limits.to_dict():
         raise ValueError("current task graph no longer matches the signed structured execution limits")
     ledger = _verify_execution_snapshot_against_ledger(
         root, workflow_root, task_id, contract, authority_secret=authority_secret,
@@ -5136,18 +5145,27 @@ def _bound_execution_expiry_snapshot(
     else:
         if channel.get("state") != "issued":
             raise ValueError("bound execution return capability is not issued")
-        for field in ("result_path", "submission_file"):
-            path = Path(str(contract.get(field) or "")).expanduser()
-            try:
-                path.resolve().relative_to((root / ".agentflow/runtime").resolve())
-            except ValueError as exc:
-                raise ValueError(f"bound execution {field} is outside managed runtime") from exc
-            if path.is_symlink() or path.exists():
-                raise ValueError(f"bound execution already has a {field} and cannot be expired safely")
+        if require_pristine and _bound_execution_has_pending_result(root, contract):
+            raise ValueError("bound execution already has a result and cannot be expired safely")
     return {
         "contract": dict(contract), "binding": dict(binding), "record": dict(record),
         "deadline_epoch": deadline, "ledger": dict(ledger), "status": status,
     }
+
+
+def _bound_execution_has_pending_result(root: Path, contract: Mapping[str, Any]) -> bool:
+    """Return true for a signed launch whose result inbox has been touched."""
+    for field in ("result_path", "submission_file"):
+        path = Path(str(contract.get(field) or "")).expanduser()
+        try:
+            path.resolve().relative_to((root / ".agentflow/runtime").resolve())
+        except ValueError as exc:
+            raise ValueError(f"bound execution {field} is outside managed runtime") from exc
+        if path.is_symlink():
+            raise ValueError(f"bound execution {field} is not a regular managed path")
+        if path.exists():
+            return True
+    return False
 
 
 def _commit_expired_bound_execution(
@@ -5164,7 +5182,7 @@ def _commit_expired_bound_execution(
             root, workflow_root, task_id, record, authority_secret=authority_secret,
         )
         return
-    _require_definitively_absent_herdr_pane(str(snapshot["record"].get("pane_id") or ""))
+    _require_definitively_absent_herdr_pane(str(binding.get("pane_id") or ""))
     state_path = root / ".agentflow/herdr/sessions.json"
     with _herdr_transaction(state_path) as state:
         record = state.get("sessions", {}).get(task_id)
@@ -5192,6 +5210,9 @@ def _commit_expired_bound_execution(
         submission = Path(str(contract.get("submission_file") or "")).expanduser()
         if submission.is_symlink() or submission.exists():
             raise ValueError("a worker submission appeared before expiry could revoke its capability")
+        result = Path(str(contract.get("result_path") or "")).expanduser()
+        if result.is_symlink() or result.exists():
+            raise ValueError("a worker result appeared before expiry could revoke its capability")
         ledger = _expired_preidentity_ledger_disposition(
             root, workflow_root, task_id, contract,
             authority_secret=authority_secret,
@@ -5249,27 +5270,78 @@ def _expire_bound_execution_if_due(
     if not isinstance(record, Mapping) or not isinstance(record.get("binding"), Mapping):
         # Identity-pending recovery has its own stricter signed path.
         return None
+    if (
+        str(record.get("status") or "") not in {"launched", "running", "expired_execution"}
+        or record.get("result") not in (None, {})
+    ):
+        return None
     channel = record.get("return_channel")
-    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    binding = record.get("binding")
+    if not isinstance(channel, Mapping) or not isinstance(binding, Mapping):
+        raise ValueError("bound execution identity or return channel is unavailable")
+    launch_id = str(record.get("launch_id") or "")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if (
+        not launch_id or contract_path.is_symlink()
+        or contract_path.resolve() != expected_path.resolve() or not contract_path.is_file()
+    ):
+        raise ValueError("bound launch contract path is not canonical")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
     if not isinstance(contract, Mapping):
+        raise ValueError("bound launch contract is malformed")
+    _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret,
+    )
+    expected_binding = {
+        "root": str(contract.get("workspace_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "provider": str(contract.get("provider") or ""),
+    }
+    if any(not expected or str(binding.get(field) or "") != expected
+           for field, expected in expected_binding.items()):
+        raise ValueError("provider session binding differs from the signed return contract")
+    record_pane_id = record.get("pane_id")
+    if not str(binding.get("pane_id") or "") or (
+        record_pane_id not in (None, "")
+        and str(record_pane_id) != str(binding.get("pane_id") or "")
+    ):
+        raise ValueError("provider session pane identity differs from its durable binding")
+    limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
+    if limits is None:
         return None
-    try:
-        limits = execution_limits_backend.parse_limits(contract.get("execution_limits"))
-        deadline = float(contract.get("deadline_epoch"))
-    except (TypeError, ValueError, execution_limits_backend.ExecutionLimitError):
+    snapshot = _bound_execution_expiry_snapshot(
+        args, controller, root, workflow_root, lease, task_id,
+        authority_secret=authority_secret,
+        require_budget=False,
+        require_pristine=False,
+    )
+    deadline = snapshot.get("deadline_epoch")
+    # A canonical, signed unbudgeted launch has no expiry disposition.
+    if deadline is None:
         return None
-    # Ordinary unbudgeted launches have no expiry disposition.  Do not run
-    # expiry-only snapshot checks before their normal result ingestion path.
-    if limits is None or deadline <= 0:
+    if time.time() < float(deadline):
+        return None
+    if (
+        snapshot.get("status") != "expired_execution"
+        and (
+            snapshot["record"].get("result") not in (None, {})
+            or _bound_execution_has_pending_result(root, snapshot["contract"])
+        )
+    ):
+        # Leave an inbox submission or result to the ordinary ingestion path;
+        # it is never expiry evidence, including after the deadline.
         return None
     snapshot = _bound_execution_expiry_snapshot(
         args, controller, root, workflow_root, lease, task_id,
         authority_secret=authority_secret,
     )
-    if time.time() < float(snapshot["deadline_epoch"]):
-        return None
     if snapshot.get("status") != "expired_execution":
-        _require_definitively_absent_herdr_pane(str(snapshot["record"].get("pane_id") or ""))
+        _require_definitively_absent_herdr_pane(str(snapshot["binding"].get("pane_id") or ""))
 
     def commit() -> None:
         latest = _bound_execution_expiry_snapshot(
