@@ -44,9 +44,18 @@ def herdr_pane_is_definitively_absent(
     outputs = [value.strip() for value in (stdout, stderr) if value.strip()]
     if len(outputs) != 1:
         return False
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
     try:
-        response = json.loads(outputs[0])
-    except (json.JSONDecodeError, TypeError):
+        response = json.loads(outputs[0], object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return False
     if (
         not isinstance(response, Mapping)

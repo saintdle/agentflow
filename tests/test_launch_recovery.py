@@ -59,6 +59,24 @@ class LaunchRecoveryReducerTests(unittest.TestCase):
                     1, stdout, stderr, pane_id="pane-1",
                 ))
 
+    def test_duplicate_json_keys_never_prove_pane_absence(self) -> None:
+        duplicates = (
+            '{"error":{"code":"transport_error"},'
+            '"error":{"code":"pane_not_found","message":"pane pane-1 not found"},'
+            '"id":"cli:pane:get"}',
+            '{"error":{"code":"pane_not_found","message":"pane pane-1 not found"},'
+            '"id":"other","id":"cli:pane:get"}',
+            '{"error":{"code":"transport_error","code":"pane_not_found",'
+            '"message":"pane pane-1 not found"},"id":"cli:pane:get"}',
+            '{"error":{"code":"pane_not_found","message":"other",'
+            '"message":"pane pane-1 not found"},"id":"cli:pane:get"}',
+        )
+        for response in duplicates:
+            with self.subTest(response=response):
+                self.assertFalse(herdr_pane_is_definitively_absent(
+                    1, "", response, pane_id="pane-1",
+                ))
+
     def test_ambiguous_timeout_is_operator_action_not_a_failed_or_retryable_launch(self) -> None:
         decision = reduce_incomplete_launch(
             "claimed_no_session",
