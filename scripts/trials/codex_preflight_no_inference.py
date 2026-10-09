@@ -751,10 +751,10 @@ def _child_diagnostic(env: dict[str, str]) -> dict[str, Any]:
                 plan_type_value = getattr(payload, "plan_type", None)
                 auth_mode = _enum(auth_mode_value) if auth_mode_value is not None else None
                 plan_type = _enum(plan_type_value) if plan_type_value is not None else None
-                # The pinned payload carries account metadata only. Keep the earlier ChatGPT
-                # decision stable by rejecting non-ChatGPT modes and any changed account plan.
-                if (auth_mode not in {None, "chatgpt", "chatgptAuthTokens"}
-                        or (plan_type is not None and plan_type != account_plan_type)):
+                # These pinned fields are nullable, so absence cannot confirm the earlier
+                # account decision. Require its exact ChatGPT mode and an explicit matching plan.
+                if (auth_mode != "chatgpt" or plan_type is None or account_plan_type is None
+                        or plan_type != account_plan_type):
                     reject_notification(method_category, payload_category, "account_state_mismatch")
                 result["startup_notifications_skipped"] += 1
                 continue

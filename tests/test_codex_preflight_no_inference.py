@@ -754,6 +754,25 @@ class CodexPreflightTests(unittest.TestCase):
         self.assertEqual(changed_plan["notification_mismatch_reason"], "account_state_mismatch")
         self.assertNotIn("private-plan-label", json.dumps(changed_plan))
 
+        incomplete_or_changed_states = (
+            ("both_null", {"auth_mode": None, "plan_type": None}),
+            ("null_auth_mode", {"auth_mode": None, "plan_type": "pro"}),
+            ("null_plan_type", {"auth_mode": "chatgpt", "plan_type": None}),
+            ("missing_auth_mode", {"plan_type": "pro"}),
+            ("missing_plan_type", {"auth_mode": "chatgpt"}),
+            ("alternate_chatgpt_mode", {"auth_mode": "chatgptAuthTokens", "plan_type": "pro"}),
+        )
+        for label, fields in incomplete_or_changed_states:
+            with self.subTest(account_update=label):
+                result = self._diagnose_prefix_notification(
+                    lambda sdk, fields=fields: (
+                        "account/updated", sdk.AccountUpdatedNotification(**fields),
+                    ),
+                )
+                self.assertEqual(result["code"], "settings_unsupported")
+                self.assertEqual(result["notification_mismatch_reason"], "account_state_mismatch")
+                self.assertFalse(result["profile_observed"])
+
     def test_unknown_malformed_nonempty_and_wrong_target_notifications_fail_closed(self):
         cases = (
             (
