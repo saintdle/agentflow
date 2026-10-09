@@ -436,13 +436,68 @@ class CodexPreflightTests(unittest.TestCase):
             # Reproduce the reported launch: Popen receives only the synthesized
             # environment while macOS adds this one runtime marker to Python -I.
             env.pop(preflight.DARWIN_TEXT_ENCODING_ENV, None)
-            child_code = (
-                "import os, runpy; "
-                f"ns=runpy.run_path({str(RUNNER)!r}); "
-                f"assert {preflight.DARWIN_TEXT_ENCODING_ENV!r} in os.environ; "
-                f"ns['_validate_child_context'](dict(os.environ), {token!r}); "
-                "print('validated')"
-            )
+            child_code = """
+import json
+import os
+import runpy
+
+marker = os.environ.get(__MARKER_ENV__)
+field_count = 0 if marker is None else marker.count(":") + 1
+if field_count <= 3:
+    field_count_bucket = str(field_count)
+else:
+    field_count_bucket = "4plus"
+if marker is None:
+    length_bucket = "missing"
+elif len(marker) == 0:
+    length_bucket = "0"
+elif len(marker) <= 16:
+    length_bucket = "1-16"
+elif len(marker) <= 32:
+    length_bucket = "17-32"
+elif len(marker) <= 64:
+    length_bucket = "33-64"
+else:
+    length_bucket = "65plus"
+
+parts = marker.split(":") if marker is not None and len(marker) <= 64 else []
+uid_matches_current = False
+if parts:
+    uid_field = parts[0]
+    uid_digits = uid_field[2:]
+    if (uid_field[:2].lower() == "0x" and 0 < len(uid_digits) <= 16
+            and all(character in "0123456789abcdefABCDEF" for character in uid_digits)):
+        uid_matches_current = int(uid_digits, 16) == os.getuid()
+
+selector_diagnostics = []
+for selector in parts[1:3]:
+    if selector.isascii() and selector.isdecimal():
+        parsed_selector = int(selector, 10)
+        selector_format = "decimal"
+    elif (selector[:2].lower() == "0x" and selector[2:]
+          and all(character in "0123456789abcdefABCDEF" for character in selector[2:])):
+        parsed_selector = int(selector[2:], 16)
+        selector_format = "hex"
+    else:
+        parsed_selector = None
+        selector_format = "other"
+    selector_diagnostics.append({
+        "format": selector_format,
+        "within_16bit": None if parsed_selector is None else parsed_selector <= 0xFFFF,
+    })
+
+print(json.dumps({
+    "field_count_bucket": field_count_bucket,
+    "length_bucket": length_bucket,
+    "uid_matches_current": uid_matches_current,
+    "selectors": selector_diagnostics,
+}, sort_keys=True, separators=(",", ":")), flush=True)
+ns = runpy.run_path(__RUNNER_PATH__)
+ns["_validate_child_context"](dict(os.environ), __CHILD_TOKEN__)
+print("validated", flush=True)
+""".replace("__MARKER_ENV__", repr(preflight.DARWIN_TEXT_ENCODING_ENV)).replace(
+    "__RUNNER_PATH__", repr(str(RUNNER)),
+).replace("__CHILD_TOKEN__", repr(token))
             self.spawn_denial.stop()
             try:
                 completed = subprocess.run(
@@ -452,8 +507,26 @@ class CodexPreflightTests(unittest.TestCase):
             finally:
                 self.spawn_guard = self.spawn_denial.start()
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "validated")
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        output_lines = completed.stdout.splitlines()
+        self.assertEqual(len(output_lines), 2, completed.stdout)
+        self.assertEqual(output_lines[-1], "validated", completed.stdout)
+        classification = json.loads(output_lines[0])
+        self.assertEqual(set(classification), {
+            "field_count_bucket", "length_bucket", "uid_matches_current", "selectors",
+        })
+        self.assertIn(classification["field_count_bucket"], {"0", "1", "2", "3", "4plus"})
+        self.assertIn(classification["length_bucket"], {
+            "missing", "0", "1-16", "17-32", "33-64", "65plus",
+        })
+        self.assertIs(type(classification["uid_matches_current"]), bool)
+        self.assertLessEqual(len(classification["selectors"]), 2)
+        for selector in classification["selectors"]:
+            self.assertIn(selector["format"], {"decimal", "hex", "other"})
+            if selector["format"] == "other":
+                self.assertIsNone(selector["within_16bit"])
+            else:
+                self.assertIs(type(selector["within_16bit"]), bool)
         self.assertEqual(self.loader_guard.call_count, 0)
         self.assertEqual(self.spawn_guard.call_count, 0)
         self.assertEqual(self.sdk_import_attempts, [])
