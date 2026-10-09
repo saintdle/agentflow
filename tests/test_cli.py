@@ -3009,15 +3009,35 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                     continue_after_cancelled_preidentity=fixture.task_id,
                     continue_task="distinct-ready-child",
                 )
-                def one_step(_args, active_controller, root, lease, *, operation):
-                    resumed = active_controller.resume([], lease=lease)
-                    return ({"operation": operation, "ok": True, "root": str(root),
-                             "result": resumed.to_dict()}, True)
-                with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": fixture.workflow_root}), \
-                     mock.patch.object(cli, "_verify_cancelled_preidentity_continuation",
-                                       return_value="distinct-ready-child"), \
+                ready_issue = {
+                    "id": "distinct-ready-child", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                descendants = [fixture.task_issue, ready_issue]
+                def get_issue(_cwd, issue_id):
+                    return {
+                        fixture.workflow_root: fixture.root_issue,
+                        fixture.task_id: fixture.task_issue,
+                        ready_issue["id"]: ready_issue,
+                    }[issue_id]
+                def beads_run(_cwd, *argv):
+                    if argv and argv[0] == "update" and "--claim" in argv:
+                        ready_issue["status"] = "in_progress"
+                        ready_issue["assignee"] = argv[argv.index("--actor") + 1]
+                        return subprocess.CompletedProcess(["bd", *argv], 0, "", "")
+                    rows = [ready_issue] if "--unassigned" in argv else []
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+                def update_metadata(_cwd, task_id, fields):
+                    if task_id == ready_issue["id"]:
+                        ready_issue["metadata"].setdefault("agentflow", {}).update(fields)
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=descendants), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=beads_run), \
+                     mock.patch.object(cli.beads_backend, "update_agentflow_metadata", side_effect=update_metadata), \
                      mock.patch.object(cli, "_bind_current_controller_sessions"), \
-                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                     mock.patch.object(cli, "_dispatch_via_herdr", return_value=lambda _task: {
+                         "session_id": "ready-child-session", "state": "running",
+                     }):
                     continued = _run_controller_json(cli.controller_resume, resume_args)
                 self.assertTrue(continued["ok"], continued)
                 committed = json.loads(controller.state_path.read_text())
@@ -3025,8 +3045,72 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertNotIn("continuation_reattach", committed)
                 self.assertEqual(
                     controller._load_checkpoint()["pending_continuation_task"],
-                    "distinct-ready-child",
+                    "",
                 )
+                committed_checkpoint = controller._load_checkpoint()
+                self.assertEqual(committed_checkpoint["task"], "distinct-ready-child")
+                self.assertEqual(
+                    committed_checkpoint["claim_id"],
+                    f"{fixture.workflow_root}/distinct-ready-child/{fixture.controller}",
+                )
+                self.assertEqual(committed_checkpoint["session_id"], "ready-child-session")
+                self.assertEqual(committed_checkpoint["state"], "running")
+                self.assertEqual(ready_issue["status"], "in_progress")
+                self.assertEqual(ready_issue["assignee"], fixture.controller)
+
+    def test_owner_continuation_rejects_bad_tombstone_claim_root_and_ready_target_before_rotation(self) -> None:
+        for mode in ("missing-disposition", "forged-disposition", "unrevoked-channel", "wrong-root", "wrong-claim", "wrong-target"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, _contract, _ledger, baseline, repair_args = self._owner_epoch_fixture(base)
+                    repaired, _ = self._run_owner_epoch_repair(fixture, repair_args)
+                    self.assertTrue(repaired["ok"], repaired)
+                    ready_issue = {
+                        "id": "distinct-ready-child", "status": "open", "assignee": "",
+                        "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                    }
+                    if mode == "missing-disposition":
+                        with cli._herdr_transaction(baseline["state_path"]) as record_state:
+                            record_state["sessions"][fixture.task_id].pop("recovery_disposition", None)
+                    elif mode == "forged-disposition":
+                        with cli._herdr_transaction(baseline["state_path"]) as record_state:
+                            record_state["sessions"][fixture.task_id]["recovery_disposition"]["reason"] = "forged_owner_reason"
+                    elif mode == "unrevoked-channel":
+                        with cli._herdr_transaction(baseline["state_path"]) as record_state:
+                            record_state["sessions"][fixture.task_id]["return_channel"]["state"] = "active"
+                    elif mode == "wrong-root":
+                        fixture.task_issue["metadata"]["agentflow"]["root"] = "foreign-root"
+                    elif mode == "wrong-claim":
+                        fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "foreign-claim"
+                    descendants = [fixture.task_issue, ready_issue]
+                    resume_args = _controller_args(
+                        fixture.root, workflow_root=fixture.workflow_root, controller=fixture.controller,
+                        continue_after_cancelled_preidentity=fixture.task_id,
+                        continue_task="distinct-ready-child",
+                    )
+                    def get_issue(_cwd, issue_id):
+                        return {
+                            fixture.workflow_root: fixture.root_issue,
+                            fixture.task_id: fixture.task_issue,
+                            ready_issue["id"]: ready_issue,
+                        }[issue_id]
+                    def beads_run(_cwd, *argv):
+                        rows = ([{"id": "other-ready-task"}] if mode == "wrong-target"
+                                else [ready_issue] if "--unassigned" in argv else [])
+                        return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+                    state_before = controller.state_path.read_bytes()
+                    checkpoint_before = controller.checkpoint_path.read_bytes()
+                    credential_before = cli._resume_key_path(repair_args).read_bytes()
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=descendants), \
+                         mock.patch.object(cli.beads_backend, "run", side_effect=beads_run), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"):
+                        rejected = _run_controller_json(cli.controller_resume, resume_args)
+                    self.assertFalse(rejected["ok"], rejected)
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                    self.assertEqual(cli._resume_key_path(repair_args).read_bytes(), credential_before)
 
     def test_stop_cannot_remove_binding_while_owner_repair_intent_is_pending(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

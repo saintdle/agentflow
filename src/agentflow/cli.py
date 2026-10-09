@@ -2560,6 +2560,7 @@ def _verify_cancelled_preidentity_continuation(
     if retirement_reason not in {
         "expired launch deadline; Herdr definitively reports pane absent before provider identity",
         "superseded_legacy_scope",
+        "owner_abandoned_epoch",
     }:
         raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
     marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
@@ -2613,7 +2614,7 @@ def _verify_cancelled_preidentity_continuation(
     ):
         raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
     assert isinstance(record, Mapping)
-    legacy_scope = retirement_reason == "superseded_legacy_scope"
+    legacy_scope = retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
     channel = record.get("return_channel")
     contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
     if (
