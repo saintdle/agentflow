@@ -15,10 +15,12 @@ import importlib.metadata
 import json
 import math
 import os
+import sqlite3
 import stat
 import time
+from contextlib import closing
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 
 SUPPORTED_SDK_VERSION = "1.0.17"
@@ -181,6 +183,403 @@ def derive_evidence_key(
     context = _KEY_DOMAIN + run_nonce.encode("utf-8") + b"\0" + _canonical(identity.to_dict())
     return hmac.new(authority_secret.encode("utf-8"), context, hashlib.sha256).digest()
 
+
+@dataclasses.dataclass(frozen=True)
+class CopilotLedgerHead:
+    """Controller-owned high-water mark for one exact launch identity."""
+
+    identity_digest: str
+    sequence: int
+    signature: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.identity_digest, str)
+            or len(self.identity_digest) != 64
+            or not isinstance(self.sequence, int)
+            or isinstance(self.sequence, bool)
+            or self.sequence < 0
+            or not isinstance(self.signature, str)
+            or len(self.signature) != 64
+            or any(character not in "0123456789abcdef" for character in self.signature)
+            or any(character not in "0123456789abcdef" for character in self.identity_digest)
+        ):
+            raise CopilotSDKError("Copilot ledger anchor head is invalid")
+
+
+@dataclasses.dataclass(frozen=True)
+class CopilotLedgerSnapshot:
+    """One atomically committed controller ledger and its current head."""
+
+    head: CopilotLedgerHead
+    rows: tuple[Mapping[str, Any], ...]
+
+
+class CopilotLedgerAnchorStore(Protocol):
+    """Controller-owned durable storage outside the worker write boundary.
+
+    ``compare_and_append`` must atomically persist both the signed row and new
+    head, comparing the stored head with ``expected``. Implementations must
+    keep ledger data outside worker-writable storage. The signing key is never
+    passed here. Restart verification also compares against the controller's
+    separately persisted expected head, so restoring an older store snapshot
+    fails closed.
+    """
+
+    def read_ledger(self, anchor_id: str) -> CopilotLedgerSnapshot | None: ...
+
+    def compare_and_append(
+        self,
+        anchor_id: str,
+        expected: CopilotLedgerHead | None,
+        signed_row: Mapping[str, Any],
+        replacement: CopilotLedgerHead,
+    ) -> bool: ...
+
+
+class SQLiteCopilotLedgerStore:
+    """Atomic durable adapter for a private controller-owned SQLite file.
+
+    The containing directory must already be private and outside the worker
+    workspace. The caller still supplies the independently authenticated
+    expected head when verifying after restart.
+    """
+
+    def __init__(self, path: Path, *, workspace_root: Path) -> None:
+        try:
+            root = workspace_root.expanduser().resolve(strict=False)
+            parent = Path(path).expanduser().parent.resolve(strict=True)
+            resolved = parent / Path(path).name
+            if resolved == root or root in resolved.parents:
+                raise CopilotSDKError("Copilot controller ledger must be outside the worker workspace")
+            parent_info = parent.stat()
+            if not stat.S_ISDIR(parent_info.st_mode) or stat.S_IMODE(parent_info.st_mode) & 0o077:
+                raise CopilotSDKError("Copilot controller ledger directory is not private")
+            if hasattr(os, "getuid") and parent_info.st_uid != os.getuid():
+                raise CopilotSDKError("Copilot controller ledger directory has a different owner")
+            if resolved.is_symlink():
+                raise CopilotSDKError("Copilot controller ledger cannot be a symlink")
+            if resolved.exists():
+                info = resolved.lstat()
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+                    raise CopilotSDKError("Copilot controller ledger file is not private")
+                if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                    raise CopilotSDKError("Copilot controller ledger file has a different owner")
+            else:
+                descriptor = os.open(resolved, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                os.close(descriptor)
+            self.path = resolved
+            self._initialize()
+        except CopilotSDKError:
+            raise
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            raise CopilotSDKError("Copilot controller ledger storage is unavailable") from exc
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _initialize(self) -> None:
+        try:
+            with closing(self._connect()) as connection:
+                mode = connection.execute("PRAGMA journal_mode = DELETE").fetchone()
+                if mode is None or mode[0].lower() != "delete":
+                    raise CopilotSDKError("Copilot controller ledger cannot enable crash-safe journaling")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS copilot_ledger_head ("
+                    "anchor_id TEXT PRIMARY KEY, identity_digest TEXT NOT NULL, "
+                    "sequence INTEGER NOT NULL, signature TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS copilot_ledger_row ("
+                    "anchor_id TEXT NOT NULL, sequence INTEGER NOT NULL, payload TEXT NOT NULL, "
+                    "PRIMARY KEY(anchor_id, sequence), "
+                    "FOREIGN KEY(anchor_id) REFERENCES copilot_ledger_head(anchor_id))"
+                )
+            os.chmod(self.path, 0o600)
+        except (OSError, sqlite3.Error) as exc:
+            raise CopilotSDKError("Copilot controller ledger schema could not be initialized") from exc
+
+    def read_ledger(self, anchor_id: str) -> CopilotLedgerSnapshot | None:
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN")
+                saved = connection.execute(
+                    "SELECT identity_digest, sequence, signature "
+                    "FROM copilot_ledger_head WHERE anchor_id = ?",
+                    (anchor_id,),
+                ).fetchone()
+                if saved is None:
+                    stray_rows = connection.execute(
+                        "SELECT 1 FROM copilot_ledger_row WHERE anchor_id = ? LIMIT 1",
+                        (anchor_id,),
+                    ).fetchone()
+                    connection.commit()
+                    if stray_rows is not None:
+                        raise CopilotSDKError("Copilot controller ledger has rows without a head")
+                    return None
+                rows = connection.execute(
+                    "SELECT payload FROM copilot_ledger_row WHERE anchor_id = ? ORDER BY sequence",
+                    (anchor_id,),
+                ).fetchall()
+                connection.commit()
+            parsed = tuple(json.loads(row[0]) for row in rows)
+            if any(not isinstance(row, Mapping) for row in parsed):
+                raise CopilotSDKError("Copilot controller ledger has malformed rows")
+            return CopilotLedgerSnapshot(
+                head=CopilotLedgerHead(saved[0], saved[1], saved[2]),
+                rows=parsed,
+            )
+        except CopilotSDKError:
+            raise
+        except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CopilotSDKError("Copilot controller ledger could not be read") from exc
+
+    def compare_and_append(
+        self,
+        anchor_id: str,
+        expected: CopilotLedgerHead | None,
+        signed_row: Mapping[str, Any],
+        replacement: CopilotLedgerHead,
+    ) -> bool:
+        row = dict(signed_row)
+        try:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                saved = connection.execute(
+                    "SELECT identity_digest, sequence, signature "
+                    "FROM copilot_ledger_head WHERE anchor_id = ?",
+                    (anchor_id,),
+                ).fetchone()
+                current = None if saved is None else CopilotLedgerHead(*saved)
+                if current != expected:
+                    connection.rollback()
+                    return False
+                expected_sequence = 0 if current is None else current.sequence + 1
+                expected_previous = "0" * 64 if current is None else current.signature
+                if (
+                    row.get("sequence") != expected_sequence
+                    or row.get("previous_signature") != expected_previous
+                    or row.get("signature") != replacement.signature
+                    or replacement.sequence != expected_sequence
+                    or current is not None and replacement.identity_digest != current.identity_digest
+                ):
+                    connection.rollback()
+                    return False
+                if current is None:
+                    connection.execute(
+                        "INSERT INTO copilot_ledger_head(anchor_id, identity_digest, sequence, signature) "
+                        "VALUES (?, ?, ?, ?)",
+                        (anchor_id, replacement.identity_digest, replacement.sequence, replacement.signature),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE copilot_ledger_head SET sequence = ?, signature = ? "
+                        "WHERE anchor_id = ? AND identity_digest = ? AND sequence = ? AND signature = ?",
+                        (
+                            replacement.sequence, replacement.signature, anchor_id,
+                            current.identity_digest, current.sequence, current.signature,
+                        ),
+                    )
+                    if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                        connection.rollback()
+                        return False
+                connection.execute(
+                    "INSERT INTO copilot_ledger_row(anchor_id, sequence, payload) VALUES (?, ?, ?)",
+                    (anchor_id, expected_sequence, json.dumps(row, sort_keys=True, separators=(",", ":"))),
+                )
+                connection.commit()
+            return True
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise CopilotSDKError("Copilot controller ledger atomic append failed") from exc
+
+
+class ProtectedCopilotLedger:
+    """Validate and append to a controller-owned atomic durable ledger."""
+
+    def __init__(
+        self,
+        *,
+        identity: CopilotLaunchIdentity,
+        evidence_key: bytes,
+        anchor_store: CopilotLedgerAnchorStore,
+    ) -> None:
+        self.identity = identity
+        self._identity_digest = hashlib.sha256(_canonical(identity.to_dict())).hexdigest()
+        self._anchor_id = _scope("protected-ledger", self._identity_digest)
+        self._launch_key = self._validate_key(evidence_key)
+        self._anchor_store = anchor_store
+        if self._read_snapshot() is not None:
+            raise CopilotSDKError("Copilot protected ledger already exists; launch resume is unsupported")
+        self._rows: list[dict[str, Any]] = []
+        self._head: CopilotLedgerHead | None = None
+        self._session_scope = ""
+        self._session_key = b""
+
+    @classmethod
+    def verify_existing(
+        cls,
+        *,
+        identity: CopilotLaunchIdentity,
+        evidence_key: bytes,
+        anchor_store: CopilotLedgerAnchorStore,
+        expected_head: CopilotLedgerHead,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Verify a completed or interrupted ledger after restart.
+
+        The caller supplies its separately persisted expected head. Reopening a
+        ledger for event collection is intentionally unsupported because SDK
+        resume does not replay all usage events.
+        """
+        instance = cls.__new__(cls)
+        instance.identity = identity
+        instance._identity_digest = hashlib.sha256(_canonical(identity.to_dict())).hexdigest()
+        instance._anchor_id = _scope("protected-ledger", instance._identity_digest)
+        instance._launch_key = cls._validate_key(evidence_key)
+        instance._anchor_store = anchor_store
+        instance._rows = []
+        instance._head = None
+        instance._session_scope = ""
+        instance._session_key = b""
+        rows, head = instance._load_and_validate()
+        if head != expected_head:
+            raise CopilotSDKError("Copilot protected ledger head rolled back or changed")
+        return tuple(dict(row) for row in rows)
+
+    @staticmethod
+    def _validate_key(evidence_key: bytes) -> bytes:
+        if not isinstance(evidence_key, bytes) or len(evidence_key) < 32:
+            raise CopilotSDKError("controller Copilot evidence key is unavailable")
+        return evidence_key
+
+    def _read_snapshot(self) -> CopilotLedgerSnapshot | None:
+        try:
+            snapshot = self._anchor_store.read_ledger(self._anchor_id)
+        except Exception as exc:
+            raise CopilotSDKError("controller Copilot protected ledger is unavailable") from exc
+        if snapshot is not None and not isinstance(snapshot, CopilotLedgerSnapshot):
+            raise CopilotSDKError("controller Copilot protected ledger has an invalid shape")
+        return snapshot
+
+    @property
+    def head(self) -> CopilotLedgerHead | None:
+        return self._head
+
+    @property
+    def rows(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(dict(row) for row in self._rows)
+
+    def append(self, signed_row: Mapping[str, Any]) -> None:
+        row = dict(signed_row)
+        candidate = [*self._rows, row]
+        head = self._verify_rows(candidate)
+        if head is None:
+            raise CopilotSDKError("Copilot protected ledger row is incomplete")
+        try:
+            committed = self._anchor_store.compare_and_append(
+                self._anchor_id, self._head, row, head,
+            )
+        except Exception as exc:
+            raise CopilotSDKError("controller Copilot ledger atomic commit failed") from exc
+        if not committed:
+            raise CopilotSDKError("controller Copilot ledger compare-and-append failed")
+        self._rows = candidate
+        self._head = head
+
+    def matches(self, rows: list[dict[str, Any]]) -> bool:
+        try:
+            saved_rows, saved_head = self._load_and_validate()
+        except CopilotSDKError:
+            return False
+        return saved_rows == rows and saved_head == self._head
+
+    def _load_and_validate(self) -> tuple[list[dict[str, Any]], CopilotLedgerHead]:
+        snapshot = self._read_snapshot()
+        if snapshot is None:
+            raise CopilotSDKError("Copilot protected ledger rows are missing or invalid")
+        if snapshot.head.identity_digest != self._identity_digest:
+            raise CopilotSDKError("Copilot protected ledger belongs to another launch")
+        copied = [dict(row) for row in snapshot.rows]
+        if not copied:
+            raise CopilotSDKError("Copilot protected ledger rows are missing or invalid")
+        head = self._verify_rows(copied)
+        if head is None or snapshot.head != head:
+            raise CopilotSDKError("Copilot protected ledger head does not match its signed rows")
+        if not isinstance(snapshot.rows, tuple):
+            raise CopilotSDKError("Copilot protected ledger rows have an invalid shape")
+        return copied, head
+
+    def _verify_rows(self, rows: list[dict[str, Any]]) -> CopilotLedgerHead | None:
+        previous = "0" * 64
+        session_scope = ""
+        session_key = b""
+        usage_sequence = 0
+        saw_runtime_pin = False
+        saw_runtime_status = False
+        saw_launch = False
+        for sequence, saved in enumerate(rows):
+            row = dict(saved)
+            signature = row.pop("signature", None)
+            if row.get("sequence") != sequence or row.get("previous_signature") != previous:
+                raise CopilotSDKError("Copilot protected ledger has a sequence gap")
+            kind = row.get("kind")
+            if kind == "runtime_pin":
+                if sequence != 0 or saw_runtime_pin:
+                    raise CopilotSDKError("Copilot protected ledger runtime pin order is invalid")
+                saw_runtime_pin = True
+                signing_key = self._launch_key
+            elif kind == "runtime_status":
+                if sequence != 1 or not saw_runtime_pin or saw_runtime_status:
+                    raise CopilotSDKError("Copilot protected ledger runtime status order is invalid")
+                saw_runtime_status = True
+                signing_key = self._launch_key
+            else:
+                if not saw_runtime_status:
+                    raise CopilotSDKError("Copilot protected ledger runtime identity is incomplete")
+                if kind == "launch":
+                    if saw_launch or row.get("identity") != self.identity.to_dict():
+                        raise CopilotSDKError("Copilot protected ledger launch identity is invalid")
+                    candidate_scope = row.get("session_scope")
+                    if not isinstance(candidate_scope, str) or not candidate_scope:
+                        raise CopilotSDKError("Copilot protected ledger session identity is missing")
+                    session_scope = candidate_scope
+                    session_key = hmac.new(
+                        self._launch_key,
+                        _LEDGER_DOMAIN + b"session\0" + session_scope.encode("ascii"),
+                        hashlib.sha256,
+                    ).digest()
+                    saw_launch = True
+                if not saw_launch:
+                    raise CopilotSDKError("Copilot protected ledger has rows before session attachment")
+                signing_key = session_key
+                if kind == "assistant.usage":
+                    usage_sequence += 1
+                    if (
+                        row.get("call_sequence") != usage_sequence
+                        or row.get("session_scope") != session_scope
+                        or row.get("requested_model") != self.identity.requested_model
+                        or not isinstance(row.get("actual_model"), str)
+                        or not row.get("actual_model")
+                    ):
+                        raise CopilotSDKError("Copilot protected ledger usage identity is invalid")
+            expected = hmac.new(
+                signing_key,
+                _LEDGER_DOMAIN + previous.encode("ascii") + b"\0" + _canonical(row),
+                hashlib.sha256,
+            ).hexdigest()
+            if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+                raise CopilotSDKError("Copilot protected ledger signature is invalid")
+            previous = signature
+        if not rows:
+            return None
+        return CopilotLedgerHead(
+            identity_digest=self._identity_digest,
+            sequence=len(rows) - 1,
+            signature=previous,
+        )
 
 def _numeric(value: Any) -> int | float | None:
     if (
@@ -380,7 +779,7 @@ def create_proof_client(
 
 
 class CopilotUsageCollector:
-    """Capture only pinned-runtime usage events and sign a per-run memory chain."""
+    """Capture pinned-runtime usage and anchor each signed row as it arrives."""
 
     def __init__(
         self,
@@ -388,10 +787,14 @@ class CopilotUsageCollector:
         *,
         evidence_key: bytes,
         runtime_pin: CopilotRuntimePin,
+        protected_ledger: ProtectedCopilotLedger | None = None,
     ) -> None:
         if not isinstance(evidence_key, bytes) or len(evidence_key) < 32:
             raise CopilotSDKError("collector evidence key is unavailable")
+        if protected_ledger is not None and protected_ledger.identity != identity:
+            raise CopilotSDKError("Copilot protected ledger belongs to another launch")
         self.identity = identity
+        self._protected_ledger = protected_ledger
         self._runtime_pin = runtime_pin
         self._key_seed = evidence_key
         self._launch_key = evidence_key
@@ -427,6 +830,12 @@ class CopilotUsageCollector:
             hashlib.sha256,
         ).hexdigest()
         body["signature"] = signature
+        if self._protected_ledger is not None:
+            try:
+                self._protected_ledger.append(body)
+            except CopilotSDKError:
+                self._fail("protected_anchor_commit_failed")
+                raise
         self._rows.append(body)
 
     def record_runtime_pin(self) -> None:
@@ -635,6 +1044,10 @@ class CopilotUsageCollector:
             self._fail("tool_inventory_incomplete")
         if self._pending_denials:
             self._fail("permission_denial_not_bound_to_session")
+        if self._protected_ledger is None:
+            self._fail("protected_anchor_unavailable")
+        elif not self._protected_ledger.matches(self._rows):
+            self._fail("protected_anchor_mismatch")
         if not self._chain_is_valid():
             self._fail("signed_chain_invalid")
         if self._unsubscribe is not None:
@@ -679,7 +1092,10 @@ class CopilotUsageCollector:
             if not isinstance(supplied, str) or not hmac.compare_digest(supplied, expected):
                 return False
             previous = supplied
-        return True
+        return (
+            self._protected_ledger is not None
+            and self._protected_ledger.matches(self._rows)
+        )
 
 
 class CopilotProofRun:
@@ -699,11 +1115,16 @@ class CopilotProofRun:
         *,
         identity: CopilotLaunchIdentity,
         evidence_key: bytes,
+        protected_ledger: ProtectedCopilotLedger | None = None,
         base_directory: Path,
         workspace_root: Path,
         github_token: str,
     ) -> "CopilotProofRun":
         """Start a fresh managed session and attach before any model request."""
+        if not isinstance(protected_ledger, ProtectedCopilotLedger):
+            raise CopilotSDKError("Copilot proof run requires a protected controller ledger")
+        if protected_ledger.identity != identity:
+            raise CopilotSDKError("Copilot protected ledger belongs to another launch")
         deadline = time.monotonic() + MAX_PROOF_SECONDS
         prepared = create_proof_client(
             base_directory=base_directory,
@@ -713,6 +1134,7 @@ class CopilotProofRun:
         client = prepared.client
         collector = CopilotUsageCollector(
             identity, evidence_key=evidence_key, runtime_pin=prepared.runtime_pin,
+            protected_ledger=protected_ledger,
         )
         session = None
         try:
@@ -838,7 +1260,9 @@ class CopilotProofRun:
 
 
 __all__ = [
-    "COPILOT_NEGATIVE_CONTROL_PROMPT", "CopilotLaunchIdentity", "CopilotProofRun", "CopilotSDKError",
+    "COPILOT_NEGATIVE_CONTROL_PROMPT", "CopilotLaunchIdentity", "CopilotLedgerAnchorStore",
+    "CopilotLedgerHead", "CopilotLedgerSnapshot", "CopilotProofRun", "CopilotSDKError",
+    "ProtectedCopilotLedger", "SQLiteCopilotLedgerStore",
     "CopilotRuntimePin", "CopilotUsageCollector", "CopilotUsageReport", "MAX_PROOF_SECONDS",
     "SUPPORTED_CLI_RELEASE_VERSION", "SUPPORTED_RUNTIME_API_RELEASE_VERSION",
     "SUPPORTED_RUNTIME_ARTIFACT_RELEASE", "SUPPORTED_RUNTIME_PROTOCOL_VERSION",

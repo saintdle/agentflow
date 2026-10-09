@@ -4,11 +4,13 @@ import asyncio
 import importlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -329,23 +331,37 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         pin = _fake_runtime_pin()
 
         async def exercise() -> copilot_sdk.CopilotUsageReport:
-            with (
-                mock.patch.object(
-                    copilot_sdk, "create_proof_client",
-                    return_value=copilot_sdk._PreparedProofClient(client, pin),
-                ),
-                mock.patch.object(copilot_sdk, "_verify_runtime_pin"),
-            ):
-                run = await copilot_sdk.CopilotProofRun.open(
+            with tempfile.TemporaryDirectory() as raw:
+                private_state = Path(raw) / "protected"
+                private_state.mkdir(mode=0o700)
+                os.chmod(private_state, 0o700)
+                store = copilot_sdk.SQLiteCopilotLedgerStore(
+                    private_state / "ledger.sqlite",
+                    workspace_root=Path("/tmp/workspace"),
+                )
+                protected_ledger = copilot_sdk.ProtectedCopilotLedger(
                     identity=identity,
                     evidence_key=evidence_key,
-                    base_directory=Path("/tmp/private-proof-home"),
-                    workspace_root=Path("/tmp/workspace"),
-                    github_token="ephemeral-test-credential",
+                    anchor_store=store,
                 )
-            report = await run.send_once("Reply with a short acknowledgement.")
-            await run.close()
-            return report
+                with (
+                    mock.patch.object(
+                        copilot_sdk, "create_proof_client",
+                        return_value=copilot_sdk._PreparedProofClient(client, pin),
+                    ),
+                    mock.patch.object(copilot_sdk, "_verify_runtime_pin"),
+                ):
+                    run = await copilot_sdk.CopilotProofRun.open(
+                        identity=identity,
+                        evidence_key=evidence_key,
+                        protected_ledger=protected_ledger,
+                        base_directory=Path("/tmp/private-proof-home"),
+                        workspace_root=Path("/tmp/workspace"),
+                        github_token="ephemeral-test-credential",
+                    )
+                report = await run.send_once("Reply with a short acknowledgement.")
+                await run.close()
+                return report
 
         report = asyncio.run(exercise())
         self.assertTrue(report.verified)
@@ -397,6 +413,18 @@ class CopilotSDKOptionalTests(unittest.TestCase):
 
 
 class CopilotUsageCollectorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._ledger_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._ledger_temp.cleanup)
+        self._ledger_directory = Path(self._ledger_temp.name) / "protected"
+        self._ledger_directory.mkdir(mode=0o700)
+        os.chmod(self._ledger_directory, 0o700)
+        self._ledger_count = 0
+        self._last_identity: copilot_sdk.CopilotLaunchIdentity | None = None
+        self._last_evidence_key = b""
+        self._last_protected_ledger: copilot_sdk.ProtectedCopilotLedger | None = None
+        self._last_store: copilot_sdk.SQLiteCopilotLedgerStore | None = None
+
     def _identity(self) -> copilot_sdk.CopilotLaunchIdentity:
         return copilot_sdk.CopilotLaunchIdentity(
             workflow_root="root-1", task_id="task-1", claim_id="claim-1",
@@ -405,13 +433,35 @@ class CopilotUsageCollectorTests(unittest.TestCase):
         )
 
     def _collector(self) -> copilot_sdk.CopilotUsageCollector:
+        identity = self._identity()
         evidence_key = copilot_sdk.derive_evidence_key(
             "controller-authority-test-key-0123456789",
-            self._identity(),
+            identity,
             run_nonce="one-run-nonce-for-unit-tests",
         )
+        protected_ledger = self._protected_ledger(identity, evidence_key)
+        self._last_identity = identity
+        self._last_evidence_key = evidence_key
+        self._last_protected_ledger = protected_ledger
         return copilot_sdk.CopilotUsageCollector(
-            self._identity(), evidence_key=evidence_key, runtime_pin=_fake_runtime_pin(),
+            identity, evidence_key=evidence_key, runtime_pin=_fake_runtime_pin(),
+            protected_ledger=protected_ledger,
+        )
+
+    def _protected_ledger(
+        self,
+        identity: copilot_sdk.CopilotLaunchIdentity,
+        evidence_key: bytes,
+    ) -> copilot_sdk.ProtectedCopilotLedger:
+        self._ledger_count += 1
+        self._last_store = copilot_sdk.SQLiteCopilotLedgerStore(
+            self._ledger_directory / f"ledger-{self._ledger_count}.sqlite",
+            workspace_root=Path("/tmp/workspace"),
+        )
+        return copilot_sdk.ProtectedCopilotLedger(
+            identity=identity,
+            evidence_key=evidence_key,
+            anchor_store=self._last_store,
         )
 
     def _attach_and_begin(self, collector: copilot_sdk.CopilotUsageCollector) -> None:
@@ -593,6 +643,133 @@ class CopilotUsageCollectorTests(unittest.TestCase):
         report = collector.report()
         self.assertFalse(report.verified)
         self.assertIn("signed_chain_invalid", report.reason_codes)
+
+    def test_protected_ledger_survives_restart_with_expected_head(self) -> None:
+        collector = self._collector()
+        self._attach_and_begin(collector)
+        collector.on_event(self._usage_event())
+        collector.record_tool_inventory([])
+        collector.finish_request(completed=True)
+        report = collector.report()
+        ledger = self._last_protected_ledger
+        self.assertIsNotNone(ledger)
+        self.assertIsNotNone(ledger.head)
+        restarted_store = copilot_sdk.SQLiteCopilotLedgerStore(
+            self._last_store.path,
+            workspace_root=Path("/tmp/workspace"),
+        )
+
+        restored = copilot_sdk.ProtectedCopilotLedger.verify_existing(
+            identity=self._last_identity,
+            evidence_key=self._last_evidence_key,
+            anchor_store=restarted_store,
+            expected_head=ledger.head,
+        )
+        self.assertEqual(list(restored), list(report.ledger))
+        self.assertFalse(report.persistent_admission)
+        with self.assertRaisesRegex(copilot_sdk.CopilotSDKError, "resume is unsupported"):
+            copilot_sdk.ProtectedCopilotLedger(
+                identity=self._last_identity,
+                evidence_key=self._last_evidence_key,
+                anchor_store=self._last_store,
+            )
+
+    def test_protected_ledger_rejects_tamper_gap_foreign_launch_and_rollback(self) -> None:
+        def complete() -> tuple[
+            copilot_sdk.CopilotUsageReport,
+            copilot_sdk.ProtectedCopilotLedger,
+            copilot_sdk.CopilotLedgerSnapshot,
+        ]:
+            collector = self._collector()
+            self._attach_and_begin(collector)
+            ledger = self._last_protected_ledger
+            before_usage = ledger._anchor_store.read_ledger(ledger._anchor_id)
+            collector.on_event(self._usage_event())
+            collector.record_tool_inventory([])
+            collector.finish_request(completed=True)
+            report = collector.report()
+            return report, ledger, before_usage
+
+        for mutation in ("actual_model", "sequence", "foreign_launch"):
+            with self.subTest(mutation=mutation):
+                _report, ledger, _before_usage = complete()
+                identity = self._last_identity
+                expected_head = ledger.head
+                if mutation == "foreign_launch":
+                    identity = copilot_sdk.CopilotLaunchIdentity(
+                        **{**identity.to_dict(), "launch_id": "foreign-launch"},
+                    )
+                else:
+                    snapshot = ledger._anchor_store.read_ledger(ledger._anchor_id)
+                    usage = next(row for row in snapshot.rows if row["kind"] == "assistant.usage")
+                    changed = dict(usage)
+                    usage["actual_model" if mutation == "actual_model" else "sequence"] = (
+                        "gpt-5.4" if mutation == "actual_model" else usage["sequence"] + 1
+                    )
+                    sequence = changed["sequence"]
+                    with closing(sqlite3.connect(ledger._anchor_store.path)) as connection:
+                        connection.execute(
+                            "UPDATE copilot_ledger_row SET payload = ? WHERE anchor_id = ? AND sequence = ?",
+                            (json.dumps(usage, sort_keys=True, separators=(",", ":")), ledger._anchor_id, sequence),
+                        )
+                        connection.commit()
+                with self.assertRaises(copilot_sdk.CopilotSDKError):
+                    copilot_sdk.ProtectedCopilotLedger.verify_existing(
+                        identity=identity,
+                        evidence_key=self._last_evidence_key,
+                        anchor_store=self._last_store,
+                        expected_head=expected_head,
+                    )
+
+        _report, ledger, before_usage = complete()
+        expected_head = ledger.head
+        self.assertIsNotNone(before_usage)
+        with closing(sqlite3.connect(ledger._anchor_store.path)) as connection:
+            connection.execute(
+                "DELETE FROM copilot_ledger_row WHERE anchor_id = ? AND sequence > ?",
+                (ledger._anchor_id, before_usage.head.sequence),
+            )
+            connection.execute(
+                "UPDATE copilot_ledger_head SET sequence = ?, signature = ? WHERE anchor_id = ?",
+                (before_usage.head.sequence, before_usage.head.signature, ledger._anchor_id),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(copilot_sdk.CopilotSDKError, "rolled back"):
+            copilot_sdk.ProtectedCopilotLedger.verify_existing(
+                identity=self._last_identity,
+                evidence_key=self._last_evidence_key,
+                anchor_store=self._last_store,
+                expected_head=expected_head,
+            )
+
+    def test_collector_without_controller_anchor_cannot_verify(self) -> None:
+        identity = self._identity()
+        evidence_key = copilot_sdk.derive_evidence_key(
+            "controller-authority-test-key-0123456789",
+            identity,
+            run_nonce="missing-anchor-test-nonce",
+        )
+        collector = copilot_sdk.CopilotUsageCollector(
+            identity, evidence_key=evidence_key, runtime_pin=_fake_runtime_pin(),
+        )
+        self._attach_and_begin(collector)
+        collector.on_event(self._usage_event())
+        collector.record_tool_inventory([])
+        collector.finish_request(completed=True)
+        report = collector.report()
+        self.assertFalse(report.verified)
+        self.assertIn("protected_anchor_unavailable", report.reason_codes)
+        self.assertFalse(report.persistent_admission)
+
+    def test_sqlite_ledger_must_be_outside_workspace(self) -> None:
+        workspace = self._ledger_directory / "workspace"
+        workspace.mkdir(mode=0o700)
+        os.chmod(workspace, 0o700)
+        with self.assertRaisesRegex(copilot_sdk.CopilotSDKError, "outside the worker workspace"):
+            copilot_sdk.SQLiteCopilotLedgerStore(
+                workspace / "ledger.sqlite",
+                workspace_root=workspace,
+            )
 
 
 if __name__ == "__main__":

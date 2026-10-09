@@ -39,6 +39,8 @@ from agentflow.copilot_sdk import (
     CopilotLaunchIdentity,
     COPILOT_NEGATIVE_CONTROL_PROMPT,
     CopilotProofRun,
+    ProtectedCopilotLedger,
+    SQLiteCopilotLedgerStore,
     derive_evidence_key,
 )
 
@@ -58,10 +60,20 @@ evidence_key = derive_evidence_key(
     identity,
     run_nonce=controller_generated_nonce,
 )
+ledger_store = SQLiteCopilotLedgerStore(
+    protected_controller_state / "copilot-usage.sqlite3",
+    workspace_root=workspace_root,
+)
+ledger = ProtectedCopilotLedger(
+    identity=identity,
+    evidence_key=evidence_key,
+    anchor_store=ledger_store,
+)
 
 async with await CopilotProofRun.open(
     identity=identity,
     evidence_key=evidence_key,
+    protected_ledger=ledger,
     base_directory=private_empty_home,
     workspace_root=workspace_root,
     github_token=credential_held_in_memory,
@@ -69,34 +81,49 @@ async with await CopilotProofRun.open(
     report = await run.send_once(COPILOT_NEGATIVE_CONTROL_PROMPT)
 ```
 
-The authority secret is used only to derive a launch-scoped collector key; the
-SDK client, child runtime environment, prompt, and usage ledger receive only
-the derived key or no key. The token is passed to the SDK in memory and is
-never added to the report. The SDK home must be a private empty directory
-outside the worktree. The built-in negative-control prompt asks for a harmless shell
-print, a read of a unique nonexistent path, and a request to the reserved
+The authority secret is used only to derive a launch-scoped collector key. The
+derived key stays in controller memory and is never passed to the SDK or written
+to SQLite. The token is passed to the SDK in memory and is never added to the
+report. The SDK home must be a private empty directory outside the worktree.
+The built-in negative-control prompt asks for a harmless shell print, a read of
+a unique nonexistent path, and a request to the reserved
 `.invalid` domain. Do not substitute operations that access user data or have
 side effects. Never pass worker-writable event files into the collector.
-Persist the signed report only in controller-owned protected state.
+The example controller state directory must already exist, be private, and be
+outside the workflow workspace. SQLite uses full synchronous commits and one
+transaction for each signed row and its new head. Persist the resulting
+`ledger.head` in the controller's authenticated launch state with the proof
+result. After restart, call `ProtectedCopilotLedger.verify_existing` with that
+independently saved `expected_head` and the exact launch identity before
+accepting the report. A missing or stale expected head fails closed.
 
 The returned chain binds the supplied root/task/claim/lease-continuity/launch
 identity, the hashed SDK session ID, each observed call and model, the SDK
 package and declared CLI release, the published runtime bundle digest and
 local artifact paths/hashes, plus the connected status API release and
 protocol. It is a local observation from the pinned Copilot runtime,
-not provider-signed evidence. The current prototype keeps its chain in memory;
-it does not anchor a persisted head across controller restarts or authenticate
-the supplied launch identity itself. Test fixtures can exercise rejection
-logic but cannot enable admission. The report always has
+not provider-signed evidence. The SQLite store persists signed rows and the
+current head in one transaction. Restart verification checks every signature
+and sequence, then compares the stored head with the separately authenticated
+`expected_head` supplied by the controller. This detects a restored older
+database snapshot when the controller's expected head is current. File
+permissions alone do not prevent a same-user process from replacing or rolling
+back the database; the controller must keep the database outside worker-writable
+storage and keep its expected head in trusted state. The collector refuses to
+reuse an existing launch ledger. `verify_existing` is read-only; SDK resume
+does not replay all usage events, and resume events fail the proof. Fixtures
+exercise rejection logic but cannot enable admission. The report always has
 `persistent_admission: false`, and Copilot's persistent Herdr guard remains
 disabled.
 
 This is a no-tools proof route; it does not confine a persistent coding worker.
 The synchronous Agentflow OS sandbox does not confine a later Herdr session.
 Before any persistent route can be considered, a controller-owned live run
-must prove the runtime and tool boundary, and protected ledger continuity must
-be integrated. A service fallback/mismatch and a resume-gap negative control
-also require live evidence; fixtures do not supply it.
+must prove the runtime and tool boundary, wire the SQLite adapter to protected
+controller state and its authenticated expected-head record, and complete
+restart verification. A service fallback/mismatch and a resume-gap negative
+control also require live evidence; fixtures do not supply it. This remains an
+optional proof prototype until that integration and live evidence exist.
 
 The implementation follows GitHub's pinned
 [Python SDK reference](https://github.com/github/copilot-sdk/blob/v1.0.17/python/README.md),
