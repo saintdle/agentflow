@@ -2953,6 +2953,96 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(retry_probe.call_count, 0)
                 self.assertEqual(json.loads(controller.state_path.read_text())["epoch"], lease.epoch)
 
+    def test_owner_repair_retry_rejects_changed_checkpoint_but_accepts_exact_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline, args = self._owner_epoch_fixture(base)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write crash")):
+                    failed, _ = self._run_owner_epoch_repair(fixture, args)
+                self.assertFalse(failed["ok"], failed)
+                original_checkpoint = controller.checkpoint_path.read_bytes()
+                staged_state = controller.state_path.read_bytes()
+                self.assertIn(b"abandoned_epoch_repair", staged_state)
+
+                changed = json.loads(original_checkpoint)
+                changed["terminal_reason"] = "modified after owner intent"
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, changed)
+                changed_state = controller.state_path.read_bytes()
+                changed_credentials = cli._resume_key_path(args).read_bytes()
+                rejected, _ = self._run_owner_epoch_repair(fixture, args)
+                self.assertFalse(rejected["ok"], rejected)
+                self.assertIn("checkpoint changed", rejected["error"])
+                self.assertEqual(controller.state_path.read_bytes(), changed_state)
+                self.assertEqual(cli._resume_key_path(args).read_bytes(), changed_credentials)
+
+                controller.checkpoint_path.write_bytes(original_checkpoint)
+                retried, _ = self._run_owner_epoch_repair(fixture, args)
+                self.assertTrue(retried["ok"], retried)
+                receipt = json.loads(controller.state_path.read_text())["abandoned_epoch_repair_receipt"]
+                self.assertEqual(
+                    hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest(),
+                    receipt["retired_checkpoint_sha256"],
+                )
+
+    def test_owner_repair_receipt_fences_plain_resume_then_exact_continuation_consumes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline, repair_args = self._owner_epoch_fixture(base)
+                result, _ = self._run_owner_epoch_repair(fixture, repair_args)
+                self.assertTrue(result["ok"], result)
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credential_path = cli._resume_key_path(repair_args)
+                credential_before = credential_path.read_bytes()
+                state = json.loads(state_before)
+                current = cli.controller_backend.Lease.from_dict(state["lease"])
+                with self.assertRaisesRegex(cli.controller_backend.LeaseConflict, "repair halt is pending"):
+                    controller.acquire(resume_proof=current.resume_secret)
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(credential_path.read_bytes(), credential_before)
+
+                resume_args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root, controller=fixture.controller,
+                    continue_after_cancelled_preidentity=fixture.task_id,
+                    continue_task="distinct-ready-child",
+                )
+                def one_step(_args, active_controller, root, lease, *, operation):
+                    resumed = active_controller.resume([], lease=lease)
+                    return ({"operation": operation, "ok": True, "root": str(root),
+                             "result": resumed.to_dict()}, True)
+                with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": fixture.workflow_root}), \
+                     mock.patch.object(cli, "_verify_cancelled_preidentity_continuation",
+                                       return_value="distinct-ready-child"), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                    continued = _run_controller_json(cli.controller_resume, resume_args)
+                self.assertTrue(continued["ok"], continued)
+                committed = json.loads(controller.state_path.read_text())
+                self.assertNotIn("abandoned_epoch_repair_receipt", committed)
+                self.assertNotIn("continuation_reattach", committed)
+                self.assertEqual(
+                    controller._load_checkpoint()["pending_continuation_task"],
+                    "distinct-ready-child",
+                )
+
+    def test_stop_cannot_remove_binding_while_owner_repair_intent_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline, args = self._owner_epoch_fixture(base)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write crash")):
+                    failed, _ = self._run_owner_epoch_repair(fixture, args)
+                self.assertFalse(failed["ok"], failed)
+                before = controller.state_path.read_bytes()
+                with mock.patch.object(cli.workspace_binding_backend, "remove_controller") as remove:
+                    stopped = _run_controller_json(cli.controller_stop, args)
+                self.assertFalse(stopped["ok"], stopped)
+                remove.assert_not_called()
+                self.assertEqual(controller.state_path.read_bytes(), before)
+
     def test_owner_epoch_repair_fails_closed_on_ack_snapshot_and_pane_mismatches(self) -> None:
         for mode in ("no-ack", "state-hash", "checkpoint-hash", "contract-hash", "unknown-pane"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:

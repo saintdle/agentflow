@@ -357,6 +357,10 @@ class RootController:
             raise LeaseConflict(
                 "an authenticated abandoned-epoch repair is pending; retry that exact repair"
             )
+        if "abandoned_epoch_repair_receipt" in state:
+            raise LeaseConflict(
+                "an abandoned-epoch repair halt is pending; explicitly continue with one distinct ready task"
+            )
 
     def _current_lease(self) -> Lease:
         with self._locked():
@@ -872,6 +876,13 @@ class RootController:
                     raise LeaseConflict("pending abandoned-epoch repair does not match this exact owner request")
                 if not isinstance(payload.get("nonce"), str) or not payload.get("nonce"):
                     raise LeaseConflict("pending abandoned-epoch repair nonce is malformed")
+                current_checkpoint_digest = hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+                allowed_checkpoint_digests = {str(payload.get("checkpoint_sha256") or "")}
+                retired_checkpoint_digest = str(payload.get("retired_checkpoint_sha256") or "")
+                if retired_checkpoint_digest:
+                    allowed_checkpoint_digests.add(retired_checkpoint_digest)
+                if current_checkpoint_digest not in allowed_checkpoint_digests:
+                    raise LeaseConflict("checkpoint changed from the exact staged owner-repair transaction")
                 stored_epoch = state.get("epoch")
                 active = self._read_lease(state)
                 if stored_epoch == abandoned_epoch:
@@ -927,6 +938,8 @@ class RootController:
                         or current.continuity_id != candidate.continuity_id
                         or current.resume_secret_hash != candidate.resume_secret_hash
                         or not current.verify_resume_proof(resume_proof)
+                        or hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+                            != payload.get("retired_checkpoint_sha256")
                         or checkpoint.admission_phase(document) != "terminal"
                         or checkpoint.resume_state(document) != "blocked"
                         or document.get("terminal") is not True
@@ -997,6 +1010,103 @@ class RootController:
         ):
             raise LeaseConflict("abandoned-epoch repair authority does not match the staged exact launch")
 
+    @staticmethod
+    def _signed_owner_receipt_payload(
+        state: Mapping[str, Any], *, root: str, controller: str,
+        workflow_root: str, cancelled_task: str, authority_secret: str,
+    ) -> dict[str, Any] | None:
+        receipt = state.get("abandoned_epoch_repair_receipt")
+        if receipt is None:
+            return None
+        if not isinstance(receipt, Mapping):
+            raise LeaseConflict("abandoned-epoch repair completion receipt is malformed")
+        payload = dict(receipt)
+        supplied = str(payload.pop("authority_hmac", ""))
+        if (
+            payload.get("schema") != "agentflow.abandoned_epoch_repair@1"
+            or payload.get("root") != root
+            or payload.get("controller") != controller
+            or payload.get("workflow_root") != workflow_root
+            or payload.get("task_id") != cancelled_task
+            or payload.get("continuity_id") == ""
+            or not authority_secret
+            or not hmac.compare_digest(
+                supplied,
+                _authority_mac(authority_secret, payload, domain="abandoned-epoch-repair-v1"),
+            )
+        ):
+            raise LeaseConflict("abandoned-epoch repair receipt does not authenticate this exact cancelled launch")
+        return payload
+
+    def _verify_owner_receipt_for_new_continuation(
+        self, state: Mapping[str, Any], *, workflow_root: str,
+        cancelled_task: str, ready_task: str, authority_secret: str,
+        resume_proof: str,
+    ) -> dict[str, Any] | None:
+        payload = self._signed_owner_receipt_payload(
+            state, root=self.root, controller=self.controller,
+            workflow_root=workflow_root, cancelled_task=cancelled_task,
+            authority_secret=authority_secret,
+        )
+        if payload is None:
+            return None
+        current = self._read_lease(state)
+        try:
+            expected_epoch = int(payload["new_epoch"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("abandoned-epoch receipt epoch is malformed") from exc
+        document = self._load_checkpoint()
+        retired_check = (
+            f"cancelled owner_abandoned_epoch preidentity launch "
+            f"{payload.get('launch_id')} for {cancelled_task}"
+        )
+        checkpoint_digest = hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest()
+        if (
+            ready_task == cancelled_task
+            or current is None or state.get("epoch") != expected_epoch
+            or current.epoch != expected_epoch or current.root != self.root
+            or current.controller != self.controller
+            or current.continuity_id != payload.get("continuity_id")
+            or current.resume_secret_hash != payload.get("candidate_resume_secret_hash")
+            or not current.verify_resume_proof(resume_proof)
+            or payload.get("retired_checkpoint_sha256") != checkpoint_digest
+            or checkpoint.admission_phase(document) != "terminal"
+            or checkpoint.resume_state(document) != "blocked"
+            or document.get("terminal") is not True
+            or document.get("root") != self.root
+            or document.get("controller") != self.controller
+            or document.get("epoch") != expected_epoch
+            or document.get("task") != self.root
+            or document.get("last_check") != retired_check
+            or _active_tasks_from_checkpoint(document, self.root)
+        ):
+            raise LeaseConflict("owner-repair receipt is not an unconsumed exact cancelled-preidentity halt")
+        return payload
+
+    def _verify_staged_owner_receipt_link(
+        self, state: Mapping[str, Any], pending: Mapping[str, Any], *,
+        workflow_root: str, cancelled_task: str, authority_secret: str,
+    ) -> None:
+        receipt = self._signed_owner_receipt_payload(
+            state, root=self.root, controller=self.controller,
+            workflow_root=workflow_root, cancelled_task=cancelled_task,
+            authority_secret=authority_secret,
+        )
+        receipt_hash = ""
+        if receipt is not None:
+            raw = state.get("abandoned_epoch_repair_receipt")
+            receipt_hash = hashlib.sha256(
+                json.dumps(dict(raw), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        supplied_hash = str(pending.get("owner_repair_receipt_sha256") or "")
+        if receipt_hash != supplied_hash:
+            raise LeaseConflict("staged continuation does not consume the exact owner-repair receipt")
+        if receipt is not None and (
+            pending.get("previous_epoch") != receipt.get("new_epoch")
+            or pending.get("continuity_id") != receipt.get("continuity_id")
+        ):
+            raise LeaseConflict("staged continuation does not follow the repaired controller incarnation")
+
     def pending_explicit_continuation(
         self,
         *,
@@ -1010,6 +1120,11 @@ class RootController:
         with self._locked():
             state = _read_json(self.state_path)
             if "continuation_reattach" not in state:
+                self._verify_owner_receipt_for_new_continuation(
+                    state, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, ready_task=ready_task,
+                    authority_secret=authority_secret, resume_proof=resume_proof,
+                )
                 return None
             pending = state["continuation_reattach"]
             if not isinstance(pending, Mapping):
@@ -1032,6 +1147,10 @@ class RootController:
                 )
             ):
                 raise LeaseConflict("staged continuation does not authenticate this exact target")
+            self._verify_staged_owner_receipt_link(
+                state, pending, workflow_root=workflow_root,
+                cancelled_task=cancelled_task, authority_secret=authority_secret,
+            )
             try:
                 previous_epoch = int(payload["previous_epoch"])
                 candidate_epoch = int(payload["epoch"])
@@ -1120,6 +1239,10 @@ class RootController:
             )
         ):
             raise LeaseConflict("staged continuation does not authenticate this exact target")
+        self._verify_staged_owner_receipt_link(
+            state, pending, workflow_root=workflow_root,
+            cancelled_task=cancelled_task, authority_secret=authority_secret,
+        )
         try:
             previous_epoch = int(payload["previous_epoch"])
             candidate_epoch = int(payload["epoch"])
@@ -1193,6 +1316,7 @@ class RootController:
             if "continuation_reattach" in state and not isinstance(pending_value, Mapping):
                 raise LeaseConflict("staged continuation reattach record is malformed")
             pending: dict[str, Any] | None = None
+            owner_receipt_hash = ""
             if pending_value is not None:
                 if not isinstance(pending_value, Mapping):
                     raise LeaseConflict("staged continuation reattach record is malformed")
@@ -1212,6 +1336,10 @@ class RootController:
                     )
                 ):
                     raise LeaseConflict("staged continuation does not authenticate this exact target")
+                self._verify_staged_owner_receipt_link(
+                    state, pending_value, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, authority_secret=authority_secret,
+                )
                 if checkpoint_epoch not in {pending.get("previous_epoch"), pending.get("epoch")}:
                     raise LeaseConflict("staged continuation checkpoint epoch changed")
                 candidate_hash = str(pending.get("resume_secret_hash") or "")
@@ -1256,6 +1384,17 @@ class RootController:
                     self._write_state(state)
                     self._lease = candidate
                     return candidate
+            else:
+                receipt = self._verify_owner_receipt_for_new_continuation(
+                    state, workflow_root=workflow_root,
+                    cancelled_task=cancelled_task, ready_task=ready_task,
+                    authority_secret=authority_secret, resume_proof=resume_proof,
+                )
+                if receipt is not None:
+                    raw_receipt = state.get("abandoned_epoch_repair_receipt")
+                    owner_receipt_hash = hashlib.sha256(
+                        json.dumps(dict(raw_receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest()
             previous = active or dormant
             if (
                 previous is None or previous.root != self.root
@@ -1285,6 +1424,8 @@ class RootController:
                 "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
                 "resume_secret_hash": candidate.resume_secret_hash,
             }
+            if owner_receipt_hash:
+                payload["owner_repair_receipt_sha256"] = owner_receipt_hash
             payload["authority_hmac"] = _authority_mac(
                 authority_secret, payload, domain="continuation-reattach-v1",
             )
@@ -1357,6 +1498,15 @@ class RootController:
             ):
                 raise LeaseConflict("staged continuation cannot be cleared before its exact target is durable")
             state.pop("continuation_reattach", None)
+            receipt_hash = str(payload.get("owner_repair_receipt_sha256") or "")
+            if receipt_hash:
+                receipt = state.get("abandoned_epoch_repair_receipt")
+                actual_receipt_hash = hashlib.sha256(
+                    json.dumps(dict(receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest() if isinstance(receipt, Mapping) else ""
+                if actual_receipt_hash != receipt_hash:
+                    raise LeaseConflict("owner-repair receipt changed before exact continuation consumption")
+                state.pop("abandoned_epoch_repair_receipt", None)
             self._write_state(state)
 
     @staticmethod
@@ -1543,6 +1693,15 @@ class RootController:
                     state, expected, _abandoned_epoch_repair_authority,
                     root=self.root, controller=self.controller,
                 )
+            if "abandoned_epoch_repair_receipt" in state:
+                if "continuation_reattach" in state:
+                    if _abandoned_epoch_repair_authority is not None:
+                        raise LeaseConflict("owner-repair receipt is already being consumed by its exact continuation")
+                elif (
+                    _abandoned_epoch_repair_authority is None
+                    or _continuation_authority is not None
+                ):
+                    self._reject_pending_continuation(state)
             self._lease = current
             yield current
         finally:
@@ -2146,6 +2305,10 @@ class RootController:
                 and not document.get("active_tasks")
                 and document.get("last_check") == retired_check
             ):
+                if retirement_reason == "owner_abandoned_epoch":
+                    self._verify_owner_retired_checkpoint_digest(
+                        state=_read_json(self.state_path), authority=_abandoned_epoch_repair_authority,
+                    )
                 commit_cancellation()
                 if retirement_reason == "owner_abandoned_epoch":
                     state = _read_json(self.state_path)
@@ -2169,9 +2332,6 @@ class RootController:
             )
             if not eligible:
                 raise ControllerError("checkpoint is not the exact eligible identity-pending task halt")
-            # Cross-file crash semantics are deliberate: Herdr is atomically
-            # fenced first, and only then is the checkpoint pointer cleared.
-            commit_cancellation()
             document.update({
                 "task": self.root,
                 "phase": "controller",
@@ -2189,8 +2349,37 @@ class RootController:
                 "next_action": "explicitly continue with a distinct ready task",
                 "last_check": retired_check,
             })
+            retired_digest = ""
+            if retirement_reason == "owner_abandoned_epoch":
+                state = _read_json(self.state_path)
+                intent = state.get("abandoned_epoch_repair")
+                if not isinstance(intent, Mapping):
+                    raise LeaseConflict("owner-repair cancellation has no signed durable intent")
+                if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != intent.get("checkpoint_sha256"):
+                    raise LeaseConflict("unretired checkpoint changed from the exact owner-approved snapshot")
+                retired_document = checkpoint.build_checkpoint(document)
+                retired_bytes = (json.dumps(retired_document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                retired_digest = hashlib.sha256(retired_bytes).hexdigest()
+                old_digest = str(intent.get("retired_checkpoint_sha256") or "")
+                if old_digest and old_digest != retired_digest:
+                    raise LeaseConflict("owner-repair retired checkpoint does not match its staged transaction")
+                payload = dict(intent)
+                payload.pop("authority_hmac", None)
+                payload["retired_checkpoint_sha256"] = retired_digest
+                payload["authority_hmac"] = _authority_mac(
+                    str(_abandoned_epoch_repair_authority.get("authority_secret") or ""),
+                    payload, domain="abandoned-epoch-repair-v1",
+                )
+                state["abandoned_epoch_repair"] = payload
+                self._write_state(state)
+            # Cross-file crash semantics are deliberate: the exact checkpoint
+            # output is signed into the protected intent first, then Herdr is
+            # atomically fenced, and only then is the checkpoint pointer cleared.
+            commit_cancellation()
             result = self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
             if retirement_reason == "owner_abandoned_epoch":
+                if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != retired_digest:
+                    raise LeaseConflict("retired checkpoint bytes do not match the signed owner-repair output")
                 state = _read_json(self.state_path)
                 pending = state.pop("abandoned_epoch_repair", None)
                 if isinstance(pending, Mapping):
@@ -2199,6 +2388,30 @@ class RootController:
                 elif not isinstance(state.get("abandoned_epoch_repair_receipt"), Mapping):
                     raise LeaseConflict("completed abandoned-epoch repair lost its signed intent")
             return result
+
+    def _verify_owner_retired_checkpoint_digest(
+        self, *, state: Mapping[str, Any], authority: Mapping[str, Any] | None,
+    ) -> None:
+        if authority is None:
+            raise LeaseConflict("owner-repair checkpoint requires its exact signed authority")
+        expected = self._read_lease(state) or self._lease
+        if not isinstance(expected, Lease):
+            raise LeaseConflict("owner-repair checkpoint has no exact candidate lease")
+        self._verify_abandoned_epoch_fence_authority(
+            state, expected,
+            authority, root=self.root, controller=self.controller,
+        )
+        pending = state.get("abandoned_epoch_repair")
+        if pending is None:
+            pending = state.get("abandoned_epoch_repair_receipt")
+        if not isinstance(pending, Mapping):
+            raise LeaseConflict("owner-repair checkpoint has no signed transaction record")
+        expected_digest = str(pending.get("retired_checkpoint_sha256") or "")
+        if (
+            len(expected_digest) != 64
+            or hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != expected_digest
+        ):
+            raise LeaseConflict("retired checkpoint is not the exact transaction-produced output")
 
     def cancel_superseded_legacy_preidentity_task(
         self,
@@ -2241,6 +2454,7 @@ class RootController:
             recognized = (
                 retired_check.startswith("cancelled expired preidentity launch ")
                 or retired_check.startswith("cancelled superseded_legacy_scope preidentity launch ")
+                or retired_check.startswith("cancelled owner_abandoned_epoch preidentity launch ")
             ) and retired_check.endswith(f" for {cancelled_task}")
             if (
                 checkpoint.admission_phase(document) != "terminal"

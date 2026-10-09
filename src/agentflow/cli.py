@@ -2872,6 +2872,25 @@ def _controller_preidentity_retirement(
                     raise controller_backend.LeaseConflict(
                         "controller state or checkpoint changed from the explicitly acknowledged snapshot"
                     )
+                if owner_abandoned_epoch and repair_pending:
+                    repair_record = state.get("abandoned_epoch_repair")
+                    if repair_record is None:
+                        repair_record = state.get("abandoned_epoch_repair_receipt")
+                    if not isinstance(repair_record, Mapping):
+                        raise controller_backend.LeaseConflict("owner-repair retry record is malformed")
+                    actual_checkpoint_sha256 = hashlib.sha256(
+                        controller.checkpoint_path.read_bytes()
+                    ).hexdigest()
+                    allowed_checkpoint_sha256 = set()
+                    if "abandoned_epoch_repair" in state:
+                        allowed_checkpoint_sha256.add(str(repair_record.get("checkpoint_sha256") or ""))
+                    retired_checkpoint_sha256 = str(repair_record.get("retired_checkpoint_sha256") or "")
+                    if retired_checkpoint_sha256:
+                        allowed_checkpoint_sha256.add(retired_checkpoint_sha256)
+                    if actual_checkpoint_sha256 not in allowed_checkpoint_sha256:
+                        raise controller_backend.LeaseConflict(
+                            "checkpoint changed from the exact staged owner-repair transaction"
+                        )
                 lease = controller.repair_abandoned_epoch(
                     workflow_root=workflow_root, contract=contract,
                     authority_secret=credentials["authority_secret"], resume_proof=proof,
@@ -3534,10 +3553,7 @@ def controller_stop(args: argparse.Namespace) -> int:
         controller, root = _controller_instance(args)
         with controller.supervisor_lock():
             state = json.loads(controller.state_path.read_text(encoding="utf-8")) if controller.state_path.exists() else {}
-            if "continuation_reattach" in state:
-                raise controller_backend.LeaseConflict(
-                    "an authenticated explicit continuation is pending; retry that exact continuation"
-                )
+            controller_backend.RootController._reject_pending_continuation(state)
             lease_data = state.get("lease") if isinstance(state.get("lease"), dict) else None
             if lease_data is None:
                 payload = {"operation": "stop", "ok": True, "root": str(root), "released": False, "status": "idle"}
