@@ -2723,12 +2723,19 @@ def controller_retire_superseded_legacy_preidentity(args: argparse.Namespace) ->
     return _controller_preidentity_retirement(args, superseded_legacy_scope=True)
 
 
+def controller_repair_abandoned_epoch(args: argparse.Namespace) -> int:
+    """Repair one explicitly acknowledged abandoned controller epoch gap."""
+    return _controller_preidentity_retirement(args, owner_abandoned_epoch=True)
+
+
 def _controller_preidentity_retirement(
-    args: argparse.Namespace, *, superseded_legacy_scope: bool,
+    args: argparse.Namespace, *, superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
 ) -> int:
     """Retire one exact absent-pane identity-pending launch under its root lease."""
     operation_name = (
-        "retire-superseded-legacy-preidentity" if superseded_legacy_scope
+        "repair-abandoned-epoch" if owner_abandoned_epoch
+        else "retire-superseded-legacy-preidentity" if superseded_legacy_scope
         else "recover-preidentity"
     )
     try:
@@ -2801,6 +2808,37 @@ def _controller_preidentity_retirement(
                     preauthenticated_epoch = candidate.epoch
                     break
 
+            abandoned_epoch = getattr(args, "abandoned_epoch", None)
+            expected_state_sha256 = str(getattr(args, "expected_state_sha256", "") or "")
+            expected_checkpoint_sha256 = str(getattr(args, "expected_checkpoint_sha256", "") or "")
+            expected_contract_sha256 = str(getattr(args, "expected_contract_sha256", "") or "")
+            repair_pending = (
+                isinstance(state.get("abandoned_epoch_repair"), Mapping)
+                or isinstance(state.get("abandoned_epoch_repair_receipt"), Mapping)
+            )
+            if owner_abandoned_epoch:
+                if not bool(getattr(args, "acknowledge_abandoned_epoch", False)):
+                    raise ValueError("--acknowledge-abandoned-epoch is required for this one scoped repair")
+                if (
+                    isinstance(abandoned_epoch, bool) or not isinstance(abandoned_epoch, int)
+                    or abandoned_epoch < 1
+                    or any(len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+                           for value in (expected_state_sha256, expected_checkpoint_sha256,
+                                         expected_contract_sha256))
+                ):
+                    raise ValueError("exact abandoned epoch and three lowercase SHA-256 anchors are required")
+                if not repair_pending and (
+                    active is not None or dormant is not None
+                    or state.get("epoch") != abandoned_epoch
+                    or state.get("lease") is not None
+                    or state.get("dormant_lease") is not None
+                ):
+                    raise controller_backend.LeaseConflict(
+                        "owner repair requires the exact unowned abandoned epoch with no active or dormant lease"
+                    )
+                if preauthenticated_epoch is None:
+                    preauthenticated_epoch = abandoned_epoch
+
             # Validate all immutable protected evidence before changing a
             # released/legacy lease epoch or writing a cancellation record.
             snapshot = _preidentity_recovery_snapshot(
@@ -2808,6 +2846,7 @@ def _controller_preidentity_retirement(
                 authority_secret=credentials["authority_secret"],
                 expected_current_epoch=preauthenticated_epoch,
                 superseded_legacy_scope=superseded_legacy_scope,
+                owner_abandoned_epoch=owner_abandoned_epoch,
             )
             contract = snapshot["contract"]
             if credentials["continuity_id"] != contract.get("continuity_id"):
@@ -2816,7 +2855,36 @@ def _controller_preidentity_retirement(
                 )
             if snapshot["record"].get("status") != "cancelled_preidentity":
                 _require_definitively_absent_herdr_pane(pane_id)
-            if active is not None:
+            if owner_abandoned_epoch:
+                raw_contract_sha256 = hashlib.sha256(
+                    Path(snapshot["contract_path"]).read_bytes()
+                ).hexdigest()
+                if raw_contract_sha256 != expected_contract_sha256:
+                    raise controller_backend.LeaseConflict(
+                        "signed launch contract changed from the explicitly acknowledged snapshot"
+                    )
+                if not repair_pending and (
+                    hashlib.sha256(controller.state_path.read_bytes()).hexdigest()
+                    != expected_state_sha256
+                    or hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest()
+                    != expected_checkpoint_sha256
+                ):
+                    raise controller_backend.LeaseConflict(
+                        "controller state or checkpoint changed from the explicitly acknowledged snapshot"
+                    )
+                lease = controller.repair_abandoned_epoch(
+                    workflow_root=workflow_root, contract=contract,
+                    authority_secret=credentials["authority_secret"], resume_proof=proof,
+                    abandoned_epoch=abandoned_epoch, acknowledge_abandoned_epoch=True,
+                    state_sha256=expected_state_sha256,
+                    checkpoint_sha256=expected_checkpoint_sha256,
+                    contract_sha256=expected_contract_sha256,
+                    persist_credentials=lambda candidate: _controller_credentials(
+                        args, candidate, key_path=key_path,
+                    ),
+                )
+                credentials = _read_controller_credentials(key_path)
+            elif active is not None:
                 if (
                     active.root != str(root) or active.controller != controller.controller
                     or active.epoch != int(state.get("epoch", -1))
@@ -2858,6 +2926,7 @@ def _controller_preidentity_retirement(
                 authority_secret=credentials["authority_secret"],
                 expected_current_epoch=lease.epoch,
                 superseded_legacy_scope=superseded_legacy_scope,
+                owner_abandoned_epoch=owner_abandoned_epoch,
             )
             def commit_cancellation() -> None:
                 current = _preidentity_recovery_snapshot(
@@ -2865,6 +2934,7 @@ def _controller_preidentity_retirement(
                     authority_secret=credentials["authority_secret"],
                     expected_current_epoch=lease.epoch,
                     superseded_legacy_scope=superseded_legacy_scope,
+                    owner_abandoned_epoch=owner_abandoned_epoch,
                 )
                 if current["contract"] != snapshot["contract"]:
                     raise ValueError("signed launch changed during recovery")
@@ -2872,6 +2942,7 @@ def _controller_preidentity_retirement(
                     root, workflow_root, task_id, launch_id, pane_id,
                     current["contract"], authority_secret=credentials["authority_secret"],
                     superseded_legacy_scope=superseded_legacy_scope,
+                    owner_abandoned_epoch=owner_abandoned_epoch,
                 )
             if superseded_legacy_scope:
                 result = controller.cancel_superseded_legacy_preidentity_task(
@@ -2882,6 +2953,17 @@ def _controller_preidentity_retirement(
                 result = controller.cancel_expired_preidentity_task(
                     task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
                     commit_cancellation=commit_cancellation, lease=lease,
+                    retirement_reason=("owner_abandoned_epoch" if owner_abandoned_epoch else "expired"),
+                    _abandoned_epoch_repair_authority=(
+                        {
+                            "workflow_root": workflow_root,
+                            "task_id": task_id,
+                            "claim_id": str(snapshot["contract"].get("claim_id") or ""),
+                            "launch_id": launch_id,
+                            "contract_sha256": expected_contract_sha256,
+                            "authority_secret": credentials["authority_secret"],
+                        } if owner_abandoned_epoch else None
+                    ),
                 )
             payload = {
                 "operation": operation_name, "ok": True,
@@ -4104,11 +4186,15 @@ def _preidentity_recovery_snapshot(
     authority_secret: str,
     expected_current_epoch: int | None = None,
     superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
 ) -> dict[str, Any]:
     """Prove the exact halted launch before any lease or state transition."""
     document = controller._load_checkpoint()
     expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
-    retirement_reason = "superseded_legacy_scope" if superseded_legacy_scope else "expired"
+    retirement_reason = (
+        "owner_abandoned_epoch" if owner_abandoned_epoch
+        else "superseded_legacy_scope" if superseded_legacy_scope else "expired"
+    )
     retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
     rows = controller.active_tasks()
     already_retired = (
@@ -4134,7 +4220,8 @@ def _preidentity_recovery_snapshot(
         and str(document.get("terminal_reason") or "").startswith(expected_reason)
     )
     if (
-        not ((terminal_halt and not superseded_legacy_scope) or retained_draining or already_retired)
+        not ((terminal_halt and not superseded_legacy_scope and not owner_abandoned_epoch)
+             or retained_draining or already_retired)
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
         or not (
@@ -4164,7 +4251,8 @@ def _preidentity_recovery_snapshot(
     ):
         raise ValueError("another workflow descendant is still claimed in progress")
     task_issue = beads_backend.get_issue(root, task_id)
-    expected_task_status = "blocked" if superseded_legacy_scope else "in_progress"
+    legacy_scope = superseded_legacy_scope or owner_abandoned_epoch
+    expected_task_status = "blocked" if legacy_scope else "in_progress"
     if str(task_issue.get("status") or "").lower() != expected_task_status:
         raise ValueError("exact task no longer has the expected retained claim status")
     metadata = task_issue.get("metadata")
@@ -4174,7 +4262,7 @@ def _preidentity_recovery_snapshot(
     actor = str(agentflow.get("actor") or "")
     if not claim_token or not actor:
         raise ValueError("exact live Beads claim is unavailable")
-    if superseded_legacy_scope:
+    if legacy_scope:
         if (
             str(task_issue.get("assignee") or "") != controller.controller
             or actor != controller.controller
@@ -4229,7 +4317,11 @@ def _preidentity_recovery_snapshot(
             record.get("recovery_disposition"), contract, pane_id=pane_id,
             authority_secret=authority_secret,
         )
-        if (disposition.get("reason") == "superseded_legacy_scope") != superseded_legacy_scope:
+        expected_disposition_reason = (
+            "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+            if retirement_reason == "expired" else retirement_reason
+        )
+        if disposition.get("reason") != expected_disposition_reason:
             raise ValueError("cancelled preidentity launch requires its matching retirement command")
         if channel.get("revocation") != dict(disposition):
             raise ValueError("return channel revocation does not match the signed cancellation")
@@ -4266,7 +4358,7 @@ def _preidentity_recovery_snapshot(
     if (
         str(record.get("provider") or "") != str(contract.get("provider") or "")
         or (
-            not superseded_legacy_scope
+            not legacy_scope
             and int(record.get("attempt") or 0) != int(contract.get("attempt") or 0)
         )
         or str(agentflow.get("claim_id") or "") != str(binding.get("claim_id") or "")
@@ -4276,14 +4368,14 @@ def _preidentity_recovery_snapshot(
     matching_attempts = [
         item for item in attempts if isinstance(item, Mapping)
         and (
-            superseded_legacy_scope
+            legacy_scope
             or int(item.get("attempt") or 0) == int(contract.get("attempt") or 0)
         )
         and str(item.get("launch_id") or "") == launch_id
     ] if isinstance(attempts, list) else []
     if len(matching_attempts) != 1 or matching_attempts[0].get("pane_id") != pane_id or matching_attempts[0].get("status") != "identity_pending":
         raise ValueError("launch attempt history does not match the exact pending pane")
-    if superseded_legacy_scope:
+    if legacy_scope:
         _verify_unbudgeted_legacy_preidentity(
             root, workflow_root, task_id, contract, record,
             authority_secret=authority_secret,
@@ -4349,7 +4441,7 @@ def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
 
 def _preidentity_disposition(
     contract: Mapping[str, Any], *, pane_id: str, authority_secret: str,
-    superseded_legacy_scope: bool = False,
+    superseded_legacy_scope: bool = False, owner_abandoned_epoch: bool = False,
 ) -> dict[str, Any]:
     value = {
         "schema": "agentflow.preidentity-cancellation@1",
@@ -4366,11 +4458,12 @@ def _preidentity_disposition(
         "lease_epoch": contract.get("lease_epoch"),
         "recorded_at": _now(),
         "reason": (
-            "superseded_legacy_scope" if superseded_legacy_scope
+            "owner_abandoned_epoch" if owner_abandoned_epoch
+            else "superseded_legacy_scope" if superseded_legacy_scope
             else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
         ),
     }
-    if superseded_legacy_scope:
+    if superseded_legacy_scope or owner_abandoned_epoch:
         value["budget_availability"] = "unknown"
     else:
         value["attempt"] = contract.get("attempt")
@@ -4405,7 +4498,7 @@ def _verify_preidentity_disposition(
     )
     if any(value.get(field) != contract.get(field) for field in fields):
         raise ValueError("preidentity cancellation does not match the exact signed launch")
-    if value.get("reason") == "superseded_legacy_scope":
+    if value.get("reason") in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
         if (
             value.get("budget_availability") != "unknown"
             or any(field in value for field in (
@@ -4436,6 +4529,7 @@ def _commit_preidentity_cancellation(
     *,
     authority_secret: str,
     superseded_legacy_scope: bool = False,
+    owner_abandoned_epoch: bool = False,
 ) -> None:
     """Atomically revoke the late-result channel and retain an audit record."""
     state_path = root / ".agentflow/herdr/sessions.json"
@@ -4454,11 +4548,16 @@ def _commit_preidentity_cancellation(
                 record.get("recovery_disposition"), contract,
                 pane_id=pane_id, authority_secret=authority_secret,
             )
-            if (disposition.get("reason") == "superseded_legacy_scope") != superseded_legacy_scope:
+            expected_reason = (
+                "owner_abandoned_epoch" if owner_abandoned_epoch
+                else "superseded_legacy_scope" if superseded_legacy_scope
+                else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
+            )
+            if disposition.get("reason") != expected_reason:
                 raise ValueError("preidentity retirement mode does not match the durable disposition")
             if channel.get("state") != "revoked" or channel.get("revocation") != dict(disposition):
                 raise ValueError("cancelled Herdr channel is not durably fenced")
-            if superseded_legacy_scope:
+            if superseded_legacy_scope or owner_abandoned_epoch:
                 _verify_unbudgeted_legacy_preidentity(
                     root, workflow_root, task_id, contract, record,
                     authority_secret=authority_secret,
@@ -4482,7 +4581,7 @@ def _commit_preidentity_cancellation(
         ):
             raise ValueError("Herdr launch is no longer an unbound identity-pending attempt")
         _require_definitively_absent_herdr_pane(pane_id)
-        if superseded_legacy_scope:
+        if superseded_legacy_scope or owner_abandoned_epoch:
             _verify_unbudgeted_legacy_preidentity(
                 root, workflow_root, task_id, contract, record,
                 authority_secret=authority_secret,
@@ -4495,6 +4594,7 @@ def _commit_preidentity_cancellation(
         disposition = _preidentity_disposition(
             contract, pane_id=pane_id, authority_secret=authority_secret,
             superseded_legacy_scope=superseded_legacy_scope,
+            owner_abandoned_epoch=owner_abandoned_epoch,
         )
         # Preserve the attempt list and count. This is a separate lifecycle
         # disposition; it never fabricates provider output or task failure.
@@ -4543,7 +4643,7 @@ def _authenticated_cancelled_preidentity(
         )
         if channel.get("revocation") != dict(disposition) or record.get("result") not in (None, {}):
             return False
-        if disposition.get("reason") == "superseded_legacy_scope":
+        if disposition.get("reason") in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
             _verify_unbudgeted_legacy_preidentity(
                 root, workflow_root, task_id, contract, record,
                 authority_secret=authority_secret,
@@ -12612,6 +12712,32 @@ def build_parser() -> argparse.ArgumentParser:
     controller_legacy_retire_parser.add_argument("--stale-after", type=float, default=300.0)
     controller_legacy_retire_parser.add_argument("--json", action="store_true")
     controller_legacy_retire_parser.set_defaults(func=controller_retire_superseded_legacy_preidentity)
+    controller_epoch_repair_parser = controller_sub.add_parser(
+        "repair-abandoned-epoch",
+        help=(
+            "Repair one explicitly acknowledged unowned epoch gap from exact protected snapshots; "
+            "does not dispatch a task"
+        ),
+    )
+    controller_epoch_repair_parser.add_argument("--root", required=True)
+    controller_epoch_repair_parser.add_argument("--workflow-root", required=True)
+    controller_epoch_repair_parser.add_argument("--controller", default="agentflow-controller")
+    controller_epoch_repair_parser.add_argument("--task", required=True)
+    controller_epoch_repair_parser.add_argument("--launch-id", required=True)
+    controller_epoch_repair_parser.add_argument("--pane-id", required=True)
+    controller_epoch_repair_parser.add_argument("--state-path", default="")
+    controller_epoch_repair_parser.add_argument("--checkpoint-path", default="")
+    controller_epoch_repair_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_epoch_repair_parser.add_argument(
+        "--acknowledge-abandoned-epoch", action="store_true", required=True,
+        help="owner acknowledgement for this exact single abandoned epoch snapshot",
+    )
+    controller_epoch_repair_parser.add_argument("--abandoned-epoch", type=int, required=True)
+    controller_epoch_repair_parser.add_argument("--expected-state-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--expected-checkpoint-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--expected-contract-sha256", required=True)
+    controller_epoch_repair_parser.add_argument("--json", action="store_true")
+    controller_epoch_repair_parser.set_defaults(func=controller_repair_abandoned_epoch)
     controller_supervise_parser = controller_sub.add_parser(
         "supervise",
         help="Run one protected root supervisor in a separate terminal; explicitly rerun it after a crash",

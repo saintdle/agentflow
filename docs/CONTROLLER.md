@@ -102,3 +102,31 @@ not manufacture an expiry, attempt count, or ledger entry. It revokes the old
 result channel before clearing the checkpoint pointer. Continue only through
 the distinct-ready-task command above, using the same protected controller
 credential and the cancelled task ID.
+
+## One explicitly authorized abandoned-epoch repair
+
+Ordinary recovery rejects a controller state epoch that no longer matches the
+signed launch. A separate owner repair command exists only for an explicitly
+authorized, exact unowned legacy epoch gap. It requires the canonical
+protected credential, the signed unbudgeted launch, a definitively absent
+pane, and the exact state, checkpoint, and contract SHA-256 fingerprints from
+the approved snapshot. It does not dispatch work or reset a claim, history, or
+budget. Do not substitute newly calculated fingerprints if any snapshot has
+changed; the command must fail closed and be reassessed.
+
+```sh
+agentflow controller repair-abandoned-epoch \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID \
+  --acknowledge-abandoned-epoch --abandoned-epoch EPOCH \
+  --expected-state-sha256 STATE_SHA256 \
+  --expected-checkpoint-sha256 CHECKPOINT_SHA256 \
+  --expected-contract-sha256 CONTRACT_SHA256
+```
+
+The repair records a protected signed intent before rotating the controller
+credential and lease. Rerun only this exact command after an interrupted
+transaction. After the old launch is durably cancelled, the command leaves
+the workflow halted; continue only by explicitly selecting a distinct ready
+descendant with the continuation command above.
