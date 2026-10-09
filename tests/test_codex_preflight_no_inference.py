@@ -406,6 +406,28 @@ class CodexPreflightTests(unittest.TestCase):
                     preflight._validate_child_context(env, token)
                 self.assertEqual(raised.exception.code, "trial_layout_invalid")
 
+    def test_prepare_trial_synthesizes_canonical_darwin_marker(self):
+        user_id = os.getuid()
+        canonical = f"0x{user_id:X}:0:0"
+        ambient_markers = (
+            ("unset", None),
+            ("malformed", "ambient-marker"),
+            ("different_selectors", f"0x{user_id:X}:0:1"),
+            ("different_uid", f"0x{user_id + 1:X}:0:0"),
+        )
+        for label, ambient_marker in ambient_markers:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
+                with mock.patch.object(preflight.sys, "platform", "darwin"), \
+                     mock.patch.dict(os.environ):
+                    if ambient_marker is None:
+                        os.environ.pop(preflight.DARWIN_TEXT_ENCODING_ENV, None)
+                    else:
+                        os.environ[preflight.DARWIN_TEXT_ENCODING_ENV] = ambient_marker
+                    _workspace, _authority, env, _config_hash, _fixture_hash = (
+                        preflight._prepare_trial(Path(temporary) / "trial", 1)
+                    )
+                self.assertEqual(env[preflight.DARWIN_TEXT_ENCODING_ENV], canonical)
+
     @unittest.skipUnless(sys.platform == "darwin", "macOS child runtime injects the CoreFoundation marker")
     def test_real_isolated_child_accepts_only_the_runtime_darwin_marker(self):
         with tempfile.TemporaryDirectory() as temporary:
