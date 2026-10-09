@@ -706,11 +706,11 @@ def _reject_custom_controller_state_path(args: argparse.Namespace) -> None:
         )
 
 
-def _reject_custom_retirement_checkpoint(args: argparse.Namespace) -> None:
-    """Keep retirement and its continuation bound to the canonical checkpoint."""
+def _reject_custom_controller_checkpoint(args: argparse.Namespace) -> None:
+    """Keep controller authority bound to its canonical namespaced checkpoint."""
     if str(getattr(args, "checkpoint_path", "") or ""):
         raise ValueError(
-            "preidentity retirement and continuation require the canonical namespaced controller checkpoint"
+            "controller mutations require the canonical namespaced controller checkpoint"
         )
 
 
@@ -2733,7 +2733,7 @@ def _controller_preidentity_retirement(
     )
     try:
         _reject_custom_controller_state_path(args)
-        _reject_custom_retirement_checkpoint(args)
+        _reject_custom_controller_checkpoint(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
         workflow_root = raw_workflow_root.strip()
         task_id = str(getattr(args, "task", "") or "")
@@ -2906,10 +2906,7 @@ def _controller_preidentity_retirement(
 def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     try:
         _reject_custom_controller_state_path(args)
-        if operation == "resume" and str(
-            getattr(args, "continue_after_cancelled_preidentity", "") or ""
-        ):
-            _reject_custom_retirement_checkpoint(args)
+        _reject_custom_controller_checkpoint(args)
         raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
         workflow_root = raw_workflow_root.strip()
         if not workflow_root:
@@ -3076,7 +3073,13 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                             allow_staged_selection=continuation_already_selected,
                         )
                         if continuation_already_selected:
-                            lease = controller.authorize(resume_proof)
+                            lease = controller.authorize_explicit_continuation(
+                                workflow_root=workflow_root,
+                                cancelled_task=continue_cancelled_task,
+                                ready_task=continue_ready_task,
+                                authority_secret=credentials["authority_secret"],
+                                resume_proof=resume_proof,
+                            )
                         else:
                             lease = controller.reattach_for_explicit_continuation(
                                 workflow_root=workflow_root,
@@ -3114,7 +3117,8 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                 ready_task = continue_ready_task
                 if not continuation_already_selected:
                     controller.acknowledge_cancelled_preidentity_halt(
-                        workflow_root, continue_cancelled_task, ready_task, lease=lease,
+                        workflow_root, continue_cancelled_task, ready_task,
+                        authority_secret=credentials["authority_secret"], lease=lease,
                     )
                 controller.clear_explicit_continuation(
                     workflow_root=workflow_root,
@@ -3310,6 +3314,7 @@ def _authorize_controller_command(
     args: argparse.Namespace,
 ) -> tuple[controller_backend.RootController, Path, controller_backend.Lease]:
     _reject_custom_controller_state_path(args)
+    _reject_custom_controller_checkpoint(args)
     if not str(getattr(args, "workflow_root", "") or "").strip():
         raise ValueError("--workflow-root is required for controller progress and rotation")
     controller, root = _controller_instance(args)
@@ -3443,32 +3448,38 @@ def controller_rotate(args: argparse.Namespace) -> int:
 def controller_stop(args: argparse.Namespace) -> int:
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
         controller, root = _controller_instance(args)
-        state = json.loads(controller.state_path.read_text(encoding="utf-8")) if controller.state_path.exists() else {}
-        lease_data = state.get("lease") if isinstance(state.get("lease"), dict) else None
-        if lease_data is None:
-            payload = {"operation": "stop", "ok": True, "root": str(root), "released": False, "status": "idle"}
-        else:
-            lease = controller_backend.Lease.from_dict(lease_data)
-            if lease.owner_id != controller.owner_id:
-                key_path = _resume_key_path(args)
-                proof = getattr(args, "resume_token", "") or ""
-                if not proof and key_path is not None:
-                    proof = _read_resume_key(key_path)
-                    legacy = _legacy_resume_key_path(args)
-                    if not proof and legacy is not None:
-                        proof = _read_resume_key(legacy)
-                if not proof:
-                    raise controller_backend.DuplicateController(
-                        "stopping a live controller requires --resume-token or --resume-key-file"
-                    )
-                lease = controller.acquire(resume_proof=proof)
-            controller.release(lease)
-            payload = {"operation": "stop", "ok": True, "root": str(root), "released": True, "status": "stopped"}
-        workspace_binding_backend.remove_controller(
-            _workspace_binding_path(), workspace_root=root,
-            workflow_root=str(getattr(args, "workflow_root", "") or ""),
-        )
+        with controller.supervisor_lock():
+            state = json.loads(controller.state_path.read_text(encoding="utf-8")) if controller.state_path.exists() else {}
+            if "continuation_reattach" in state:
+                raise controller_backend.LeaseConflict(
+                    "an authenticated explicit continuation is pending; retry that exact continuation"
+                )
+            lease_data = state.get("lease") if isinstance(state.get("lease"), dict) else None
+            if lease_data is None:
+                payload = {"operation": "stop", "ok": True, "root": str(root), "released": False, "status": "idle"}
+            else:
+                lease = controller_backend.Lease.from_dict(lease_data)
+                if lease.owner_id != controller.owner_id:
+                    key_path = _resume_key_path(args)
+                    proof = getattr(args, "resume_token", "") or ""
+                    if not proof and key_path is not None:
+                        proof = _read_resume_key(key_path)
+                        legacy = _legacy_resume_key_path(args)
+                        if not proof and legacy is not None:
+                            proof = _read_resume_key(legacy)
+                    if not proof:
+                        raise controller_backend.DuplicateController(
+                            "stopping a live controller requires --resume-token or --resume-key-file"
+                        )
+                    lease = controller.acquire(resume_proof=proof)
+                controller.release(lease)
+                payload = {"operation": "stop", "ok": True, "root": str(root), "released": True, "status": "stopped"}
+            workspace_binding_backend.remove_controller(
+                _workspace_binding_path(), workspace_root=root,
+                workflow_root=str(getattr(args, "workflow_root", "") or ""),
+            )
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STOP")
         return 0
     except (controller_backend.ControllerError, OSError, ValueError, json.JSONDecodeError) as exc:
@@ -12466,6 +12477,7 @@ def controller_approve_waiver(args: argparse.Namespace) -> int:
     """Record an exact waiver authorization through the controller lease."""
     try:
         _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
         controller, root = _controller_instance(args)
         key_path = _resume_key_path(args)
         proof = str(getattr(args, "resume_token", "") or "") or _read_resume_key(key_path)

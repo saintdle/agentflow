@@ -69,6 +69,13 @@ controller incarnation, root, and absence of other active work before
 reopening the checkpoint. This flow does not close the cancelled Beads task
 or claim a provider result for it.
 
+If this explicit continuation is interrupted while its protected credential
+is being rotated, rerun the same command with the same task IDs. Ordinary
+controller start, resume, supervise, recovery, stop, progress, rotate, and
+waiver commands remain fenced until that exact continuation finishes. Mutating
+controller commands always use the namespaced checkpoint; `--checkpoint-path`
+is available only to read-only `controller status`.
+
 ## Superseded legacy launch without budget metadata
 
 Some older signed launches predate structured execution budgets. Their return

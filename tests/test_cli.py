@@ -3740,6 +3740,184 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 self.assertTrue(retry["ok"], retry)
                 self._assert_continuation_committed(args, controller, "ready-task")
 
+    def test_plain_resume_is_fenced_at_each_staged_continuation_crash_point(self) -> None:
+        for phase in ("credential-before", "credential-after", "state-commit", "checkpoint-commit"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    args, controller, lease = self._continuation_fixture(base)
+                    original_credentials = cli._controller_credentials
+                    if phase == "credential-before":
+                        with mock.patch.object(
+                            cli, "_controller_credentials", side_effect=OSError("credential crash"),
+                        ):
+                            staged = self._run_continuation_once(args)
+                    elif phase == "credential-after":
+                        def write_then_fail(*call_args, **call_kwargs):
+                            original_credentials(*call_args, **call_kwargs)
+                            raise OSError("credential crash after write")
+
+                        with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_fail):
+                            staged = self._run_continuation_once(args)
+                    elif phase == "state-commit":
+                        writer = cli.controller_backend.RootController._write_state
+                        writes = 0
+
+                        def write_state_then_fail(instance, state):
+                            nonlocal writes
+                            writes += 1
+                            writer(instance, state)
+                            if writes == 2:
+                                raise OSError("state crash after active lease write")
+
+                        with mock.patch.object(
+                            cli.controller_backend.RootController, "_write_state",
+                            new=write_state_then_fail,
+                        ):
+                            staged = self._run_continuation_once(args)
+                    else:
+                        writer = cli.checkpoint_backend.write_checkpoint
+
+                        def write_checkpoint_then_fail(path, document):
+                            saved = writer(path, document)
+                            if Path(path) == controller.checkpoint_path and document.get("pending_continuation_task"):
+                                raise OSError("checkpoint crash after target write")
+                            return saved
+
+                        with mock.patch.object(
+                            cli.checkpoint_backend, "write_checkpoint",
+                            side_effect=write_checkpoint_then_fail,
+                        ):
+                            staged = self._run_continuation_once(args)
+                    self.assertFalse(staged["ok"], staged)
+                    self.assertIn("continuation_reattach", json.loads(controller.state_path.read_text()))
+
+                    state_before = controller.state_path.read_bytes()
+                    checkpoint_before = controller.checkpoint_path.read_bytes()
+                    credential_path = cli._resume_key_path(args)
+                    credential_before = credential_path.read_bytes()
+                    args.continue_after_cancelled_preidentity = ""
+                    args.continue_task = ""
+                    args._continuation_task = ""
+
+                    plain = self._run_continuation_once(args)
+
+                    self.assertFalse(plain["ok"], plain)
+                    self.assertIn("continuation is pending", plain["error"])
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                    self.assertEqual(credential_path.read_bytes(), credential_before)
+
+                    args.continue_after_cancelled_preidentity = "old-task"
+                    args.continue_task = "ready-task"
+                    retry = self._run_continuation_once(args)
+                    self.assertTrue(retry["ok"], retry)
+                    self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_staged_continuation_blocks_direct_lease_and_checkpoint_mutators(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential crash")):
+                    staged = self._run_continuation_once(args)
+                self.assertFalse(staged["ok"])
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credential_before = cli._resume_key_path(args).read_bytes()
+                task = {"task": "unrelated-task", "root": str(controller.root)}
+                mutations = (
+                    ("acquire", lambda: controller.acquire(resume_proof=lease.resume_secret)),
+                    ("authorize", lambda: controller.authorize(lease.resume_secret)),
+                    ("heartbeat", lambda: controller.heartbeat(lease)),
+                    ("release", lambda: controller.release(lease)),
+                    ("reserve", lambda: controller.reserve_active_task(task, lease=lease)),
+                    ("halt", lambda: controller.halt("blocked", "test", lease=lease)),
+                    ("progress", lambda: controller.record_session_event(
+                        event="phase_completed", task_class="coding", lease=lease,
+                    )),
+                    ("rotate", lambda: controller.rotate_session_budget(lease=lease)),
+                    ("checkpoint", lambda: controller._save_checkpoint(controller._load_checkpoint())),
+                    ("waiver", lambda: controller.approve_waiver(
+                        workflow_root="wf", task="task", acceptance_id="row",
+                        approval_ref="ref", approved_by="operator", approved_at="now",
+                        authority_secret="test-authority", lease=lease,
+                    )),
+                )
+                for name, mutate in mutations:
+                    with self.subTest(mutation=name), self.assertRaisesRegex(
+                        cli.controller_backend.LeaseConflict, "continuation is pending",
+                    ):
+                        mutate()
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                    self.assertEqual(cli._resume_key_path(args).read_bytes(), credential_before)
+
+                stopped = _run_controller_json(cli.controller_stop, args)
+                self.assertFalse(stopped["ok"], stopped)
+                self.assertIn("continuation is pending", stopped["error"])
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(cli._resume_key_path(args).read_bytes(), credential_before)
+
+                retry = self._run_continuation_once(args)
+                self.assertTrue(retry["ok"], retry)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+
+    def _args(self, workspace: Path, checkpoint_path: Path) -> argparse.Namespace:
+        return argparse.Namespace(
+            root=str(workspace), workflow_root="wf", controller="controller",
+            state_path="", checkpoint_path=str(checkpoint_path), stale_after=300.0,
+            takeover=False, resume_token="", resume_key_file="", once=True,
+            poll_interval=0.01, deadline=0.0, identity_deadline=5.0,
+            continue_after_cancelled_preidentity="", continue_task="",
+            acknowledge_no_ready_halt=False, json=True, task="task", launch_id="launch",
+            pane_id="pane", event="phase_completed", task_class="coding", phase="",
+            approach="", evidence="", rotate_after_tasks=None, rotate_after_phases=None,
+            same_approach_limit=None, acceptance_id="row", approval_ref="ref",
+            approved_by="operator", approved_at="", reason="",
+        )
+
+    def test_every_mutating_controller_command_rejects_checkpoint_override_before_writes(self) -> None:
+        handlers = (
+            cli.controller_start, cli.controller_resume, cli.controller_supervise,
+            cli.controller_recover_preidentity, cli.controller_retire_superseded_legacy_preidentity,
+            cli.controller_progress, cli.controller_rotate, cli.controller_stop,
+            cli.controller_approve_waiver,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            checkpoint = base / "alternate-checkpoint.json"
+            state_home = base / "state-home"
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state_home)}):
+                for handler in handlers:
+                    with self.subTest(handler=handler.__name__):
+                        result = _run_controller_json(handler, self._args(workspace, checkpoint))
+                        self.assertFalse(result["ok"], result)
+                        self.assertIn("canonical namespaced controller checkpoint", result["error"])
+                        self.assertFalse(checkpoint.exists())
+                        self.assertFalse(state_home.exists())
+
+    def test_status_may_inspect_an_alternate_checkpoint_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            workspace = base / "workspace"
+            workspace.mkdir()
+            checkpoint = base / "alternate-checkpoint.json"
+            cli.checkpoint_backend.write_checkpoint(checkpoint, cli.checkpoint_backend.build_checkpoint({
+                "task": str(workspace), "phase": "controller", "next_action": "inspect",
+                "root": str(workspace), "controller": "controller",
+                "state": "blocked", "status": "blocked", "terminal": True,
+            }))
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", side_effect=cli.beads_backend.BeadsError("offline")):
+                result = _run_controller_json(cli.controller_status, self._args(workspace, checkpoint))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["checkpoint"]["state"], "blocked")
+
     def test_explicit_continuation_retries_after_credential_write_then_crash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()

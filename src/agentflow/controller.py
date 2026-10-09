@@ -347,6 +347,13 @@ class RootController:
         state["version"] = 1
         _atomic_json(self.state_path, state)
 
+    @staticmethod
+    def _reject_pending_continuation(state: Mapping[str, Any]) -> None:
+        if "continuation_reattach" in state:
+            raise LeaseConflict(
+                "an authenticated explicit continuation is pending; retry that exact continuation"
+            )
+
     def _current_lease(self) -> Lease:
         with self._locked():
             lease = self._read_lease(_read_json(self.state_path))
@@ -358,6 +365,7 @@ class RootController:
         now = float(self.clock())
         with self._locked():
             state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
             previous = self._read_lease(state)
             if previous is not None:
                 age = max(0.0, now - previous.heartbeat_at)
@@ -545,6 +553,7 @@ class RootController:
 
         with self._locked():
             state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
             active = self._read_lease(state)
             dormant_value = state.get("dormant_lease")
             dormant = (
@@ -696,9 +705,9 @@ class RootController:
         """Authenticate a staged exact-target continuation, if one exists."""
         with self._locked():
             state = _read_json(self.state_path)
-            pending = state.get("continuation_reattach")
-            if pending is None:
+            if "continuation_reattach" not in state:
                 return None
+            pending = state["continuation_reattach"]
             if not isinstance(pending, Mapping):
                 raise LeaseConflict("staged continuation reattach record is malformed")
             payload = dict(pending)
@@ -775,6 +784,84 @@ class RootController:
             return ""
         return lease.continuity_id
 
+    def _authenticated_pending_candidate(
+        self,
+        state: Mapping[str, Any],
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Lease:
+        """Verify the only lease allowed to mutate a staged continuation."""
+        pending = state.get("continuation_reattach")
+        if not isinstance(pending, Mapping):
+            raise LeaseConflict("staged continuation record is missing or malformed")
+        payload = dict(pending)
+        supplied = str(payload.pop("authority_hmac", ""))
+        expected = {
+            "schema": "agentflow.continuation-reattach@1",
+            "root": self.root,
+            "controller": self.controller,
+            "workflow_root": workflow_root,
+            "cancelled_task": cancelled_task,
+            "ready_task": ready_task,
+        }
+        if (
+            not authority_secret
+            or any(payload.get(key) != value for key, value in expected.items())
+            or not hmac.compare_digest(
+                supplied, _authority_mac(authority_secret, payload, domain="continuation-reattach-v1"),
+            )
+        ):
+            raise LeaseConflict("staged continuation does not authenticate this exact target")
+        try:
+            previous_epoch = int(payload["previous_epoch"])
+            candidate_epoch = int(payload["epoch"])
+            state_epoch = int(state.get("epoch", -1))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LeaseConflict("staged continuation epochs are malformed") from exc
+        active = self._read_lease(state)
+        candidate_hash = str(payload.get("resume_secret_hash") or "")
+        if (
+            candidate_epoch != previous_epoch + 1
+            or state_epoch != candidate_epoch
+            or active is None
+            or active.root != self.root
+            or active.controller != self.controller
+            or active.epoch != candidate_epoch
+            or active.token != payload.get("token")
+            or active.continuity_id != payload.get("continuity_id")
+            or active.resume_secret_hash != candidate_hash
+            or not hmac.compare_digest(_hash_secret(resume_proof), candidate_hash)
+        ):
+            raise LeaseConflict("staged continuation requires its exact committed credential")
+        candidate = self._continuation_lease_from_record(pending, resume_proof)
+        if not self._lease_matches(active, candidate):
+            raise LeaseConflict("staged continuation lease no longer matches protected state")
+        return candidate
+
+    def authorize_explicit_continuation(
+        self,
+        *,
+        workflow_root: str,
+        cancelled_task: str,
+        ready_task: str,
+        authority_secret: str,
+        resume_proof: str,
+    ) -> Lease:
+        """Authorize only the exact candidate lease saved in a continuation intent."""
+        with self._locked():
+            state = _read_json(self.state_path)
+            candidate = self._authenticated_pending_candidate(
+                state, workflow_root=workflow_root, cancelled_task=cancelled_task,
+                ready_task=ready_task, authority_secret=authority_secret,
+                resume_proof=resume_proof,
+            )
+            self._lease = candidate
+            return candidate
+
     def reattach_for_explicit_continuation(
         self,
         *,
@@ -799,6 +886,8 @@ class RootController:
             if dormant_value is not None and dormant is None:
                 raise LeaseConflict("dormant controller lease is malformed")
             pending_value = state.get("continuation_reattach")
+            if "continuation_reattach" in state and not isinstance(pending_value, Mapping):
+                raise LeaseConflict("staged continuation reattach record is malformed")
             pending: dict[str, Any] | None = None
             if pending_value is not None:
                 if not isinstance(pending_value, Mapping):
@@ -840,8 +929,11 @@ class RootController:
                     and int(state.get("epoch", -1)) == candidate_epoch
                     and active.verify_resume_proof(resume_proof)
                 ):
-                    self._lease = active
-                    return active
+                    candidate = self._continuation_lease_from_record(pending_value, resume_proof)
+                    if not self._lease_matches(active, candidate):
+                        raise LeaseConflict("staged continuation lease no longer matches protected state")
+                    self._lease = candidate
+                    return candidate
                 if candidate_hash and hmac.compare_digest(
                     hashlib.sha256(resume_proof.encode("utf-8")).hexdigest(), candidate_hash,
                 ):
@@ -912,10 +1004,13 @@ class RootController:
         lease: Lease | str,
     ) -> None:
         """Clear a staged continuation only after its target is checkpointed."""
-        with self.fence(lease) as current:
+        with self.fence(
+            lease,
+            _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
+        ) as current:
             state = _read_json(self.state_path)
             pending = state.get("continuation_reattach")
-            if pending is None:
+            if "continuation_reattach" not in state:
                 return
             if not isinstance(pending, Mapping):
                 raise LeaseConflict("staged continuation reattach record is malformed")
@@ -1017,7 +1112,9 @@ class RootController:
         if not resume_proof:
             raise LeaseConflict("controller resume proof is required")
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
         if (
             current is None
             or current.root != self.root
@@ -1042,7 +1139,9 @@ class RootController:
             raise FencedLease("controller lease is required")
         now = float(self.clock())
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
             state = _read_json(self.state_path)
@@ -1069,7 +1168,9 @@ class RootController:
         if expected is None:
             raise FencedLease("controller lease is required")
         with self._locked():
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            self._reject_pending_continuation(state)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
             state = _read_json(self.state_path)
@@ -1084,7 +1185,12 @@ class RootController:
             self._lease = None
 
     @contextmanager
-    def fence(self, lease: Lease | str | None = None):
+    def fence(
+        self,
+        lease: Lease | str | None = None,
+        *,
+        _continuation_authority: tuple[str, str, str, str] | None = None,
+    ):
         """Hold the controller lock across an external critical section.
 
         Re-verifies ``lease`` (or the retained lease) at entry, exactly like
@@ -1105,9 +1211,19 @@ class RootController:
         handle = self.lock_path.open("a+", encoding="utf-8")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
-            current = self._read_lease(_read_json(self.state_path))
+            state = _read_json(self.state_path)
+            current = self._read_lease(state)
             if current is None or not self._lease_matches(current, expected) or current.root != self.root:
                 raise FencedLease("controller lease is no longer current")
+            if "continuation_reattach" in state:
+                if _continuation_authority is None or not isinstance(expected, Lease):
+                    self._reject_pending_continuation(state)
+                workflow_root, cancelled_task, ready_task, authority_secret = _continuation_authority
+                self._authenticated_pending_candidate(
+                    state, workflow_root=workflow_root, cancelled_task=cancelled_task,
+                    ready_task=ready_task, authority_secret=authority_secret,
+                    resume_proof=expected.resume_secret,
+                )
             self._lease = current
             yield current
         finally:
@@ -1220,7 +1336,10 @@ class RootController:
         same lock instead of racing it.
         """
         if lease is None:
-            return checkpoint.write_checkpoint(self.checkpoint_path, document)
+            with self._locked():
+                state = _read_json(self.state_path)
+                self._reject_pending_continuation(state)
+                return checkpoint.write_checkpoint(self.checkpoint_path, document)
         with self.fence(lease):
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
 
@@ -1672,6 +1791,7 @@ class RootController:
         cancelled_task: str,
         ready_task: str,
         *,
+        authority_secret: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Reopen only a signed cancelled-preidentity halt for distinct ready work."""
@@ -1680,7 +1800,10 @@ class RootController:
             raise ControllerError("workflow root, cancelled task, and ready descendant are required")
         if ready_task == cancelled_task:
             raise ControllerError("continuation must select a task distinct from the cancelled launch")
-        with self.fence(lease) as current:
+        with self.fence(
+            lease,
+            _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
+        ) as current:
             document = self._load_checkpoint()
             reason = str(document.get("terminal_reason") or "")
             retired_check = str(document.get("last_check") or "")
