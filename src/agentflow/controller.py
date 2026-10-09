@@ -1506,12 +1506,20 @@ class RootController:
             saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
             return self._result(saved, resumed=True)
 
-    def _result(self, document: Mapping[str, Any], *, dispatched: bool = False, resumed: bool = False) -> ResumeResult:
+    def _result(
+        self,
+        document: Mapping[str, Any],
+        *,
+        dispatched: bool = False,
+        resumed: bool = False,
+        task: str | None = None,
+        session_id: str | None = None,
+    ) -> ResumeResult:
         state = checkpoint.resume_state(dict(document))
         return ResumeResult(
             state=state,
-            task=str(document.get("task") or ""),
-            session_id=str(document.get("session_id") or ""),
+            task=str(document.get("task") or "") if task is None else task,
+            session_id=str(document.get("session_id") or "") if session_id is None else session_id,
             dispatched=dispatched,
             halted=state in TERMINAL_STATES,
             resumed=resumed,
@@ -1609,17 +1617,71 @@ class RootController:
         else:
             session_id = str(outcome or "")
             outcome_state = ""
-        # Dispatch may have taken long enough for an explicit takeover.  The
-        # old epoch must never be allowed to write a post-dispatch checkpoint.
-        current_lease = self.assert_lease(current_lease)
-        after_launch = dict(document)
-        after_launch["session_id"] = session_id
-        after_launch["state"] = outcome_state or ("running" if session_id else "claimed_no_session")
-        after_launch["status"] = after_launch["state"]
-        after_launch["next_action"] = "await session" if session_id else "inspect claimed task"
-        after_launch["terminal"] = after_launch["state"] in TERMINAL_STATES
-        saved = self._save_checkpoint(after_launch, lease=current_lease)
-        return self._result(saved, dispatched=True)
+        launch_state = outcome_state or ("running" if session_id else "claimed_no_session")
+        selected_claim_id = str(claim)
+        # The callback runs without the controller lock. Another worker may
+        # reserve a sibling while it is in progress, so bind only our exact
+        # reservation against the latest checkpoint instead of replacing it
+        # with the stale pre-dispatch snapshot.
+        with self.fence(current_lease) as current_lease:
+            latest = self._load_checkpoint()
+            if checkpoint.admission_phase(latest) == "terminal":
+                raise ControllerError("controller checkpoint became terminal during task dispatch")
+            rows = _active_tasks_from_checkpoint(latest, self.root)
+            matches = [row for row in rows if row.get("task") == task_id]
+            if len(matches) != 1 or matches[0].get("claim_id") != selected_claim_id:
+                raise ControllerError(
+                    f"task {task_id} no longer has its exact pending dispatch reservation"
+                )
+            selected_row = matches[0]
+            if selected_row.get("state") != "claimed_no_session" or selected_row.get("session_id"):
+                if (
+                    selected_row.get("state") != "claimed_no_session"
+                    and selected_row.get("state") == launch_state
+                    and selected_row.get("session_id") == session_id
+                ):
+                    return self._result(
+                        latest, dispatched=True, task=task_id, session_id=session_id,
+                    )
+                raise ControllerError(f"task {task_id} dispatch reservation was already changed")
+
+            after_launch = dict(latest)
+            after_launch.update({
+                "task": task_id,
+                "phase": str(selected.get("phase") or "dispatch"),
+                "root": self.root,
+                "controller": self.controller,
+                "actor": actor,
+                "claim_id": selected_claim_id,
+                "epoch": current_lease.epoch,
+                "lease_token": current_lease.token,
+                "session_id": session_id,
+                "state": launch_state,
+                "status": launch_state,
+                "next_action": "await session" if session_id else "inspect claimed task",
+                "terminal": launch_state in TERMINAL_STATES,
+            })
+            has_active_rows = bool(latest.get("active_tasks"))
+            if has_active_rows and launch_state not in TERMINAL_STATES:
+                if launch_state not in checkpoint.ACTIVE_TASK_STATES:
+                    raise ControllerError(
+                        f"dispatch returned unsupported active task state {launch_state!r}"
+                    )
+                selected_row["session_id"] = session_id
+                selected_row["state"] = launch_state
+                saved = self._checkpoint_active_tasks(latest, rows, current_lease)
+                return self._result(
+                    saved, dispatched=True, task=task_id, session_id=session_id,
+                )
+
+            if has_active_rows and len(rows) > 1:
+                raise ControllerError(
+                    "cannot commit a terminal dispatch outcome while sibling tasks are active"
+                )
+            if has_active_rows:
+                after_launch["active_tasks"] = []
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, after_launch)
+            return self._result(saved, dispatched=True, task=task_id, session_id=session_id)
 
     schedule = resume
 

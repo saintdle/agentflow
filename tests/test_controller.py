@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import Any, Mapping
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -36,6 +37,23 @@ class Clock:
 
 
 class ControllerTests(unittest.TestCase):
+    def _controller_with_pending_continuation(self, base: Path) -> tuple[RootController, Lease]:
+        state = base / "controller.json"
+        cp = base / "checkpoint.json"
+        controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+        lease = controller.acquire()
+        controller.halt(
+            "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+            lease=lease,
+        )
+        document = controller._load_checkpoint()
+        document["last_check"] = "cancelled expired preidentity launch old-launch for old"
+        checkpoint.write_checkpoint(cp, document)
+        controller.acknowledge_cancelled_preidentity_halt(
+            "workflow", "old", "ready-task", lease=lease,
+        )
+        return controller, lease
+
     def test_supervisor_lock_is_exclusive_per_root_and_released_on_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "controller.json"
@@ -636,6 +654,159 @@ class ControllerTests(unittest.TestCase):
             self.assertFalse(any(thread.is_alive() for thread in threads), "reservation threads did not finish")
             self.assertEqual(failures, [])
             self.assertEqual({row["task"] for row in controller.active_tasks()}, {"task-a", "task-b"})
+
+    def test_resume_binds_selected_task_without_erasing_concurrent_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, lease = self._controller_with_pending_continuation(Path(tmp))
+            during_dispatch: list[str] = []
+
+            def dispatch(_task: Mapping[str, Any]) -> dict[str, str]:
+                reserved = controller.reserve_active_task(
+                    {"task": "other-task", "root": "root", "claim_id": "claim-other"},
+                    lease=lease,
+                )
+                during_dispatch.extend(row["task"] for row in reserved.checkpoint["active_tasks"])
+                return {"session_id": "ready-session", "state": "running"}
+
+            result = controller.resume(
+                [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                dispatch=dispatch,
+                lease=lease,
+            )
+
+            self.assertEqual(set(during_dispatch), {"ready-task", "other-task"})
+            rows = {row["task"]: row for row in checkpoint.load_checkpoint(controller.checkpoint_path)["active_tasks"]}
+            self.assertEqual(set(rows), {"ready-task", "other-task"})
+            self.assertEqual(rows["ready-task"]["claim_id"], "claim-ready")
+            self.assertEqual(rows["ready-task"]["session_id"], "ready-session")
+            self.assertEqual(rows["ready-task"]["state"], "running")
+            self.assertEqual(rows["other-task"]["claim_id"], "claim-other")
+            self.assertEqual(rows["other-task"]["session_id"], "")
+            self.assertEqual(rows["other-task"]["state"], "claimed_no_session")
+            self.assertEqual(result.session_id, "ready-session")
+
+    def test_dispatch_exception_preserves_both_durable_reservations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, lease = self._controller_with_pending_continuation(Path(tmp))
+
+            def dispatch(_task: Mapping[str, Any]) -> dict[str, str]:
+                controller.reserve_active_task(
+                    {"task": "other-task", "root": "root", "claim_id": "claim-other"},
+                    lease=lease,
+                )
+                raise RuntimeError("simulated provider handoff failure")
+
+            with self.assertRaisesRegex(RuntimeError, "simulated provider handoff failure"):
+                controller.resume(
+                    [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                    dispatch=dispatch,
+                    lease=lease,
+                )
+
+            rows = {row["task"]: row for row in checkpoint.load_checkpoint(controller.checkpoint_path)["active_tasks"]}
+            self.assertEqual(set(rows), {"ready-task", "other-task"})
+            self.assertEqual(rows["ready-task"]["claim_id"], "claim-ready")
+            self.assertEqual(rows["ready-task"]["state"], "claimed_no_session")
+            self.assertEqual(rows["other-task"]["state"], "claimed_no_session")
+
+    def test_postdispatch_checkpoint_crash_keeps_session_binding_and_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, lease = self._controller_with_pending_continuation(Path(tmp))
+            writer = checkpoint.write_checkpoint
+
+            def write_then_crash(path: Path, document: Mapping[str, Any]) -> dict[str, Any]:
+                saved = writer(path, document)
+                if (
+                    Path(path) == controller.checkpoint_path
+                    and any(
+                        row.get("task") == "ready-task"
+                        and row.get("session_id") == "ready-session"
+                        for row in document.get("active_tasks", [])
+                    )
+                ):
+                    raise OSError("simulated crash after bound checkpoint commit")
+                return saved
+
+            with mock.patch.object(checkpoint, "write_checkpoint", side_effect=write_then_crash):
+                def dispatch(_task: Mapping[str, Any]) -> dict[str, str]:
+                    controller.reserve_active_task(
+                        {"task": "other-task", "root": "root", "claim_id": "claim-other"},
+                        lease=lease,
+                    )
+                    return {"session_id": "ready-session", "state": "running"}
+
+                with self.assertRaisesRegex(OSError, "after bound checkpoint commit"):
+                    controller.resume(
+                        [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                        dispatch=dispatch,
+                        lease=lease,
+                    )
+
+            rows = {row["task"]: row for row in checkpoint.load_checkpoint(controller.checkpoint_path)["active_tasks"]}
+            self.assertEqual(set(rows), {"ready-task", "other-task"})
+            self.assertEqual(rows["ready-task"]["claim_id"], "claim-ready")
+            self.assertEqual(rows["ready-task"]["session_id"], "ready-session")
+            self.assertEqual(rows["ready-task"]["state"], "running")
+            self.assertEqual(rows["other-task"]["state"], "claimed_no_session")
+
+    def test_terminal_dispatch_after_migration_keeps_selected_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, lease = self._controller_with_pending_continuation(Path(tmp))
+
+            def dispatch(_task: Mapping[str, Any]) -> dict[str, str]:
+                controller.migrate_active_tasks(lease=lease)
+                return {"session_id": "ready-session", "state": "completed"}
+
+            result = controller.resume(
+                [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                dispatch=dispatch,
+                lease=lease,
+            )
+
+            self.assertEqual(result.state, "completed")
+            self.assertEqual(result.task, "ready-task")
+            self.assertEqual(result.session_id, "ready-session")
+            document = checkpoint.load_checkpoint(controller.checkpoint_path)
+            self.assertEqual(document["task"], "ready-task")
+            self.assertEqual(document["claim_id"], "claim-ready")
+            self.assertEqual(document["session_id"], "ready-session")
+            self.assertEqual(document["active_tasks"], [])
+
+    def test_dispatch_binding_rejects_changed_claim_or_foreign_session(self) -> None:
+        for change in ("claim", "session"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                controller, lease = self._controller_with_pending_continuation(Path(tmp))
+
+                def dispatch(_task: Mapping[str, Any]) -> dict[str, str]:
+                    controller.migrate_active_tasks(lease=lease)
+                    if change == "claim":
+                        with controller.fence(lease) as current:
+                            document = controller._load_checkpoint()
+                            rows = controller_module._active_tasks_from_checkpoint(document, controller.root)
+                            rows[0]["claim_id"] = "foreign-claim"
+                            controller._checkpoint_active_tasks(document, rows, current)
+                    else:
+                        controller.bind_active_task(
+                            "ready-task", session_id="foreign-session", state="running", lease=lease,
+                        )
+                    return {"session_id": "ready-session", "state": "running"}
+
+                with self.assertRaisesRegex(ControllerError, "reservation|already changed"):
+                    controller.resume(
+                        [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                        dispatch=dispatch,
+                        lease=lease,
+                    )
+
+                row = checkpoint.load_checkpoint(controller.checkpoint_path)["active_tasks"][0]
+                if change == "claim":
+                    self.assertEqual(row["claim_id"], "foreign-claim")
+                    self.assertEqual(row["session_id"], "")
+                    self.assertEqual(row["state"], "claimed_no_session")
+                else:
+                    self.assertEqual(row["claim_id"], "claim-ready")
+                    self.assertEqual(row["session_id"], "foreign-session")
+                    self.assertEqual(row["state"], "running")
 
     def test_pending_continuation_rejects_unrelated_reservation_without_checkpoint_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
