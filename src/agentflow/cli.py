@@ -2691,6 +2691,12 @@ def _verify_cancelled_preidentity_continuation(
         if str(other.get("status") or "").lower() in {"launching", "identity_pending", "launched", "running"}:
             raise controller_backend.ControllerError("another descendant has an active Herdr lifecycle")
         if str(other.get("status") or "").lower() not in {"completed"}:
+            if str(other.get("status") or "").lower() == "cancelled_preidentity":
+                _verify_retired_preidentity_descendant(
+                    root, workflow_root, task_id, row, controller, lease,
+                    authority_secret=authority_secret,
+                )
+                continue
             raise controller_backend.ControllerError("another descendant has an unresolved Herdr lifecycle")
         other_channel = other.get("return_channel")
         other_result = other.get("result")
@@ -2727,6 +2733,79 @@ def _verify_cancelled_preidentity_continuation(
     if len(rows) != 1 or not isinstance(rows[0], Mapping) or str(rows[0].get("id") or "") != ready_task:
         raise controller_backend.ControllerError("requested continuation is not the exact current ready task")
     return ready_task
+
+
+def _verify_retired_preidentity_descendant(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    descendant: Mapping[str, Any],
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    *,
+    authority_secret: str,
+) -> None:
+    """Accept only another independently authenticated, blocked legacy retirement."""
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or not _authenticated_cancelled_preidentity(
+        root, workflow_root, task_id, authority_secret=authority_secret,
+    ):
+        raise controller_backend.ControllerError(
+            "another descendant has an unauthenticated preidentity retirement"
+        )
+    disposition = record.get("recovery_disposition")
+    reason = str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
+    if reason not in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
+        raise controller_backend.ControllerError(
+            "another descendant has an unsupported preidentity retirement"
+        )
+    channel = record.get("return_channel")
+    contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+    epoch = contract.get("lease_epoch") if isinstance(contract, Mapping) else None
+    if (
+        not isinstance(contract, Mapping)
+        or record.get("task_id") != task_id
+        or record.get("root") != str(root)
+        or record.get("workflow_root") != workflow_root
+        or record.get("launch_id") != contract.get("launch_id")
+        or record.get("binding") not in (None, {})
+        or record.get("result") not in (None, {})
+        or contract.get("controller_id") != lease.controller
+        or contract.get("actor") != lease.controller
+        or contract.get("continuity_id") != lease.continuity_id
+        or not isinstance(epoch, int) or isinstance(epoch, bool)
+        or epoch < 0 or epoch > lease.epoch
+    ):
+        raise controller_backend.ControllerError(
+            "another preidentity retirement belongs to a different controller incarnation"
+        )
+
+    issue = beads_backend.get_issue(root, task_id)
+    metadata = issue.get("metadata")
+    agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+    agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+    claim_token = str(agentflow.get("claim_token") or "")
+    if (
+        str(issue.get("id") or "") != task_id
+        or str(issue.get("parent") or "") != workflow_root
+        or str(issue.get("status") or "").lower() != "blocked"
+        or str(issue.get("assignee") or "") != lease.controller
+        or str(descendant.get("status") or "").lower() != "blocked"
+        or str(descendant.get("assignee") or "") != lease.controller
+        or str(agentflow.get("root") or "") != workflow_root
+        or str(agentflow.get("task") or "") != task_id
+        or str(agentflow.get("actor") or "") != lease.controller
+        or not str(contract.get("claim_id") or "")
+        or not claim_token
+        or str(agentflow.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or not hmac.compare_digest(
+            hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            str(contract.get("claim_token_sha256") or ""),
+        )
+    ):
+        raise controller_backend.ControllerError(
+            "another retired task no longer has its exact blocked Beads claim"
+        )
 
 
 def controller_recover_preidentity(args: argparse.Namespace) -> int:

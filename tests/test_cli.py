@@ -2902,6 +2902,257 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         args.expected_contract_sha256 = hashlib.sha256(Path(contract["contract_path"]).read_bytes()).hexdigest()
         return fixture, controller, contract, ledger_path, baseline, args
 
+    def _install_signed_legacy_retirement(
+        self, fixture: ValidLaunch, baseline: dict, *, task_id: str, claim_id: str,
+        claim_token: str, lease_epoch: int, owner_abandoned_epoch: bool,
+    ) -> dict:
+        """Add an independently signed, unbudgeted retired task to this fixture."""
+        state_path = baseline["state_path"]
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        source = state["sessions"][fixture.task_id]
+        record = json.loads(json.dumps(source))
+        source_contract = source["return_channel"]["contract_binding"]
+        contract = json.loads(json.dumps(source_contract))
+        launch_id = f"launch-{task_id}"
+        lease_id = f"lease-{task_id}"
+        contract_dir = cli._runtime_launch_dir(fixture.root, fixture.workflow_root, launch_id)
+        contract_path = contract_dir / "return.contract.json"
+        contract.update({
+            "task_id": task_id,
+            "claim_id": claim_id,
+            "claim_token_sha256": hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+            "lease_id": lease_id,
+            "lease_token_sha256": hashlib.sha256(lease_id.encode("utf-8")).hexdigest(),
+            "launch_id": launch_id,
+            "lease_epoch": lease_epoch,
+            "contract_path": str(contract_path.resolve()),
+            "result_path": str((contract_dir / "result.json").resolve()),
+            "submission_file": str((contract_dir / "submitted.json").resolve()),
+        })
+        contract["authority_hmac"] = cli._authority_mac(
+            fixture.authority_secret, contract, domain="return-contract-v1",
+        )
+        cli._private_atomic_json(contract_path, contract)
+
+        pane_id = f"pane-{task_id}"
+        record.update({
+            "task_id": task_id,
+            "claim_id": claim_id,
+            "launch_id": launch_id,
+            "pane_id": pane_id,
+            "binding": None,
+            "result": None,
+            "status": "cancelled_preidentity",
+        })
+        record.pop("deadline_epoch", None)
+        record.pop("execution_limits", None)
+        record.pop("max_attempts", None)
+        record.pop("execution_limit_capabilities", None)
+        disposition = cli._preidentity_disposition(
+            contract, pane_id=pane_id, authority_secret=fixture.authority_secret,
+            owner_abandoned_epoch=owner_abandoned_epoch,
+            superseded_legacy_scope=not owner_abandoned_epoch,
+        )
+        record["recovery_disposition"] = disposition
+        channel = record["return_channel"]
+        channel.update({
+            "contract_path": str(contract_path.resolve()),
+            "contract_binding": contract,
+            "contract_sha256": cli._canonical_json_digest(contract),
+            "result_path": contract["result_path"],
+            "submission_file": contract["submission_file"],
+            "state": "revoked",
+            "revoked_at": disposition["recorded_at"],
+            "revocation": disposition,
+        })
+        with cli._herdr_transaction(state_path) as current:
+            current["sessions"][task_id] = record
+        return {
+            "id": task_id,
+            "title": "Previously retired task",
+            "status": "blocked",
+            "assignee": fixture.controller,
+            "parent": fixture.workflow_root,
+            "metadata": {"agentflow": {
+                "root": fixture.workflow_root,
+                "task": task_id,
+                "actor": fixture.controller,
+                "claim_id": claim_id,
+                "claim_token": claim_token,
+            }},
+        }
+
+    def _rewrite_signed_legacy_sibling(
+        self, fixture: ValidLaunch, baseline: dict, *, contract_updates: dict | None = None,
+        disposition_updates: dict | None = None, record_updates: dict | None = None,
+    ) -> None:
+        task_id = "task-prior"
+        state_path = baseline["state_path"]
+        with cli._herdr_transaction(state_path) as state:
+            record = state["sessions"][task_id]
+            channel = record["return_channel"]
+            contract = dict(channel["contract_binding"])
+            contract.update(contract_updates or {})
+            contract["authority_hmac"] = cli._authority_mac(
+                fixture.authority_secret, contract, domain="return-contract-v1",
+            )
+            cli._private_atomic_json(Path(contract["contract_path"]), contract)
+            channel["contract_binding"] = contract
+            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+            if contract_updates:
+                disposition = cli._preidentity_disposition(
+                    contract, pane_id=record["pane_id"],
+                    authority_secret=fixture.authority_secret,
+                    owner_abandoned_epoch=(
+                        record["recovery_disposition"]["reason"] == "owner_abandoned_epoch"
+                    ),
+                    superseded_legacy_scope=(
+                        record["recovery_disposition"]["reason"] == "superseded_legacy_scope"
+                    ),
+                )
+                record["recovery_disposition"] = disposition
+                channel["revocation"] = disposition
+            if disposition_updates:
+                record["recovery_disposition"].update(disposition_updates)
+                channel["revocation"] = record["recovery_disposition"]
+            if record_updates:
+                record.update(record_updates)
+
+    def test_continuation_accepts_two_authenticated_retirements_in_one_controller_incarnation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                retired, _ = self._run_recovery(fixture, self._args(fixture), legacy_scope=True)
+                self.assertTrue(retired["ok"], retired)
+                prior_issue = self._install_signed_legacy_retirement(
+                    fixture, baseline, task_id="task-prior", claim_id="claim-prior",
+                    claim_token="opaque-prior-claim-token-0123456789abcdef",
+                    lease_epoch=0, owner_abandoned_epoch=True,
+                )
+                current_lease = cli.controller_backend.Lease.from_dict(
+                    json.loads(controller.state_path.read_text(encoding="utf-8"))["lease"]
+                )
+                ready = {
+                    "id": "distinct-ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    "task-prior": prior_issue,
+                    "distinct-ready-task": ready,
+                }
+
+                def run_beads(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": "distinct-ready-task"}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+
+                state_before = baseline["state_path"].read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, "task-prior",
+                    authority_secret=fixture.authority_secret,
+                ))
+                prior_contract = json.loads(state_before)["sessions"]["task-prior"]["return_channel"]["contract_binding"]
+                current_contract = json.loads(state_before)["sessions"][fixture.task_id]["return_channel"]["contract_binding"]
+                self.assertNotEqual(prior_contract["lease_epoch"], current_contract["lease_epoch"])
+                self.assertNotEqual(
+                    json.loads(state_before)["sessions"]["task-prior"]["recovery_disposition"]["reason"],
+                    json.loads(state_before)["sessions"][fixture.task_id]["recovery_disposition"]["reason"],
+                )
+                prior_contract_path = Path(prior_contract["contract_path"])
+                prior_contract_before = prior_contract_path.read_bytes()
+
+                def verify():
+                    return cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                        "distinct-ready-task", controller, current_lease,
+                        authority_secret=fixture.authority_secret,
+                    )
+
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[
+                         fixture.task_issue, prior_issue, ready,
+                     ]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                    self.assertEqual(verify(), "distinct-ready-task")
+                self.assertEqual(baseline["state_path"].read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+
+                # Every invalid sibling remains a hard stop before any authority mutation.
+                cases = (
+                    "forged-disposition", "wrong-claim", "wrong-root", "wrong-beads-root",
+                    "wrong-controller", "wrong-incarnation", "future-epoch", "unrevoked",
+                    "binding", "result",
+                )
+                for case in cases:
+                    with self.subTest(case=case):
+                        with cli._herdr_transaction(baseline["state_path"]) as state:
+                            state["sessions"]["task-prior"] = json.loads(state_before)["sessions"]["task-prior"]
+                        prior_contract_path.write_bytes(prior_contract_before)
+                        prior_agentflow = prior_issue["metadata"]["agentflow"]
+                        prior_agentflow.update({
+                            "root": fixture.workflow_root,
+                            "task": "task-prior",
+                            "actor": fixture.controller,
+                            "claim_id": "claim-prior",
+                        })
+                        if case == "forged-disposition":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline,
+                                disposition_updates={"reason": "owner_abandoned_epoch forged"},
+                            )
+                        elif case == "wrong-claim":
+                            prior_issue["metadata"]["agentflow"]["claim_id"] = "foreign-claim"
+                        elif case == "wrong-beads-root":
+                            prior_issue["metadata"]["agentflow"]["root"] = "foreign-root"
+                        elif case == "wrong-root":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline, contract_updates={"workflow_root": "foreign-root"},
+                            )
+                        elif case == "wrong-controller":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline,
+                                contract_updates={"controller_id": "foreign-controller"},
+                            )
+                        elif case == "wrong-incarnation":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline, contract_updates={"continuity_id": "foreign-continuity"},
+                            )
+                        elif case == "future-epoch":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline,
+                                contract_updates={"lease_epoch": current_lease.epoch + 1},
+                            )
+                        elif case == "unrevoked":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline, record_updates={"return_channel": {"state": "issued"}},
+                            )
+                        elif case == "binding":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline, record_updates={"binding": {"session_id": "committed"}},
+                            )
+                        elif case == "result":
+                            self._rewrite_signed_legacy_sibling(
+                                fixture, baseline, record_updates={"result": {"outcome": "completed"}},
+                            )
+                        protected_before = baseline["state_path"].read_bytes()
+                        checkpoint_before_case = controller.checkpoint_path.read_bytes()
+                        with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                             mock.patch.object(cli.beads_backend, "root_descendants", return_value=[
+                                 fixture.task_issue, prior_issue, ready,
+                             ]), \
+                             mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                            with self.assertRaises(cli.controller_backend.ControllerError):
+                                verify()
+                        self.assertEqual(baseline["state_path"].read_bytes(), protected_before)
+                        self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before_case)
+
     def _run_owner_epoch_repair(self, fixture: ValidLaunch, args: argparse.Namespace,
                                 *, pane_response: str | None = None,
                                 pane_stderr: str | None = None,
