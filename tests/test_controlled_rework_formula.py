@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-import unittest
+import json
+import os
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 compatibility
@@ -40,7 +48,9 @@ def _queue_ids(
 
 
 class ControlledReworkFormulaTests(unittest.TestCase):
-    def test_wide_dispatch_waits_for_pilot_and_independent_controller_validation(self) -> None:
+    def test_wide_dispatch_waits_for_pilot_and_independent_controller_validation(
+        self,
+    ) -> None:
         steps = _steps()
         pilot_id = "pilot-slice"
         validation_id = "pilot-validation"
@@ -82,14 +92,39 @@ class ControlledReworkFormulaTests(unittest.TestCase):
         self.assertIn("authoritative checks", description)
         self.assertIn("separate verdict", description)
 
+    def test_nonlearner_review_uses_project_criteria_without_pedagogy_requirement(
+        self,
+    ) -> None:
+        step = _steps()["project-domain-review"]
+        description = " ".join(str(step.get("description", "")).lower().split())
+        self.assertNotIn("af:cap:pedagogy", step.get("labels", []))
+        self.assertIn(
+            "project-specific review criteria in the approved specification",
+            description,
+        )
+        self.assertIn("required project skills named there", description)
+        self.assertIn("for non-learner work", description)
+        self.assertIn("without adding pedagogy assumptions", description)
+
+    def test_learner_pedagogy_review_remains_available_when_the_spec_requires_it(
+        self,
+    ) -> None:
+        description = " ".join(
+            str(_steps()["project-domain-review"].get("description", "")).lower().split()
+        )
+        self.assertIn("for learner-facing work", description)
+        self.assertIn("learner-journey and pedagogy criteria", description)
+        self.assertIn("when the specification requires them", description)
+        self.assertIn("only when the project specification calls for them", description)
+
     def test_review_ci_and_final_integration_remain_downstream_without_cycles(self) -> None:
         steps = _steps()
-        self.assertEqual(steps["pedagogy-review"].get("needs"), ["writer-swarm"])
+        self.assertEqual(steps["project-domain-review"].get("needs"), ["writer-swarm"])
         self.assertEqual(steps["lifecycle-review"].get("needs"), ["writer-swarm"])
         self.assertEqual(steps["ci-validation"].get("needs"), ["writer-swarm"])
         self.assertEqual(
             set(steps["controller-integration"].get("needs", [])),
-            {"pedagogy-review", "lifecycle-review", "ci-validation"},
+            {"project-domain-review", "lifecycle-review", "ci-validation"},
         )
 
         visiting: set[str] = set()
@@ -110,6 +145,150 @@ class ControlledReworkFormulaTests(unittest.TestCase):
 
     def test_packaged_formula_mirrors_the_editable_template(self) -> None:
         self.assertEqual(FORMULA.read_bytes(), PACKAGED_FORMULA.read_bytes())
+
+    def test_disposable_beads_cli_enforces_the_pilot_gate(self) -> None:
+        bd = shutil.which("bd")
+        if bd is None:
+            self.skipTest("Beads CLI is unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="agentflow-pilot-cli-") as temporary:
+            temporary_root = Path(temporary)
+            workspace = temporary_root / "workspace"
+            private_home = temporary_root / "home"
+            workspace.mkdir()
+            private_home.mkdir()
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(private_home),
+                    "XDG_CONFIG_HOME": str(private_home / "config"),
+                    "BEADS_DIR": str(workspace / ".beads"),
+                    "BD_NON_INTERACTIVE": "1",
+                    "DOLT_DISABLE_EVENT_FLUSH": "1",
+                    "PYTHONPATH": str(ROOT / "src"),
+                }
+            )
+
+            version = subprocess.run(
+                [bd, "version"],
+                cwd=workspace,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            version_text = (version.stdout or version.stderr).strip()
+            match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version_text)
+            if (
+                version.returncode
+                or match is None
+                or tuple(map(int, match.groups())) < (1, 1, 0)
+            ):
+                self.skipTest(
+                    "Beads 1.1.0 or later is required for the CLI integration fixture"
+                )
+
+            def run(*command: str) -> str:
+                result = subprocess.run(
+                    list(command),
+                    cwd=workspace,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, 0,
+                    msg=f"{command[0]} failed: {(result.stderr or result.stdout).strip()}",
+                )
+                return result.stdout
+
+            run(sys.executable, "-m", "agentflow", "beads", "init", str(workspace))
+            run(
+                bd,
+                "mol",
+                "pour",
+                "agentflow-controlled-rework",
+                "--var",
+                "work_name=CLI Gate Probe",
+            )
+            issues = json.loads(run(bd, "list", "--all", "--json"))
+            root_rows = [issue for issue in issues if issue.get("issue_type") == "molecule"]
+            self.assertEqual(len(root_rows), 1)
+            root_id = str(root_rows[0]["id"])
+
+            def issue_id(title_start: str) -> str:
+                matches = [
+                    issue
+                    for issue in issues
+                    if str(issue.get("title", "")).startswith(title_start)
+                ]
+                self.assertEqual(len(matches), 1, title_start)
+                return str(matches[0]["id"])
+
+            contract_id = issue_id("Controller: approve CLI Gate Probe contract")
+            specification_id = issue_id(
+                "Controller: specify CLI Gate Probe interfaces"
+            )
+            pilot_id = issue_id("Writer: implement one pilot slice for CLI Gate Probe")
+            validation_id = issue_id("Controller: independently validate the pilot slice")
+            dispatch_id = issue_id(
+                "Controller: coordinate CLI Gate Probe sub-primary writers"
+            )
+
+            def close(issue: str, actor: str) -> None:
+                run(
+                    bd,
+                    "close",
+                    issue,
+                    "--reason",
+                    "disposable pilot-gate acceptance",
+                    "--actor",
+                    actor,
+                )
+
+            def pull(stage: str, actor: str) -> str:
+                return run(
+                    sys.executable,
+                    "-m",
+                    "agentflow",
+                    "worker",
+                    "pull",
+                    "--root",
+                    root_id,
+                    "--stage",
+                    stage,
+                    "--actor",
+                    actor,
+                    "--once",
+                )
+
+            close(contract_id, "controller-test")
+            close(specification_id, "controller-test")
+            self.assertIn("No ready dispatch work", pull("dispatch", "writer-test"))
+            pilot_claim = pull("code", "pilot-writer")
+            self.assertIn(
+                f"CLAIMED Writer: implement one pilot slice for CLI Gate Probe ({pilot_id})",
+                pilot_claim,
+            )
+
+            close(pilot_id, "pilot-writer")
+            self.assertIn("No ready code work", pull("code", "writer-test"))
+            validation_claim = pull("integration", "controller-test")
+            self.assertIn(
+                f"CLAIMED Controller: independently validate the pilot slice for CLI Gate Probe ({validation_id})",
+                validation_claim,
+            )
+            self.assertIn("No ready dispatch work", pull("dispatch", "writer-test"))
+
+            close(validation_id, "controller-test")
+            dispatch_claim = pull("dispatch", "controller-test")
+            self.assertIn(
+                f"CLAIMED Controller: coordinate CLI Gate Probe sub-primary writers ({dispatch_id})",
+                dispatch_claim,
+            )
 
 
 if __name__ == "__main__":

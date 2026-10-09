@@ -116,20 +116,26 @@ its original writer.
 """
 
 [[steps]]
-id = "pedagogy-review"
-title = "Read-only pedagogy review for {{work_name}}"
+id = "project-domain-review"
+title = "Read-only project-domain review for {{work_name}}"
 needs = ["writer-swarm"]
-labels = ["agentflow", "af:stage:review", "af:role:reviewer", "af:cap:pedagogy", "af:mode:read-only"]
+labels = ["agentflow", "af:stage:review", "af:role:reviewer", "af:mode:read-only"]
 description = """
-Review the complete learner or user journey without editing. Return only
-actionable findings with stable IDs, severity, exact evidence, expected and
-actual behavior, proposed correction, authoritative evidence lane, and
-confidence. Return APPROVE when no material issue remains.
+Review the complete change against the project-specific review criteria in the
+approved specification. Use the required project skills named there; they
+determine the review scope. For non-learner work, follow the relevant project
+criteria without adding pedagogy assumptions. For learner-facing work, include
+learner-journey and pedagogy criteria when the specification requires them.
+Return only actionable findings with stable IDs, severity, exact evidence,
+expected and actual behavior, proposed correction, authoritative evidence lane,
+and confidence. Return APPROVE when no material issue remains.
 
 ## Acceptance criteria
 
-A read-only pedagogy or user-journey verdict is returned to the controller with
-reproducible evidence.
+A read-only verdict covers the project criteria selected in the specification,
+with reproducible evidence and explicit untested lanes. Learner-journey and
+pedagogy criteria are included only when the project specification calls for
+them.
 """
 
 [[steps]]
@@ -176,7 +182,7 @@ polls external CI, and failed checks are routed as bounded corrective work.
 [[steps]]
 id = "controller-integration"
 title = "Controller: final judgment for {{work_name}}"
-needs = ["pedagogy-review", "lifecycle-review", "ci-validation"]
+needs = ["project-domain-review", "lifecycle-review", "ci-validation"]
 labels = ["agentflow", "af:stage:integration", "af:role:controller"]
 description = """
 Disposition every reviewer finding. Reproduce accepted high and medium
