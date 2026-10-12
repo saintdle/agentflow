@@ -427,24 +427,42 @@ class ProcessGroupTeardownTests(unittest.TestCase):
                 "import subprocess, signal, time, sys\n"
                 "# Grandchild ignores SIGTERM\n"
                 "child_script = '''\n"
-                "import signal, time\n"
+                "import os, signal, time\n"
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"temporary = {str(pidfile.with_suffix('.tmp'))!r}\n"
+                f"ready = {str(pidfile)!r}\n"
+                "with open(temporary, 'w') as handle:\n"
+                "    handle.write(str(os.getpid()))\n"
+                "os.replace(temporary, ready)\n"
                 "time.sleep(30)\n"
                 "'''\n"
                 "child = subprocess.Popen([sys.executable, '-c', child_script])\n"
-                f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
-                "sys.stdout.flush()\n"
                 "# Parent waits so teardown can operate on the active group\n"
                 "time.sleep(30)\n"
             )
             process = isolation.spawn_supervised(
                 [sys.executable, "-c", script], isolation.IsolationSpec(), env=os.environ.copy()
             )
-            time.sleep(0.3)  # Give grandchild time to install SIGTERM handler
-            grandchild_pid = int(pidfile.read_text().strip())
-            # Verify grandchild is alive before teardown
-            os.kill(grandchild_pid, 0)
-            status = isolation.teardown(process, grace_seconds=1.0)
+            try:
+                deadline = time.monotonic() + 5.0
+                while True:
+                    if process.poll() is not None:
+                        self.fail("parent exited before grandchild reported readiness")
+                    if pidfile.is_file():
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.fail(
+                            "grandchild did not report readiness after installing SIGTERM handler"
+                        )
+                    time.sleep(min(0.01, remaining))
+
+                grandchild_pid = int(pidfile.read_text().strip())
+                # The ready file is published only after SIGTERM is ignored.
+                os.kill(grandchild_pid, 0)
+            finally:
+                # Even a readiness failure must clean up only this owned group.
+                status = isolation.teardown(process, grace_seconds=1.0)
             self.assertIn(status, {"terminated", "killed"})
             # Verify grandchild is gone after teardown
             deadline = time.monotonic() + 2.0
