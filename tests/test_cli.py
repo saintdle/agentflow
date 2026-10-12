@@ -5208,6 +5208,8 @@ class ControllerRunTests(unittest.TestCase):
                     controller.halt(
                         "blocked",
                         "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: old (.12)",
+                        drain_cause_kind="no_ready_work",
+                        drain_cause_provenance="scheduler_no_ready_work",
                         lease=lease,
                     )
                     cli._private_atomic_json(
@@ -5323,6 +5325,8 @@ class ControllerRunTests(unittest.TestCase):
                 controller.halt(
                     "blocked",
                     "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    drain_cause_kind="no_ready_work",
+                    drain_cause_provenance="scheduler_no_ready_work",
                     lease=lease,
                 )
                 cli._private_atomic_json(
@@ -5348,6 +5352,8 @@ class ControllerRunTests(unittest.TestCase):
                 controller.halt(
                     "blocked",
                     "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: task-1",
+                    drain_cause_kind="no_ready_work",
+                    drain_cause_provenance="scheduler_no_ready_work",
                     lease=lease,
                 )
                 if mode == "no-ready":

@@ -27,56 +27,36 @@ from agentflow import session_control
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
-_DRAIN_FAILURE_EVIDENCE_PREFIX = "agentflow.drain-failure-evidence@1:"
 
 
-def draining_failure_tasks(last_check: Any) -> list[str] | None:
-    """Return typed failed-task evidence from a controller-owned drain marker."""
-    if not isinstance(last_check, str) or not last_check.startswith(_DRAIN_FAILURE_EVIDENCE_PREFIX):
-        return None
-    encoded = last_check[len(_DRAIN_FAILURE_EVIDENCE_PREFIX):]
-    try:
-        payload = json.loads(encoded)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if (
-        not isinstance(payload, Mapping)
-        or set(payload) != {"schema", "failed_tasks"}
-        or payload.get("schema") != "agentflow.drain-failure-evidence@1"
-        or not isinstance(payload.get("failed_tasks"), list)
-    ):
-        return None
-    tasks = payload["failed_tasks"]
-    if (
-        not tasks or len(tasks) > checkpoint.MAX_ACTIVE_TASKS
-        or any(not isinstance(task, str) or not task or len(task) > checkpoint.FIELD_MAX for task in tasks)
-        or len(set(tasks)) != len(tasks)
-    ):
-        return None
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    if encoded != canonical:
-        return None
-    return list(tasks)
+def checkpoint_digest(document: Mapping[str, Any]) -> str:
+    """Return a stable digest of one validated checkpoint state."""
+    encoded = json.dumps(dict(document), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def has_draining_failure_marker(last_check: Any) -> bool:
-    return isinstance(last_check, str) and last_check.startswith(_DRAIN_FAILURE_EVIDENCE_PREFIX)
+def _drain_causes_digest(causes: list[Mapping[str, Any]]) -> str:
+    encoded = json.dumps(causes, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _record_draining_failure_task(document: dict[str, Any], task_id: str) -> None:
-    tasks = draining_failure_tasks(document.get("last_check")) or []
-    if task_id not in tasks:
-        tasks.append(task_id)
-    if len(tasks) > checkpoint.MAX_ACTIVE_TASKS:
-        raise ControllerError("too many causal failure tasks to preserve safely")
-    payload = json.dumps(
-        {"schema": "agentflow.drain-failure-evidence@1", "failed_tasks": tasks},
-        sort_keys=True, separators=(",", ":"),
-    )
-    marker = _DRAIN_FAILURE_EVIDENCE_PREFIX + payload
-    if len(marker) > checkpoint.FIELD_MAX:
-        raise ControllerError("causal failure evidence is too large to preserve safely")
-    document["last_check"] = marker
+def _append_drain_cause(
+    document: dict[str, Any], *, kind: str, provenance: str,
+    task_id: str = "", launch_id: str = "",
+) -> None:
+    causes = document.get("drain_causes")
+    if not isinstance(causes, list):
+        raise ControllerError("checkpoint drain cause set is malformed")
+    if len(causes) >= checkpoint.MAX_DRAIN_CAUSES:
+        raise ControllerError("drain cause limit reached; refusing to discard prior authority data")
+    causes.append({
+        "cause_id": uuid.uuid4().hex,
+        "kind": kind,
+        "provenance": provenance,
+        "task_id": task_id,
+        "launch_id": launch_id,
+        "diagnostic_sha256": "",
+    })
 
 
 class ControllerError(RuntimeError):
@@ -2030,6 +2010,10 @@ class RootController:
         reason: str,
         *,
         failed_task: str = "",
+        cause_kind: str = "unknown",
+        cause_provenance: str = "controller_unclassified",
+        cause_task: str = "",
+        cause_launch: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Persist a failure and stop new launches while active siblings drain."""
@@ -2043,8 +2027,13 @@ class RootController:
                 failed_task = str(failed_task).strip()
                 if not failed_task:
                     raise ControllerError("causal failed task ID is required")
-                _record_draining_failure_task(document, failed_task)
                 rows = [item for item in rows if item["task"] != failed_task]
+            cause_task = str(cause_task or failed_task).strip()
+            cause_launch = str(cause_launch).strip()
+            _append_drain_cause(
+                document, kind=cause_kind, provenance=cause_provenance,
+                task_id=cause_task, launch_id=cause_launch,
+            )
             existing = str(document.get("terminal_reason") or "")
             if existing and reason not in existing:
                 terminal_reason = f"{existing}; {reason}"[:500]
@@ -2249,12 +2238,20 @@ class RootController:
         state: str,
         reason: str,
         *,
+        drain_cause_kind: str = "",
+        drain_cause_provenance: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         if state not in TERMINAL_STATES:
             raise ControllerError(f"not a terminal halt state: {state}")
         current = self.assert_lease(lease)
         document = self._load_checkpoint()
+        if drain_cause_kind or drain_cause_provenance:
+            _append_drain_cause(
+                document,
+                kind=drain_cause_kind or "unknown",
+                provenance=drain_cause_provenance or "controller_unclassified",
+            )
         document.update(
             {
                 "root": self.root,
@@ -2282,17 +2279,21 @@ class RootController:
             raise ControllerError("workflow root and ready descendant are required")
         with self.fence(lease) as current:
             document = self._load_checkpoint()
-            reason = str(document.get("terminal_reason") or "")
-            recognized = reason.startswith(
-                "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
-            ) or reason.startswith(
-                "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: "
+            causes = document.get("drain_causes")
+            recognized_causes = (
+                isinstance(causes, list) and bool(causes)
+                and all(
+                    isinstance(cause, Mapping)
+                    and cause.get("kind") == "no_ready_work"
+                    and cause.get("provenance") == "scheduler_no_ready_work"
+                    for cause in causes
+                )
             )
             if (
                 checkpoint.admission_phase(document) != "terminal"
                 or checkpoint.resume_state(document) not in {"blocked", "halted"}
                 or not document.get("terminal")
-                or not recognized
+                or not recognized_causes
                 or str(document.get("root") or "") != self.root
                 or str(document.get("controller") or "") != self.controller
                 or str(document.get("task") or "") != self.root
@@ -2304,7 +2305,7 @@ class RootController:
                 raise ControllerError("checkpoint is not an eligible no-ready-work halt")
             acknowledgement = (
                 f"authenticated NO_READY_WORK acknowledgement for {workflow_root}; "
-                f"ready descendant {ready_task}"
+                f"ready descendant {ready_task}; causes_sha256={_drain_causes_digest(causes)}"
             )
             if len(acknowledgement) > checkpoint.FIELD_MAX:
                 raise ControllerError("workflow and ready task IDs are too long to acknowledge safely")
@@ -2518,6 +2519,7 @@ class RootController:
         session_id: str,
         *,
         commit_expiration: Callable[[], None],
+        expected_checkpoint_sha256: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Fence one signed-deadline-expired bound task before retiring its slot."""
@@ -2577,6 +2579,14 @@ class RootController:
                 raise ControllerError(
                     "checkpoint is not the exact current single bound-task reservation"
                 )
+            if (
+                len(expected_checkpoint_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in expected_checkpoint_sha256)
+                or checkpoint_digest(document) != expected_checkpoint_sha256
+            ):
+                raise ControllerError(
+                    "checkpoint changed since the signed bound-expiry snapshot"
+                )
             expiration_reason = (
                 f"USER_ACTION_REQUIRED: task {task_id} reached its signed execution deadline "
                 "with no authenticated result; its exact Herdr pane is absent"
@@ -2627,19 +2637,16 @@ class RootController:
             _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
         ) as current:
             document = self._load_checkpoint()
-            reason = str(document.get("terminal_reason") or "")
-            retired_check = str(document.get("last_check") or "")
-            recognized = (
-                retired_check.startswith("cancelled expired preidentity launch ")
-                or retired_check.startswith("cancelled superseded_legacy_scope preidentity launch ")
-                or retired_check.startswith("cancelled owner_abandoned_epoch preidentity launch ")
-                or retired_check.startswith("expired bound execution launch ")
-            ) and retired_check.endswith(f" for {cancelled_task}")
+            causes = document.get("drain_causes")
+            if not isinstance(causes, list) or any(
+                not isinstance(cause, Mapping) or cause.get("kind") == "unknown"
+                for cause in causes
+            ):
+                raise ControllerError("checkpoint has unresolved or opaque drain causes")
             if (
                 checkpoint.admission_phase(document) != "terminal"
                 or checkpoint.resume_state(document) != "blocked"
                 or not document.get("terminal")
-                or not recognized
                 or str(document.get("root") or "") != self.root
                 or str(document.get("controller") or "") != self.controller
                 or document.get("active_tasks")

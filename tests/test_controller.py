@@ -170,6 +170,50 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(checkpoint.admission_phase(result.checkpoint), "draining")
             dispatch.assert_not_called()
 
+    def test_draining_appends_complete_typed_causes_in_either_order(self) -> None:
+        cases = (
+            ["no_ready_work", "managed_task_failure", "unknown"],
+            ["unknown", "managed_task_failure", "no_ready_work"],
+        )
+        for sequence in cases:
+            with self.subTest(sequence=sequence), tempfile.TemporaryDirectory() as tmp:
+                controller = RootController(
+                    "root", "one", state_path=Path(tmp) / "state.json",
+                    checkpoint_path=Path(tmp) / "checkpoint.json",
+                )
+                lease = controller.acquire()
+                for index, kind in enumerate(sequence):
+                    if kind == "no_ready_work":
+                        controller.begin_draining(
+                            "no ready work", cause_kind=kind,
+                            cause_provenance="scheduler_no_ready_work", lease=lease,
+                        )
+                    elif kind == "managed_task_failure":
+                        controller.begin_draining(
+                            "managed task failed", failed_task="failed-task",
+                            cause_kind=kind, cause_provenance="authenticated_task_outcome",
+                            cause_task="failed-task", cause_launch="launch-1", lease=lease,
+                        )
+                    else:
+                        controller.begin_draining(
+                            "unclassified halt", cause_kind=kind, lease=lease,
+                        )
+                causes = controller._load_checkpoint()["drain_causes"]
+                self.assertEqual([cause["kind"] for cause in causes], sequence)
+                self.assertEqual(len({cause["cause_id"] for cause in causes}), 3)
+
+    def test_draining_cause_overflow_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=Path(tmp) / "state.json", checkpoint_path=cp)
+            lease = controller.acquire()
+            for index in range(checkpoint.MAX_DRAIN_CAUSES):
+                controller.begin_draining(f"cause {index}", lease=lease)
+            before = cp.read_bytes()
+            with self.assertRaisesRegex(ControllerError, "refusing to discard"):
+                controller.begin_draining("overflow", lease=lease)
+            self.assertEqual(cp.read_bytes(), before)
+
     def test_bound_expiry_rejects_nonexact_draining_reservations_without_checkpoint_change(self) -> None:
         for case in ("wrong-claim", "wrong-session", "stale-lease", "sibling"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:

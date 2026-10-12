@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 import subprocess
@@ -41,7 +42,10 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 yield fixture, args, controller, controller._current_lease(), record
 
     @contextlib.contextmanager
-    def _expired_draining_execution(self, reason, failed_task=""):
+    def _expired_draining_execution(
+        self, reason, failed_task="", *, cause_kind="unknown",
+        cause_provenance="controller_unclassified", cause_launch="", cause_sequence=None,
+    ):
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             controller.migrate_active_tasks(lease=lease)
             if failed_task:
@@ -49,7 +53,20 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                     {"id": failed_task, "root": str(fixture.root), "phase": "dispatch"},
                     lease=lease,
                 )
-            controller.begin_draining(reason, failed_task=failed_task, lease=lease)
+            if cause_sequence is None:
+                controller.begin_draining(
+                    reason, failed_task=failed_task, cause_kind=cause_kind,
+                    cause_provenance=cause_provenance,
+                    cause_task=failed_task, cause_launch=cause_launch, lease=lease,
+                )
+            else:
+                for index, (kind, provenance, task_id, launch_id) in enumerate(cause_sequence):
+                    controller.begin_draining(
+                        reason if index == 0 else f"additional {kind} cause",
+                        failed_task=task_id if kind == "managed_task_failure" else "",
+                        cause_kind=kind, cause_provenance=provenance,
+                        cause_task=task_id, cause_launch=launch_id, lease=lease,
+                    )
             deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
             with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
                  mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
@@ -399,13 +416,38 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         expected_retirement_kind="expired_execution",
                     )
 
+    def test_expired_bound_continuation_preserves_mixed_causes_in_both_orders(self) -> None:
+        reason = "USER_ACTION_REQUIRED: NO_READY_WORK: diagnostic text"
+        no_ready = ("no_ready_work", "scheduler_no_ready_work", "", "")
+        failure = ("managed_task_failure", "authenticated_task_outcome", "failed-task", "failed-launch")
+        unknown = ("unknown", "controller_unclassified", "", "")
+        for sequence in ([no_ready, failure, unknown], [unknown, failure, no_ready]):
+            with self.subTest(order=[item[0] for item in sequence]), self._expired_draining_execution(
+                reason, cause_sequence=sequence,
+            ) as (fixture, args, controller, lease, _record):
+                receipt = cli._herdr_session_record(fixture.root, fixture.task_id)["execution_disposition"]
+                causes = receipt["prior_controller_state"]["drain_causes"]
+                self.assertEqual([cause["kind"] for cause in causes], [item[0] for item in sequence])
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, "unknown prior drain cause",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, "ready-task",
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    )
+
     def test_expired_bound_continuation_rejects_blocked_native_sibling_without_herdr_record(self) -> None:
         no_ready_reason = (
             "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
             "ready-task (ready-task)"
         )
-        with self._expired_draining_execution(no_ready_reason, failed_task="native-failure") as (
-            fixture, args, controller, lease, _record,
+        with self._expired_draining_execution(
+            no_ready_reason, failed_task="native-failure",
+            cause_kind="managed_task_failure",
+            cause_provenance="authenticated_task_outcome", cause_launch="native-launch",
+        ) as (
+            fixture, args, controller, lease, expired_record,
         ):
             ready = {
                 "id": "ready-task", "status": "open", "assignee": "",
@@ -413,7 +455,11 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             }
             blocked = {
                 "id": "native-failure", "status": "blocked", "assignee": fixture.controller,
-                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                "parent": fixture.workflow_root,
+                "metadata": {"agentflow": {
+                    "root": fixture.workflow_root, "task": "native-failure",
+                    "actor": fixture.controller, "claim_id": "native-claim",
+                }},
             }
             self.assertIsNone(cli._herdr_session_record(fixture.root, blocked["id"]))
 
@@ -443,21 +489,71 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         expected_retirement_kind="expired_execution",
                     )
                 blocked["status"] = "closed"
-                self.assertEqual(
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, "no authenticated launch record",
+                ):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
                         controller, lease, authority_secret=args._authority_secret,
                         expected_retirement_kind="expired_execution",
-                    ),
-                    ready["id"],
+                    )
+                native_token = "native-claim-token"
+                native_claim = "native-claim"
+                native_binding = {
+                    "root": str(fixture.root), "task_id": "native-failure",
+                    "claim_id": native_claim, "launch_id": "native-launch",
+                    "provider": "codex", "session_id": "native-session",
+                }
+                native_result = {
+                    **native_binding, "outcome": "failed",
+                }
+                native_record = {
+                    "root": str(fixture.root), "workflow_root": fixture.workflow_root,
+                    "task_id": "native-failure", "launch_id": "native-launch",
+                    "claim_id": native_claim, "status": "completed",
+                    "binding": native_binding, "result": native_result,
+                    "return_channel": {
+                        "state": "consumed",
+                        "result_sha256": cli._canonical_json_digest(native_result),
+                        "contract_binding": {
+                            "launch_id": "native-launch", "claim_id": native_claim,
+                            "claim_token_sha256": hashlib.sha256(native_token.encode()).hexdigest(),
+                        },
+                    },
+                }
+                blocked["status"] = "closed"
+                blocked["metadata"]["agentflow"]["claim_id"] = native_claim
+                blocked["metadata"]["agentflow"]["claim_token"] = native_token
+                current_expired_record = cli._herdr_session_record(
+                    fixture.root, fixture.task_id,
                 )
+
+                def session_record(_root, task_id):
+                    if task_id == "native-failure":
+                        return native_record
+                    if task_id == fixture.task_id:
+                        return current_expired_record
+                    return None
+
+                with mock.patch.object(cli, "_herdr_session_record", side_effect=session_record):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                            controller, lease, authority_secret=args._authority_secret,
+                            expected_retirement_kind="expired_execution",
+                        ),
+                        ready["id"],
+                    )
 
     def test_expired_bound_continuation_allows_known_no_ready_cause_with_exact_current_ready(self) -> None:
         no_ready_reason = (
             "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
             "ready-task (ready-task)"
         )
-        with self._expired_draining_execution(no_ready_reason) as (
+        with self._expired_draining_execution(
+            no_ready_reason, cause_kind="no_ready_work",
+            cause_provenance="scheduler_no_ready_work",
+        ) as (
             fixture, args, controller, lease, _record,
         ):
             ready = {
@@ -506,14 +602,18 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
             "ready-task (ready-task)"
         )
-        with self._expired_draining_execution(no_ready_reason) as (
+        with self._expired_draining_execution(
+            no_ready_reason, cause_kind="no_ready_work",
+            cause_provenance="scheduler_no_ready_work",
+        ) as (
             fixture, args, controller, _lease, _record,
         ):
             before = controller.checkpoint_path.read_bytes()
             with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
                 receipt = state["sessions"][fixture.task_id]["execution_disposition"]
-                self.assertEqual(receipt["prior_controller_state"]["drain_cause"], "no_ready_work")
-                receipt["prior_controller_state"]["drain_cause"] = "none"
+                causes = receipt["prior_controller_state"]["drain_causes"]
+                self.assertEqual(causes[0]["kind"], "no_ready_work")
+                causes[0]["kind"] = "unknown"
 
             self.assertFalse(cli._authenticated_expired_bound_execution(
                 fixture.root, fixture.workflow_root, fixture.task_id,

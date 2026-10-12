@@ -1886,6 +1886,8 @@ def _controller_step_serial(
             result = controller.halt(
                 "blocked",
                 f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
+                drain_cause_kind="no_ready_work",
+                drain_cause_provenance="scheduler_no_ready_work",
                 lease=lease,
             )
             stop_reason = "USER_ACTION_REQUIRED"
@@ -1962,11 +1964,41 @@ def _controller_step_parallel(
         reason: str,
         *,
         provider_terminal: bool = False,
+        authenticated_failure: bool = False,
+        failure_launch_id: str = "",
     ) -> controller_backend.ResumeResult:
         nonlocal draining, drain_reason
+        cause_kind = "unknown"
+        cause_provenance = "controller_unclassified"
+        cause_launch = ""
+        if task_id and authenticated_failure and failure_launch_id:
+            cause_kind = "managed_task_failure"
+            cause_provenance = "authenticated_task_outcome"
+            cause_launch = failure_launch_id
+        elif task_id and provider_terminal:
+            record = _herdr_session_record(root, task_id)
+            launch_id = str(record.get("launch_id") or "") if isinstance(record, Mapping) else ""
+            authority_secret = str(getattr(args, "_authority_secret", "") or "")
+            signed_retirement = bool(
+                launch_id and authority_secret and (
+                    _authenticated_cancelled_preidentity(
+                        root, workflow_root, task_id, authority_secret=authority_secret,
+                    ) or _authenticated_expired_bound_execution(
+                        root, workflow_root, task_id, authority_secret=authority_secret,
+                    )
+                )
+            )
+            if signed_retirement:
+                cause_kind = "managed_task_failure"
+                cause_provenance = "signed_negative_retirement"
+                cause_launch = launch_id
         result = controller.begin_draining(
             reason,
             failed_task=task_id if provider_terminal else "",
+            cause_kind=cause_kind,
+            cause_provenance=cause_provenance,
+            cause_task=task_id,
+            cause_launch=cause_launch,
             lease=lease,
         )
         draining = True
@@ -2124,6 +2156,20 @@ def _controller_step_parallel(
             note_failure(
                 task_id, f"task {task_id} Herdr result outcome={outcome or 'unknown'}",
                 provider_terminal=provider_terminal,
+                authenticated_failure=(
+                    _has_authenticated_herdr_result(terminal_record)
+                    and isinstance(terminal_record.get("result"), Mapping)
+                    and str(terminal_record["result"].get("outcome") or "") == outcome
+                    and str(terminal_record.get("task_id") or "") == task_id
+                    and str(terminal_record.get("root") or "") == str(root)
+                    and str(terminal_record.get("workflow_root") or "") == workflow_root
+                    and isinstance(terminal_record.get("binding"), Mapping)
+                    and str(terminal_record["binding"].get("task_id") or "") == task_id
+                    and str(terminal_record["binding"].get("root") or "") == str(root)
+                    and str(terminal_record["binding"].get("launch_id") or "")
+                    == str(terminal_record.get("launch_id") or "")
+                ),
+                failure_launch_id=str(terminal_record.get("launch_id") or ""),
             )
             continue
         # Ingestion atomically changes the channel from issued to consumed;
@@ -2426,6 +2472,8 @@ def _controller_step_parallel(
         )
         result = controller.halt(
             "blocked", f"USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: {titles}",
+            drain_cause_kind="no_ready_work",
+            drain_cause_provenance="scheduler_no_ready_work",
             lease=lease,
         )
         return payload(result, "USER_ACTION_REQUIRED"), True
@@ -2467,16 +2515,6 @@ def _controller_step(
     return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
-_NO_READY_WORK_REASON_PREFIXES = (
-    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: ",
-    "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: ",
-)
-
-
-def _recognized_no_ready_work_reason(reason: str) -> bool:
-    return any(reason.startswith(prefix) for prefix in _NO_READY_WORK_REASON_PREFIXES)
-
-
 def _verify_no_ready_ack_candidate(
     root: Path, workflow_root: str,
     controller: controller_backend.RootController,
@@ -2484,9 +2522,14 @@ def _verify_no_ready_ack_candidate(
 ) -> str:
     """Read-only proof that this same root has ready work and nothing live."""
     document = controller._load_checkpoint()
-    reason = str(document.get("terminal_reason") or "")
-    if not _recognized_no_ready_work_reason(reason):
-        raise controller_backend.ControllerError("checkpoint is not a recognized no-ready-work halt")
+    causes = document.get("drain_causes")
+    if not isinstance(causes, list) or not causes or any(
+        not isinstance(cause, Mapping)
+        or cause.get("kind") != "no_ready_work"
+        or cause.get("provenance") != "scheduler_no_ready_work"
+        for cause in causes
+    ):
+        raise controller_backend.ControllerError("checkpoint has no complete typed no-ready cause set")
     if controller.active_tasks():
         raise controller_backend.ControllerError("cannot acknowledge while controller workers remain active")
     ledger = controller.session_ledger()
@@ -2670,6 +2713,7 @@ def _verify_cancelled_preidentity_continuation(
         )
     if controller.session_ledger().get("blocked"):
         raise controller_backend.ControllerError("cannot continue a blocked controller budget")
+    prior_causes: list[dict[str, str]] = []
     if bound_expired:
         if not _authenticated_expired_bound_execution(
             root, workflow_root, cancelled_task, authority_secret=authority_secret,
@@ -2682,28 +2726,32 @@ def _verify_cancelled_preidentity_continuation(
         )
         if not isinstance(prior_controller_state, Mapping):
             raise controller_backend.ControllerError(
-                "expired task has no authenticated prior controller cause"
+                "expired task has no authenticated prior controller state"
             )
         prior_phase = str(prior_controller_state.get("admission_phase") or "")
-        prior_cause = str(prior_controller_state.get("drain_cause") or "")
-        prior_reason = str(prior_controller_state.get("terminal_reason") or "")
+        prior_causes_raw = prior_controller_state.get("drain_causes")
+        try:
+            prior_causes = checkpoint_backend._check_drain_causes(prior_causes_raw)
+        except checkpoint_backend.CheckpointError as exc:
+            raise controller_backend.ControllerError(
+                "expired task has malformed authenticated prior drain causes"
+            ) from exc
+        if document.get("drain_causes") != prior_causes:
+            raise controller_backend.ControllerError(
+                "current checkpoint drain causes differ from the signed expiry receipt"
+            )
         if prior_phase == "draining":
-            failed_tasks = prior_controller_state.get("failed_tasks")
-            if prior_cause == "no_ready_work" and _recognized_no_ready_work_reason(prior_reason):
-                pass
-            elif (
-                prior_cause == "independent_failure"
-                and isinstance(failed_tasks, list) and failed_tasks
-                and all(isinstance(task_id, str) and task_id for task_id in failed_tasks)
-            ):
-                pass
-            else:
+            if not prior_causes:
                 raise controller_backend.ControllerError(
-                    "expired task cannot clear an unresolved prior drain cause"
+                    "expired task cannot continue from a draining checkpoint without typed causes"
                 )
-        elif prior_phase != "open" or prior_cause != "none":
+        elif prior_phase != "open":
             raise controller_backend.ControllerError(
                 "expired task has an unknown prior controller cause"
+            )
+        if any(cause["kind"] == "unknown" for cause in prior_causes):
+            raise controller_backend.ControllerError(
+                "expired task cannot continue while an unknown prior drain cause remains"
             )
     elif not _authenticated_cancelled_preidentity(
         root, workflow_root, cancelled_task, authority_secret=authority_secret,
@@ -2755,22 +2803,99 @@ def _verify_cancelled_preidentity_continuation(
     by_id = {str(row.get("id") or ""): row for row in descendants}
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
-    if bound_expired and isinstance(prior_controller_state, Mapping):
-        prior_failed_tasks = prior_controller_state.get("failed_tasks")
-        if prior_failed_tasks:
-            if not isinstance(prior_failed_tasks, list) or any(
-                not isinstance(task_id, str) or not task_id for task_id in prior_failed_tasks
-            ):
-                raise controller_backend.ControllerError("prior causal failure evidence is malformed")
-            unresolved = [
-                task_id for task_id in prior_failed_tasks
-                if task_id not in by_id
-                or str(by_id[task_id].get("status") or "").lower() not in reconciliation_backend.TERMINAL
-            ]
-            if unresolved:
+    resolved_failure_tasks: set[str] = set()
+    if bound_expired:
+        for cause in prior_causes:
+            kind = cause["kind"]
+            if kind == "no_ready_work":
+                if cause["provenance"] != "scheduler_no_ready_work":
+                    raise controller_backend.ControllerError("prior no-ready cause provenance is unsupported")
+                continue
+            if kind != "managed_task_failure":
                 raise controller_backend.ControllerError(
-                    "prior causal failure task remains unresolved: " + ", ".join(unresolved)
+                    "expired task cannot continue while an unknown prior drain cause remains"
                 )
+            causal_task = cause["task_id"]
+            causal_launch = cause["launch_id"]
+            causal_row = by_id.get(causal_task)
+            if (
+                not causal_row
+                or str(causal_row.get("status") or "").lower() not in reconciliation_backend.TERMINAL
+            ):
+                raise controller_backend.ControllerError(
+                    f"causal failure task remains unresolved: {causal_task}"
+                )
+            causal_issue = beads_backend.get_issue(root, causal_task)
+            causal_metadata = causal_issue.get("metadata")
+            causal_agentflow = (
+                causal_metadata.get("agentflow")
+                if isinstance(causal_metadata, Mapping) else None
+            )
+            causal_agentflow = causal_agentflow if isinstance(causal_agentflow, Mapping) else {}
+            if (
+                str(causal_issue.get("id") or "") != causal_task
+                or str(causal_issue.get("status") or "").lower()
+                != str(causal_row.get("status") or "").lower()
+                or str(causal_issue.get("assignee") or "") != lease.controller
+                or str(causal_agentflow.get("root") or "") != workflow_root
+                or str(causal_agentflow.get("task") or "") != causal_task
+                or str(causal_agentflow.get("actor") or "") != lease.controller
+                or not str(causal_agentflow.get("claim_id") or "")
+            ):
+                raise controller_backend.ControllerError(
+                    f"causal failure task lost its exact owned-root claim: {causal_task}"
+                )
+            causal_record = _herdr_session_record(root, causal_task)
+            if not isinstance(causal_record, Mapping):
+                raise controller_backend.ControllerError(
+                    f"causal failure task has no authenticated launch record: {causal_task}"
+                )
+            causal_binding = causal_record.get("binding")
+            causal_result = causal_record.get("result")
+            causal_channel = causal_record.get("return_channel")
+            causal_contract = (
+                causal_channel.get("contract_binding")
+                if isinstance(causal_channel, Mapping) else None
+            )
+            causal_claim_token = str(causal_agentflow.get("claim_token") or "")
+            exact_launch = (
+                causal_record.get("task_id") == causal_task
+                and causal_record.get("root") == str(root)
+                and causal_record.get("workflow_root") == workflow_root
+                and causal_record.get("launch_id") == causal_launch
+                and isinstance(causal_binding, Mapping)
+                and causal_binding.get("launch_id") == causal_launch
+                and isinstance(causal_contract, Mapping)
+                and causal_contract.get("launch_id") == causal_launch
+                and causal_record.get("claim_id") == causal_agentflow.get("claim_id")
+                and causal_contract.get("claim_id") == causal_agentflow.get("claim_id")
+                and bool(causal_claim_token)
+                and hmac.compare_digest(
+                    hashlib.sha256(causal_claim_token.encode("utf-8")).hexdigest(),
+                    str(causal_contract.get("claim_token_sha256") or ""),
+                )
+            )
+            authenticated_outcome = bool(
+                exact_launch and cause["provenance"] == "authenticated_task_outcome"
+                and _has_authenticated_herdr_result(causal_record)
+                and isinstance(causal_result, Mapping)
+                and str(causal_result.get("outcome") or "") not in {"", "completed"}
+            )
+            authenticated_retirement = bool(
+                exact_launch and cause["provenance"] == "signed_negative_retirement"
+                and (
+                    _authenticated_cancelled_preidentity(
+                        root, workflow_root, causal_task, authority_secret=authority_secret,
+                    ) or _authenticated_expired_bound_execution(
+                        root, workflow_root, causal_task, authority_secret=authority_secret,
+                    )
+                )
+            )
+            if not (authenticated_outcome or authenticated_retirement):
+                raise controller_backend.ControllerError(
+                    f"causal failure task lacks its exact authenticated outcome: {causal_task}"
+                )
+            resolved_failure_tasks.add(causal_task)
     expected_cancelled_status = "blocked" if legacy_scope else "in_progress"
     if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
@@ -2784,6 +2909,8 @@ def _verify_cancelled_preidentity_continuation(
         )
         if task_id != cancelled_task and status == "in_progress" and not retired_bound:
             raise controller_backend.ControllerError("another workflow task is still claimed in progress")
+        if task_id in resolved_failure_tasks:
+            continue
         other = _herdr_session_record(root, task_id) if task_id else None
         if not isinstance(other, Mapping):
             continue
@@ -4977,36 +5104,33 @@ def _verify_bound_execution_expiry_disposition(
     prior = value.get("prior_controller_state")
     if prior is not None:
         if not isinstance(prior, Mapping) or set(prior) != {
-            "schema", "admission_phase", "drain_cause", "terminal_reason",
-            "last_check", "failed_tasks",
-        } or prior.get("schema") != "agentflow.bound-expiry-prior-controller-state@1":
+            "schema", "admission_phase", "phase", "state", "status", "terminal", "task",
+            "terminal_reason", "last_check", "drain_causes", "checkpoint_sha256",
+        } or prior.get("schema") != "agentflow.bound-expiry-prior-controller-state@2":
             raise ValueError("bound execution expiry prior controller state is malformed")
         prior_phase = str(prior.get("admission_phase") or "")
         prior_reason = str(prior.get("terminal_reason") or "")
-        prior_last_check = prior.get("last_check")
-        failed_tasks = prior.get("failed_tasks")
-        parsed_failed_tasks = controller_backend.draining_failure_tasks(prior_last_check)
-        if prior_phase == "open":
-            expected_cause = "none"
-            expected_failed_tasks: list[str] = []
-        elif controller_backend.has_draining_failure_marker(prior_last_check):
-            expected_cause = "independent_failure" if parsed_failed_tasks else "unclassified"
-            expected_failed_tasks = parsed_failed_tasks or []
-        elif _recognized_no_ready_work_reason(prior_reason):
-            expected_cause = "no_ready_work"
-            expected_failed_tasks = []
-        else:
-            expected_cause = "unclassified"
-            expected_failed_tasks = []
+        causes = prior.get("drain_causes")
+        try:
+            validated_causes = checkpoint_backend._check_drain_causes(causes)
+        except checkpoint_backend.CheckpointError as exc:
+            raise ValueError("bound execution expiry prior drain causes are malformed") from exc
+        checkpoint_sha256 = str(prior.get("checkpoint_sha256") or "")
         if (
             prior_phase not in {"open", "draining"}
-            or prior.get("drain_cause") != expected_cause
-            or failed_tasks != expected_failed_tasks
-            or not isinstance(prior_last_check, str)
-            or len(prior_last_check) > checkpoint_backend.FIELD_MAX
+            or (prior_phase == "open" and validated_causes)
+            or not isinstance(prior.get("phase"), str)
+            or not isinstance(prior.get("state"), str)
+            or not isinstance(prior.get("status"), str)
+            or not isinstance(prior.get("terminal"), bool)
+            or not isinstance(prior.get("task"), str)
+            or not isinstance(prior.get("last_check"), str)
+            or len(str(prior.get("last_check"))) > checkpoint_backend.FIELD_MAX
             or len(prior_reason) > checkpoint_backend.FIELD_MAX
+            or list(validated_causes) != causes
+            or not re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256)
         ):
-            raise ValueError("bound execution expiry prior controller cause is inconsistent")
+            raise ValueError("bound execution expiry prior controller state is inconsistent")
     return value
 
 
@@ -5098,27 +5222,18 @@ def _bound_execution_expiry_snapshot(
     ):
         raise ValueError("checkpoint is not the exact single current bound execution")
     prior_reason = str(document.get("terminal_reason") or "")
-    prior_last_check = str(document.get("last_check") or "")
-    failed_tasks = controller_backend.draining_failure_tasks(prior_last_check)
-    if admission_phase == "open":
-        prior_cause = "none"
-        failed_tasks = []
-    elif controller_backend.has_draining_failure_marker(prior_last_check):
-        prior_cause = "independent_failure" if failed_tasks else "unclassified"
-        failed_tasks = failed_tasks or []
-    elif _recognized_no_ready_work_reason(prior_reason):
-        prior_cause = "no_ready_work"
-        failed_tasks = []
-    else:
-        prior_cause = "unclassified"
-        failed_tasks = []
     prior_controller_state = {
-        "schema": "agentflow.bound-expiry-prior-controller-state@1",
+        "schema": "agentflow.bound-expiry-prior-controller-state@2",
         "admission_phase": admission_phase,
-        "drain_cause": prior_cause,
+        "phase": str(document.get("phase") or ""),
+        "state": str(document.get("state") or ""),
+        "status": str(document.get("status") or ""),
+        "terminal": document.get("terminal"),
+        "task": str(document.get("task") or ""),
         "terminal_reason": prior_reason,
-        "last_check": prior_last_check,
-        "failed_tasks": failed_tasks,
+        "last_check": str(document.get("last_check") or ""),
+        "drain_causes": [dict(cause) for cause in document.get("drain_causes", [])],
+        "checkpoint_sha256": controller_backend.checkpoint_digest(document),
     }
     state = _read_json_value(str(controller.state_path))
     stored_lease = controller._read_lease(state) if isinstance(state, Mapping) else None
@@ -5259,9 +5374,16 @@ def _bound_execution_expiry_snapshot(
     if not deadline:
         raise ValueError("signed bound execution has no absolute deadline")
     if status == "expired_execution":
-        _verify_expired_bound_execution_record(
+        _contract, _binding = _verify_expired_bound_execution_record(
             root, workflow_root, task_id, record, authority_secret=authority_secret,
         )
+        disposition = record.get("execution_disposition")
+        signed_prior = (
+            disposition.get("prior_controller_state")
+            if isinstance(disposition, Mapping) else None
+        )
+        if not isinstance(signed_prior, Mapping) or dict(signed_prior) != prior_controller_state:
+            raise ValueError("checkpoint changed since the signed bound-expiry receipt")
     else:
         if channel.get("state") != "issued":
             raise ValueError("bound execution return capability is not issued")
@@ -5535,6 +5657,9 @@ def _expire_bound_execution_if_due(
             str(snapshot["contract"].get("launch_id") or ""),
             str(snapshot["binding"].get("session_id") or ""),
             commit_expiration=commit_revoked_replay, lease=lease,
+            expected_checkpoint_sha256=str(
+                snapshot["prior_controller_state"].get("checkpoint_sha256") or ""
+            ),
         )
     if (
         str(record.get("status") or "") not in {"launched", "running"}
@@ -5631,6 +5756,9 @@ def _expire_bound_execution_if_due(
         str(snapshot["contract"].get("launch_id") or ""),
         str(snapshot["binding"].get("session_id") or ""),
         commit_expiration=commit, lease=lease,
+        expected_checkpoint_sha256=str(
+            snapshot["prior_controller_state"].get("checkpoint_sha256") or ""
+        ),
     )
 
 
