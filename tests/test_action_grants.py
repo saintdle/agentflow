@@ -1,10 +1,15 @@
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agentflow.action_grants import (
     ActionGrantDenied,
@@ -39,9 +44,11 @@ class ActionGrantStoreTests(unittest.TestCase):
         return ActionGrantStore(self.store_path, authority or self.authority)
 
     @staticmethod
-    def request(*, action="dispatch", task="task-1", paths=("output.txt",), expiry=None):
+    def request(*, action="dispatch", task="task-1", paths=("output.txt",), expiry=None,
+                worktree_root=None):
         return ActionGrantRequest(
             action=action, task_id=task, declared_paths=paths, expires_at=expiry,
+            worktree_root=worktree_root,
         )
 
     def test_issue_and_require_exact_signed_scope(self) -> None:
@@ -53,6 +60,7 @@ class ActionGrantStoreTests(unittest.TestCase):
             verified.declared_paths,
             (str(self.workspace / "nested/result.txt"), str(self.workspace / "output.txt")),
         )
+        self.assertEqual(verified.worktree_root, str(self.workspace))
         self.assertNotIn("hmac", verified.to_dict())
         self.assertNotIn("authority", json.dumps(verified.to_dict()))
         self.assertNotIn("token", json.dumps(verified.to_dict()))
@@ -126,9 +134,101 @@ class ActionGrantStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ActionGrantDenied, "expired"):
             store.require(self.request(), now=100.0)
 
+    def test_expiry_is_sampled_after_locked_read_and_match(self) -> None:
+        store = self.store()
+        store.issue(self.request(expiry=100.0))
+        original_locked = store._locked
+        entered_lock = threading.Event()
+        release_lock = threading.Event()
+        failures = []
+
+        @contextmanager
+        def delayed_lock(*, create_directory):
+            with original_locked(create_directory=create_directory):
+                entered_lock.set()
+                if not release_lock.wait(timeout=5):
+                    raise TimeoutError("test did not release the grant lock")
+                yield
+
+        def verify() -> None:
+            try:
+                store.require(self.request())
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        # The old implementation sampled 99 before waiting in ``_locked``;
+        # this implementation samples 101 only after the delayed lock yields.
+        with mock.patch.object(store, "_locked", side_effect=delayed_lock), \
+             mock.patch("agentflow.action_grants.time.time", side_effect=lambda: 101.0 if entered_lock.is_set() else 99.0):
+            thread = threading.Thread(target=verify)
+            thread.start()
+            self.assertTrue(entered_lock.wait(timeout=5))
+            release_lock.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], ActionGrantDenied)
+        self.assertIn("expired", str(failures[0]))
+
+    def test_explicit_worktree_root_is_signed_and_exact(self) -> None:
+        approved = self.base / "approved-worktree"
+        unapproved = self.base / "unapproved-worktree"
+        approved.mkdir()
+        unapproved.mkdir()
+        store = self.store()
+        issued = store.issue(self.request(
+            paths=("result.txt",), worktree_root=str(approved),
+        ))
+        verified = store.require(self.request(
+            paths=("result.txt",), worktree_root=str(approved),
+        ))
+        self.assertEqual(issued, verified)
+        self.assertEqual(verified.worktree_root, str(approved))
+        self.assertEqual(verified.declared_paths, (str(approved / "result.txt"),))
+
+        with self.assertRaises(ActionGrantDenied):
+            store.require(self.request(paths=("result.txt",), worktree_root=str(unapproved)))
+        with self.assertRaisesRegex(ActionGrantError, "outside the exact bound worktree root"):
+            store.issue(self.request(
+                paths=(str(self.workspace / "output.txt"),), worktree_root=str(approved),
+            ))
+
+    def test_worktree_root_and_declared_paths_reject_symlinks_and_lexical_aliases(self) -> None:
+        store = self.store()
+        approved = self.base / "approved-worktree"
+        approved.mkdir()
+        root_alias = self.base / "worktree-alias"
+        root_alias.symlink_to(approved, target_is_directory=True)
+        with self.assertRaisesRegex(ActionGrantError, "symlink"):
+            store.issue(self.request(paths=("result.txt",), worktree_root=str(root_alias)))
+        with self.assertRaisesRegex(ActionGrantError, "aliases"):
+            store.issue(self.request(paths=("dir/./result.txt",), worktree_root=str(approved)))
+        with self.assertRaisesRegex(ActionGrantError, "aliases"):
+            store.issue(self.request(paths=(".",), worktree_root=str(approved)))
+        with self.assertRaisesRegex(ActionGrantError, "aliases"):
+            store.issue(self.request(
+                paths=("result.txt",), worktree_root=f"{approved}/.",
+            ))
+
+    def test_tampered_stored_worktree_root_fails_closed(self) -> None:
+        approved = self.base / "approved-worktree"
+        approved.mkdir()
+        store = self.store()
+        store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
+        value = json.loads(self.store_path.read_text(encoding="utf-8"))
+        only = next(iter(value["grants"].values()))
+        only["worktree_root"] = str(self.workspace)
+        self.store_path.write_text(json.dumps(value), encoding="utf-8")
+        os.chmod(self.store_path, 0o600)
+        with self.assertRaises(ActionGrantDenied):
+            store.require(self.request(paths=("result.txt",), worktree_root=str(approved)))
+
     def test_paths_reject_traversal_wildcards_duplicates_and_symlink_aliases(self) -> None:
         store = self.store()
-        for paths in (("../escape.txt",), ("*.txt",), ("output.txt", "output.txt")):
+        for paths in (
+            ("../escape.txt",), ("*.txt",), ("output.txt", "output.txt"),
+            (".",), ("dir/.",), ("dir/./file",),
+        ):
             with self.subTest(paths=paths):
                 with self.assertRaises(ActionGrantError):
                     store.issue(self.request(paths=paths))

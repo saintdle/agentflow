@@ -72,6 +72,7 @@ class ActionGrantRequest:
     task_id: str
     declared_paths: tuple[str | Path, ...]
     expires_at: float | None = None
+    worktree_root: Path | str | None = None
 
     def __init__(
         self,
@@ -80,11 +81,13 @@ class ActionGrantRequest:
         task_id: str,
         declared_paths: Iterable[str | Path],
         expires_at: float | None = None,
+        worktree_root: Path | str | None = None,
     ) -> None:
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "task_id", task_id)
         object.__setattr__(self, "declared_paths", tuple(declared_paths))
         object.__setattr__(self, "expires_at", expires_at)
+        object.__setattr__(self, "worktree_root", worktree_root)
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,7 @@ class ActionGrantSummary:
     workflow_root: str
     controller_id: str
     continuity_id: str
+    worktree_root: str
     action: str
     task_id: str
     declared_paths: tuple[str, ...]
@@ -106,6 +110,7 @@ class ActionGrantSummary:
             "workflow_root": self.workflow_root,
             "controller_id": self.controller_id,
             "continuity_id": self.continuity_id,
+            "worktree_root": self.worktree_root,
             "action": self.action,
             "task_id": self.task_id,
             "declared_paths": list(self.declared_paths),
@@ -200,27 +205,54 @@ def _canonical_workspace(path: Path | str) -> Path:
     return resolved
 
 
-def _canonical_paths(workspace: Path, values: Iterable[str | Path]) -> tuple[str, ...]:
+def _reject_lexical_alias(raw: str, *, label: str) -> None:
+    """Reject dot components before ``Path`` or ``PurePath`` normalizes them."""
+    if any(part in {".", ".."} for part in raw.split(os.sep)):
+        raise ActionGrantError(f"{label} must not contain traversal or aliases")
+
+
+def _canonical_worktree(workspace: Path, value: Path | str | None) -> Path:
+    if value is None:
+        return workspace
+    raw = os.fspath(value)
+    if not isinstance(raw, str) or not raw or "\x00" in raw or _WILDCARD.search(raw):
+        raise ActionGrantError("worktree root is malformed or contains a wildcard")
+    _reject_lexical_alias(raw, label="worktree root")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ActionGrantError("explicit worktree root must be an absolute canonical path")
+    _reject_symlink_ancestors(candidate)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ActionGrantError("explicit worktree root is unavailable") from exc
+    if not resolved.is_dir() or candidate.absolute() != resolved:
+        raise ActionGrantError("explicit worktree root must be a canonical directory")
+    return resolved
+
+
+def _canonical_paths(bound_root: Path, values: Iterable[str | Path]) -> tuple[str, ...]:
     result: list[str] = []
     for raw_value in values:
         raw = os.fspath(raw_value)
         if not isinstance(raw, str) or not raw or "\x00" in raw or _WILDCARD.search(raw):
             raise ActionGrantError("declared path is malformed or contains a wildcard")
+        _reject_lexical_alias(raw, label="declared path")
         lexical = PurePath(raw)
-        if any(part in {".", ".."} for part in lexical.parts):
-            raise ActionGrantError("declared path must not contain traversal or aliases")
-        candidate = Path(raw) if lexical.is_absolute() else workspace / lexical
+        candidate = Path(raw) if lexical.is_absolute() else bound_root / lexical
         try:
-            relative = candidate.relative_to(workspace)
+            relative = candidate.relative_to(bound_root)
         except ValueError as exc:
-            raise ActionGrantError("declared path is outside the canonical workspace") from exc
-        cursor = workspace
+            raise ActionGrantError("declared path is outside the exact bound worktree root") from exc
+        if not relative.parts:
+            raise ActionGrantError("declared path must name a descendant of the bound worktree root")
+        cursor = bound_root
         for part in relative.parts:
             cursor /= part
             if cursor.is_symlink():
                 raise ActionGrantError("declared path must not traverse a symlink")
         # ``absolute`` is lexical and therefore cannot hide a symlink already
-        # rejected above. It also preserves the canonical workspace prefix.
+        # rejected above. It also preserves the signed bound-root prefix.
         result.append(str(candidate.absolute()))
     if not result:
         raise ActionGrantError("at least one declared path is required")
@@ -364,14 +396,16 @@ class ActionGrantStore:
             raise
 
     def _scope(self, request: ActionGrantRequest) -> dict[str, Any]:
+        worktree_root = _canonical_worktree(self.workspace, request.worktree_root)
         return {
             "workspace_root": str(self.workspace),
             "workflow_root": self.workflow_root,
             "controller_id": self.controller_id,
             "continuity_id": self.continuity_id,
+            "worktree_root": str(worktree_root),
             "action": _safe_identity(request.action, "action category"),
             "task_id": _safe_identity(request.task_id, "task identity"),
-            "declared_paths": list(_canonical_paths(self.workspace, request.declared_paths)),
+            "declared_paths": list(_canonical_paths(worktree_root, request.declared_paths)),
             "expires_at": _safe_expiry(request.expires_at),
         }
 
@@ -380,7 +414,8 @@ class ActionGrantStore:
         return ActionGrantSummary(
             workspace_root=str(payload["workspace_root"]),
             workflow_root=str(payload["workflow_root"]), controller_id=str(payload["controller_id"]),
-            continuity_id=str(payload["continuity_id"]), action=str(payload["action"]),
+            continuity_id=str(payload["continuity_id"]), worktree_root=str(payload["worktree_root"]),
+            action=str(payload["action"]),
             task_id=str(payload["task_id"]), declared_paths=tuple(payload["declared_paths"]),
             expires_at=payload["expires_at"],
         )
@@ -388,7 +423,7 @@ class ActionGrantStore:
     def _validated_payload(self, grant_id: str, raw: Any) -> dict[str, Any]:
         fields = {
             "schema", "grant_id", "workspace_root", "workflow_root", "controller_id",
-            "continuity_id", "action", "task_id", "declared_paths", "expires_at", "hmac",
+            "continuity_id", "worktree_root", "action", "task_id", "declared_paths", "expires_at", "hmac",
         }
         if not isinstance(raw, Mapping) or set(raw) != fields or not isinstance(grant_id, str):
             raise ActionGrantDenied("protected action grant is malformed")
@@ -397,7 +432,7 @@ class ActionGrantStore:
         if (
             not all(isinstance(payload.get(field), str) for field in (
                 "schema", "grant_id", "workspace_root", "workflow_root", "controller_id",
-                "continuity_id", "action", "task_id",
+                "continuity_id", "worktree_root", "action", "task_id",
             ))
             or not isinstance(supplied, str)
         ):
@@ -414,12 +449,14 @@ class ActionGrantStore:
             canonical = self._scope(ActionGrantRequest(
                 action=str(payload["action"]), task_id=str(payload["task_id"]),
                 declared_paths=tuple(payload["declared_paths"]), expires_at=payload["expires_at"],
+                worktree_root=str(payload["worktree_root"]),
             ))
         except (KeyError, TypeError, ActionGrantError) as exc:
             raise ActionGrantDenied("protected action grant is malformed") from exc
         if (
             canonical["declared_paths"] != payload.get("declared_paths")
             or canonical["expires_at"] != payload.get("expires_at")
+            or canonical["worktree_root"] != payload.get("worktree_root")
         ):
             raise ActionGrantDenied("protected action grant is not canonical")
         if (
@@ -461,9 +498,6 @@ class ActionGrantStore:
         """
 
         scope = self._scope(request)
-        instant = time.time() if now is None else float(now)
-        if not math.isfinite(instant):
-            raise ActionGrantError("verification time must be finite")
         with self._locked(create_directory=False):
             document = self._read(required=True)
             matches: list[dict[str, Any]] = []
@@ -475,14 +509,21 @@ class ActionGrantStore:
                     if key != "expires_at"
                 ):
                     matches.append(payload)
-        if not matches:
-            raise ActionGrantDenied("no protected action grant matches this exact scope")
-        valid = [item for item in matches if item["expires_at"] is None or instant < item["expires_at"]]
-        if not valid:
-            raise ActionGrantDenied("matching protected action grant is expired")
-        # Multiple independently issued grants for the same scope are harmless;
-        # selecting a stable one makes safe status output deterministic.
-        return self._summary(sorted(valid, key=lambda item: item["grant_id"])[0])
+            # Time is deliberately sampled only after the protected store has
+            # been read and matched, while its lock remains held. Sampling
+            # before a contended lock can otherwise accept a grant that expires
+            # while the caller waits to verify it.
+            instant = time.time() if now is None else float(now)
+            if not math.isfinite(instant):
+                raise ActionGrantError("verification time must be finite")
+            if not matches:
+                raise ActionGrantDenied("no protected action grant matches this exact scope")
+            valid = [item for item in matches if item["expires_at"] is None or instant < item["expires_at"]]
+            if not valid:
+                raise ActionGrantDenied("matching protected action grant is expired")
+            # Multiple independently issued grants for the same scope are harmless;
+            # selecting a stable one makes safe status output deterministic.
+            return self._summary(sorted(valid, key=lambda item: item["grant_id"])[0])
 
     def status(self) -> ActionGrantStoreStatus:
         """Return availability without granting authority or exposing secrets."""
