@@ -85,6 +85,15 @@ class AdmissionPhaseTests(unittest.TestCase):
         with self.assertRaises(checkpoint.CheckpointError):
             checkpoint.build_checkpoint(self._document(drain_causes=[valid] * (checkpoint.MAX_DRAIN_CAUSES + 1)))
 
+    def test_load_checkpoint_rejects_non_object_json_with_checkpoint_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.json"
+            for payload in ("[]", "null", "\"checkpoint\""):
+                with self.subTest(payload=payload):
+                    path.write_text(payload, encoding="utf-8")
+                    with self.assertRaisesRegex(checkpoint.CheckpointError, "payload must be an object"):
+                        checkpoint.load_checkpoint(path)
+
 
 if __name__ == "__main__":
     unittest.main()

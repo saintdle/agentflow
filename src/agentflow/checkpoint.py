@@ -401,6 +401,8 @@ def load_checkpoint(path: Path, *, migrate: bool = True) -> dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CheckpointError(f"cannot read checkpoint: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise CheckpointError("checkpoint payload must be an object")
     normalized_input = dict(raw)
     missing_drain_causes = "drain_causes" not in raw
     if missing_drain_causes:

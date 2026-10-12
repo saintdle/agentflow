@@ -44,6 +44,10 @@ class ControllerTests(unittest.TestCase):
         lease = controller.acquire()
         controller.halt(
             "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+            drain_cause_kind="managed_task_failure",
+            drain_cause_provenance="signed_negative_retirement",
+            drain_cause_task="old",
+            drain_cause_launch="old-launch",
             lease=lease,
         )
         document = controller._load_checkpoint()
@@ -213,6 +217,109 @@ class ControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(ControllerError, "refusing to discard"):
                 controller.begin_draining("overflow", lease=lease)
             self.assertEqual(cp.read_bytes(), before)
+
+    def test_no_ready_ack_archives_before_clear_and_retry_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state_path = base / "controller.json"
+            cp = base / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state_path, checkpoint_path=cp)
+            lease = controller.acquire()
+            halted = controller.halt(
+                "blocked", "no ready work",
+                drain_cause_kind="no_ready_work",
+                drain_cause_provenance="scheduler_no_ready_work",
+                lease=lease,
+            )
+            cause, = halted.checkpoint["drain_causes"]
+            state = controller_module._read_json(state_path)
+            state["independent_helper"] = {"retain": "across audit writes"}
+            controller._write_state(state)
+            checkpoint_before = cp.read_bytes()
+            original_write = checkpoint.write_checkpoint
+            calls = 0
+
+            def fail_once(path, document):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("simulated checkpoint crash")
+                return original_write(path, document)
+
+            with mock.patch.object(checkpoint, "write_checkpoint", side_effect=fail_once):
+                with self.assertRaisesRegex(OSError, "simulated checkpoint crash"):
+                    controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+                archived_state = controller_module._read_json(state_path)
+                self.assertEqual(len(archived_state["drain_audit"]), 1)
+                self.assertEqual(archived_state["independent_helper"], {"retain": "across audit writes"})
+                self.assertEqual(cp.read_bytes(), checkpoint_before)
+
+                resolved = controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+
+            self.assertEqual(resolved.checkpoint["drain_causes"], [])
+            self.assertIn(archived_state["drain_audit"][0]["causes_sha256"], resolved.checkpoint["last_check"])
+            self.assertEqual(archived_state["drain_audit"][0]["cause_ids"], [cause["cause_id"]])
+            state_after = controller_module._read_json(state_path)
+            self.assertEqual(len(state_after["drain_audit"]), 1)
+            self.assertEqual(state_after["independent_helper"], {"retain": "across audit writes"})
+
+            stale = controller.halt("blocked", "unrelated later failure", lease=lease)
+            self.assertEqual([item["kind"] for item in stale.checkpoint["drain_causes"]], ["unknown"])
+            with self.assertRaisesRegex(ControllerError, "eligible no-ready-work halt"):
+                controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+
+    def test_drain_audit_overflow_denies_clear_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            state_path = base / "controller.json"
+            cp = base / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state_path, checkpoint_path=cp)
+            lease = controller.acquire()
+            controller.halt(
+                "blocked", "no ready work",
+                drain_cause_kind="no_ready_work",
+                drain_cause_provenance="scheduler_no_ready_work",
+                lease=lease,
+            )
+            state = controller_module._read_json(state_path)
+            audit = []
+            for index in range(controller_module.MAX_DRAIN_AUDIT_ENTRIES):
+                identity = {
+                    "schema": controller_module.DRAIN_AUDIT_SCHEMA,
+                    "cause_ids": [f"old-{index}"],
+                    "causes_sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+                    "resolution": "prior_resolution",
+                    "context": {"index": str(index)},
+                }
+                audit_id = hashlib.sha256(json.dumps(
+                    identity, sort_keys=True, separators=(",", ":"),
+                ).encode()).hexdigest()
+                audit.append({
+                    **identity, "audit_id": audit_id,
+                    "resolved_epoch": lease.epoch, "resolved_at": float(index),
+                })
+            state["drain_audit"] = audit
+            state["independent_helper"] = {"retained": True}
+            controller._write_state(state)
+            before_checkpoint = cp.read_bytes()
+            before_state = state_path.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "audit is full"):
+                controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+
+            self.assertEqual(cp.read_bytes(), before_checkpoint)
+            self.assertEqual(state_path.read_bytes(), before_state)
+
+    def test_cancelled_preidentity_reopen_archives_and_clears_typed_causes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, lease = self._controller_with_pending_continuation(Path(tmp))
+            document = controller._load_checkpoint()
+            state = controller_module._read_json(controller.state_path)
+            self.assertEqual(document["drain_causes"], [])
+            self.assertEqual(len(state["drain_audit"]), 1)
+            self.assertEqual(
+                state["drain_audit"][0]["resolution"], "authenticated_continuation",
+            )
 
     def test_bound_expiry_rejects_nonexact_draining_reservations_without_checkpoint_change(self) -> None:
         for case in ("wrong-claim", "wrong-session", "stale-lease", "sibling"):
@@ -903,6 +1010,10 @@ class ControllerTests(unittest.TestCase):
             lease = controller.acquire()
             controller.halt(
                 "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                drain_cause_kind="managed_task_failure",
+                drain_cause_provenance="signed_negative_retirement",
+                drain_cause_task="old",
+                drain_cause_launch="old-launch",
                 lease=lease,
             )
             document = controller._load_checkpoint()
@@ -935,6 +1046,10 @@ class ControllerTests(unittest.TestCase):
             lease = first.acquire()
             first.halt(
                 "blocked", "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                drain_cause_kind="managed_task_failure",
+                drain_cause_provenance="signed_negative_retirement",
+                drain_cause_task="old",
+                drain_cause_launch="old-launch",
                 lease=lease,
             )
             document = first._load_checkpoint()

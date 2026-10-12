@@ -27,6 +27,8 @@ from agentflow import session_control
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
+MAX_DRAIN_AUDIT_ENTRIES = 16
+DRAIN_AUDIT_SCHEMA = "agentflow.controller-drain-audit@1"
 
 
 def checkpoint_digest(document: Mapping[str, Any]) -> str:
@@ -1864,6 +1866,100 @@ class RootController:
         with self.fence(lease):
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
 
+    def _archive_resolved_drain_causes(
+        self,
+        document: dict[str, Any],
+        current: Lease,
+        *,
+        resolution: str,
+        context: Mapping[str, str],
+    ) -> str:
+        """Durably archive one fully resolved typed set before clearing it.
+
+        The caller holds ``fence`` while it performs its exact resolution
+        checks.  The controller-state write is the first half of a small
+        recoverable transaction: if checkpoint replacement fails, retry finds
+        the identical audit record and completes the clear without duplicating
+        or changing the resolution.
+        """
+        causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+        if not causes:
+            return ""
+        if any(cause["kind"] == "unknown" for cause in causes):
+            raise ControllerError("cannot archive unresolved or opaque drain causes")
+        clean_context = {str(key): str(value) for key, value in context.items()}
+        identity: dict[str, Any] = {
+            "schema": DRAIN_AUDIT_SCHEMA,
+            "cause_ids": [cause["cause_id"] for cause in causes],
+            "causes_sha256": _drain_causes_digest(causes),
+            "resolution": resolution,
+            "context": clean_context,
+        }
+        audit_id = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        record = {
+            **identity,
+            "audit_id": audit_id,
+            "resolved_epoch": current.epoch,
+            "resolved_at": float(self.clock()),
+        }
+
+        state = _read_json(self.state_path)
+        stored_lease = self._read_lease(state)
+        if stored_lease is None or not self._lease_matches(stored_lease, current):
+            raise FencedLease("controller lease changed before drain resolution was archived")
+        raw_audit = state.get("drain_audit", [])
+        if not isinstance(raw_audit, list) or len(raw_audit) > MAX_DRAIN_AUDIT_ENTRIES:
+            raise ControllerError("controller drain audit is malformed or exceeds its bounded size")
+        audit: list[dict[str, Any]] = []
+        known_ids: set[str] = set()
+        same_cause_resolution = False
+        for item in raw_audit:
+            fields = {
+                "schema", "cause_ids", "causes_sha256", "resolution", "context",
+                "audit_id", "resolved_epoch", "resolved_at",
+            }
+            if not isinstance(item, Mapping) or set(item) != fields:
+                raise ControllerError("controller drain audit entry is malformed")
+            copied = dict(item)
+            item_identity = {key: copied[key] for key in identity}
+            expected_id = hashlib.sha256(
+                json.dumps(item_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if (
+                copied.get("schema") != DRAIN_AUDIT_SCHEMA
+                or copied.get("audit_id") != expected_id
+                or expected_id in known_ids
+                or not isinstance(copied.get("cause_ids"), list)
+                or not isinstance(copied.get("causes_sha256"), str)
+                or not isinstance(copied.get("resolution"), str)
+                or not isinstance(copied.get("context"), Mapping)
+                or isinstance(copied.get("resolved_epoch"), bool)
+                or not isinstance(copied.get("resolved_epoch"), int)
+                or copied.get("resolved_epoch", -1) < 0
+                or isinstance(copied.get("resolved_at"), bool)
+                or not isinstance(copied.get("resolved_at"), (int, float))
+            ):
+                raise ControllerError("controller drain audit entry failed validation")
+            known_ids.add(expected_id)
+            if copied.get("causes_sha256") == identity["causes_sha256"]:
+                if expected_id != audit_id:
+                    raise ControllerError("drain cause set already has a different resolution intent")
+                same_cause_resolution = True
+                if any(copied.get(key) != value for key, value in identity.items()):
+                    raise ControllerError("controller drain audit identity changed during retry")
+            audit.append(copied)
+
+        if not same_cause_resolution:
+            if len(audit) >= MAX_DRAIN_AUDIT_ENTRIES:
+                raise ControllerError("controller drain audit is full; refusing to discard resolution history")
+            audit.append(record)
+            state["drain_audit"] = audit
+            self._write_state(state)
+        document["drain_causes"] = []
+        return audit_id
+
     def active_tasks(self) -> list[dict[str, str]]:
         """Return current workers, preserving a legacy single-task checkpoint."""
         return _active_tasks_from_checkpoint(self._load_checkpoint(), self.root)
@@ -2240,32 +2336,40 @@ class RootController:
         *,
         drain_cause_kind: str = "",
         drain_cause_provenance: str = "",
+        drain_cause_task: str = "",
+        drain_cause_launch: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         if state not in TERMINAL_STATES:
             raise ControllerError(f"not a terminal halt state: {state}")
-        current = self.assert_lease(lease)
-        document = self._load_checkpoint()
-        if drain_cause_kind or drain_cause_provenance:
-            _append_drain_cause(
-                document,
-                kind=drain_cause_kind or "unknown",
-                provenance=drain_cause_provenance or "controller_unclassified",
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            if state != "completed":
+                trusted_typed_cause = bool(drain_cause_kind and drain_cause_provenance)
+                _append_drain_cause(
+                    document,
+                    kind=drain_cause_kind if trusted_typed_cause else "unknown",
+                    provenance=(
+                        drain_cause_provenance if trusted_typed_cause
+                        else "controller_unclassified"
+                    ),
+                    task_id=drain_cause_task if trusted_typed_cause else "",
+                    launch_id=drain_cause_launch if trusted_typed_cause else "",
+                )
+            document.update(
+                {
+                    "root": self.root,
+                    "controller": self.controller,
+                    "epoch": current.epoch,
+                    "lease_token": current.token,
+                    "state": state,
+                    "status": state,
+                    "terminal": True,
+                    "terminal_reason": reason,
+                    "next_action": "no further scheduling",
+                }
             )
-        document.update(
-            {
-                "root": self.root,
-                "controller": self.controller,
-                "epoch": current.epoch,
-                "lease_token": current.token,
-                "state": state,
-                "status": state,
-                "terminal": True,
-                "terminal_reason": reason,
-                "next_action": "no further scheduling",
-            }
-        )
-        return self._result(self._save_checkpoint(document, lease=current))
+            return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document))
 
     def acknowledge_no_ready_halt(
         self, workflow_root: str, ready_task: str, *, lease: Lease | str | None = None,
@@ -2314,6 +2418,10 @@ class RootController:
             last_check = (
                 f"{prior_check[:prior_budget]}; {acknowledgement}"
                 if prior_check and prior_budget > 0 else acknowledgement
+            )
+            self._archive_resolved_drain_causes(
+                document, current, resolution="no_ready_work_acknowledged",
+                context={"workflow_root": workflow_root, "ready_task": ready_task},
             )
             document.update({
                 "epoch": current.epoch,
@@ -2661,6 +2769,14 @@ class RootController:
             )
             if len(acknowledgement) > checkpoint.FIELD_MAX:
                 raise ControllerError("workflow and task IDs are too long to acknowledge safely")
+            self._archive_resolved_drain_causes(
+                document, current, resolution="authenticated_continuation",
+                context={
+                    "workflow_root": workflow_root,
+                    "cancelled_task": cancelled_task,
+                    "ready_task": ready_task,
+                },
+            )
             document.update({
                 "task": self.root,
                 "phase": "controller",
