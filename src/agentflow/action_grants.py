@@ -207,7 +207,11 @@ def _canonical_workspace(path: Path | str) -> Path:
 
 def _reject_lexical_alias(raw: str, *, label: str) -> None:
     """Reject dot components before ``Path`` or ``PurePath`` normalizes them."""
-    if any(part in {".", ".."} for part in raw.split(os.sep)):
+    if (
+        raw.endswith(os.sep)
+        or f"{os.sep}{os.sep}" in raw
+        or any(part in {".", ".."} for part in raw.split(os.sep))
+    ):
         raise ActionGrantError(f"{label} must not contain traversal or aliases")
 
 
@@ -265,7 +269,11 @@ class ActionGrantStore:
     """A private, external store of HMAC-authenticated exact-scope grants."""
 
     def __init__(self, path: Path | str, authority: AuthenticatedGrantAuthority) -> None:
-        self.path = Path(path).expanduser()
+        raw_path = os.fspath(path)
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            raise ActionGrantError("protected grant store path is malformed")
+        _reject_lexical_alias(raw_path, label="protected grant store path")
+        self.path = Path(raw_path).expanduser()
         if not self.path.is_absolute():
             raise ActionGrantError("protected grant store path must be absolute")
         if any(part in {".", ".."} for part in self.path.parts):
@@ -280,20 +288,32 @@ class ActionGrantStore:
         if not isinstance(secret, bytes) or not secret:
             raise ActionGrantError("authenticated controller authority is required")
         self._secret = secret
-        self._validate_store_location(create_directory=False)
+        self._validate_store_location(create_directory=False, bound_roots=(self.workspace,))
 
     @property
     def lock_path(self) -> Path:
         return self.path.with_name(f".{self.path.name}.lock")
 
-    def _validate_store_location(self, *, create_directory: bool) -> None:
+    def _validate_store_location(
+        self,
+        *,
+        create_directory: bool,
+        bound_roots: Iterable[Path],
+    ) -> None:
         _reject_symlink_ancestors(self.path.parent)
-        try:
-            self.path.relative_to(self.workspace)
-        except ValueError:
-            pass
-        else:
-            raise ActionGrantError("protected grant store must be outside the worker workspace")
+        roots = tuple(bound_roots)
+        if not roots:
+            raise ActionGrantError("protected grant store requires a bound worker root")
+        for root in roots:
+            for protected_path in (self.path, self.lock_path):
+                try:
+                    protected_path.relative_to(root)
+                except ValueError:
+                    continue
+                raise ActionGrantError(
+                    "protected grant store and lock must be outside the worker workspace "
+                    "and every bound worktree root"
+                )
         if self.path.is_symlink() or self.lock_path.is_symlink():
             raise ActionGrantError("protected grant store must not use a symlink")
         if create_directory:
@@ -320,8 +340,9 @@ class ActionGrantStore:
                     raise ActionGrantError("protected grant store file permissions must be 0600")
 
     @contextmanager
-    def _locked(self, *, create_directory: bool) -> Iterator[None]:
-        self._validate_store_location(create_directory=create_directory)
+    def _locked(self, *, create_directory: bool, bound_roots: Iterable[Path]) -> Iterator[None]:
+        roots = tuple(bound_roots)
+        self._validate_store_location(create_directory=create_directory, bound_roots=roots)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -334,7 +355,7 @@ class ActionGrantStore:
             with os.fdopen(descriptor, "a", encoding="utf-8", closefd=True) as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 try:
-                    self._validate_store_location(create_directory=False)
+                    self._validate_store_location(create_directory=False, bound_roots=roots)
                     yield
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -466,6 +487,10 @@ class ActionGrantStore:
             or payload.get("continuity_id") != self.continuity_id
         ):
             raise ActionGrantDenied("protected action grant belongs to a different controller scope")
+        self._validate_store_location(
+            create_directory=False,
+            bound_roots=(self.workspace, Path(canonical["worktree_root"])),
+        )
         return payload
 
     def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
@@ -479,7 +504,10 @@ class ActionGrantStore:
         scope = self._scope(request)
         payload = {"schema": GRANT_SCHEMA, "grant_id": secrets.token_hex(24), **scope}
         payload["hmac"] = _mac(self._secret, payload)
-        with self._locked(create_directory=True):
+        with self._locked(
+            create_directory=True,
+            bound_roots=(self.workspace, Path(scope["worktree_root"])),
+        ):
             document = self._read(required=False)
             for grant_id, raw in document["grants"].items():
                 self._validated_payload(grant_id, raw)
@@ -498,7 +526,10 @@ class ActionGrantStore:
         """
 
         scope = self._scope(request)
-        with self._locked(create_directory=False):
+        with self._locked(
+            create_directory=False,
+            bound_roots=(self.workspace, Path(scope["worktree_root"])),
+        ):
             document = self._read(required=True)
             matches: list[dict[str, Any]] = []
             for grant_id, raw in document["grants"].items():
@@ -529,7 +560,7 @@ class ActionGrantStore:
         """Return availability without granting authority or exposing secrets."""
 
         try:
-            with self._locked(create_directory=False):
+            with self._locked(create_directory=False, bound_roots=(self.workspace,)):
                 document = self._read(required=True)
                 for grant_id, raw in document["grants"].items():
                     self._validated_payload(grant_id, raw)

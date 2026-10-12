@@ -143,8 +143,8 @@ class ActionGrantStoreTests(unittest.TestCase):
         failures = []
 
         @contextmanager
-        def delayed_lock(*, create_directory):
-            with original_locked(create_directory=create_directory):
+        def delayed_lock(*, create_directory, bound_roots):
+            with original_locked(create_directory=create_directory, bound_roots=bound_roots):
                 entered_lock.set()
                 if not release_lock.wait(timeout=5):
                     raise TimeoutError("test did not release the grant lock")
@@ -193,6 +193,42 @@ class ActionGrantStoreTests(unittest.TestCase):
                 paths=(str(self.workspace / "output.txt"),), worktree_root=str(approved),
             ))
 
+    def test_external_store_supports_default_and_explicit_worktree_roots(self) -> None:
+        approved = self.base / "approved-worktree"
+        approved.mkdir()
+        store = self.store()
+        store.issue(self.request(paths=("workspace-result.txt",)))
+        store.issue(self.request(paths=("worktree-result.txt",), worktree_root=str(approved)))
+        self.assertEqual(
+            store.require(self.request(paths=("workspace-result.txt",))).worktree_root,
+            str(self.workspace),
+        )
+        self.assertEqual(
+            store.require(self.request(
+                paths=("worktree-result.txt",), worktree_root=str(approved),
+            )).worktree_root,
+            str(approved),
+        )
+
+    def test_store_inside_explicit_worktree_fails_closed_for_issue_require_and_status(self) -> None:
+        approved = self.base / "approved-worktree"
+        approved.mkdir()
+        request = self.request(paths=("result.txt",), worktree_root=str(approved))
+        unsafe_path = approved / "controller-state" / "action-grants.json"
+        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
+        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+            unsafe_store.issue(request)
+        self.assertFalse(unsafe_path.exists())
+
+        safe_store = self.store()
+        safe_store.issue(request)
+        unsafe_path.parent.mkdir(mode=0o700)
+        unsafe_path.write_bytes(self.store_path.read_bytes())
+        os.chmod(unsafe_path, 0o600)
+        self.assertEqual(unsafe_store.status().mode, "unavailable")
+        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+            unsafe_store.require(request)
+
     def test_worktree_root_and_declared_paths_reject_symlinks_and_lexical_aliases(self) -> None:
         store = self.store()
         approved = self.base / "approved-worktree"
@@ -209,6 +245,18 @@ class ActionGrantStoreTests(unittest.TestCase):
             store.issue(self.request(
                 paths=("result.txt",), worktree_root=f"{approved}/.",
             ))
+
+    def test_repeated_and_trailing_separators_are_rejected_before_normalization(self) -> None:
+        store = self.store()
+        absolute_path = str(self.workspace / "absolute-result.txt")
+        store.issue(self.request(paths=(absolute_path,)))
+        self.assertEqual(store.require(self.request(paths=(absolute_path,))).declared_paths, (absolute_path,))
+        for paths in (("dir//result.txt",), ("dir/result.txt/",)):
+            with self.subTest(paths=paths):
+                with self.assertRaisesRegex(ActionGrantError, "aliases"):
+                    store.issue(self.request(paths=paths))
+                with self.assertRaisesRegex(ActionGrantError, "aliases"):
+                    store.require(self.request(paths=paths))
 
     def test_tampered_stored_worktree_root_fails_closed(self) -> None:
         approved = self.base / "approved-worktree"
