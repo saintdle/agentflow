@@ -835,6 +835,144 @@ def _has_authenticated_herdr_result(record: Mapping[str, Any]) -> bool:
     )
 
 
+def _consumed_outcome_disposition(
+    contract: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> dict[str, Any]:
+    """Sign one consumed outcome while the authenticated result transaction is open."""
+    value = {
+        "schema": "agentflow.consumed-outcome-disposition@1",
+        "status": "consumed",
+        "workspace_root": str(contract.get("workspace_root") or ""),
+        "workflow_root": str(contract.get("workflow_root") or ""),
+        "task_id": str(contract.get("task_id") or ""),
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "native_binding_sha256": _canonical_json_digest(dict(binding)),
+        "contract_sha256": _canonical_json_digest(dict(contract)),
+        "result_sha256": _canonical_json_digest(dict(result)),
+        "outcome": str(result.get("outcome") or ""),
+        "recorded_at": _now(),
+        "authority_key_id": _credential_key_id(authority_secret),
+    }
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="consumed-outcome-disposition-v1",
+    )
+    return value
+
+
+def _verify_consumed_outcome_disposition(
+    record: Mapping[str, Any],
+    *,
+    root: Path,
+    workflow_root: str,
+    authority_secret: str,
+) -> Mapping[str, Any]:
+    result = record.get("result")
+    binding = record.get("binding")
+    channel = record.get("return_channel")
+    if not (
+        isinstance(result, Mapping)
+        and isinstance(binding, Mapping)
+        and isinstance(channel, Mapping)
+        and channel.get("state") == "consumed"
+    ):
+        raise ValueError("consumed outcome has no bound consumed result")
+    task_id = str(record.get("task_id") or "")
+    launch_id = str(record.get("launch_id") or "")
+    contract = channel.get("contract_binding")
+    contract_path = Path(str(channel.get("contract_path") or "")).expanduser()
+    if not task_id or not launch_id or not isinstance(contract, Mapping):
+        raise ValueError("consumed outcome has no canonical signed return contract")
+    expected_path = _runtime_launch_dir(root, workflow_root, launch_id) / "return.contract.json"
+    if contract_path.resolve() != expected_path.resolve():
+        raise ValueError("consumed outcome return contract path is not canonical")
+    verified_contract = _verify_return_contract_binding(
+        contract, expected_path, task_id, record,
+        root=root, authority_secret=authority_secret, require_issued=False,
+    )
+    if dict(verified_contract) != dict(contract):
+        raise ValueError("consumed outcome return contract is not canonical")
+    if (
+        str(record.get("root") or "") != str(root.resolve())
+        or str(record.get("workflow_root") or "") != workflow_root
+        or str(record.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or launch_id != str(contract.get("launch_id") or "")
+        or str(binding.get("root") or "") != str(root.resolve())
+        or str(binding.get("task_id") or "") != task_id
+        or str(binding.get("claim_id") or "") != str(contract.get("claim_id") or "")
+        or str(binding.get("lease_id") or "") != str(contract.get("lease_id") or "")
+        or str(binding.get("launch_id") or "") != launch_id
+        or str(binding.get("provider") or "") != str(contract.get("provider") or "")
+        or not str(binding.get("session_id") or "")
+        or str(result.get("task_id") or "") != task_id
+        or str(result.get("launch_id") or "") != launch_id
+        or str(result.get("provider") or "") != str(contract.get("provider") or "")
+        or str(result.get("session_id") or "") != str(binding.get("session_id") or "")
+    ):
+        raise ValueError("consumed outcome identity differs from its signed launch")
+    result_digest = _canonical_json_digest(dict(result))
+    if not hmac.compare_digest(str(channel.get("result_sha256") or ""), result_digest):
+        raise ValueError("consumed outcome result digest does not match its canonical result")
+    disposition = record.get("consumed_outcome_disposition")
+    if not isinstance(disposition, Mapping) or (
+        disposition.get("schema") != "agentflow.consumed-outcome-disposition@1"
+        or disposition.get("status") != "consumed"
+        or disposition.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, disposition, domain="consumed-outcome-disposition-v1",
+        )
+    ):
+        raise ValueError("consumed outcome disposition is not authenticated")
+    expected = {
+        "workspace_root": str(root.resolve()),
+        "workflow_root": workflow_root,
+        "task_id": task_id,
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": launch_id,
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+        "native_binding_sha256": _canonical_json_digest(dict(binding)),
+        "contract_sha256": _canonical_json_digest(dict(contract)),
+        "result_sha256": result_digest,
+        "outcome": str(result.get("outcome") or ""),
+    }
+    if any(disposition.get(field) != value for field, value in expected.items()):
+        raise ValueError("consumed outcome disposition does not match its signed launch and result")
+    return disposition
+
+
+def _has_authenticated_causal_herdr_result(
+    record: Mapping[str, Any],
+    *,
+    root: Path,
+    workflow_root: str,
+    authority_secret: str,
+) -> bool:
+    """Require the atomic controller signature before a result supplies causality."""
+    try:
+        disposition = _verify_consumed_outcome_disposition(
+            record, root=root, workflow_root=workflow_root,
+            authority_secret=authority_secret,
+        )
+        return bool(
+            _has_authenticated_herdr_result(record)
+            and isinstance(record.get("result"), Mapping)
+            and disposition.get("outcome") == record["result"].get("outcome")
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
     """Read the exact provider/model/effort/role route a ready task declares.
 
@@ -2157,7 +2295,10 @@ def _controller_step_parallel(
                 task_id, f"task {task_id} Herdr result outcome={outcome or 'unknown'}",
                 provider_terminal=provider_terminal,
                 authenticated_failure=(
-                    _has_authenticated_herdr_result(terminal_record)
+                    _has_authenticated_causal_herdr_result(
+                        terminal_record, root=root, workflow_root=workflow_root,
+                        authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+                    )
                     and isinstance(terminal_record.get("result"), Mapping)
                     and str(terminal_record["result"].get("outcome") or "") == outcome
                     and str(terminal_record.get("task_id") or "") == task_id
@@ -2617,6 +2758,92 @@ def _verify_no_ready_ack_candidate(
     return task_id
 
 
+def _has_matching_drain_resolution_audit(
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    *,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    causes: list[dict[str, str]],
+) -> bool:
+    """Verify the protected archive for a cause set cleared by continuation.
+
+    The controller writes this archive under its lease fence before replacing
+    the checkpoint. A staged checkpoint can therefore have no active causes
+    while the signed expiry receipt still names the resolved set. Match every
+    part of that receipt to the exact durable archive entry before accepting
+    the retry.
+    """
+    try:
+        state = _read_json_value(str(controller.state_path))
+        audit = state.get("drain_audit") if isinstance(state, Mapping) else None
+        if (
+            not isinstance(audit, list)
+            or len(audit) > controller_backend.MAX_DRAIN_AUDIT_ENTRIES
+            or not causes
+        ):
+            return False
+        cause_ids = [cause["cause_id"] for cause in causes]
+        causes_sha256 = controller_backend._drain_causes_digest(causes)
+        expected_context = {
+            "workflow_root": workflow_root,
+            "cancelled_task": cancelled_task,
+            "ready_task": ready_task,
+        }
+        fields = {
+            "schema", "cause_ids", "causes_sha256", "resolution", "context",
+            "audit_id", "resolved_epoch", "resolved_at",
+        }
+        known_ids: set[str] = set()
+        match = False
+        for item in audit:
+            if not isinstance(item, Mapping) or set(item) != fields:
+                return False
+            identity = {key: item[key] for key in (
+                "schema", "cause_ids", "causes_sha256", "resolution", "context",
+            )}
+            if (
+                item.get("schema") != controller_backend.DRAIN_AUDIT_SCHEMA
+                or not isinstance(item.get("cause_ids"), list)
+                or not item["cause_ids"]
+                or any(not isinstance(value, str) or not value for value in item["cause_ids"])
+                or len(set(item["cause_ids"])) != len(item["cause_ids"])
+                or not isinstance(item.get("causes_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["causes_sha256"])
+                or not isinstance(item.get("resolution"), str)
+                or not item["resolution"]
+                or not isinstance(item.get("context"), Mapping)
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       for key, value in item["context"].items())
+                or isinstance(item.get("resolved_epoch"), bool)
+                or not isinstance(item.get("resolved_epoch"), int)
+                or item["resolved_epoch"] < 0
+                or isinstance(item.get("resolved_at"), bool)
+                or not isinstance(item.get("resolved_at"), (int, float))
+                or not math.isfinite(float(item["resolved_at"]))
+                or item["resolved_at"] < 0
+            ):
+                return False
+            audit_id = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if item.get("audit_id") != audit_id or audit_id in known_ids:
+                return False
+            known_ids.add(audit_id)
+            if (
+                item["resolved_epoch"] == lease.epoch
+                and item["cause_ids"] == cause_ids
+                and item["causes_sha256"] == causes_sha256
+                and item["resolution"] == "authenticated_continuation"
+                and dict(item["context"]) == expected_context
+            ):
+                match = True
+        return match
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return False
+
+
 def _verify_cancelled_preidentity_continuation(
     root: Path,
     workflow_root: str,
@@ -2736,7 +2963,23 @@ def _verify_cancelled_preidentity_continuation(
             raise controller_backend.ControllerError(
                 "expired task has malformed authenticated prior drain causes"
             ) from exc
-        if document.get("drain_causes") != prior_causes:
+        try:
+            current_causes = checkpoint_backend._check_drain_causes(
+                document.get("drain_causes")
+            )
+        except checkpoint_backend.CheckpointError as exc:
+            raise controller_backend.ControllerError(
+                "current checkpoint has malformed drain causes"
+            ) from exc
+        cleared_by_authenticated_ack = bool(
+            staged_selection and prior_causes and not current_causes
+            and _has_matching_drain_resolution_audit(
+                controller, lease, workflow_root=workflow_root,
+                cancelled_task=cancelled_task, ready_task=ready_task,
+                causes=prior_causes,
+            )
+        )
+        if current_causes != prior_causes and not cleared_by_authenticated_ack:
             raise controller_backend.ControllerError(
                 "current checkpoint drain causes differ from the signed expiry receipt"
             )
@@ -2877,15 +3120,19 @@ def _verify_cancelled_preidentity_continuation(
             )
             authenticated_outcome = bool(
                 exact_launch and cause["provenance"] == "authenticated_task_outcome"
-                and _has_authenticated_herdr_result(causal_record)
+                and _has_authenticated_causal_herdr_result(
+                    causal_record, root=root, workflow_root=workflow_root,
+                    authority_secret=authority_secret,
+                )
                 and isinstance(causal_result, Mapping)
                 and str(causal_result.get("outcome") or "") not in {"", "completed"}
             )
             authenticated_retirement = bool(
                 exact_launch and cause["provenance"] == "signed_negative_retirement"
                 and (
-                    _authenticated_cancelled_preidentity(
-                        root, workflow_root, causal_task, authority_secret=authority_secret,
+                    _authenticated_causal_preidentity_retirement(
+                        root, workflow_root, causal_task, causal_launch,
+                        causal_issue, lease, authority_secret=authority_secret,
                     ) or _authenticated_expired_bound_execution(
                         root, workflow_root, causal_task, authority_secret=authority_secret,
                     )
@@ -5023,6 +5270,72 @@ def _authenticated_cancelled_preidentity(
         return False
 
 
+def _authenticated_causal_preidentity_retirement(
+    root: Path,
+    workflow_root: str,
+    task_id: str,
+    launch_id: str,
+    issue: Mapping[str, Any],
+    lease: controller_backend.Lease,
+    *,
+    authority_secret: str,
+) -> bool:
+    """Accept a signed negative preidentity retirement only for its blocked, unbound claim."""
+    try:
+        record = _herdr_session_record(root, task_id)
+        if not isinstance(record, Mapping) or (
+            record.get("status") != "cancelled_preidentity"
+            or record.get("root") != str(root.resolve())
+            or record.get("workflow_root") != workflow_root
+            or record.get("task_id") != task_id
+            or record.get("launch_id") != launch_id
+            or record.get("binding") not in (None, {})
+            or record.get("result") not in (None, {})
+            or str(issue.get("id") or "") != task_id
+            or str(issue.get("parent") or "") != workflow_root
+            or str(issue.get("status") or "").lower() != "blocked"
+            or str(issue.get("assignee") or "") != lease.controller
+        ):
+            return False
+        channel = record.get("return_channel")
+        contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
+        disposition = record.get("recovery_disposition")
+        if (
+            not isinstance(contract, Mapping)
+            or not isinstance(disposition, Mapping)
+            or disposition.get("reason") not in {"superseded_legacy_scope", "owner_abandoned_epoch"}
+            or str(contract.get("controller_id") or "") != lease.controller
+            or str(contract.get("continuity_id") or "") != lease.continuity_id
+            or not isinstance(contract.get("lease_epoch"), int)
+            or isinstance(contract.get("lease_epoch"), bool)
+            or int(contract.get("lease_epoch")) < 0
+            or int(contract.get("lease_epoch")) > lease.epoch
+        ):
+            return False
+        metadata = issue.get("metadata")
+        agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+        agentflow = agentflow if isinstance(agentflow, Mapping) else {}
+        claim_token = str(agentflow.get("claim_token") or "")
+        if (
+            str(agentflow.get("root") or "") != workflow_root
+            or str(agentflow.get("task") or "") != task_id
+            or str(agentflow.get("actor") or "") != lease.controller
+            or str(agentflow.get("claim_id") or "") != str(contract.get("claim_id") or "")
+            or str(record.get("claim_id") or "") != str(contract.get("claim_id") or "")
+            or not claim_token
+            or not hmac.compare_digest(
+                hashlib.sha256(claim_token.encode("utf-8")).hexdigest(),
+                str(contract.get("claim_token_sha256") or ""),
+            )
+        ):
+            return False
+        return _authenticated_cancelled_preidentity(
+            root, workflow_root, task_id, authority_secret=authority_secret,
+        )
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
 _BOUND_EXECUTION_EXPIRY_REASON = (
     "signed execution deadline expired; Herdr definitively reported the exact bound pane absent"
 )
@@ -5425,6 +5738,18 @@ def _commit_expired_bound_execution(
             root, workflow_root, task_id, record, authority_secret=authority_secret,
         )
         return
+    disposition = snapshot.get("proposed_expiry_disposition")
+    if not isinstance(disposition, Mapping):
+        disposition = _bound_execution_expiry_disposition(
+            contract, binding,
+            prior_controller_state=snapshot["prior_controller_state"],
+            authority_secret=authority_secret,
+        )
+    verified_disposition = _verify_bound_execution_expiry_disposition(
+        disposition, contract, binding, authority_secret=authority_secret,
+    )
+    if dict(verified_disposition) != dict(disposition):
+        raise ValueError("proposed bound execution expiry receipt changed during verification")
     _require_definitively_absent_herdr_pane(str(binding.get("pane_id") or ""))
     state_path = root / ".agentflow/herdr/sessions.json"
     with _herdr_transaction(state_path) as state:
@@ -5462,16 +5787,11 @@ def _commit_expired_bound_execution(
         )
         if ledger.get("status") != "expired":
             raise ValueError("protected execution budget did not durably expire")
-        disposition = _bound_execution_expiry_disposition(
-            contract, binding,
-            prior_controller_state=snapshot["prior_controller_state"],
-            authority_secret=authority_secret,
-        )
         record["status"] = "expired_execution"
-        record["execution_disposition"] = disposition
+        record["execution_disposition"] = dict(disposition)
         channel["state"] = "revoked"
         channel["revoked_at"] = disposition["recorded_at"]
-        channel["revocation"] = disposition
+        channel["revocation"] = dict(disposition)
 
 
 def _authenticated_expired_bound_execution(
@@ -5746,6 +6066,18 @@ def _expire_bound_execution_if_due(
             or latest.get("prior_controller_state") != snapshot.get("prior_controller_state")
         ):
             raise ValueError("bound execution changed during expiry disposition")
+        proposed_disposition = _bound_execution_expiry_disposition(
+            latest["contract"], latest["binding"],
+            prior_controller_state=latest["prior_controller_state"],
+            authority_secret=authority_secret,
+        )
+        verified_disposition = _verify_bound_execution_expiry_disposition(
+            proposed_disposition, latest["contract"], latest["binding"],
+            authority_secret=authority_secret,
+        )
+        if dict(verified_disposition) != proposed_disposition:
+            raise ValueError("proposed bound execution expiry receipt changed during verification")
+        latest = {**latest, "proposed_expiry_disposition": proposed_disposition}
         _commit_expired_bound_execution(
             root, workflow_root, task_id, latest,
             authority_secret=authority_secret,
@@ -8219,6 +8551,8 @@ def herdr_result(args: argparse.Namespace) -> int:
                     channel = record.get("return_channel")
                     if not isinstance(channel, dict) or channel.get("state") != "issued":
                         raise ValueError("return capability is already consumed or unavailable")
+                    if "consumed_outcome_disposition" in record:
+                        raise ValueError("return capability already has a consumed outcome disposition")
                     current_contract = json.loads(contract_path.read_text(encoding="utf-8"))
                     if not isinstance(current_contract, dict):
                         raise ValueError("return contract is malformed")
@@ -8336,14 +8670,18 @@ def herdr_result(args: argparse.Namespace) -> int:
                         "acceptance_results": acceptance_results,
                         "evidence": [dict(item) for item in evidence],
                     }
+                    result_sha256 = _canonical_json_digest(canonical)
+                    outcome_disposition = _consumed_outcome_disposition(
+                        current_contract, binding_data, canonical,
+                        authority_secret=signing_secret,
+                    )
                     record["result"] = canonical
                     record["status"] = outcome
+                    record["consumed_outcome_disposition"] = outcome_disposition
                     channel["state"] = "consumed"
                     channel["consumed_at"] = _now()
                     channel["consumed_at_epoch"] = time.time()
-                    channel["result_sha256"] = hashlib.sha256(
-                        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                    ).hexdigest()
+                    channel["result_sha256"] = result_sha256
             # Cleanup is deliberately after the atomic Herdr replacement.
             for private_path in (
                 capability_path, contract_path, result_path, submission_path,

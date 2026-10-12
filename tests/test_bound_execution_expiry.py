@@ -120,6 +120,38 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertEqual(controller.active_tasks(), [])
             self.assertIsNone(cli._expire_bound_execution_if_due(args, controller, fixture.root, lease))
 
+    def test_inconsistent_open_expiry_receipt_denies_before_any_protected_write(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            document = controller._load_checkpoint()
+            document["drain_causes"] = [{
+                "cause_id": "prior-no-ready",
+                "kind": "no_ready_work",
+                "provenance": "scheduler_no_ready_work",
+                "task_id": "",
+                "launch_id": "",
+                "diagnostic_sha256": "",
+            }]
+            cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+            ledger_path = cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root)
+            protected_paths = (
+                controller.checkpoint_path,
+                controller.state_path,
+                fixture.root / ".agentflow/herdr/sessions.json",
+                ledger_path,
+            )
+            before = {path: path.read_bytes() for path in protected_paths}
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"), \
+                 self.assertRaisesRegex(ValueError, "prior controller state is inconsistent"):
+                cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+            self.assertEqual({path: path.read_bytes() for path in protected_paths}, before)
+            current = cli._herdr_session_record(fixture.root, fixture.task_id)
+            self.assertEqual(current["status"], "launched")
+            self.assertEqual(current["return_channel"]["state"], "issued")
+
     def test_due_absent_pane_expires_the_exact_bound_task_while_draining(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             controller.migrate_active_tasks(lease=lease)
@@ -314,6 +346,12 @@ class BoundExecutionExpiryTests(unittest.TestCase):
     def test_bound_retirement_verifier_replays_the_staged_target_checkpoint(self) -> None:
         """A crash after target persistence re-verifies this exact bound retirement."""
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            controller.begin_draining(
+                "typed no-ready cause before bound expiry",
+                cause_kind="no_ready_work",
+                cause_provenance="scheduler_no_ready_work",
+                lease=lease,
+            )
             deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
             with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
                  mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
@@ -372,6 +410,21 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         controller, lease, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="cancelled_preidentity",
+                    )
+                checkpoint = controller._load_checkpoint()
+                self.assertEqual(checkpoint["drain_causes"], [])
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                state["drain_audit"][0]["cause_ids"] = ["forged-cause-id"]
+                cli._private_atomic_json(controller.state_path, state)
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError,
+                    "current checkpoint drain causes differ from the signed expiry receipt",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        allow_staged_selection=True,
+                        expected_retirement_kind="expired_execution",
                     )
 
             with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
@@ -536,14 +589,15 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                     return None
 
                 with mock.patch.object(cli, "_herdr_session_record", side_effect=session_record):
-                    self.assertEqual(
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError,
+                        "causal failure task lacks its exact authenticated outcome",
+                    ):
                         cli._verify_cancelled_preidentity_continuation(
                             fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
                             controller, lease, authority_secret=args._authority_secret,
                             expected_retirement_kind="expired_execution",
-                        ),
-                        ready["id"],
-                    )
+                        )
 
     def test_expired_bound_continuation_allows_known_no_ready_cause_with_exact_current_ready(self) -> None:
         no_ready_reason = (

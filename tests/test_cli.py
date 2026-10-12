@@ -2785,6 +2785,10 @@ def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict,
     controller.halt(
         "blocked",
         f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within 1800s",
+        drain_cause_kind="managed_task_failure",
+        drain_cause_provenance="signed_negative_retirement",
+        drain_cause_task=fixture.task_id,
+        drain_cause_launch=str(record.get("launch_id") or ""),
         lease=fixture.lease,
     )
     return fixture, controller, contract, ledger_path, {"attempts": attempts, "state_path": state_path}
@@ -3028,6 +3032,34 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 channel["revocation"] = record["recovery_disposition"]
             if record_updates:
                 record.update(record_updates)
+
+    def test_signed_blocked_preidentity_retirement_is_unbound_and_not_bound_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline = self._legacy_fixture(base)
+                result, _pane_probe = self._run_recovery(
+                    fixture, self._args(fixture), legacy_scope=True,
+                )
+                self.assertTrue(result["ok"], result)
+                record = cli._herdr_session_record(fixture.root, fixture.task_id)
+                self.assertEqual(record["status"], "cancelled_preidentity")
+                self.assertIn(record["binding"], (None, {}))
+                self.assertIn(record["result"], (None, {}))
+                self.assertEqual(record["recovery_disposition"]["reason"], "superseded_legacy_scope")
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+                self.assertFalse(cli._authenticated_expired_bound_execution(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+                self.assertTrue(cli._authenticated_causal_preidentity_retirement(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    str(record["launch_id"]), fixture.task_issue, controller._current_lease(),
+                    authority_secret=fixture.authority_secret,
+                ))
 
     def test_continuation_accepts_two_authenticated_retirements_in_one_controller_incarnation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4250,6 +4282,10 @@ class ControllerPendingContinuationTests(unittest.TestCase):
         controller.halt(
             "blocked",
             "USER_ACTION_REQUIRED: task old-task provider identity never resolved within 1800s",
+            drain_cause_kind="managed_task_failure",
+            drain_cause_provenance="signed_negative_retirement",
+            drain_cause_task="old-task",
+            drain_cause_launch="old-launch",
             lease=lease,
         )
         halted = controller._load_checkpoint()
@@ -4301,6 +4337,10 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 controller.halt(
                     "blocked",
                     "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                    drain_cause_kind="managed_task_failure",
+                    drain_cause_provenance="signed_negative_retirement",
+                    drain_cause_task="old",
+                    drain_cause_launch="old-launch",
                     lease=lease,
                 )
                 halted = controller._load_checkpoint()
@@ -4738,6 +4778,10 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             controller.halt(
                 "blocked",
                 "USER_ACTION_REQUIRED: task old provider identity never resolved within 1800s",
+                drain_cause_kind="managed_task_failure",
+                drain_cause_provenance="signed_negative_retirement",
+                drain_cause_task="old",
+                drain_cause_launch="old-launch",
                 lease=lease,
             )
             halted = controller._load_checkpoint()
@@ -7258,16 +7302,27 @@ class GenuineLifecycleTests(unittest.TestCase):
             with fixture.beads_patches():
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cli.herdr_result(report_args), 0)
-                record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))["sessions"]["task-1"]
-                self.assertEqual(record["return_channel"]["state"], "consumed")
-                # Replay: restore the deleted protected files and retry -- the
-                # channel is already consumed, so it must fail closed.
-                Path(channel["contract_path"]).write_bytes(contract_bytes)
-                Path(channel["capability_file"]).write_bytes(cap_bytes)
-                Path(channel["result_path"]).write_text(json.dumps(result_body), encoding="utf-8")
-                payloads: list[dict] = []
-                with mock.patch.object(cli, "_json_or_status", side_effect=lambda p, **k: payloads.append(p)):
-                    self.assertEqual(cli.herdr_result(report_args), 2)
+            record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))["sessions"]["task-1"]
+            self.assertEqual(record["return_channel"]["state"], "consumed")
+            self.assertTrue(cli._has_authenticated_causal_herdr_result(
+                record, root=fixture.root, workflow_root=fixture.workflow_root,
+                authority_secret=fixture.authority_secret,
+            ))
+            legacy_copy = json.loads(json.dumps(record))
+            legacy_copy.pop("consumed_outcome_disposition")
+            self.assertTrue(cli._has_authenticated_herdr_result(legacy_copy))
+            self.assertFalse(cli._has_authenticated_causal_herdr_result(
+                legacy_copy, root=fixture.root, workflow_root=fixture.workflow_root,
+                authority_secret=fixture.authority_secret,
+            ))
+            # Replay: restore the deleted protected files and retry -- the
+            # channel is already consumed, so it must fail closed.
+            Path(channel["contract_path"]).write_bytes(contract_bytes)
+            Path(channel["capability_file"]).write_bytes(cap_bytes)
+            Path(channel["result_path"]).write_text(json.dumps(result_body), encoding="utf-8")
+            payloads: list[dict] = []
+            with mock.patch.object(cli, "_json_or_status", side_effect=lambda p, **k: payloads.append(p)):
+                self.assertEqual(cli.herdr_result(report_args), 2)
             self.assertIn("consumed", payloads[-1]["error"])
 
     def test_provider_cannot_replace_acceptance_id_in_return_contract(self) -> None:
