@@ -10,14 +10,17 @@ never enables persistent worker admission.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import hashlib
 import hmac
 import json
 import os
 import sqlite3
 import stat
+import subprocess
+import time
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,11 +38,14 @@ from agentflow.copilot_sdk import (
 
 
 _CHECKPOINT_DOMAIN = b"agentflow.copilot-controller.expected-head@1\0"
-_AUTHORITY_KEY_DOMAIN = b"agentflow.copilot-controller.authority-key@1\0"
-_APPROVAL_FIELDS = {
-    "schema", "purpose", "decision", "approved_by", "workspace_root", "identity",
-    "budget", "preflight",
-}
+_MANIFEST_DOMAIN = b"agentflow.copilot-controller.proof-manifest@1\0"
+_REVIEW_DOMAIN = b"agentflow.copilot-controller.accepted-review@1\0"
+_MANIFEST_SCHEMA = "agentflow.copilot-proof-manifest@1"
+_REVIEW_SCHEMA = "agentflow.copilot-accepted-review@1"
+_PROOF_DEADLINE_SECONDS = 180
+_PROOF_RETRIES = 0
+_PROOF_MAX_ATTEMPTS = 1
+_ACTIVE_CLAIM_STATES = frozenset({"claimed_no_session", "running", "launched", "identity_pending"})
 
 
 def _canonical(value: Mapping[str, Any]) -> bytes:
@@ -54,78 +60,537 @@ def _identity_digest(identity: CopilotLaunchIdentity) -> str:
     return hashlib.sha256(_canonical(identity.to_dict())).hexdigest()
 
 
+def _source_fingerprint() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[2]
+    files = {
+        "copilot_controller.py": Path(__file__).resolve(),
+        "copilot_sdk.py": Path(__file__).with_name("copilot_sdk.py").resolve(),
+        "copilot_proof_runner.py": root / "scripts" / "copilot_proof_runner.py",
+    }
+    try:
+        source_sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()}
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CopilotSDKError("Copilot reviewed source identity is unavailable") from exc
+    if len(source_sha) != 40 or any(len(value) != 64 for value in hashes.values()):
+        raise CopilotSDKError("Copilot reviewed source identity is malformed")
+    return {"source_sha": source_sha, "module_sha256": hashes}
+
+
 def _workspace_scope(workspace_root: Path) -> str:
     resolved = Path(workspace_root).expanduser().resolve(strict=False)
     return _scope("workspace-root", str(resolved))
 
 
-def _checkpoint_key(authority_secret: str, identity: CopilotLaunchIdentity, workspace_scope: str) -> bytes:
-    if not isinstance(authority_secret, str) or len(authority_secret) < 32:
-        raise CopilotSDKError("controller Copilot authority key is unavailable")
-    context = _AUTHORITY_KEY_DOMAIN + _canonical(identity.to_dict()) + b"\0" + workspace_scope.encode("ascii")
-    return hmac.new(authority_secret.encode("utf-8"), context, hashlib.sha256).digest()
+def _cli_backend():
+    # Keep CLI startup and optional provider discovery out of import time.
+    from agentflow import cli
+    return cli
 
 
-def _run_nonce(identity: CopilotLaunchIdentity) -> str:
-    """Make the nonce deterministic for this controller-issued unique launch."""
-    return hashlib.sha256(b"agentflow.copilot.launch-nonce\0" + _canonical(identity.to_dict())).hexdigest()
+def _owned_by_current_user(info: os.stat_result) -> bool:
+    return not hasattr(os, "getuid") or info.st_uid == os.getuid()
 
 
-def load_approved_proof_manifest(
-    path: Path,
-    *,
-    identity: CopilotLaunchIdentity,
-    workspace_root: Path,
-) -> Mapping[str, Any]:
-    """Require an explicit private approval record before credential prompts or SDK startup."""
+def _strict_path(path: Path, *, must_exist: bool, name: str) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() or candidate != Path(os.path.normpath(str(candidate))):
+        raise CopilotSDKError(f"Copilot {name} path is not canonical")
     try:
-        workspace = Path(workspace_root).expanduser().resolve(strict=True)
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute() or candidate.is_symlink():
-            raise CopilotSDKError("Copilot proof approval manifest path is invalid")
         parent = candidate.parent.resolve(strict=True)
-        resolved = parent / candidate.name
-        if resolved == workspace or workspace in resolved.parents:
-            raise CopilotSDKError("Copilot proof approval manifest must be outside the worker workspace")
-        info = resolved.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise CopilotSDKError(f"Copilot {name} parent directory is unavailable") from exc
+    if parent != candidate.parent:
+        raise CopilotSDKError(f"Copilot {name} path uses a symlink or path alias")
+    try:
+        names = {entry.name.casefold(): entry.name for entry in parent.iterdir()}
+    except OSError as exc:
+        raise CopilotSDKError(f"Copilot {name} parent directory is unavailable") from exc
+    actual_case = names.get(candidate.name.casefold())
+    if actual_case is not None and actual_case != candidate.name:
+        raise CopilotSDKError(f"Copilot {name} path uses a case alias")
+    if must_exist and actual_case is None:
+        raise CopilotSDKError(f"Copilot {name} file is unavailable")
+    return candidate
+
+
+def _private_directory(path: Path, *, workspace_root: Path, create: bool = False) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() or candidate != Path(os.path.normpath(str(candidate))):
+        raise CopilotSDKError("Copilot controller state directory path is not canonical")
+    if create and not candidate.exists():
+        candidate.mkdir(parents=True, mode=0o700)
+        os.chmod(candidate, 0o700)
+    try:
+        resolved = candidate.resolve(strict=True)
+        info = candidate.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise CopilotSDKError("Copilot controller state directory is unavailable") from exc
+    if resolved != candidate or not stat.S_ISDIR(info.st_mode):
+        raise CopilotSDKError("Copilot controller state directory uses a symlink or path alias")
+    if resolved == workspace_root or resolved in workspace_root.parents or workspace_root in resolved.parents:
+        raise CopilotSDKError("Copilot controller state directory must be separate from the worker workspace")
+    if stat.S_IMODE(info.st_mode) & 0o077 or not _owned_by_current_user(info):
+        raise CopilotSDKError("Copilot controller state directory is not private and owned")
+    return resolved
+
+
+def _private_json(
+    path: Path, *, workspace_root: Path, immutable: bool = False,
+    allow_within_workspace: bool = False,
+) -> dict[str, Any]:
+    candidate = _strict_path(path, must_exist=True, name="controller file")
+    try:
+        info = candidate.lstat()
         if (
             not stat.S_ISREG(info.st_mode)
             or stat.S_IMODE(info.st_mode) & 0o077
-            or hasattr(os, "getuid") and info.st_uid != os.getuid()
+            or immutable and stat.S_IMODE(info.st_mode) & 0o222
+            or not _owned_by_current_user(info)
+            or info.st_nlink != 1
             or info.st_size > 16_384
         ):
-            raise CopilotSDKError("Copilot proof approval manifest is not a private controller file")
-        document = json.loads(resolved.read_text(encoding="utf-8"))
+            raise CopilotSDKError("Copilot controller file is not private, owned, and immutable")
+        if not allow_within_workspace and (
+            candidate == workspace_root or candidate in workspace_root.parents or workspace_root in candidate.parents
+        ):
+            raise CopilotSDKError("Copilot controller file must be separate from the worker workspace")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise CopilotSDKError("Copilot controller file changed while it was opened")
+            value = json.load(handle)
     except CopilotSDKError:
         raise
-    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-        raise CopilotSDKError("Copilot proof approval manifest is unavailable") from exc
-    if not isinstance(document, dict) or set(document) != _APPROVAL_FIELDS:
-        raise CopilotSDKError("Copilot proof approval manifest has an unsupported shape")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise CopilotSDKError("Copilot controller file is unavailable or malformed") from exc
+    if not isinstance(value, dict):
+        raise CopilotSDKError("Copilot controller file has an invalid shape")
+    return value
+
+
+@dataclass(frozen=True)
+class _ControllerAuthority:
+    workspace_root: Path
+    workflow_root: str
+    credential_path: Path
+    controller_id: str
+    lease: Any = field(repr=False)
+    authority_secret: str = field(repr=False)
+    controller: Any = field(repr=False)
+
+
+def _load_controller_authority(workspace_root: Path, workflow_root: str) -> _ControllerAuthority:
+    try:
+        workspace = Path(workspace_root).expanduser().resolve(strict=True)
+        if not workspace.is_dir() or not workflow_root or workflow_root.strip() != workflow_root:
+            raise CopilotSDKError("Copilot proof workspace or workflow root is invalid")
+        cli = _cli_backend()
+        args = argparse.Namespace(root=str(workspace), workflow_root=workflow_root, resume_key_file="")
+        credential_path = _strict_path(
+            cli._resume_key_path(args), must_exist=True, name="canonical controller credential",
+        )
+        parent_info = credential_path.parent.stat()
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_IMODE(parent_info.st_mode) & 0o077
+            or not _owned_by_current_user(parent_info)
+        ):
+            raise CopilotSDKError("canonical controller credential directory is not private and owned")
+        credentials = _private_json(credential_path, workspace_root=workspace)
+        if (
+            credentials.get("schema") != "agentflow.controller_credentials"
+            or credentials.get("version") != 2
+            or credentials.get("workspace_root") != str(workspace)
+            or credentials.get("workflow_root") != workflow_root
+            or not isinstance(credentials.get("authority_secret"), str)
+            or len(credentials["authority_secret"]) < 32
+            or not isinstance(credentials.get("resume_secret"), str)
+            or not credentials["resume_secret"]
+            or not isinstance(credentials.get("continuity_id"), str)
+            or not credentials["continuity_id"]
+        ):
+            raise CopilotSDKError("canonical controller credentials do not match this proof root")
+        state_path = cli._controller_state_dir(workspace, workflow_root) / "state.json"
+        checkpoint_path = state_path.with_name("checkpoint.json")
+        state = _private_json(state_path, workspace_root=workspace, allow_within_workspace=True)
+        lease_document = state.get("lease")
+        if not isinstance(lease_document, Mapping):
+            raise CopilotSDKError("Copilot proof requires a current controller lease")
+        controller_id = str(lease_document.get("controller") or "")
+        if not controller_id:
+            raise CopilotSDKError("Copilot proof controller identity is missing")
+        from agentflow.controller import RootController
+        controller = RootController(
+            str(workspace), controller_id,
+            state_path=state_path, checkpoint_path=checkpoint_path,
+        )
+        lease = controller.authorize(credentials["resume_secret"])
+        if (
+            lease.root != str(workspace)
+            or lease.continuity_id != credentials["continuity_id"]
+            or lease.epoch != lease_document.get("epoch")
+        ):
+            raise CopilotSDKError("canonical controller credentials do not authenticate the current lease")
+        with controller.fence(lease):
+            controller.active_tasks()
+        return _ControllerAuthority(
+            workspace, workflow_root, credential_path, controller_id, lease,
+            credentials["authority_secret"], controller,
+        )
+    except CopilotSDKError:
+        raise
+    except Exception as exc:
+        raise CopilotSDKError("canonical controller authority could not be authenticated") from exc
+
+
+def _active_claim(authority: _ControllerAuthority, task_id: str, claim_id: str) -> Mapping[str, str]:
+    with authority.controller.fence(authority.lease):
+        matches = [
+            row for row in authority.controller.active_tasks()
+            if row.get("task") == task_id and row.get("claim_id") == claim_id
+        ]
+    if len(matches) != 1:
+        raise CopilotSDKError("Copilot proof task is not the exact active claim for this workflow root")
+    row = matches[0]
+    if row.get("actor") != authority.controller_id or row.get("state") not in _ACTIVE_CLAIM_STATES:
+        raise CopilotSDKError("Copilot proof task claim is not owned by the current controller")
+    return row
+
+
+def _execution_reservation_path(authority: _ControllerAuthority) -> Path:
+    path = _cli_backend()._execution_limit_ledger_path(
+        authority.workspace_root, authority.workflow_root,
+    )
+    _private_directory(path.parent, workspace_root=authority.workspace_root)
+    if path.exists() or path.is_symlink():
+        _private_json(path, workspace_root=authority.workspace_root)
+    lock = path.with_name(f".{path.name}.lock")
+    if lock.exists() or lock.is_symlink():
+        info = lock.lstat()
+        if not stat.S_ISREG(info.st_mode) or not _owned_by_current_user(info) or stat.S_IMODE(info.st_mode) & 0o077:
+            raise CopilotSDKError("protected execution ledger lock is not private and owned")
+    return path
+
+
+@dataclass(frozen=True)
+class AuthenticatedCopilotProofManifest:
+    identity: CopilotLaunchIdentity
+    workspace_root: Path
+    workflow_root: str
+    task_claim: Mapping[str, str]
+    deadline_epoch: float
+    execution_reservation_digest: str
+    review_attestation_digest: str
+    authority: _ControllerAuthority = field(repr=False)
+
+
+def _manifest_body(document: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in document.items() if key != "manifest_hmac"}
+
+
+def _manifest_mac(secret: str, document: Mapping[str, Any]) -> str:
+    return hmac.new(
+        secret.encode("utf-8"), _MANIFEST_DOMAIN + _canonical(_manifest_body(document)), hashlib.sha256,
+    ).hexdigest()
+
+
+def _review_mac(secret: str, document: Mapping[str, Any]) -> str:
+    body = {key: value for key, value in document.items() if key != "attestation_hmac"}
+    return hmac.new(secret.encode("utf-8"), _REVIEW_DOMAIN + _canonical(body), hashlib.sha256).hexdigest()
+
+
+def _preflight_digest(authority: _ControllerAuthority, identity: CopilotLaunchIdentity,
+                      claim: Mapping[str, str], source: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical({
+        "workspace_root": str(authority.workspace_root), "workflow_root": identity.workflow_root,
+        "identity": identity.to_dict(), "claim": dict(claim),
+        "lease_token_scope": _scope("lease-token", authority.lease.token),
+        "controller_id": authority.controller_id, "source": dict(source),
+        "budget": {"deadline_seconds": _PROOF_DEADLINE_SECONDS, "retry_count": _PROOF_RETRIES,
+                   "attempt": 1, "max_attempts": 1},
+        "checks": ["canonical-credential", "current-lease", "exact-active-claim", "same-root"],
+    })).hexdigest()
+
+
+def _verify_review_attestation(path: Path, authority: _ControllerAuthority,
+                               identity: CopilotLaunchIdentity, claim: Mapping[str, str]) -> str:
+    candidate = _manifest_path(path, authority.workspace_root, must_exist=True)
+    document = _private_json(candidate, workspace_root=authority.workspace_root, immutable=True)
+    source = _source_fingerprint()
+    preflight = _preflight_digest(authority, identity, claim, source)
+    reviews = document.get("reviews")
+    fields = {"schema", "workspace_root", "workflow_root", "identity", "task_claim_sha256",
+              "source", "preflight_sha256", "reviews", "authority_key_id", "attestation_hmac"}
+    valid_reviews = (
+        isinstance(reviews, list) and len(reviews) == 2
+        and all(isinstance(row, Mapping) and set(row) == {"reviewer", "artifact_sha256", "disposition"}
+                and isinstance(row.get("reviewer"), str) and row["reviewer"]
+                and isinstance(row.get("artifact_sha256"), str) and len(row["artifact_sha256"]) == 64
+                and row.get("disposition") == "accepted" for row in reviews)
+        and reviews[0]["reviewer"] != reviews[1]["reviewer"]
+    )
+    if (
+        set(document) != fields
+        or document.get("schema") != _REVIEW_SCHEMA
+        or not hmac.compare_digest(str(document.get("attestation_hmac") or ""), _review_mac(authority.authority_secret, document))
+        or document.get("workspace_root") != str(authority.workspace_root)
+        or document.get("workflow_root") != identity.workflow_root
+        or document.get("identity") != identity.to_dict()
+        or document.get("task_claim_sha256") != hashlib.sha256(_canonical(dict(claim))).hexdigest()
+        or document.get("source") != source
+        or document.get("preflight_sha256") != preflight
+        or document.get("authority_key_id") != hashlib.sha256(authority.authority_secret.encode()).hexdigest()[:24]
+        or not valid_reviews
+    ):
+        raise CopilotSDKError("Copilot accepted-review attestation is missing, stale, or unauthenticated")
+    return hashlib.sha256(_canonical(document)).hexdigest()
+
+
+def _manifest_path(path: Path, workspace_root: Path, *, must_exist: bool) -> Path:
+    candidate = _strict_path(path, must_exist=must_exist, name="proof manifest")
+    if candidate == workspace_root or candidate in workspace_root.parents or workspace_root in candidate.parents:
+        raise CopilotSDKError("Copilot proof manifest must be separate from the worker workspace")
+    _private_directory(candidate.parent, workspace_root=workspace_root)
+    if must_exist:
+        _private_json(candidate, workspace_root=workspace_root, immutable=True)
+    elif candidate.exists() or candidate.is_symlink():
+        raise CopilotSDKError("Copilot proof manifest is immutable and cannot be overwritten")
+    return candidate
+
+
+def _write_immutable_manifest(path: Path, document: Mapping[str, Any]) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o400)
+    try:
+        payload = json.dumps(document, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o400)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        Path(path).unlink(missing_ok=True)
+        raise
+
+
+def issue_copilot_proof_manifest(
+    path: Path,
+    *,
+    workspace_root: Path,
+    workflow_root: str,
+    task_id: str,
+    claim_id: str,
+    launch_id: str,
+    role: str,
+    requested_model: str,
+    effort: str,
+    review_attestation_path: Path,
+) -> AuthenticatedCopilotProofManifest:
+    """Reserve one existing protected task attempt and issue a signed, write-once manifest."""
+    authority = _load_controller_authority(workspace_root, workflow_root)
+    claim = dict(_active_claim(authority, task_id, claim_id))
+    identity = CopilotLaunchIdentity(
+        workflow_root=workflow_root, task_id=task_id, claim_id=claim_id,
+        lease_epoch=authority.lease.epoch, continuity_id=authority.lease.continuity_id,
+        launch_id=launch_id, role=role, requested_model=requested_model, effort=effort,
+    )
+    manifest_path = _manifest_path(path, authority.workspace_root, must_exist=False)
+    review_digest = _verify_review_attestation(review_attestation_path, authority, identity, claim)
+    cli = _cli_backend()
+    ledger_path = _execution_reservation_path(authority)
+    try:
+        reservation = cli._reserve_execution_attempt(
+            authority.workspace_root, workflow_root, task_id,
+            limits=cli.execution_limits_backend.ExecutionLimits(_PROOF_DEADLINE_SECONDS, _PROOF_RETRIES),
+            policy_max_attempts=_PROOF_MAX_ATTEMPTS,
+            authority_secret=authority.authority_secret,
+            claim_id=claim_id, lease_id=authority.lease.token, launch_id=launch_id,
+            controller_id=authority.controller_id,
+            continuity_id=authority.lease.continuity_id, lease_epoch=authority.lease.epoch,
+        )
+    except Exception as exc:
+        raise CopilotSDKError("protected one-attempt Copilot proof budget could not be reserved") from exc
+    reservation = dict(reservation)
+    expected_launch = {
+        "workspace_root": str(authority.workspace_root), "workflow_root": workflow_root,
+        "task_id": task_id, "claim_id": claim_id, "lease_id": authority.lease.token,
+        "launch_id": launch_id, "controller_id": authority.controller_id,
+        "continuity_id": authority.lease.continuity_id, "lease_epoch": authority.lease.epoch,
+    }
+    if (
+        reservation.get("launch_identity") != expected_launch
+        or reservation.get("attempt") != 1
+        or reservation.get("max_attempts") != 1
+        or reservation.get("status") != "active"
+        or reservation.get("execution_limits") != {"deadline_seconds": _PROOF_DEADLINE_SECONDS, "max_retries": _PROOF_RETRIES}
+    ):
+        raise CopilotSDKError("protected Copilot proof budget does not match the exact first attempt")
+    budget = {
+        "deadline_seconds": _PROOF_DEADLINE_SECONDS,
+        "retry_count": _PROOF_RETRIES,
+        "attempt": reservation["attempt"],
+        "max_attempts": reservation["max_attempts"],
+        "deadline_epoch": reservation["deadline_epoch"],
+    }
+    document: dict[str, Any] = {
+        "schema": _MANIFEST_SCHEMA,
+        "purpose": "copilot-negative-control-proof",
+        "workspace_root": str(authority.workspace_root),
+        "workflow_root": workflow_root,
+        "identity": identity.to_dict(),
+        "lease": {
+            "controller_id": authority.controller_id,
+            "continuity_id": authority.lease.continuity_id,
+            "lease_epoch": authority.lease.epoch,
+            "lease_token_scope": _scope("lease-token", authority.lease.token),
+        },
+        "task_claim": claim,
+        "review_attestation_path": str(Path(review_attestation_path).expanduser().resolve()),
+        "budget": budget,
+        "preflight": {
+            "controller_status": "passed",
+            "task_claim_status": "passed",
+            "independent_review_status": "controller-attested",
+            "proof_invocation_status": "not_started",
+        },
+        "review_attestation_digest": review_digest,
+        "authority_key_id": hashlib.sha256(authority.authority_secret.encode("utf-8")).hexdigest()[:24],
+        "execution_reservation_digest": hashlib.sha256(_canonical(reservation)).hexdigest(),
+    }
+    document["manifest_hmac"] = _manifest_mac(authority.authority_secret, document)
+    _write_immutable_manifest(manifest_path, document)
+    # Ensure the reservation came from the configured canonical protected ledger.
+    if ledger_path != cli._execution_limit_ledger_path(authority.workspace_root, workflow_root):
+        raise CopilotSDKError("protected Copilot proof budget came from an unexpected ledger origin")
+    return AuthenticatedCopilotProofManifest(
+        identity, authority.workspace_root, workflow_root, claim,
+        float(budget["deadline_epoch"]), document["execution_reservation_digest"], review_digest, authority,
+    )
+
+
+def load_authenticated_proof_manifest(
+    path: Path, *, workspace_root: Path, workflow_root: str,
+) -> AuthenticatedCopilotProofManifest:
+    """Authenticate a write-once manifest against the canonical lease and protected attempt ledger."""
+    authority = _load_controller_authority(workspace_root, workflow_root)
+    manifest_path = _manifest_path(path, authority.workspace_root, must_exist=True)
+    document = _private_json(manifest_path, workspace_root=authority.workspace_root, immutable=True)
+    fields = {
+        "schema", "purpose", "workspace_root", "workflow_root", "identity", "lease",
+        "task_claim", "review_attestation_path", "budget", "preflight", "authority_key_id",
+        "execution_reservation_digest", "review_attestation_digest", "manifest_hmac",
+    }
+    if set(document) != fields or not hmac.compare_digest(
+        str(document.get("manifest_hmac") or ""), _manifest_mac(authority.authority_secret, document),
+    ):
+        raise CopilotSDKError("Copilot proof manifest authentication failed")
+    try:
+        identity_data = document["identity"]
+        identity = CopilotLaunchIdentity(**identity_data)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise CopilotSDKError("Copilot proof manifest launch identity is malformed") from exc
+    claim = _active_claim(authority, identity.task_id, identity.claim_id)
+    attestation_path = Path(str(document.get("review_attestation_path") or ""))
+    review_digest = _verify_review_attestation(attestation_path, authority, identity, claim)
+    lease = document.get("lease")
     budget = document.get("budget")
     preflight = document.get("preflight")
+    expected_lease = {
+        "controller_id": authority.controller_id,
+        "continuity_id": authority.lease.continuity_id,
+        "lease_epoch": authority.lease.epoch,
+        "lease_token_scope": _scope("lease-token", authority.lease.token),
+    }
+    expected_budget_fields = {
+        "deadline_seconds": _PROOF_DEADLINE_SECONDS, "retry_count": _PROOF_RETRIES,
+        "attempt": 1, "max_attempts": 1,
+    }
     if (
-        document.get("schema") != 1
+        document.get("schema") != _MANIFEST_SCHEMA
         or document.get("purpose") != "copilot-negative-control-proof"
-        or document.get("decision") != "approved"
-        or not isinstance(document.get("approved_by"), str)
-        or not document["approved_by"].strip()
-        or document.get("workspace_root") != str(workspace)
-        or document.get("identity") != identity.to_dict()
-        or not isinstance(budget, dict)
-        or set(budget) != {"deadline_seconds", "retry_count"}
-        or type(budget.get("deadline_seconds")) is not int
-        or budget.get("deadline_seconds") != 180
-        or type(budget.get("retry_count")) is not int
-        or budget.get("retry_count") != 0
-        or not isinstance(preflight, dict)
-        or set(preflight) != {"controller_status", "independent_review_status", "proof_invocation_status"}
-        or preflight.get("controller_status") != "passed"
-        or preflight.get("independent_review_status") != "passed"
-        or preflight.get("proof_invocation_status") != "not_started"
+        or document.get("workspace_root") != str(authority.workspace_root)
+        or document.get("workflow_root") != workflow_root
+        or identity.workflow_root != workflow_root
+        or identity.lease_epoch != authority.lease.epoch
+        or identity.continuity_id != authority.lease.continuity_id
+        or dict(lease) != expected_lease
+        or dict(document.get("task_claim") or {}) != dict(claim)
+        or not isinstance(budget, Mapping)
+        or set(budget) != set(expected_budget_fields) | {"deadline_epoch"}
+        or any(budget.get(key) != value for key, value in expected_budget_fields.items())
+        or isinstance(budget.get("deadline_epoch"), bool)
+        or not isinstance(budget.get("deadline_epoch"), (int, float))
+        or float(budget["deadline_epoch"]) <= time.time()
+        or not isinstance(preflight, Mapping)
+        or dict(preflight) != {
+            "controller_status": "passed", "task_claim_status": "passed",
+            "independent_review_status": "controller-attested", "proof_invocation_status": "not_started",
+        }
+        or document.get("review_attestation_digest") != review_digest
+        or document.get("authority_key_id") != hashlib.sha256(authority.authority_secret.encode("utf-8")).hexdigest()[:24]
     ):
-        raise CopilotSDKError("Copilot proof approval manifest is incomplete or mismatched")
-    return document
+        raise CopilotSDKError("Copilot proof manifest does not match the current lease, claim, or preflight")
+    cli = _cli_backend()
+    ledger_path = _execution_reservation_path(authority)
+    reservation = cli._read_any_execution_ledger_entry(
+        authority.workspace_root, workflow_root, identity.task_id,
+        authority_secret=authority.authority_secret,
+    )
+    expected_launch = {
+        "workspace_root": str(authority.workspace_root), "workflow_root": workflow_root,
+        "task_id": identity.task_id, "claim_id": identity.claim_id,
+        "lease_id": authority.lease.token, "launch_id": identity.launch_id,
+        "controller_id": authority.controller_id,
+        "continuity_id": authority.lease.continuity_id,
+        "lease_epoch": authority.lease.epoch,
+    }
+    if (
+        reservation is None
+        or reservation.get("launch_identity") != expected_launch
+        or reservation.get("execution_limits") != {"deadline_seconds": _PROOF_DEADLINE_SECONDS, "max_retries": _PROOF_RETRIES}
+        or reservation.get("attempt") != 1
+        or reservation.get("max_attempts") != 1
+        or reservation.get("status") != "active"
+        or reservation.get("deadline_epoch") != budget.get("deadline_epoch")
+        or hashlib.sha256(_canonical(dict(reservation))).hexdigest() != document.get("execution_reservation_digest")
+        or ledger_path != cli._execution_limit_ledger_path(authority.workspace_root, workflow_root)
+    ):
+        raise CopilotSDKError("Copilot proof manifest does not match its protected first-attempt budget")
+    return AuthenticatedCopilotProofManifest(
+        identity, authority.workspace_root, workflow_root, dict(claim),
+        float(budget["deadline_epoch"]), str(document["execution_reservation_digest"]), review_digest, authority,
+    )
+
+
+def copilot_proof_storage_directory(context: AuthenticatedCopilotProofManifest) -> Path:
+    authority = context.authority
+    workflow_scope = hashlib.sha256(context.workflow_root.encode("utf-8")).hexdigest()[:24]
+    launch_scope = hashlib.sha256(context.identity.launch_id.encode("utf-8")).hexdigest()[:24]
+    return authority.credential_path.parent / "copilot-proofs" / workflow_scope / launch_scope
+
+
+def _create_private_storage_tree(path: Path, authority: _ControllerAuthority) -> Path:
+    base = authority.credential_path.parent
+    relative = path.relative_to(base)
+    current = base
+    for part in relative.parts:
+        current = current / part
+        if current.exists() or current.is_symlink():
+            _private_directory(current, workspace_root=authority.workspace_root)
+        else:
+            current.mkdir(mode=0o700)
+            os.chmod(current, 0o700)
+    return _private_directory(path, workspace_root=authority.workspace_root)
 
 
 @dataclass(frozen=True)
@@ -157,14 +622,16 @@ class SQLiteCopilotControllerStore:
         workspace_root: Path,
         identity: CopilotLaunchIdentity,
         authority_key: bytes,
+        readonly: bool = False,
     ) -> None:
         if not isinstance(identity, CopilotLaunchIdentity):
             raise CopilotSDKError("controller Copilot launch identity is unavailable")
         if not isinstance(authority_key, bytes) or len(authority_key) < 32:
             raise CopilotSDKError("controller Copilot checkpoint key is unavailable")
         try:
-            self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
+            self.workspace_root = Path(workspace_root).expanduser().resolve(strict=True)
             self.identity = identity
+            self.readonly = bool(readonly)
             self.identity_digest = _identity_digest(identity)
             self.workspace_scope = _workspace_scope(self.workspace_root)
             self.anchor_id = _scope("protected-ledger", self.identity_digest)
@@ -173,38 +640,35 @@ class SQLiteCopilotControllerStore:
             self.authority_path = self._private_database_path(authority_path, "authority")
             if self.ledger_path == self.authority_path:
                 raise CopilotSDKError("Copilot ledger and authority stores must be separate files")
-            self._initialize()
+            if not self.readonly:
+                self._initialize()
         except CopilotSDKError:
             raise
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
             raise CopilotSDKError("Copilot controller continuity storage is unavailable") from exc
 
     def _private_database_path(self, path: Path, name: str) -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute() or candidate.is_symlink():
-            raise CopilotSDKError(f"Copilot controller {name} store path is invalid")
-        parent = candidate.parent.resolve(strict=True)
+        candidate = _strict_path(path, must_exist=self.readonly, name=f"{name} store")
+        parent = _private_directory(candidate.parent, workspace_root=self.workspace_root)
         resolved = parent / candidate.name
-        if resolved == self.workspace_root or self.workspace_root in resolved.parents:
-            raise CopilotSDKError("Copilot controller stores must be outside the worker workspace")
-        parent_info = parent.stat()
         if (
-            not stat.S_ISDIR(parent_info.st_mode)
-            or stat.S_IMODE(parent_info.st_mode) & 0o077
-            or hasattr(os, "getuid") and parent_info.st_uid != os.getuid()
+            resolved == self.workspace_root
+            or resolved in self.workspace_root.parents
+            or self.workspace_root in resolved.parents
         ):
-            raise CopilotSDKError(f"Copilot controller {name} directory is not private and owned")
-        if resolved.is_symlink():
-            raise CopilotSDKError(f"Copilot controller {name} store cannot be a symlink")
-        if resolved.exists():
+            raise CopilotSDKError("Copilot controller stores must be separate from the worker workspace")
+        if resolved.exists() or resolved.is_symlink():
             info = resolved.lstat()
             if (
                 not stat.S_ISREG(info.st_mode)
                 or stat.S_IMODE(info.st_mode) & 0o077
-                or hasattr(os, "getuid") and info.st_uid != os.getuid()
+                or not _owned_by_current_user(info)
+                or info.st_nlink != 1
             ):
                 raise CopilotSDKError(f"Copilot controller {name} store is not private and owned")
         else:
+            if self.readonly:
+                raise CopilotSDKError(f"Copilot controller {name} store is unavailable for verification")
             flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -213,20 +677,31 @@ class SQLiteCopilotControllerStore:
         return resolved
 
     def _connect_ledger(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.ledger_path, timeout=10, isolation_level=None)
+        if self.readonly:
+            connection = sqlite3.connect(
+                f"{self.ledger_path.as_uri()}?mode=ro", timeout=10, isolation_level=None, uri=True,
+            )
+            connection.execute("PRAGMA query_only = ON")
+        else:
+            connection = sqlite3.connect(self.ledger_path, timeout=10, isolation_level=None)
         connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA synchronous = FULL")
+        if not self.readonly:
+            connection.execute("PRAGMA synchronous = FULL")
         return connection
 
     def _connect_atomic(self) -> sqlite3.Connection:
         connection = self._connect_ledger()
         try:
-            connection.execute("ATTACH DATABASE ? AS authority", (str(self.authority_path),))
-            for schema in ("main", "authority"):
-                mode = connection.execute(f"PRAGMA {schema}.journal_mode = DELETE").fetchone()
-                if mode is None or mode[0].lower() != "delete":
-                    raise CopilotSDKError("Copilot controller stores cannot enable atomic rollback journaling")
-                connection.execute(f"PRAGMA {schema}.synchronous = FULL")
+            authority_uri = (
+                f"{self.authority_path.as_uri()}?mode=ro" if self.readonly else str(self.authority_path)
+            )
+            connection.execute("ATTACH DATABASE ? AS authority", (authority_uri,))
+            if not self.readonly:
+                for schema in ("main", "authority"):
+                    mode = connection.execute(f"PRAGMA {schema}.journal_mode = DELETE").fetchone()
+                    if mode is None or mode[0].lower() != "delete":
+                        raise CopilotSDKError("Copilot controller stores cannot enable atomic rollback journaling")
+                    connection.execute(f"PRAGMA {schema}.synchronous = FULL")
             return connection
         except Exception:
             connection.close()
@@ -357,6 +832,8 @@ class SQLiteCopilotControllerStore:
         signed_row: Mapping[str, Any],
         replacement: CopilotLedgerHead,
     ) -> bool:
+        if self.readonly:
+            raise CopilotSDKError("Copilot verify-only storage cannot accept ledger writes")
         row = dict(signed_row)
         try:
             with closing(self._connect_atomic()) as connection:
@@ -441,33 +918,50 @@ class SQLiteCopilotControllerStore:
 
 
 class CopilotControllerContinuity:
-    """Bind a fresh proof and restart verification to explicit controller authority."""
+    """Bind a proof to a canonical credential, current lease, and signed manifest."""
 
     def __init__(
         self,
+        context: AuthenticatedCopilotProofManifest,
         *,
-        identity: CopilotLaunchIdentity,
-        authority_secret: str,
-        workspace_root: Path,
-        ledger_path: Path,
-        authority_path: Path,
+        readonly: bool = False,
     ) -> None:
-        self.identity = identity
-        workspace = Path(workspace_root).expanduser().resolve(strict=False)
+        if not isinstance(context, AuthenticatedCopilotProofManifest):
+            raise CopilotSDKError("Copilot proof requires an authenticated controller manifest")
+        authority = context.authority
+        self.context = context
+        self.identity = context.identity
+        workspace = context.workspace_root
         workspace_scope = _workspace_scope(workspace)
-        checkpoint_key = _checkpoint_key(authority_secret, identity, workspace_scope)
+        key_context = _canonical({
+            "identity": context.identity.to_dict(),
+            "workspace_scope": workspace_scope,
+            "execution_reservation_digest": context.execution_reservation_digest,
+        })
+        checkpoint_key = hmac.new(
+            authority.authority_secret.encode("utf-8"), _CHECKPOINT_DOMAIN + key_context, hashlib.sha256,
+        ).digest()
         self.evidence_key = derive_evidence_key(
-            authority_secret, identity, run_nonce=_run_nonce(identity),
+            authority.authority_secret, context.identity,
+            run_nonce=context.execution_reservation_digest,
         )
+        storage = copilot_proof_storage_directory(context)
+        if readonly:
+            _private_directory(storage, workspace_root=workspace)
+        else:
+            _create_private_storage_tree(storage, authority)
         self.store = SQLiteCopilotControllerStore(
-            ledger_path,
-            authority_path,
+            storage / "copilot-ledger.sqlite3",
+            storage / "expected-head.sqlite3",
             workspace_root=workspace,
-            identity=identity,
+            identity=context.identity,
             authority_key=checkpoint_key,
+            readonly=readonly,
         )
 
     def new_ledger(self) -> ProtectedCopilotLedger:
+        if self.store.readonly:
+            raise CopilotSDKError("Copilot verify-only storage cannot start a proof")
         self.store.assert_unused()
         return ProtectedCopilotLedger(
             identity=self.identity,
@@ -506,6 +1000,10 @@ class CopilotControllerContinuity:
         github_token: str,
     ) -> CopilotUsageReport:
         """Run exactly one approved no-tools turn and verify its durable checkpoint."""
+        if self.store.readonly:
+            raise CopilotSDKError("Copilot verify-only context cannot start a proof")
+        if self.context.deadline_epoch <= time.time():
+            raise CopilotSDKError("Copilot proof first-attempt deadline expired; do not retry")
         ledger = self.new_ledger()
         async with await CopilotProofRun.open(
             identity=self.identity,
@@ -514,6 +1012,7 @@ class CopilotControllerContinuity:
             base_directory=base_directory,
             workspace_root=self.store.workspace_root,
             github_token=github_token,
+            deadline_epoch=self.context.deadline_epoch,
         ) as run:
             report = await run.send_once(COPILOT_NEGATIVE_CONTROL_PROMPT)
         if not report.verified or report.persistent_admission:
@@ -525,8 +1024,11 @@ class CopilotControllerContinuity:
 
 
 __all__ = [
+    "AuthenticatedCopilotProofManifest",
     "CopilotControllerCheckpoint",
     "CopilotControllerContinuity",
     "SQLiteCopilotControllerStore",
-    "load_approved_proof_manifest",
+    "copilot_proof_storage_directory",
+    "issue_copilot_proof_manifest",
+    "load_authenticated_proof_manifest",
 ]

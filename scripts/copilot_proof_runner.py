@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactively run or verify one explicitly approved Copilot proof launch."""
+"""Prepare, verify, or run one controller-authorized Copilot SDK proof."""
 
 from __future__ import annotations
 
@@ -11,109 +11,143 @@ import os
 import stat
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agentflow.copilot_controller import (  # noqa: E402
     CopilotControllerContinuity,
-    load_approved_proof_manifest,
+    issue_copilot_proof_manifest,
+    load_authenticated_proof_manifest,
 )
-from agentflow.copilot_sdk import CopilotLaunchIdentity, CopilotSDKError  # noqa: E402
-
-
-def _private_directory(path: Path, *, workspace_root: Path, create: bool) -> Path:
-    candidate = Path(path).expanduser()
-    if not candidate.is_absolute() or candidate.is_symlink():
-        raise CopilotSDKError("Copilot controller state directory path is invalid")
-    unresolved = candidate.resolve(strict=False)
-    if (
-        unresolved == workspace_root
-        or unresolved in workspace_root.parents
-        or workspace_root in unresolved.parents
-    ):
-        raise CopilotSDKError("Copilot controller state directory must be outside the worker workspace")
-    if create and not candidate.exists():
-        candidate.mkdir(parents=True, mode=0o700)
-    resolved = candidate.resolve(strict=True)
-    if resolved == workspace_root or resolved in workspace_root.parents or workspace_root in resolved.parents:
-        raise CopilotSDKError("Copilot controller state directory must be outside the worker workspace")
-    info = resolved.stat()
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) & 0o077
-        or hasattr(os, "getuid") and info.st_uid != os.getuid()
-    ):
-        raise CopilotSDKError("Copilot controller state directory is not private and owned")
-    return resolved
-
-
-def _identity_from_args(args: argparse.Namespace) -> CopilotLaunchIdentity:
-    return CopilotLaunchIdentity(
-        workflow_root=args.workflow_root,
-        task_id=args.task_id,
-        claim_id=args.claim_id,
-        lease_epoch=args.lease_epoch,
-        continuity_id=args.continuity_id,
-        launch_id=args.launch_id,
-        role=args.role,
-        requested_model=args.model,
-        effort=args.effort,
-    )
+from agentflow.copilot_sdk import CopilotSDKError  # noqa: E402
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace-root", type=Path, required=True)
-    parser.add_argument("--state-dir", type=Path, required=True)
-    parser.add_argument("--proof-approval", type=Path, required=True)
     parser.add_argument("--workflow-root", required=True)
-    parser.add_argument("--task-id", required=True)
-    parser.add_argument("--claim-id", required=True)
-    parser.add_argument("--lease-epoch", type=int, required=True)
-    parser.add_argument("--continuity-id", required=True)
-    parser.add_argument("--launch-id", required=True)
-    parser.add_argument("--role", required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--effort", required=True)
+    parser.add_argument("--manifest", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--prepare-manifest", action="store_true")
+    mode.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--task-id")
+    parser.add_argument("--claim-id")
+    parser.add_argument("--launch-id")
+    parser.add_argument("--role")
+    parser.add_argument("--model")
+    parser.add_argument("--effort")
+    parser.add_argument("--review-attestation", type=Path,
+                        help="controller-signed accepted-review attestation (protected, immutable file)")
     parser.add_argument(
-        "--verify-only",
-        action="store_true",
-        help="verify a completed ledger without prompting for a provider credential",
+        "--credential-fd", type=int,
+        help="read a provider credential from an inherited pipe, socket, or tty file descriptor",
     )
     return parser
 
 
+def _provider_credential(fd: int | None) -> str:
+    if fd is not None:
+        try:
+            info = os.fstat(fd)
+            if not (stat.S_ISFIFO(info.st_mode) or stat.S_ISSOCK(info.st_mode) or os.isatty(fd)):
+                raise CopilotSDKError("provider credential FD must be a protected pipe, socket, or tty")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= 4096:
+                chunk = os.read(fd, min(4097 - total, 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > 4096:
+                raise CopilotSDKError("provider credential FD exceeded its size limit")
+            value = raw.decode("utf-8").rstrip("\r\n")
+        except CopilotSDKError:
+            raise
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CopilotSDKError("provider credential FD could not be read safely") from exc
+    else:
+        if os.name == "nt" or not sys.stdin.isatty() or not hasattr(getpass, "unix_getpass"):
+            raise CopilotSDKError("provider credential requires a no-echo terminal or protected FD")
+        try:
+            import termios
+            descriptor = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0))
+            try:
+                termios.tcgetattr(descriptor)
+            finally:
+                os.close(descriptor)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                value = getpass.unix_getpass("Copilot-compatible GitHub credential: ")
+        except CopilotSDKError:
+            raise
+        except Exception as exc:
+            raise CopilotSDKError("provider credential requires a working no-echo terminal or protected FD") from exc
+    if not value or "\x00" in value:
+        raise CopilotSDKError("provider credential is empty or malformed")
+    return value
+
+
+def _prepare(args: argparse.Namespace) -> int:
+    required = (args.task_id, args.claim_id, args.launch_id, args.role, args.model, args.effort)
+    if not all(required) or args.review_attestation is None:
+        raise CopilotSDKError("manifest preparation requires an exact claimed task and controller-signed review attestation")
+    manifest = issue_copilot_proof_manifest(
+        args.manifest,
+        workspace_root=args.workspace_root,
+        workflow_root=args.workflow_root,
+        task_id=args.task_id,
+        claim_id=args.claim_id,
+        launch_id=args.launch_id,
+        role=args.role,
+        requested_model=args.model,
+        effort=args.effort,
+        review_attestation_path=args.review_attestation,
+    )
+    print(json.dumps({
+        "manifest_issued": True,
+        "launch_id": manifest.identity.launch_id,
+        "deadline_epoch": manifest.deadline_epoch,
+        "attempt": 1,
+        "max_attempts": 1,
+        "persistent_admission": False,
+    }, sort_keys=True))
+    return 0
+
+
 async def _run(args: argparse.Namespace) -> int:
-    workspace = args.workspace_root.expanduser().resolve(strict=True)
-    identity = _identity_from_args(args)
-    load_approved_proof_manifest(
-        args.proof_approval,
-        identity=identity,
-        workspace_root=workspace,
+    if args.prepare_manifest:
+        return _prepare(args)
+    if any((args.task_id, args.claim_id, args.launch_id, args.role, args.model, args.effort,
+            args.review_attestation)):
+        raise CopilotSDKError("identity fields are accepted only when preparing a new manifest")
+    context = load_authenticated_proof_manifest(
+        args.manifest, workspace_root=args.workspace_root, workflow_root=args.workflow_root,
     )
-    state = _private_directory(args.state_dir, workspace_root=workspace, create=True)
-    ledger_directory = _private_directory(state / "ledger", workspace_root=workspace, create=True)
-    authority_directory = _private_directory(state / "authority", workspace_root=workspace, create=True)
-
-    authority_secret = getpass.getpass("Controller authority secret (32+ characters; not stored): ")
-    continuity = CopilotControllerContinuity(
-        identity=identity,
-        authority_secret=authority_secret,
-        workspace_root=workspace,
-        ledger_path=ledger_directory / "copilot-ledger.sqlite3",
-        authority_path=authority_directory / "expected-head.sqlite3",
-    )
-    del authority_secret
-
     if args.verify_only:
+        continuity = CopilotControllerContinuity(context, readonly=True)
         rows = continuity.verify_existing()
-        print(json.dumps({"verified": True, "row_count": len(rows), "persistent_admission": False}))
+        print(json.dumps({
+            "verified": True,
+            "row_count": len(rows),
+            "launch_id": context.identity.launch_id,
+            "persistent_admission": False,
+        }, sort_keys=True))
         return 0
 
+    continuity = CopilotControllerContinuity(context)
     continuity.store.assert_unused()
-    github_token = getpass.getpass("Copilot-compatible GitHub credential (not stored): ")
+    github_token = _provider_credential(args.credential_fd)
     try:
+        context = load_authenticated_proof_manifest(
+            args.manifest, workspace_root=args.workspace_root, workflow_root=args.workflow_root,
+        )
+        continuity = CopilotControllerContinuity(context)
+        continuity.store.assert_unused()
+        state = continuity.store.ledger_path.parent
         with tempfile.TemporaryDirectory(prefix="copilot-proof-home-", dir=state) as raw_home:
             report = await continuity.run_proof(base_directory=Path(raw_home), github_token=github_token)
     finally:
@@ -122,8 +156,8 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
-    args = _parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
     try:
         return asyncio.run(_run(args))
     except (CopilotSDKError, OSError, ValueError, RuntimeError) as exc:

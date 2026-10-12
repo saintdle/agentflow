@@ -1119,13 +1119,21 @@ class CopilotProofRun:
         base_directory: Path,
         workspace_root: Path,
         github_token: str,
+        deadline_epoch: float | None = None,
     ) -> "CopilotProofRun":
         """Start a fresh managed session and attach before any model request."""
         if not isinstance(protected_ledger, ProtectedCopilotLedger):
             raise CopilotSDKError("Copilot proof run requires a protected controller ledger")
         if protected_ledger.identity != identity:
             raise CopilotSDKError("Copilot protected ledger belongs to another launch")
-        deadline = time.monotonic() + MAX_PROOF_SECONDS
+        remaining = MAX_PROOF_SECONDS
+        if deadline_epoch is not None:
+            if isinstance(deadline_epoch, bool) or not isinstance(deadline_epoch, (int, float)):
+                raise CopilotSDKError("Copilot proof deadline is invalid")
+            remaining = min(remaining, float(deadline_epoch) - time.time())
+        if remaining <= 0:
+            raise CopilotSDKError("Copilot proof first-attempt deadline expired; do not retry")
+        deadline = time.monotonic() + remaining
         prepared = create_proof_client(
             base_directory=base_directory,
             workspace_root=workspace_root,
