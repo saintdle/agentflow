@@ -176,12 +176,20 @@ def _safe_expiry(value: float | None) -> float | None:
 
 def _existing_ancestor(path: Path) -> Path:
     current = path
-    while not current.exists() and not current.is_symlink():
+    while True:
+        try:
+            current.lstat()
+            return current
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ActionGrantError(
+                "could not determine protected grant storage filesystem identity"
+            ) from exc
         parent = current.parent
         if parent == current:
             raise ActionGrantError("protected grant storage has no existing ancestor")
         current = parent
-    return current
 
 
 def _reject_symlink_ancestors(path: Path) -> None:
@@ -191,6 +199,33 @@ def _reject_symlink_ancestors(path: Path) -> None:
             raise ActionGrantError("protected grant storage must not use a symlink")
         if current.parent == current:
             return
+        current = current.parent
+
+
+def _is_within_filesystem_root(path: Path, root: Path) -> bool:
+    """Check lexical and existing filesystem ancestry for a bound root.
+
+    ``Path.relative_to`` alone misses a differently-cased path on a
+    case-insensitive filesystem. Walk existing ancestors and compare their
+    filesystem identities with the canonical root before creating anything.
+    """
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        pass
+
+    current = _existing_ancestor(path)
+    while True:
+        try:
+            if current.samefile(root):
+                return True
+        except OSError as exc:
+            raise ActionGrantError(
+                "could not determine protected grant storage filesystem identity"
+            ) from exc
+        if current.parent == current:
+            return False
         current = current.parent
 
 
@@ -306,14 +341,11 @@ class ActionGrantStore:
             raise ActionGrantError("protected grant store requires a bound worker root")
         for root in roots:
             for protected_path in (self.path, self.lock_path):
-                try:
-                    protected_path.relative_to(root)
-                except ValueError:
-                    continue
-                raise ActionGrantError(
-                    "protected grant store and lock must be outside the worker workspace "
-                    "and every bound worktree root"
-                )
+                if _is_within_filesystem_root(protected_path, root):
+                    raise ActionGrantError(
+                        "protected grant store and lock must be outside the worker workspace "
+                        "and every bound worktree root"
+                    )
         if self.path.is_symlink() or self.lock_path.is_symlink():
             raise ActionGrantError("protected grant store must not use a symlink")
         if create_directory:
@@ -493,6 +525,35 @@ class ActionGrantStore:
         )
         return payload
 
+    def _validated_document_roots(
+        self,
+        document: Mapping[str, Any],
+        *,
+        bound_roots: Iterable[Path],
+    ) -> tuple[tuple[Path, ...], list[dict[str, Any]]]:
+        roots = list(bound_roots)
+        payloads: list[dict[str, Any]] = []
+        for grant_id, raw in document["grants"].items():
+            payload = self._validated_payload(grant_id, raw)
+            payloads.append(payload)
+            roots.append(Path(payload["worktree_root"]))
+        unique_roots = tuple(dict.fromkeys(roots))
+        self._validate_store_location(create_directory=False, bound_roots=unique_roots)
+        return unique_roots, payloads
+
+    def _preflight_roots(
+        self,
+        *,
+        required: bool,
+        bound_roots: Iterable[Path],
+    ) -> tuple[Path, ...]:
+        """Authenticate persisted roots and check them before a lock can be made."""
+        roots = tuple(dict.fromkeys((self.workspace, *bound_roots)))
+        self._validate_store_location(create_directory=False, bound_roots=roots)
+        document = self._read(required=required)
+        roots, _ = self._validated_document_roots(document, bound_roots=roots)
+        return roots
+
     def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Sign and atomically retain one exact scope grant.
 
@@ -504,13 +565,16 @@ class ActionGrantStore:
         scope = self._scope(request)
         payload = {"schema": GRANT_SCHEMA, "grant_id": secrets.token_hex(24), **scope}
         payload["hmac"] = _mac(self._secret, payload)
+        roots = self._preflight_roots(
+            required=False,
+            bound_roots=(Path(scope["worktree_root"]),),
+        )
         with self._locked(
             create_directory=True,
-            bound_roots=(self.workspace, Path(scope["worktree_root"])),
+            bound_roots=roots,
         ):
             document = self._read(required=False)
-            for grant_id, raw in document["grants"].items():
-                self._validated_payload(grant_id, raw)
+            self._validated_document_roots(document, bound_roots=roots)
             document["grants"][payload["grant_id"]] = payload
             self._write(document)
         return self._summary(scope)
@@ -526,14 +590,18 @@ class ActionGrantStore:
         """
 
         scope = self._scope(request)
+        roots = self._preflight_roots(
+            required=True,
+            bound_roots=(Path(scope["worktree_root"]),),
+        )
         with self._locked(
             create_directory=False,
-            bound_roots=(self.workspace, Path(scope["worktree_root"])),
+            bound_roots=roots,
         ):
             document = self._read(required=True)
+            _, payloads = self._validated_document_roots(document, bound_roots=roots)
             matches: list[dict[str, Any]] = []
-            for grant_id, raw in document["grants"].items():
-                payload = self._validated_payload(grant_id, raw)
+            for payload in payloads:
                 if all(
                     payload.get(key) == value
                     for key, value in scope.items()
@@ -560,10 +628,9 @@ class ActionGrantStore:
         """Return availability without granting authority or exposing secrets."""
 
         try:
-            with self._locked(create_directory=False, bound_roots=(self.workspace,)):
-                document = self._read(required=True)
-                for grant_id, raw in document["grants"].items():
-                    self._validated_payload(grant_id, raw)
+            self._validate_store_location(create_directory=False, bound_roots=(self.workspace,))
+            document = self._read(required=True)
+            self._validated_document_roots(document, bound_roots=(self.workspace,))
         except ActionGrantError as exc:
             return ActionGrantStoreStatus(mode="unavailable", available=False, reason=str(exc))
         return ActionGrantStoreStatus(mode="protected", available=True)

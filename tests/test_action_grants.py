@@ -226,8 +226,44 @@ class ActionGrantStoreTests(unittest.TestCase):
         unsafe_path.write_bytes(self.store_path.read_bytes())
         os.chmod(unsafe_path, 0o600)
         self.assertEqual(unsafe_store.status().mode, "unavailable")
+        self.assertFalse(unsafe_store.lock_path.exists())
         with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
             unsafe_store.require(request)
+
+    def test_existing_signed_roots_are_checked_before_issue_or_require_locks(self) -> None:
+        approved = self.base / "previously-approved-worktree"
+        approved.mkdir()
+        safe_store = self.store()
+        safe_store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
+
+        unsafe_path = approved / "controller-state" / "action-grants.json"
+        unsafe_path.parent.mkdir(mode=0o700)
+        unsafe_path.write_bytes(self.store_path.read_bytes())
+        os.chmod(unsafe_path, 0o600)
+        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
+        unrelated_request = self.request(paths=("workspace-result.txt",))
+        original = unsafe_path.read_bytes()
+
+        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+            unsafe_store.issue(unrelated_request)
+        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+            unsafe_store.require(unrelated_request)
+        self.assertFalse(unsafe_store.lock_path.exists())
+        self.assertEqual(unsafe_path.read_bytes(), original)
+
+    def test_case_insensitive_worktree_alias_is_rejected_before_creation(self) -> None:
+        approved = self.base / "approved-worktree"
+        approved.mkdir()
+        case_alias = self.base / "APPROVED-WORKTREE"
+        if not case_alias.exists() or not approved.samefile(case_alias):
+            self.skipTest("temporary filesystem is case sensitive")
+
+        unsafe_path = case_alias / "controller-state" / "action-grants.json"
+        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
+        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+            unsafe_store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
+        self.assertFalse(unsafe_path.parent.exists())
+        self.assertFalse(unsafe_store.lock_path.exists())
 
     def test_worktree_root_and_declared_paths_reject_symlinks_and_lexical_aliases(self) -> None:
         store = self.store()
