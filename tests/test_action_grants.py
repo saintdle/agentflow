@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -79,6 +80,72 @@ class ActionGrantStoreTests(unittest.TestCase):
         legacy = legacy_action_status()
         self.assertEqual(legacy.mode, "legacy")
         self.assertFalse(legacy.available)
+
+    def test_status_accepts_an_absent_lock_without_creating_it(self) -> None:
+        store = self.store()
+        request = self.request()
+        store.issue(request)
+        store.lock_path.unlink()
+
+        status = store.status()
+
+        self.assertEqual(status.mode, "protected")
+        self.assertTrue(status.available)
+        self.assertFalse(store.lock_path.exists())
+        store.require(request)
+        self.assertTrue(store.lock_path.exists())
+
+    def test_status_rejects_lock_directory_and_unsafe_permissions_read_only(self) -> None:
+        store = self.store()
+        request = self.request()
+        store.issue(request)
+        lock_path = store.lock_path
+        lock_path.unlink()
+        lock_path.mkdir(mode=0o700)
+        directory_mode = stat.S_IMODE(lock_path.stat().st_mode)
+
+        status = store.status()
+        self.assertEqual(status.mode, "unavailable")
+        self.assertFalse(status.available)
+        self.assertTrue(lock_path.is_dir())
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), directory_mode)
+        with self.assertRaisesRegex(ActionGrantError, "not a regular file"):
+            store.require(request)
+        self.assertTrue(lock_path.is_dir())
+
+        lock_path.rmdir()
+        lock_path.write_text("", encoding="utf-8")
+        os.chmod(lock_path, 0o644)
+        original_mode = stat.S_IMODE(lock_path.stat().st_mode)
+        status = store.status()
+        self.assertEqual(status.mode, "unavailable")
+        self.assertIn("permissions", status.reason)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), original_mode)
+        with self.assertRaisesRegex(ActionGrantError, "permissions"):
+            store.require(request)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), original_mode)
+
+    def test_status_rejects_lock_owned_by_another_user_without_mutating_it(self) -> None:
+        store = self.store()
+        store.issue(self.request())
+        lock_path = store.lock_path
+        original_bytes = lock_path.read_bytes()
+        path_class = type(lock_path)
+        original_lstat = path_class.lstat
+
+        def foreign_owner(path):
+            info = original_lstat(path)
+            if path == lock_path:
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=info.st_uid + 1)
+            return info
+
+        with mock.patch.object(path_class, "lstat", autospec=True, side_effect=foreign_owner):
+            status = store.status()
+
+        self.assertEqual(status.mode, "unavailable")
+        self.assertIn("owned", status.reason)
+        self.assertEqual(lock_path.read_bytes(), original_bytes)
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
 
     def test_tampered_grant_fails_closed(self) -> None:
         self.store().issue(self.request())

@@ -367,8 +367,24 @@ class ActionGrantStore:
                         "protected grant store and lock must be outside the worker workspace "
                         "and every bound worktree root"
                     )
-        if self.path.is_symlink() or self.lock_path.is_symlink():
+        if self.path.is_symlink():
             raise ActionGrantError("protected grant store must not use a symlink")
+        try:
+            lock_info = self.lock_path.lstat()
+        except FileNotFoundError:
+            lock_info = None
+        except OSError as exc:
+            raise ActionGrantError("protected grant store lock cannot be inspected") from exc
+        if lock_info is not None:
+            if stat.S_ISLNK(lock_info.st_mode):
+                raise ActionGrantError("protected grant store lock must not use a symlink")
+            if not stat.S_ISREG(lock_info.st_mode):
+                raise ActionGrantError("protected grant store lock is not a regular file")
+            if os.name == "posix":
+                if lock_info.st_uid != os.geteuid():
+                    raise ActionGrantError("protected grant store lock must be owned by this user")
+                if (lock_info.st_mode & 0o777) != 0o600:
+                    raise ActionGrantError("protected grant store lock permissions must be 0600")
         if create_directory:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _reject_symlink_ancestors(self.path.parent)
