@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import io
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -148,6 +150,89 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-1200:])
         self.assertEqual(result.stdout.strip(), "1.0.17:1.0.93:3:v1.0.93:github-copilot-1.0.93-darwin-arm64.tgz")
 
+    def test_pinned_sdk_routes_token_only_through_session_rpc(self) -> None:
+        try:
+            from copilot import CopilotClient, RuntimeConnection
+            import copilot.client as sdk_client_module
+        except ImportError:
+            self.skipTest("installed Copilot SDK is not present in this interpreter")
+
+        placeholder = "fixture-placeholder-only-never-a-real-credential"
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "private-home"
+            home.mkdir(mode=0o700)
+            runtime = Path(raw) / "copilot-runtime"
+            runtime.write_bytes(b"fixture runtime path; never executed")
+            runtime.chmod(0o700)
+            connection = RuntimeConnection.for_stdio(path=str(runtime))
+            connection.env = {
+                "HOME": str(home), "COPILOT_HOME": str(home), "PATH": os.defpath,
+                "COPILOT_PLUGIN_DIR_ONLY": "true",
+            }
+            client = CopilotClient(
+                connection=connection, mode="empty", base_directory=str(home),
+                working_directory=str(home), use_logged_in_user=False,
+                enable_remote_sessions=False, builtin_plugin_directories=[],
+            )
+            self.assertIsNone(client._options.github_token)
+            rpc_payloads = []
+            self_outer = self
+
+            class RPC:
+                async def request(self, method, payload, on_response_inline=None):
+                    self_outer.assertEqual(method, "session.create")
+                    rpc_payloads.append(dict(payload))
+                    response = {"sessionId": payload["sessionId"], "capabilities": {}}
+                    if on_response_inline is not None:
+                        on_response_inline(response)
+                    return response
+
+            client._client = RPC()
+
+            async def no_post_create_patch(*_args, **_kwargs):
+                return None
+
+            client._apply_post_create_options_patch = no_post_create_patch
+            logger = logging.getLogger("copilot.client")
+            previous_level = logger.level
+            capture = io.StringIO()
+            handler = logging.StreamHandler(capture)
+            logger.addHandler(handler)
+            logger.setLevel(logging.DEBUG)
+            try:
+                with (
+                    mock.patch.dict(os.environ, {
+                        "COPILOT_SDK_AUTH_TOKEN": placeholder,
+                        "GITHUB_TOKEN": placeholder,
+                    }),
+                    mock.patch.object(sdk_client_module.subprocess, "Popen") as popen,
+                ):
+                    popen.return_value = SimpleNamespace(pid=321)
+                    asyncio.run(client._start_cli_server())
+                    call = popen.call_args
+                    argv = call.args[0]
+                    child_env = call.kwargs["env"]
+                    self.assertNotIn(placeholder, repr(argv))
+                    self.assertNotIn(placeholder, repr(child_env))
+                    self.assertNotIn("COPILOT_SDK_AUTH_TOKEN", child_env)
+                    asyncio.run(client.create_session(
+                        model="claude-sonnet-4.6", tools=[], available_tools=[],
+                        mcp_servers={}, custom_agents=[], enable_config_discovery=False,
+                        skip_custom_instructions=True, enable_on_demand_instruction_discovery=False,
+                        enable_file_hooks=False, enable_host_git_operations=False,
+                        enable_session_store=False, enable_skills=False,
+                        included_builtin_skills=[], github_token=placeholder,
+                    ))
+                self.assertEqual(rpc_payloads[0].get("gitHubToken"), placeholder)
+                self.assertNotIn(placeholder, capture.getvalue())
+                on_disk = b"".join(
+                    path.read_bytes() for path in Path(raw).rglob("*") if path.is_file()
+                )
+                self.assertNotIn(placeholder.encode(), on_disk)
+            finally:
+                logger.removeHandler(handler)
+                logger.setLevel(previous_level)
+
     def test_runtime_status_api_release_and_protocol_are_pinned_independently(self) -> None:
         class Client:
             def __init__(self, version: str, protocol: int):
@@ -246,7 +331,6 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                             prepared = copilot_sdk.create_proof_client(
                                 base_directory=home,
                                 workspace_root=workspace,
-                                github_token="ephemeral-test-credential",
                             )
             client = prepared.client
             self.assertIs(client.kwargs["connection"], RuntimeConnection.connection)
@@ -260,7 +344,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             self.assertEqual(client.kwargs["mode"], "empty")
             self.assertEqual(client.kwargs["base_directory"], str(home.resolve()))
             self.assertEqual(client.kwargs["working_directory"], str(home.resolve()))
-            self.assertEqual(client.kwargs["github_token"], "ephemeral-test-credential")
+            self.assertNotIn("github_token", client.kwargs)
             self.assertFalse(client.kwargs["use_logged_in_user"])
             self.assertEqual(client.kwargs["builtin_plugin_directories"], [])
             self.assertNotIn("env", client.kwargs)
@@ -367,6 +451,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
         self.assertTrue(report.verified)
         self.assertFalse(report.persistent_admission)
         self.assertEqual(client.session.inventory_calls, 2)
+        self.assertEqual(client.session_config["github_token"], "ephemeral-test-credential")
         self.assertEqual(client.session_config["available_tools"], [])
         self.assertEqual(client.session_config["tools"], [])
         self.assertEqual(client.session_config["mcp_servers"], {})
@@ -401,14 +486,12 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                             copilot_sdk.create_proof_client(
                                 base_directory=workspace / ".copilot",
                                 workspace_root=workspace,
-                                github_token="ephemeral-test-credential",
                             )
                     with mock.patch.dict("os.environ", {"COPILOT_CLI_PATH": "/tmp/unpinned-copilot"}):
                         with self.assertRaises(copilot_sdk.CopilotSDKError):
                             copilot_sdk.create_proof_client(
                                 base_directory=parent / "private-home",
                                 workspace_root=workspace,
-                                github_token="ephemeral-test-credential",
                             )
 
 

@@ -126,6 +126,7 @@ async def _run(args: argparse.Namespace) -> int:
         raise CopilotSDKError("identity fields are accepted only when preparing a new manifest")
     context = load_authenticated_proof_manifest(
         args.manifest, workspace_root=args.workspace_root, workflow_root=args.workflow_root,
+        verify_only=args.verify_only,
     )
     if args.verify_only:
         continuity = CopilotControllerContinuity(context, readonly=True)

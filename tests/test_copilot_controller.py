@@ -7,6 +7,8 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -321,6 +323,70 @@ class CopilotControllerContinuityTests(unittest.TestCase):
                 self.issue()
         self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
 
+    def test_source_fingerprint_binds_installed_authority_and_runner_without_git(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            package = root / "site-packages" / "agentflow"
+            package.mkdir(parents=True)
+            runner = root / "bin" / "copilot_proof_runner.py"
+            runner.parent.mkdir()
+            for relative in (
+                "src/agentflow/copilot_controller.py", "src/agentflow/copilot_sdk.py",
+                "src/agentflow/cli.py", "src/agentflow/controller.py",
+                "src/agentflow/checkpoint.py", "src/agentflow/execution_limits.py",
+                "scripts/copilot_proof_runner.py",
+            ):
+                filename = Path(relative).name
+                destination = runner if filename == "copilot_proof_runner.py" else package / filename
+                source = Path(__file__).resolve().parents[1] / relative
+                destination.write_bytes(source.read_bytes())
+            with (
+                mock.patch.object(copilot_controller, "__file__", str(package / "copilot_controller.py")),
+                mock.patch.dict(sys.modules, {"copilot_proof_runner": SimpleNamespace(__file__=str(runner))}),
+            ):
+                before = copilot_controller._source_fingerprint()
+                with (package / "cli.py").open("ab") as handle:
+                    handle.write(b"\n# trusted controller helper changed\n")
+                after = copilot_controller._source_fingerprint()
+            self.assertIsNone(before["source_sha"])
+            self.assertEqual(before["artifact_kind"], "installed_runner")
+            self.assertIn("runner/copilot_proof_runner.py", before["module_sha256"])
+            self.assertNotEqual(before["module_sha256"]["agentflow/cli.py"],
+                                after["module_sha256"]["agentflow/cli.py"])
+            self.assertNotEqual(before, after)
+
+    def test_lease_cannot_rotate_between_reservation_and_manifest_commit(self) -> None:
+        self.write_review_attestation()
+        original_reserve = cli._reserve_execution_attempt
+        started = threading.Event()
+        rotated = threading.Event()
+        state = {"manifest_committed_before_rotation": False}
+
+        def rotate_after_release() -> None:
+            started.set()
+            replacement = RootController(
+                str(self.workspace), self.controller_id, state_path=self.state_path,
+                checkpoint_path=self.state_path.with_name("checkpoint.json"),
+                owner_id="concurrent-reattach",
+            )
+            replacement.acquire(resume_proof=self.lease.resume_secret)
+            state["manifest_committed_before_rotation"] = self.manifest_path.exists()
+            rotated.set()
+
+        def reserve_while_fenced(*args, **kwargs):
+            worker = threading.Thread(target=rotate_after_release, daemon=True)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            time.sleep(0.03)
+            self.assertFalse(rotated.is_set())
+            result = original_reserve(*args, **kwargs)
+            return result
+
+        with mock.patch.object(cli, "_reserve_execution_attempt", side_effect=reserve_while_fenced):
+            self.issue()
+        self.assertTrue(rotated.wait(3), "concurrent lease rotation did not resume after manifest commit")
+        self.assertTrue(state["manifest_committed_before_rotation"])
+
     def test_review_issuer_rejects_incompatible_active_or_draining_controller_state(self) -> None:
         self.review_judgements()
         self.root_controller.reserve_active_task({
@@ -396,10 +462,25 @@ class CopilotControllerContinuityTests(unittest.TestCase):
         self.assertEqual(row["attempt"], 1)
 
     def test_expired_first_deadline_fails_before_any_proof_startup(self) -> None:
-        self.issue()
-        with mock.patch("agentflow.copilot_controller.time.time", return_value=self.context().deadline_epoch + 1):
+        issued = self.issue()
+        self.complete_proof()
+        expired_now = issued.deadline_epoch + 1
+        with mock.patch("agentflow.copilot_controller.time.time", return_value=expired_now):
             with self.assertRaises(copilot_sdk.CopilotSDKError):
                 self.context()
+        expired_run = SimpleNamespace(
+            prepare_manifest=False, verify_only=False, workspace_root=self.workspace,
+            workflow_root=self.workflow_root, manifest=self.manifest_path,
+            task_id=None, claim_id=None, launch_id=None, role=None, model=None,
+            effort=None, review_attestation=None, credential_fd=None,
+        )
+        with (
+            mock.patch("agentflow.copilot_controller.time.time", return_value=expired_now),
+            mock.patch.object(copilot_proof_runner, "_provider_credential", side_effect=AssertionError("prompt")),
+            mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=AssertionError("SDK startup")),
+        ):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                asyncio.run(copilot_proof_runner._run(expired_run))
         with mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=AssertionError("SDK startup")):
             with mock.patch.object(copilot_proof_runner, "_provider_credential", side_effect=AssertionError("prompt")):
                 args = SimpleNamespace(
@@ -408,9 +489,63 @@ class CopilotControllerContinuityTests(unittest.TestCase):
                     task_id=None, claim_id=None, launch_id=None, role=None, model=None,
                     effort=None, review_attestation=None, credential_fd=None,
                 )
-                with mock.patch("agentflow.copilot_controller.time.time", return_value=self.context().deadline_epoch + 1):
-                    with self.assertRaises(copilot_sdk.CopilotSDKError):
-                        asyncio.run(copilot_proof_runner._run(args))
+                ledger_path = cli._execution_limit_ledger_path(self.workspace, self.workflow_root)
+                before = ledger_path.read_bytes()
+                with mock.patch("agentflow.copilot_controller.time.time", return_value=expired_now):
+                    self.assertEqual(asyncio.run(copilot_proof_runner._run(args)), 0)
+                self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_provider_startup_rechecks_claim_after_credential_read(self) -> None:
+        self.issue()
+        original_unused = copilot_controller.SQLiteCopilotControllerStore.assert_unused
+        state = {"checks": 0, "rotated": False, "started": False}
+
+        def rotate_on_second_check(store):
+            original_unused(store)
+            state["checks"] += 1
+            if state["checks"] == 2:
+                replacement = RootController(
+                    str(self.workspace), self.controller_id, state_path=self.state_path,
+                    checkpoint_path=self.state_path.with_name("checkpoint.json"),
+                    owner_id="reattached-before-sdk",
+                )
+                replacement.acquire(resume_proof=self.lease.resume_secret)
+                state["rotated"] = True
+
+        async def observe_open(**_kwargs):
+            state["started"] = True
+            raise copilot_sdk.CopilotSDKError("fixture must never start SDK")
+
+        args = SimpleNamespace(
+            prepare_manifest=False, verify_only=False, workspace_root=self.workspace,
+            workflow_root=self.workflow_root, manifest=self.manifest_path,
+            task_id=None, claim_id=None, launch_id=None, role=None, model=None,
+            effort=None, review_attestation=None, credential_fd=None,
+        )
+        with (
+            mock.patch.object(copilot_controller.SQLiteCopilotControllerStore, "assert_unused", rotate_on_second_check),
+            mock.patch.object(copilot_proof_runner, "_provider_credential", return_value="fixture-placeholder"),
+            mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=observe_open),
+        ):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                asyncio.run(copilot_proof_runner._run(args))
+        self.assertTrue(state["rotated"])
+        self.assertFalse(state["started"])
+        ledger = json.loads(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).read_text())
+        self.assertEqual(next(iter(ledger["entries"].values()))["attempt"], 1)
+
+    def test_removed_claim_never_reaches_sdk_startup(self) -> None:
+        self.issue()
+        continuity = self.continuity()
+        self.root_controller.complete_active_task(self.task_id, lease=self.lease)
+        with mock.patch.object(
+            copilot_sdk.CopilotProofRun, "open", side_effect=AssertionError("stale claim reached SDK"),
+        ):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                asyncio.run(continuity.run_proof(
+                    base_directory=self.private_state / "fixture-home",
+                    github_token="fixture-placeholder",
+                ))
 
     def test_storage_symlink_case_alias_and_other_workspace_are_rejected(self) -> None:
         self.issue()

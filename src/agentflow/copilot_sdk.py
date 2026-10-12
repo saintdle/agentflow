@@ -739,16 +739,13 @@ def _remaining(deadline: float) -> float:
 
 
 def create_proof_client(
-    *, base_directory: Path, workspace_root: Path, github_token: str,
+    *, base_directory: Path, workspace_root: Path,
 ) -> _PreparedProofClient:
     """Create a managed, pinned SDK client with no ambient tools or plugins.
 
-    The caller obtains ``github_token`` from an already-authorized source and
-    passes it in memory. This function never writes it to the environment or
-    the proof ledger.
+    Authentication is supplied later to the pinned SDK's per-session RPC
+    field. The client constructor never receives a provider credential.
     """
-    if not isinstance(github_token, str) or not github_token:
-        raise CopilotSDKError("an existing Copilot-compatible credential is required")
     configured = [name for name in _RUNTIME_OVERRIDES if os.environ.get(name)]
     if configured:
         raise CopilotSDKError("Copilot proof cannot use a runtime override")
@@ -766,7 +763,6 @@ def create_proof_client(
             mode="empty",
             base_directory=str(private_home),
             working_directory=str(private_home),
-            github_token=github_token,
             use_logged_in_user=False,
             enable_remote_sessions=False,
             builtin_plugin_directories=[],
@@ -1124,6 +1120,8 @@ class CopilotProofRun:
         """Start a fresh managed session and attach before any model request."""
         if not isinstance(protected_ledger, ProtectedCopilotLedger):
             raise CopilotSDKError("Copilot proof run requires a protected controller ledger")
+        if not isinstance(github_token, str) or not github_token:
+            raise CopilotSDKError("an existing Copilot-compatible credential is required")
         if protected_ledger.identity != identity:
             raise CopilotSDKError("Copilot protected ledger belongs to another launch")
         remaining = MAX_PROOF_SECONDS
@@ -1137,7 +1135,6 @@ class CopilotProofRun:
         prepared = create_proof_client(
             base_directory=base_directory,
             workspace_root=workspace_root,
-            github_token=github_token,
         )
         client = prepared.client
         collector = CopilotUsageCollector(
@@ -1170,6 +1167,7 @@ class CopilotProofRun:
                     enable_skills=False,
                     included_builtin_skills=[],
                     on_permission_request=collector.deny_permission,
+                    github_token=github_token,
                 ),
                 timeout=_remaining(deadline),
             )
