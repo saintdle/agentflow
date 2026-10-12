@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from agentflow import cli, copilot_sdk, copilot_controller
 from agentflow.controller import RootController
 from agentflow.copilot_controller import (
+    CopilotReviewJudgement,
     CopilotControllerContinuity,
+    issue_copilot_review_attestation,
     issue_copilot_proof_manifest,
     load_authenticated_proof_manifest,
 )
@@ -65,32 +67,38 @@ class CopilotControllerContinuityTests(unittest.TestCase):
         os.chmod(self.manifest_dir, 0o700)
         self.manifest_path = self.manifest_dir / "copilot-proof.json"
         self.review_path = self.manifest_dir / "accepted-review.json"
+        self.review_artifacts = (self.manifest_dir / "review-one.md", self.manifest_dir / "review-two.md")
+
+    def review_judgements(self):
+        review_bytes = (b"fixture artifact one", b"fixture artifact two")
+        for path, payload in zip(self.review_artifacts, review_bytes):
+            path.write_bytes(payload)
+            os.chmod(path, 0o600)
+        return (
+            CopilotReviewJudgement("reviewer-one", self.review_artifacts[0], hashlib.sha256(review_bytes[0]).hexdigest(), "accepted"),
+            CopilotReviewJudgement("reviewer-two", self.review_artifacts[1], hashlib.sha256(review_bytes[1]).hexdigest(), "accepted"),
+        )
 
     def write_review_attestation(self):
-        authority = copilot_controller._load_controller_authority(self.workspace, self.workflow_root)
-        claim = dict(copilot_controller._active_claim(authority, self.task_id, self.claim_id))
-        identity = copilot_sdk.CopilotLaunchIdentity(
-            workflow_root=self.workflow_root, task_id=self.task_id, claim_id=self.claim_id,
-            lease_epoch=authority.lease.epoch, continuity_id=authority.lease.continuity_id,
-            launch_id="launch-112-proof", role="proof", requested_model="claude-sonnet-4.6", effort="low",
-        )
-        source = copilot_controller._source_fingerprint()
-        document = {
-            "schema": copilot_controller._REVIEW_SCHEMA,
-            "workspace_root": str(self.workspace), "workflow_root": self.workflow_root,
-            "identity": identity.to_dict(),
-            "task_claim_sha256": hashlib.sha256(copilot_controller._canonical(claim)).hexdigest(),
-            "source": source,
-            "preflight_sha256": copilot_controller._preflight_digest(authority, identity, claim, source),
-            "reviews": [
-                {"reviewer": "reviewer-one", "artifact_sha256": "a" * 64, "disposition": "accepted"},
-                {"reviewer": "reviewer-two", "artifact_sha256": "b" * 64, "disposition": "accepted"},
-            ],
-            "authority_key_id": hashlib.sha256(authority.authority_secret.encode()).hexdigest()[:24],
+        return self.attest(path=self.review_path)
+
+    def attest(self, **overrides):
+        values = {
+            "path": self.review_path,
+            "workspace_root": self.workspace,
+            "workflow_root": self.workflow_root,
+            "task_id": self.task_id,
+            "claim_id": self.claim_id,
+            "launch_id": "launch-112-proof",
+            "role": "proof",
+            "requested_model": "claude-sonnet-4.6",
+            "effort": "low",
+            "resume_proof": self.credentials["resume_secret"],
+            "accepted_by": self.controller_id,
+            "reviews": self.review_judgements(),
         }
-        document["attestation_hmac"] = copilot_controller._review_mac(authority.authority_secret, document)
-        self.review_path.write_text(json.dumps(document), encoding="utf-8")
-        os.chmod(self.review_path, 0o400)
+        values.update(overrides)
+        return issue_copilot_review_attestation(**values)
 
     def issue(self, **overrides):
         if not self.review_path.exists():
@@ -223,10 +231,131 @@ class CopilotControllerContinuityTests(unittest.TestCase):
         document["reviews"][0]["disposition"] = "rejected"
         os.chmod(self.review_path, 0o600)
         self.review_path.write_text(json.dumps(document), encoding="utf-8")
-        os.chmod(self.review_path, 0o400)
+        os.chmod(self.review_path, 0o600)
         with self.assertRaises(copilot_sdk.CopilotSDKError):
             self.issue()
         self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+
+    def test_controller_review_issuer_is_write_once_private_and_reserves_nothing(self) -> None:
+        ledger_path = cli._execution_limit_ledger_path(self.workspace, self.workflow_root)
+        with mock.patch.object(copilot_proof_runner, "_provider_credential", side_effect=AssertionError("prompt")):
+            with mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=AssertionError("SDK startup")):
+                issued = self.write_review_attestation()
+        self.assertEqual(issued, self.review_path)
+        self.assertEqual(self.review_path.stat().st_mode & 0o777, 0o600)
+        document = json.loads(self.review_path.read_text(encoding="utf-8"))
+        self.assertEqual([row["disposition"] for row in document["reviews"]], ["accepted", "accepted"])
+        self.assertEqual(len({row["reviewer"] for row in document["reviews"]}), 2)
+        self.assertEqual(len({row["artifact_sha256"] for row in document["reviews"]}), 2)
+        self.assertFalse(ledger_path.exists())
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.write_review_attestation()
+        self.assertFalse(ledger_path.exists())
+
+    def test_controller_review_issuer_rejects_wrong_resume_identity_disposition_and_digest(self) -> None:
+        reviews = self.review_judgements()
+        bad_cases = (
+            {"resume_proof": "not-the-canonical-resume-proof"},
+            {"accepted_by": "different-controller"},
+            {"claim_id": "wrong-claim"},
+            {"reviews": (reviews[0], CopilotReviewJudgement(
+                reviews[1].reviewer, reviews[1].artifact_path, reviews[1].artifact_sha256, "rejected",
+            ))},
+            {"reviews": (reviews[0], CopilotReviewJudgement(
+                reviews[0].reviewer, reviews[1].artifact_path, reviews[1].artifact_sha256, "accepted",
+            ))},
+            {"reviews": (reviews[0], CopilotReviewJudgement(
+                reviews[1].reviewer, reviews[1].artifact_path, "f" * 64, "accepted",
+            ))},
+        )
+        for index, case in enumerate(bad_cases):
+            output = self.manifest_dir / f"rejected-{index}.json"
+            arguments = {"path": output, "reviews": reviews}
+            arguments.update(case)
+            with self.subTest(case=index), self.assertRaises(copilot_sdk.CopilotSDKError):
+                self.attest(**arguments)
+            self.assertFalse(output.exists())
+        alternate_state = self.root / "untrusted-state"
+        alternate_state.mkdir(mode=0o700)
+        os.chmod(alternate_state, 0o700)
+        alternate_output = self.manifest_dir / "wrong-key-origin.json"
+        with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(alternate_state)}):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                self.attest(path=alternate_output, reviews=reviews)
+        self.assertFalse(alternate_output.exists())
+        self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+
+    def test_controller_review_issuer_rejects_unsafe_and_existing_output_without_changes(self) -> None:
+        self.review_judgements()
+        inside_workspace = self.workspace / "review-attestation.json"
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest(path=inside_workspace)
+        existing = self.manifest_dir / "existing.json"
+        existing.write_bytes(b"preserve these bytes")
+        os.chmod(existing, 0o600)
+        before = existing.read_bytes()
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest(path=existing)
+        self.assertEqual(existing.read_bytes(), before)
+        alias = self.manifest_dir / "alias.json"
+        alias.symlink_to(existing)
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest(path=alias)
+        self.assertEqual(existing.read_bytes(), before)
+
+    def test_review_artifact_change_and_source_drift_reject_before_reservation(self) -> None:
+        self.write_review_attestation()
+        self.review_artifacts[0].write_bytes(b"changed after review")
+        os.chmod(self.review_artifacts[0], 0o600)
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.issue()
+        self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+        self.review_path.unlink()
+        self.review_artifacts[0].write_bytes(b"fixture artifact one")
+        os.chmod(self.review_artifacts[0], 0o600)
+        self.write_review_attestation()
+        original = copilot_controller._source_fingerprint()
+        drifted = {**original, "module_sha256": {**original["module_sha256"], "copilot_sdk.py": "f" * 64}}
+        with mock.patch("agentflow.copilot_controller._source_fingerprint", return_value=drifted):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                self.issue()
+        self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+
+    def test_review_issuer_rejects_incompatible_active_or_draining_controller_state(self) -> None:
+        self.review_judgements()
+        self.root_controller.reserve_active_task({
+            "task": "agentflow-k6x.113", "root": str(self.workspace),
+            "actor": self.controller_id, "claim_id": "claim-113", "phase": "fix",
+        }, lease=self.lease)
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest()
+        self.assertFalse(self.review_path.exists())
+        self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+
+    def test_review_issuer_rejects_draining_root_without_writes(self) -> None:
+        self.review_judgements()
+        checkpoint_path = self.state_path.with_name("checkpoint.json")
+        self.root_controller.begin_draining("fixture drain", lease=self.lease)
+        before = checkpoint_path.read_bytes()
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest()
+        self.assertFalse(self.review_path.exists())
+        self.assertEqual(checkpoint_path.read_bytes(), before)
+        self.assertFalse(cli._execution_limit_ledger_path(self.workspace, self.workflow_root).exists())
+
+    def test_review_issuer_rejects_invalid_global_budget_snapshot_without_changes(self) -> None:
+        self.review_judgements()
+        ledger_path = cli._execution_limit_ledger_path(self.workspace, self.workflow_root)
+        ledger_path.write_text(json.dumps({
+            "schema": "agentflow.execution-limit-ledger@1", "entries": {"other-task": {"attempt": 1}},
+        }), encoding="utf-8")
+        os.chmod(ledger_path, 0o600)
+        before = ledger_path.read_bytes()
+        output_before = self.review_path.exists()
+        with self.assertRaises(copilot_sdk.CopilotSDKError):
+            self.attest()
+        self.assertEqual(ledger_path.read_bytes(), before)
+        self.assertEqual(self.review_path.exists(), output_before)
 
     def test_lease_epoch_change_invalidates_manifest(self) -> None:
         self.issue()
