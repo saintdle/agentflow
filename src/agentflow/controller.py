@@ -2477,8 +2477,9 @@ class RootController:
             document = self._load_checkpoint()
             rows = _active_tasks_from_checkpoint(document, self.root)
             marker = f"expired bound execution launch {launch_id} for {task_id}"
+            admission_phase = checkpoint.admission_phase(document)
             already_retired = (
-                checkpoint.admission_phase(document) == "terminal"
+                admission_phase == "terminal"
                 and checkpoint.resume_state(document) == "blocked"
                 and document.get("terminal") is True
                 and document.get("root") == self.root
@@ -2494,7 +2495,7 @@ class RootController:
                 return self._result(document, resumed=True)
 
             active = (
-                checkpoint.admission_phase(document) == "open"
+                admission_phase in {"open", "draining"}
                 and document.get("terminal") is False
                 and document.get("root") == self.root
                 and document.get("controller") == self.controller
@@ -2522,6 +2523,11 @@ class RootController:
                 raise ControllerError(
                     "checkpoint is not the exact current single bound-task reservation"
                 )
+            expiration_reason = (
+                f"USER_ACTION_REQUIRED: task {task_id} reached its signed execution deadline "
+                "with no authenticated result; its exact Herdr pane is absent"
+            )
+            drain_reason = str(document.get("terminal_reason") or "").strip()
             document.update({
                 "task": self.root,
                 "phase": "controller",
@@ -2536,8 +2542,8 @@ class RootController:
                 "status": "blocked",
                 "terminal": True,
                 "terminal_reason": (
-                    f"USER_ACTION_REQUIRED: task {task_id} reached its signed execution deadline "
-                    "with no authenticated result; its exact Herdr pane is absent"
+                    drain_reason if admission_phase == "draining" and drain_reason
+                    else expiration_reason
                 ),
                 "active_tasks": [],
                 "last_check": marker,

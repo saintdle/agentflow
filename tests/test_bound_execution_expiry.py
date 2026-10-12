@@ -85,6 +85,95 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertEqual(controller.active_tasks(), [])
             self.assertIsNone(cli._expire_bound_execution_if_due(args, controller, fixture.root, lease))
 
+    def test_due_absent_pane_expires_the_exact_bound_task_while_draining(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            controller.migrate_active_tasks(lease=lease)
+            draining = controller.begin_draining("existing owned diagnostic drain", lease=lease)
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                result = cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result.terminal)
+            self.assertEqual(
+                result.checkpoint["terminal_reason"], draining.checkpoint["terminal_reason"],
+            )
+            self.assertEqual(
+                result.checkpoint["last_check"],
+                f"expired bound execution launch {record['launch_id']} for {fixture.task_id}",
+            )
+            self.assertEqual(controller.active_tasks(), [])
+            current = cli._herdr_session_record(fixture.root, fixture.task_id)
+            self.assertEqual(current["status"], "expired_execution")
+            self.assertEqual(current["return_channel"]["state"], "revoked")
+            self.assertTrue(cli._authenticated_expired_bound_execution(
+                fixture.root, fixture.workflow_root, fixture.task_id,
+                authority_secret=args._authority_secret,
+            ))
+
+            dispatch = mock.Mock(return_value={"session_id": "unexpected"})
+            resumed = controller.resume(
+                [{"task": "ready-child", "root": fixture.workflow_root, "ready": True}],
+                dispatch=dispatch,
+                lease=lease,
+            )
+            self.assertTrue(resumed.terminal)
+            dispatch.assert_not_called()
+
+    def test_draining_expiry_receipt_replays_after_checkpoint_crash(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            controller.migrate_active_tasks(lease=lease)
+            draining = controller.begin_draining("existing owned diagnostic drain", lease=lease)
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            snapshot = cli._bound_execution_expiry_snapshot(
+                args, controller, fixture.root, fixture.workflow_root, lease, fixture.task_id,
+                authority_secret=args._authority_secret,
+            )
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                # Simulate a crash after signed Herdr/ledger retirement but before the checkpoint halt.
+                cli._commit_expired_bound_execution(
+                    fixture.root, fixture.workflow_root, fixture.task_id, snapshot,
+                    authority_secret=args._authority_secret,
+                )
+                self.assertEqual(len(controller.active_tasks()), 1)
+                result = cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result.terminal)
+            self.assertEqual(
+                result.checkpoint["terminal_reason"], draining.checkpoint["terminal_reason"],
+            )
+            self.assertEqual(controller.active_tasks(), [])
+            current = cli._herdr_session_record(fixture.root, fixture.task_id)
+            self.assertEqual(current["status"], "expired_execution")
+            self.assertEqual(current["return_channel"]["state"], "revoked")
+
+    def test_draining_expiry_rejects_wrong_claim_or_session_without_mutation(self) -> None:
+        for field in ("claim_id", "session_id"):
+            with self.subTest(field=field), self._launched_budgeted_execution() as (
+                fixture, args, controller, lease, record,
+            ):
+                controller.migrate_active_tasks(lease=lease)
+                controller.begin_draining("existing owned diagnostic drain", lease=lease)
+                document = controller._load_checkpoint()
+                document["active_tasks"][0][field] = f"forged-{field}"
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+                before = controller.checkpoint_path.read_bytes()
+                deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+
+                with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                     mock.patch.object(cli, "_require_definitively_absent_herdr_pane"), \
+                     self.assertRaises(ValueError):
+                    cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+
+                self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+                current = cli._herdr_session_record(fixture.root, fixture.task_id)
+                self.assertEqual(current["status"], "launched")
+                self.assertEqual(current["return_channel"]["state"], "issued")
+
     def test_due_bound_expiry_reconciles_exact_pending_identity_before_retiring(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             checkpoint = controller._load_checkpoint()

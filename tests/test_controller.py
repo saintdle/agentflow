@@ -170,6 +170,49 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(checkpoint.admission_phase(result.checkpoint), "draining")
             dispatch.assert_not_called()
 
+    def test_bound_expiry_rejects_nonexact_draining_reservations_without_checkpoint_change(self) -> None:
+        for case in ("wrong-claim", "wrong-session", "stale-lease", "sibling"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                state = base / "controller.json"
+                cp = base / "checkpoint.json"
+                controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+                lease = controller.acquire()
+                controller.reserve_active_task(
+                    {"task": "task-1", "root": "root", "actor": "one", "claim_id": "claim-1"},
+                    lease=lease,
+                )
+                controller.bind_active_task("task-1", session_id="session-1", lease=lease)
+                controller.begin_draining("existing owned diagnostic drain", lease=lease)
+                if case in {"wrong-claim", "wrong-session", "sibling"}:
+                    document = controller._load_checkpoint()
+                    if case == "wrong-claim":
+                        document["active_tasks"][0]["claim_id"] = "foreign-claim"
+                    elif case == "wrong-session":
+                        document["active_tasks"][0]["session_id"] = "foreign-session"
+                    else:
+                        document["active_tasks"].append({
+                            "task": "task-2", "phase": "dispatch", "actor": "one",
+                            "claim_id": "claim-2", "session_id": "session-2", "state": "running",
+                        })
+                    checkpoint.write_checkpoint(cp, document)
+                elif case == "stale-lease":
+                    replacement = RootController("root", "one", state_path=state, checkpoint_path=cp)
+                    replacement.acquire(resume_proof=lease.resume_secret)
+
+                before = cp.read_bytes()
+                commit_expiration = mock.Mock()
+                with self.assertRaises(ControllerError):
+                    controller.expire_bound_execution_task(
+                        "task-1", "claim-1", "launch-1", "session-1",
+                        commit_expiration=commit_expiration, lease=lease,
+                    )
+
+                self.assertEqual(cp.read_bytes(), before)
+                commit_expiration.assert_not_called()
+                if case == "sibling":
+                    self.assertEqual([row["task"] for row in controller.active_tasks()], ["task-1", "task-2"])
+
     def test_deadline_does_not_reopen_terminal_checkpoint(self) -> None:
         for state in ("completed", "blocked"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
