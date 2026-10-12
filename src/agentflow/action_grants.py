@@ -53,8 +53,10 @@ class AuthenticatedGrantAuthority:
     ``authority_secret`` is intentionally accepted only as an opaque signing
     secret.  Constructing this value proves nothing by itself: callers must
     authenticate it against the canonical external controller credential
-    before calling this module, and must retain their controller fence across
-    the later dispatch/claim operation.
+    and derive ``bound_worktree_roots`` from the protected controller registry
+    before calling this module. The registry roots are frozen here so grant
+    documents cannot expand the storage boundary. Callers must retain their
+    controller fence across the later dispatch/claim operation.
     """
 
     workspace_root: Path | str
@@ -62,6 +64,20 @@ class AuthenticatedGrantAuthority:
     controller_id: str
     continuity_id: str
     authority_secret: str | bytes
+    bound_worktree_roots: tuple[Path | str, ...] = ()
+
+    def __post_init__(self) -> None:
+        roots = self.bound_worktree_roots
+        if isinstance(roots, (str, Path)):
+            roots = (roots,)
+        else:
+            try:
+                roots = tuple(roots)
+            except TypeError as exc:
+                raise ActionGrantError("trusted worktree roots must be an iterable") from exc
+        if not all(isinstance(root, (str, Path)) for root in roots):
+            raise ActionGrantError("trusted worktree roots must be path strings or Path values")
+        object.__setattr__(self, "bound_worktree_roots", roots)
 
 
 @dataclass(frozen=True)
@@ -314,6 +330,15 @@ class ActionGrantStore:
         if any(part in {".", ".."} for part in self.path.parts):
             raise ActionGrantError("protected grant store path must not contain aliases")
         self.workspace = _canonical_workspace(authority.workspace_root)
+        trusted_roots = [self.workspace]
+        for raw_root in authority.bound_worktree_roots:
+            try:
+                root = _canonical_worktree(self.workspace, raw_root)
+            except (TypeError, ValueError, ActionGrantError) as exc:
+                raise ActionGrantError("trusted worktree root is unavailable or noncanonical") from exc
+            if root not in trusted_roots:
+                trusted_roots.append(root)
+        self._trusted_roots = tuple(trusted_roots)
         self.workflow_root = _safe_identity(authority.workflow_root, "workflow root")
         self.controller_id = _safe_identity(authority.controller_id, "controller identity")
         self.continuity_id = _safe_identity(authority.continuity_id, "controller continuity")
@@ -323,7 +348,7 @@ class ActionGrantStore:
         if not isinstance(secret, bytes) or not secret:
             raise ActionGrantError("authenticated controller authority is required")
         self._secret = secret
-        self._validate_store_location(create_directory=False, bound_roots=(self.workspace,))
+        self._validate_store_location(create_directory=False)
 
     @property
     def lock_path(self) -> Path:
@@ -333,13 +358,9 @@ class ActionGrantStore:
         self,
         *,
         create_directory: bool,
-        bound_roots: Iterable[Path],
     ) -> None:
         _reject_symlink_ancestors(self.path.parent)
-        roots = tuple(bound_roots)
-        if not roots:
-            raise ActionGrantError("protected grant store requires a bound worker root")
-        for root in roots:
+        for root in self._trusted_roots:
             for protected_path in (self.path, self.lock_path):
                 if _is_within_filesystem_root(protected_path, root):
                     raise ActionGrantError(
@@ -372,9 +393,8 @@ class ActionGrantStore:
                     raise ActionGrantError("protected grant store file permissions must be 0600")
 
     @contextmanager
-    def _locked(self, *, create_directory: bool, bound_roots: Iterable[Path]) -> Iterator[None]:
-        roots = tuple(bound_roots)
-        self._validate_store_location(create_directory=create_directory, bound_roots=roots)
+    def _locked(self, *, create_directory: bool) -> Iterator[None]:
+        self._validate_store_location(create_directory=create_directory)
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -387,7 +407,7 @@ class ActionGrantStore:
             with os.fdopen(descriptor, "a", encoding="utf-8", closefd=True) as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 try:
-                    self._validate_store_location(create_directory=False, bound_roots=roots)
+                    self._validate_store_location(create_directory=False)
                     yield
                 finally:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -450,6 +470,10 @@ class ActionGrantStore:
 
     def _scope(self, request: ActionGrantRequest) -> dict[str, Any]:
         worktree_root = _canonical_worktree(self.workspace, request.worktree_root)
+        if worktree_root not in self._trusted_roots:
+            raise ActionGrantDenied(
+                "worktree root is not registered in authenticated controller authority"
+            )
         return {
             "workspace_root": str(self.workspace),
             "workflow_root": self.workflow_root,
@@ -519,40 +543,8 @@ class ActionGrantStore:
             or payload.get("continuity_id") != self.continuity_id
         ):
             raise ActionGrantDenied("protected action grant belongs to a different controller scope")
-        self._validate_store_location(
-            create_directory=False,
-            bound_roots=(self.workspace, Path(canonical["worktree_root"])),
-        )
+        self._validate_store_location(create_directory=False)
         return payload
-
-    def _validated_document_roots(
-        self,
-        document: Mapping[str, Any],
-        *,
-        bound_roots: Iterable[Path],
-    ) -> tuple[tuple[Path, ...], list[dict[str, Any]]]:
-        roots = list(bound_roots)
-        payloads: list[dict[str, Any]] = []
-        for grant_id, raw in document["grants"].items():
-            payload = self._validated_payload(grant_id, raw)
-            payloads.append(payload)
-            roots.append(Path(payload["worktree_root"]))
-        unique_roots = tuple(dict.fromkeys(roots))
-        self._validate_store_location(create_directory=False, bound_roots=unique_roots)
-        return unique_roots, payloads
-
-    def _preflight_roots(
-        self,
-        *,
-        required: bool,
-        bound_roots: Iterable[Path],
-    ) -> tuple[Path, ...]:
-        """Authenticate persisted roots and check them before a lock can be made."""
-        roots = tuple(dict.fromkeys((self.workspace, *bound_roots)))
-        self._validate_store_location(create_directory=False, bound_roots=roots)
-        document = self._read(required=required)
-        roots, _ = self._validated_document_roots(document, bound_roots=roots)
-        return roots
 
     def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Sign and atomically retain one exact scope grant.
@@ -565,16 +557,10 @@ class ActionGrantStore:
         scope = self._scope(request)
         payload = {"schema": GRANT_SCHEMA, "grant_id": secrets.token_hex(24), **scope}
         payload["hmac"] = _mac(self._secret, payload)
-        roots = self._preflight_roots(
-            required=False,
-            bound_roots=(Path(scope["worktree_root"]),),
-        )
-        with self._locked(
-            create_directory=True,
-            bound_roots=roots,
-        ):
+        with self._locked(create_directory=True):
             document = self._read(required=False)
-            self._validated_document_roots(document, bound_roots=roots)
+            for grant_id, raw in document["grants"].items():
+                self._validated_payload(grant_id, raw)
             document["grants"][payload["grant_id"]] = payload
             self._write(document)
         return self._summary(scope)
@@ -590,18 +576,11 @@ class ActionGrantStore:
         """
 
         scope = self._scope(request)
-        roots = self._preflight_roots(
-            required=True,
-            bound_roots=(Path(scope["worktree_root"]),),
-        )
-        with self._locked(
-            create_directory=False,
-            bound_roots=roots,
-        ):
+        with self._locked(create_directory=False):
             document = self._read(required=True)
-            _, payloads = self._validated_document_roots(document, bound_roots=roots)
             matches: list[dict[str, Any]] = []
-            for payload in payloads:
+            for grant_id, raw in document["grants"].items():
+                payload = self._validated_payload(grant_id, raw)
                 if all(
                     payload.get(key) == value
                     for key, value in scope.items()
@@ -628,9 +607,10 @@ class ActionGrantStore:
         """Return availability without granting authority or exposing secrets."""
 
         try:
-            self._validate_store_location(create_directory=False, bound_roots=(self.workspace,))
+            self._validate_store_location(create_directory=False)
             document = self._read(required=True)
-            self._validated_document_roots(document, bound_roots=(self.workspace,))
+            for grant_id, raw in document["grants"].items():
+                self._validated_payload(grant_id, raw)
         except ActionGrantError as exc:
             return ActionGrantStoreStatus(mode="unavailable", available=False, reason=str(exc))
         return ActionGrantStoreStatus(mode="protected", available=True)

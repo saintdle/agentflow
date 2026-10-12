@@ -29,16 +29,20 @@ class ActionGrantStoreTests(unittest.TestCase):
         self.workspace = self.base / "workspace"
         self.workspace.mkdir()
         self.store_path = self.base / "controller-state" / "action-grants.json"
-        self.authority = AuthenticatedGrantAuthority(
+        self.authority = self.authority_with_roots()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def authority_with_roots(self, *roots) -> AuthenticatedGrantAuthority:
+        return AuthenticatedGrantAuthority(
             workspace_root=self.workspace,
             workflow_root="workflow-root",
             controller_id="controller-1",
             continuity_id="continuity-1",
             authority_secret="authenticated-controller-key",
+            bound_worktree_roots=roots,
         )
-
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
 
     def store(self, authority=None) -> ActionGrantStore:
         return ActionGrantStore(self.store_path, authority or self.authority)
@@ -143,8 +147,8 @@ class ActionGrantStoreTests(unittest.TestCase):
         failures = []
 
         @contextmanager
-        def delayed_lock(*, create_directory, bound_roots):
-            with original_locked(create_directory=create_directory, bound_roots=bound_roots):
+        def delayed_lock(*, create_directory):
+            with original_locked(create_directory=create_directory):
                 entered_lock.set()
                 if not release_lock.wait(timeout=5):
                     raise TimeoutError("test did not release the grant lock")
@@ -175,7 +179,7 @@ class ActionGrantStoreTests(unittest.TestCase):
         unapproved = self.base / "unapproved-worktree"
         approved.mkdir()
         unapproved.mkdir()
-        store = self.store()
+        store = self.store(self.authority_with_roots(approved))
         issued = store.issue(self.request(
             paths=("result.txt",), worktree_root=str(approved),
         ))
@@ -195,61 +199,93 @@ class ActionGrantStoreTests(unittest.TestCase):
 
     def test_external_store_supports_default_and_explicit_worktree_roots(self) -> None:
         approved = self.base / "approved-worktree"
+        second = self.base / "second-approved-worktree"
         approved.mkdir()
-        store = self.store()
+        second.mkdir()
+        authority = self.authority_with_roots(approved, second)
+        store = self.store(authority)
         store.issue(self.request(paths=("workspace-result.txt",)))
         store.issue(self.request(paths=("worktree-result.txt",), worktree_root=str(approved)))
+        store.issue(self.request(paths=("second-result.txt",), worktree_root=str(second)))
+        reopened = ActionGrantStore(self.store_path, authority)
         self.assertEqual(
-            store.require(self.request(paths=("workspace-result.txt",))).worktree_root,
+            reopened.require(self.request(paths=("workspace-result.txt",))).worktree_root,
             str(self.workspace),
         )
         self.assertEqual(
-            store.require(self.request(
+            reopened.require(self.request(
                 paths=("worktree-result.txt",), worktree_root=str(approved),
             )).worktree_root,
             str(approved),
         )
+        self.assertEqual(
+            reopened.require(self.request(
+                paths=("second-result.txt",), worktree_root=str(second),
+            )).worktree_root,
+            str(second),
+        )
+        self.assertEqual(reopened.status().mode, "protected")
 
     def test_store_inside_explicit_worktree_fails_closed_for_issue_require_and_status(self) -> None:
         approved = self.base / "approved-worktree"
         approved.mkdir()
         request = self.request(paths=("result.txt",), worktree_root=str(approved))
         unsafe_path = approved / "controller-state" / "action-grants.json"
-        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
         with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
-            unsafe_store.issue(request)
-        self.assertFalse(unsafe_path.exists())
+            ActionGrantStore(unsafe_path, self.authority_with_roots(approved))
+        self.assertFalse(unsafe_path.parent.exists())
+        self.assertFalse(unsafe_path.with_name(".action-grants.json.lock").exists())
 
-        safe_store = self.store()
+        safe_store = self.store(self.authority_with_roots(approved))
         safe_store.issue(request)
         unsafe_path.parent.mkdir(mode=0o700)
         unsafe_path.write_bytes(self.store_path.read_bytes())
         os.chmod(unsafe_path, 0o600)
+        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
         self.assertEqual(unsafe_store.status().mode, "unavailable")
         self.assertFalse(unsafe_store.lock_path.exists())
-        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+        with self.assertRaisesRegex(ActionGrantDenied, "not registered"):
             unsafe_store.require(request)
 
-    def test_existing_signed_roots_are_checked_before_issue_or_require_locks(self) -> None:
+    def test_document_swap_locations_inside_trusted_roots_are_denied_prelock(self) -> None:
         approved = self.base / "previously-approved-worktree"
+        second = self.base / "second-approved-worktree"
         approved.mkdir()
-        safe_store = self.store()
-        safe_store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
+        second.mkdir()
+        authority = self.authority_with_roots(approved, second)
+        for root in (approved, second):
+            for operation in ("issue", "require"):
+                unsafe_path = root / operation / "controller-state" / "action-grants.json"
+                lock_path = unsafe_path.with_name(".action-grants.json.lock")
+                with self.subTest(root=root, operation=operation):
+                    with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
+                        ActionGrantStore(unsafe_path, authority)
+                    self.assertFalse(unsafe_path.parent.exists())
+                    self.assertFalse(lock_path.exists())
 
-        unsafe_path = approved / "controller-state" / "action-grants.json"
-        unsafe_path.parent.mkdir(mode=0o700)
-        unsafe_path.write_bytes(self.store_path.read_bytes())
-        os.chmod(unsafe_path, 0o600)
-        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
-        unrelated_request = self.request(paths=("workspace-result.txt",))
-        original = unsafe_path.read_bytes()
+    def test_authority_freezes_registry_roots_and_rejects_unregistered_scope_prelock(self) -> None:
+        approved = self.base / "approved-worktree"
+        unapproved = self.base / "unapproved-worktree"
+        approved.mkdir()
+        unapproved.mkdir()
+        mutable_roots = [approved]
+        authority = AuthenticatedGrantAuthority(
+            workspace_root=self.workspace,
+            workflow_root="workflow-root",
+            controller_id="controller-1",
+            continuity_id="continuity-1",
+            authority_secret="authenticated-controller-key",
+            bound_worktree_roots=mutable_roots,
+        )
+        mutable_roots.append(unapproved)
+        self.assertEqual(authority.bound_worktree_roots, (approved,))
 
-        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
-            unsafe_store.issue(unrelated_request)
-        with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
-            unsafe_store.require(unrelated_request)
-        self.assertFalse(unsafe_store.lock_path.exists())
-        self.assertEqual(unsafe_path.read_bytes(), original)
+        path = self.base / "unregistered-state" / "grants.json"
+        store = ActionGrantStore(path, authority)
+        with self.assertRaisesRegex(ActionGrantDenied, "not registered"):
+            store.issue(self.request(paths=("result.txt",), worktree_root=str(unapproved)))
+        self.assertFalse(path.parent.exists())
+        self.assertFalse(store.lock_path.exists())
 
     def test_case_insensitive_worktree_alias_is_rejected_before_creation(self) -> None:
         approved = self.base / "approved-worktree"
@@ -259,16 +295,15 @@ class ActionGrantStoreTests(unittest.TestCase):
             self.skipTest("temporary filesystem is case sensitive")
 
         unsafe_path = case_alias / "controller-state" / "action-grants.json"
-        unsafe_store = ActionGrantStore(unsafe_path, self.authority)
         with self.assertRaisesRegex(ActionGrantError, "bound worktree root"):
-            unsafe_store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
+            ActionGrantStore(unsafe_path, self.authority_with_roots(approved))
         self.assertFalse(unsafe_path.parent.exists())
-        self.assertFalse(unsafe_store.lock_path.exists())
+        self.assertFalse(unsafe_path.with_name(".action-grants.json.lock").exists())
 
     def test_worktree_root_and_declared_paths_reject_symlinks_and_lexical_aliases(self) -> None:
-        store = self.store()
         approved = self.base / "approved-worktree"
         approved.mkdir()
+        store = self.store(self.authority_with_roots(approved))
         root_alias = self.base / "worktree-alias"
         root_alias.symlink_to(approved, target_is_directory=True)
         with self.assertRaisesRegex(ActionGrantError, "symlink"):
@@ -297,7 +332,7 @@ class ActionGrantStoreTests(unittest.TestCase):
     def test_tampered_stored_worktree_root_fails_closed(self) -> None:
         approved = self.base / "approved-worktree"
         approved.mkdir()
-        store = self.store()
+        store = self.store(self.authority_with_roots(approved))
         store.issue(self.request(paths=("result.txt",), worktree_root=str(approved)))
         value = json.loads(self.store_path.read_text(encoding="utf-8"))
         only = next(iter(value["grants"].values()))
