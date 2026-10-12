@@ -40,6 +40,24 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 record = cli._herdr_session_record(fixture.root, fixture.task_id)
                 yield fixture, args, controller, controller._current_lease(), record
 
+    @contextlib.contextmanager
+    def _expired_draining_execution(self, reason, failed_task=""):
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            controller.migrate_active_tasks(lease=lease)
+            if failed_task:
+                controller.reserve_active_task(
+                    {"id": failed_task, "root": str(fixture.root), "phase": "dispatch"},
+                    lease=lease,
+                )
+            controller.begin_draining(reason, failed_task=failed_task, lease=lease)
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                result = cli._expire_bound_execution_if_due(args, controller, fixture.root, lease)
+            self.assertIsNotNone(result)
+            self.assertTrue(result.terminal)
+            yield fixture, args, controller, lease, record
+
     def test_predeadline_submission_stays_on_normal_ingestion_path(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             channel = record["return_channel"]
@@ -346,3 +364,191 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 fixture.root, fixture.workflow_root, fixture.task_id,
                 authority_secret=args._authority_secret,
             ))
+
+    def test_expired_bound_continuation_rejects_unknown_prior_drain(self) -> None:
+        with self._expired_draining_execution("existing owned diagnostic drain") as (
+            fixture, args, controller, lease, _record,
+        ):
+            ready = {
+                "id": "ready-task", "status": "open", "assignee": "",
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+
+            def get_issue(_root, task_id):
+                return {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                }[task_id]
+
+            def ready_command(_root, *_argv):
+                return subprocess.CompletedProcess([], 0, json.dumps([{"id": ready["id"]}]), "")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(
+                     cli.beads_backend, "root_descendants",
+                     return_value=[fixture.task_issue, ready],
+                 ), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, "prior drain cause",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    )
+
+    def test_expired_bound_continuation_rejects_blocked_native_sibling_without_herdr_record(self) -> None:
+        no_ready_reason = (
+            "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
+            "ready-task (ready-task)"
+        )
+        with self._expired_draining_execution(no_ready_reason, failed_task="native-failure") as (
+            fixture, args, controller, lease, _record,
+        ):
+            ready = {
+                "id": "ready-task", "status": "open", "assignee": "",
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+            blocked = {
+                "id": "native-failure", "status": "blocked", "assignee": fixture.controller,
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+            self.assertIsNone(cli._herdr_session_record(fixture.root, blocked["id"]))
+
+            def get_issue(_root, task_id):
+                return {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                    blocked["id"]: blocked,
+                }[task_id]
+
+            def ready_command(_root, *_argv):
+                return subprocess.CompletedProcess([], 0, json.dumps([{"id": ready["id"]}]), "")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(
+                     cli.beads_backend, "root_descendants",
+                     return_value=[fixture.task_issue, ready, blocked],
+                 ), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, "causal failure task remains unresolved",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    )
+                blocked["status"] = "closed"
+                self.assertEqual(
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    ),
+                    ready["id"],
+                )
+
+    def test_expired_bound_continuation_allows_known_no_ready_cause_with_exact_current_ready(self) -> None:
+        no_ready_reason = (
+            "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
+            "ready-task (ready-task)"
+        )
+        with self._expired_draining_execution(no_ready_reason) as (
+            fixture, args, controller, lease, _record,
+        ):
+            ready = {
+                "id": "ready-task", "status": "open", "assignee": "",
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+            unrelated_blocked = {
+                "id": "foundation-task", "status": "blocked", "assignee": fixture.controller,
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+            self.assertIsNone(cli._herdr_session_record(fixture.root, unrelated_blocked["id"]))
+
+            def get_issue(_root, task_id):
+                return {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                }[task_id]
+
+            def ready_command(_root, *_argv):
+                return subprocess.CompletedProcess([], 0, json.dumps([{"id": ready["id"]}]), "")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(
+                     cli.beads_backend, "root_descendants",
+                     return_value=[fixture.task_issue, ready, unrelated_blocked],
+                 ), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                self.assertEqual(
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    ),
+                    ready["id"],
+                )
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, "stale-ready",
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    )
+
+    def test_expired_bound_continuation_rejects_tampered_signed_prior_cause(self) -> None:
+        no_ready_reason = (
+            "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
+            "ready-task (ready-task)"
+        )
+        with self._expired_draining_execution(no_ready_reason) as (
+            fixture, args, controller, _lease, _record,
+        ):
+            before = controller.checkpoint_path.read_bytes()
+            with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                receipt = state["sessions"][fixture.task_id]["execution_disposition"]
+                self.assertEqual(receipt["prior_controller_state"]["drain_cause"], "no_ready_work")
+                receipt["prior_controller_state"]["drain_cause"] = "none"
+
+            self.assertFalse(cli._authenticated_expired_bound_execution(
+                fixture.root, fixture.workflow_root, fixture.task_id,
+                authority_secret=args._authority_secret,
+            ))
+            self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+
+    def test_expired_bound_continuation_rejects_stale_lease_and_foreign_checkpoint(self) -> None:
+        for case in ("stale-lease", "foreign-root"):
+            with self.subTest(case=case), self._expired_draining_execution(
+                "ordinary open checkpoint",
+            ) as (fixture, args, controller, lease, _record):
+                if case == "stale-lease":
+                    credentials = cli._read_controller_credentials(cli._resume_key_path(args))
+                    replacement = cli.controller_backend.RootController(
+                        controller.root, controller.controller,
+                        state_path=controller.state_path, checkpoint_path=controller.checkpoint_path,
+                    )
+                    replacement.acquire(resume_proof=credentials["resume_secret"])
+                    expected_error = "lease is no longer current"
+                else:
+                    document = controller._load_checkpoint()
+                    document["root"] = str(fixture.root / "foreign-workspace")
+                    cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+                    expected_error = "safely retired preidentity halt"
+
+                ready = {
+                    "id": "ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, expected_error,
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        expected_retirement_kind="expired_execution",
+                    )

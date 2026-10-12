@@ -27,6 +27,56 @@ from agentflow import session_control
 
 
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
+_DRAIN_FAILURE_EVIDENCE_PREFIX = "agentflow.drain-failure-evidence@1:"
+
+
+def draining_failure_tasks(last_check: Any) -> list[str] | None:
+    """Return typed failed-task evidence from a controller-owned drain marker."""
+    if not isinstance(last_check, str) or not last_check.startswith(_DRAIN_FAILURE_EVIDENCE_PREFIX):
+        return None
+    encoded = last_check[len(_DRAIN_FAILURE_EVIDENCE_PREFIX):]
+    try:
+        payload = json.loads(encoded)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"schema", "failed_tasks"}
+        or payload.get("schema") != "agentflow.drain-failure-evidence@1"
+        or not isinstance(payload.get("failed_tasks"), list)
+    ):
+        return None
+    tasks = payload["failed_tasks"]
+    if (
+        not tasks or len(tasks) > checkpoint.MAX_ACTIVE_TASKS
+        or any(not isinstance(task, str) or not task or len(task) > checkpoint.FIELD_MAX for task in tasks)
+        or len(set(tasks)) != len(tasks)
+    ):
+        return None
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if encoded != canonical:
+        return None
+    return list(tasks)
+
+
+def has_draining_failure_marker(last_check: Any) -> bool:
+    return isinstance(last_check, str) and last_check.startswith(_DRAIN_FAILURE_EVIDENCE_PREFIX)
+
+
+def _record_draining_failure_task(document: dict[str, Any], task_id: str) -> None:
+    tasks = draining_failure_tasks(document.get("last_check")) or []
+    if task_id not in tasks:
+        tasks.append(task_id)
+    if len(tasks) > checkpoint.MAX_ACTIVE_TASKS:
+        raise ControllerError("too many causal failure tasks to preserve safely")
+    payload = json.dumps(
+        {"schema": "agentflow.drain-failure-evidence@1", "failed_tasks": tasks},
+        sort_keys=True, separators=(",", ":"),
+    )
+    marker = _DRAIN_FAILURE_EVIDENCE_PREFIX + payload
+    if len(marker) > checkpoint.FIELD_MAX:
+        raise ControllerError("causal failure evidence is too large to preserve safely")
+    document["last_check"] = marker
 
 
 class ControllerError(RuntimeError):
@@ -1990,6 +2040,10 @@ class RootController:
             document = self._load_checkpoint()
             rows = _active_tasks_from_checkpoint(document, self.root)
             if failed_task:
+                failed_task = str(failed_task).strip()
+                if not failed_task:
+                    raise ControllerError("causal failed task ID is required")
+                _record_draining_failure_task(document, failed_task)
                 rows = [item for item in rows if item["task"] != failed_task]
             existing = str(document.get("terminal_reason") or "")
             if existing and reason not in existing:

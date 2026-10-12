@@ -2467,6 +2467,16 @@ def _controller_step(
     return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
+_NO_READY_WORK_REASON_PREFIXES = (
+    "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: ",
+    "USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: ",
+)
+
+
+def _recognized_no_ready_work_reason(reason: str) -> bool:
+    return any(reason.startswith(prefix) for prefix in _NO_READY_WORK_REASON_PREFIXES)
+
+
 def _verify_no_ready_ack_candidate(
     root: Path, workflow_root: str,
     controller: controller_backend.RootController,
@@ -2475,10 +2485,7 @@ def _verify_no_ready_ack_candidate(
     """Read-only proof that this same root has ready work and nothing live."""
     document = controller._load_checkpoint()
     reason = str(document.get("terminal_reason") or "")
-    if not (
-        reason.startswith("USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: ")
-        or reason.startswith("USER_ACTION_REQUIRED: nonterminal descendant(s) remain with no ready work: ")
-    ):
+    if not _recognized_no_ready_work_reason(reason):
         raise controller_backend.ControllerError("checkpoint is not a recognized no-ready-work halt")
     if controller.active_tasks():
         raise controller_backend.ControllerError("cannot acknowledge while controller workers remain active")
@@ -2494,7 +2501,8 @@ def _verify_no_ready_ack_candidate(
     descendants = beads_backend.root_descendants(root, workflow_root)
     for descendant in descendants:
         task_id = str(descendant.get("id") or "")
-        if str(descendant.get("status") or "").lower() == "in_progress":
+        descendant_status = str(descendant.get("status") or "").lower()
+        if descendant_status == "in_progress":
             raise controller_backend.ControllerError(
                 "cannot acknowledge while a descendant remains claimed in progress"
             )
@@ -2583,6 +2591,9 @@ def _verify_cancelled_preidentity_continuation(
         raise controller_backend.ControllerError(
             "cancelled-preidentity continuation requires a distinct ready task"
         )
+    current_lease = controller._current_lease()
+    if not controller._lease_matches(current_lease, lease):
+        raise controller_backend.ControllerError("continuation lease is no longer current")
     document = controller._load_checkpoint()
     record = _herdr_session_record(root, cancelled_task)
     bound_expired = bool(
@@ -2635,6 +2646,8 @@ def _verify_cancelled_preidentity_continuation(
         checkpoint_backend.admission_phase(document) != "terminal"
         or checkpoint_backend.resume_state(document) != "blocked"
         or document.get("terminal") is not True
+        or document.get("epoch") != lease.epoch
+        or document.get("lease_token") != lease.token
         or document.get("last_check") != retired_check
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
@@ -2662,6 +2675,36 @@ def _verify_cancelled_preidentity_continuation(
             root, workflow_root, cancelled_task, authority_secret=authority_secret,
         ):
             raise controller_backend.ControllerError("expired task has no authenticated bound execution retirement")
+        execution_disposition = record.get("execution_disposition")
+        prior_controller_state = (
+            execution_disposition.get("prior_controller_state")
+            if isinstance(execution_disposition, Mapping) else None
+        )
+        if not isinstance(prior_controller_state, Mapping):
+            raise controller_backend.ControllerError(
+                "expired task has no authenticated prior controller cause"
+            )
+        prior_phase = str(prior_controller_state.get("admission_phase") or "")
+        prior_cause = str(prior_controller_state.get("drain_cause") or "")
+        prior_reason = str(prior_controller_state.get("terminal_reason") or "")
+        if prior_phase == "draining":
+            failed_tasks = prior_controller_state.get("failed_tasks")
+            if prior_cause == "no_ready_work" and _recognized_no_ready_work_reason(prior_reason):
+                pass
+            elif (
+                prior_cause == "independent_failure"
+                and isinstance(failed_tasks, list) and failed_tasks
+                and all(isinstance(task_id, str) and task_id for task_id in failed_tasks)
+            ):
+                pass
+            else:
+                raise controller_backend.ControllerError(
+                    "expired task cannot clear an unresolved prior drain cause"
+                )
+        elif prior_phase != "open" or prior_cause != "none":
+            raise controller_backend.ControllerError(
+                "expired task has an unknown prior controller cause"
+            )
     elif not _authenticated_cancelled_preidentity(
         root, workflow_root, cancelled_task, authority_secret=authority_secret,
     ):
@@ -2712,6 +2755,22 @@ def _verify_cancelled_preidentity_continuation(
     by_id = {str(row.get("id") or ""): row for row in descendants}
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
+    if bound_expired and isinstance(prior_controller_state, Mapping):
+        prior_failed_tasks = prior_controller_state.get("failed_tasks")
+        if prior_failed_tasks:
+            if not isinstance(prior_failed_tasks, list) or any(
+                not isinstance(task_id, str) or not task_id for task_id in prior_failed_tasks
+            ):
+                raise controller_backend.ControllerError("prior causal failure evidence is malformed")
+            unresolved = [
+                task_id for task_id in prior_failed_tasks
+                if task_id not in by_id
+                or str(by_id[task_id].get("status") or "").lower() not in reconciliation_backend.TERMINAL
+            ]
+            if unresolved:
+                raise controller_backend.ControllerError(
+                    "prior causal failure task remains unresolved: " + ", ".join(unresolved)
+                )
     expected_cancelled_status = "blocked" if legacy_scope else "in_progress"
     if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
@@ -4844,6 +4903,7 @@ _BOUND_EXECUTION_EXPIRY_REASON = (
 
 def _bound_execution_expiry_disposition(
     contract: Mapping[str, Any], binding: Mapping[str, Any], *,
+    prior_controller_state: Mapping[str, Any],
     authority_secret: str,
 ) -> dict[str, Any]:
     value = {
@@ -4867,6 +4927,7 @@ def _bound_execution_expiry_disposition(
         "attempt": contract.get("attempt"),
         "max_attempts": contract.get("max_attempts"),
         "deadline_epoch": contract.get("deadline_epoch"),
+        "prior_controller_state": dict(prior_controller_state),
         "recorded_at": _now(),
         "reason": _BOUND_EXECUTION_EXPIRY_REASON,
         "authority_key_id": _credential_key_id(authority_secret),
@@ -4913,6 +4974,39 @@ def _verify_bound_execution_expiry_disposition(
     }
     if any(value.get(key) != expected_value for key, expected_value in expected.items()):
         raise ValueError("bound execution expiry does not preserve the exact signed identity and budget")
+    prior = value.get("prior_controller_state")
+    if prior is not None:
+        if not isinstance(prior, Mapping) or set(prior) != {
+            "schema", "admission_phase", "drain_cause", "terminal_reason",
+            "last_check", "failed_tasks",
+        } or prior.get("schema") != "agentflow.bound-expiry-prior-controller-state@1":
+            raise ValueError("bound execution expiry prior controller state is malformed")
+        prior_phase = str(prior.get("admission_phase") or "")
+        prior_reason = str(prior.get("terminal_reason") or "")
+        prior_last_check = prior.get("last_check")
+        failed_tasks = prior.get("failed_tasks")
+        parsed_failed_tasks = controller_backend.draining_failure_tasks(prior_last_check)
+        if prior_phase == "open":
+            expected_cause = "none"
+            expected_failed_tasks: list[str] = []
+        elif controller_backend.has_draining_failure_marker(prior_last_check):
+            expected_cause = "independent_failure" if parsed_failed_tasks else "unclassified"
+            expected_failed_tasks = parsed_failed_tasks or []
+        elif _recognized_no_ready_work_reason(prior_reason):
+            expected_cause = "no_ready_work"
+            expected_failed_tasks = []
+        else:
+            expected_cause = "unclassified"
+            expected_failed_tasks = []
+        if (
+            prior_phase not in {"open", "draining"}
+            or prior.get("drain_cause") != expected_cause
+            or failed_tasks != expected_failed_tasks
+            or not isinstance(prior_last_check, str)
+            or len(prior_last_check) > checkpoint_backend.FIELD_MAX
+            or len(prior_reason) > checkpoint_backend.FIELD_MAX
+        ):
+            raise ValueError("bound execution expiry prior controller cause is inconsistent")
     return value
 
 
@@ -4990,6 +5084,7 @@ def _bound_execution_expiry_snapshot(
 ) -> dict[str, Any]:
     document = controller._load_checkpoint()
     rows = controller.active_tasks()
+    admission_phase = checkpoint_backend.admission_phase(document)
     if (
         len(rows) != 1 or rows[0].get("task") != task_id
         or rows[0].get("state") not in {"launched", "running"}
@@ -4998,8 +5093,33 @@ def _bound_execution_expiry_snapshot(
         or document.get("lease_token") != lease.token
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != lease.controller
+        or admission_phase not in {"open", "draining"}
+        or document.get("terminal") is not False
     ):
         raise ValueError("checkpoint is not the exact single current bound execution")
+    prior_reason = str(document.get("terminal_reason") or "")
+    prior_last_check = str(document.get("last_check") or "")
+    failed_tasks = controller_backend.draining_failure_tasks(prior_last_check)
+    if admission_phase == "open":
+        prior_cause = "none"
+        failed_tasks = []
+    elif controller_backend.has_draining_failure_marker(prior_last_check):
+        prior_cause = "independent_failure" if failed_tasks else "unclassified"
+        failed_tasks = failed_tasks or []
+    elif _recognized_no_ready_work_reason(prior_reason):
+        prior_cause = "no_ready_work"
+        failed_tasks = []
+    else:
+        prior_cause = "unclassified"
+        failed_tasks = []
+    prior_controller_state = {
+        "schema": "agentflow.bound-expiry-prior-controller-state@1",
+        "admission_phase": admission_phase,
+        "drain_cause": prior_cause,
+        "terminal_reason": prior_reason,
+        "last_check": prior_last_check,
+        "failed_tasks": failed_tasks,
+    }
     state = _read_json_value(str(controller.state_path))
     stored_lease = controller._read_lease(state) if isinstance(state, Mapping) else None
     if (
@@ -5150,6 +5270,7 @@ def _bound_execution_expiry_snapshot(
     return {
         "contract": dict(contract), "binding": dict(binding), "record": dict(record),
         "deadline_epoch": deadline, "ledger": dict(ledger), "status": status,
+        "prior_controller_state": prior_controller_state,
     }
 
 
@@ -5220,7 +5341,9 @@ def _commit_expired_bound_execution(
         if ledger.get("status") != "expired":
             raise ValueError("protected execution budget did not durably expire")
         disposition = _bound_execution_expiry_disposition(
-            contract, binding, authority_secret=authority_secret,
+            contract, binding,
+            prior_controller_state=snapshot["prior_controller_state"],
+            authority_secret=authority_secret,
         )
         record["status"] = "expired_execution"
         record["execution_disposition"] = disposition
@@ -5399,6 +5522,7 @@ def _expire_bound_execution_if_due(
                 latest.get("contract") != snapshot.get("contract")
                 or latest.get("binding") != snapshot.get("binding")
                 or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+                or latest.get("prior_controller_state") != snapshot.get("prior_controller_state")
             ):
                 raise ValueError("bound execution changed during expiry disposition")
             _commit_expired_bound_execution(
@@ -5494,6 +5618,7 @@ def _expire_bound_execution_if_due(
             latest.get("contract") != snapshot.get("contract")
             or latest.get("binding") != snapshot.get("binding")
             or latest.get("deadline_epoch") != snapshot.get("deadline_epoch")
+            or latest.get("prior_controller_state") != snapshot.get("prior_controller_state")
         ):
             raise ValueError("bound execution changed during expiry disposition")
         _commit_expired_bound_execution(
