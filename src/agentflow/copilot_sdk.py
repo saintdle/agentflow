@@ -11,20 +11,13 @@ import asyncio
 import dataclasses
 import hashlib
 import hmac
-import importlib.abc
-import importlib.machinery
 import importlib.metadata
-import importlib.util
 import json
 import math
 import os
 import sqlite3
 import stat
-import sys
-import threading
 import time
-import types
-from types import MappingProxyType
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -604,332 +597,8 @@ def _field(value: Any, name: str) -> Any:
     return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
 
 
-@dataclasses.dataclass(frozen=True)
-class _SDKExecutedCode:
-    identity_sha256: str
-    source_sha256: str
-    origin: str
-    code: types.CodeType
-    code_ids: frozenset[int]
-    loader: "_VerifiedSDKSourceLoader"
-
-
-_SDK_EXECUTED_MODULES: Mapping[str, _SDKExecutedCode] = MappingProxyType({})
-_SDK_IMPORT_FINDER: "_VerifiedCopilotFinder | None" = None
-_SDK_IMPORT_LOCK = threading.RLock()
-
-
-def _sdk_identity_sha256(identity: Mapping[str, Any]) -> str:
-    return hashlib.sha256(_canonical(identity)).hexdigest()
-
-
-def _verified_source_path(identity: Mapping[str, Any], relative: str) -> Path:
-    root = Path(str(identity.get("package_origin") or "")).resolve(strict=True)
-    hashes = identity.get("source_sha256")
-    if not isinstance(hashes, Mapping) or relative not in hashes:
-        raise CopilotSDKError("Copilot SDK import requested source outside the reviewed package closure")
-    digest = hashes[relative]
-    if (not isinstance(digest, str) or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)):
-        raise CopilotSDKError("reviewed Copilot SDK source digest is malformed")
-    parts = Path(relative).parts
-    if (not parts or parts[0] != "copilot" or Path(relative).is_absolute()
-            or ".." in parts or "\\" in relative):
-        raise CopilotSDKError("reviewed Copilot SDK source path is malformed")
-    path = root.joinpath(*parts[1:])
-    info = path.lstat()
-    if (path.resolve(strict=True) != path or not stat.S_ISREG(info.st_mode)
-            or stat.S_ISLNK(info.st_mode) or root not in path.parents):
-        raise CopilotSDKError("reviewed Copilot SDK source origin is not canonical")
-    return path
-
-
-def _compiled_code_ids(code: types.CodeType) -> frozenset[int]:
-    found: set[int] = set()
-    pending = [code]
-    while pending:
-        current = pending.pop()
-        if id(current) in found:
-            continue
-        found.add(id(current))
-        pending.extend(item for item in current.co_consts if isinstance(item, types.CodeType))
-    return frozenset(found)
-
-
-class _VerifiedSDKSourceLoader(importlib.machinery.SourceFileLoader):
-    """Execute only the precise source bytes accepted by the signed review."""
-
-    def __init__(self, fullname: str, path: Path, identity: Mapping[str, Any], relative: str):
-        super().__init__(fullname, str(path))
-        self.identity_sha256 = _sdk_identity_sha256(identity)
-        self.relative = relative
-        self.source_sha256 = str(identity["source_sha256"][relative])
-
-    def get_code(self, fullname: str) -> types.CodeType:
-        if fullname != self.name:
-            raise CopilotSDKError("Copilot SDK loader was asked to compile another module")
-        path = Path(self.path)
-        if path.resolve(strict=True) != path:
-            raise CopilotSDKError("reviewed Copilot SDK source origin changed before compilation")
-        source = path.read_bytes()
-        digest = hashlib.sha256(source).hexdigest()
-        if digest != self.source_sha256:
-            raise CopilotSDKError("Copilot SDK source bytes changed before controlled import")
-        try:
-            return compile(source, str(path), "exec", dont_inherit=True)
-        except (SyntaxError, ValueError, TypeError) as exc:
-            raise CopilotSDKError("reviewed Copilot SDK source cannot be compiled") from exc
-
-    def exec_module(self, module: types.ModuleType) -> None:
-        code = self.get_code(module.__name__)
-        exec(code, module.__dict__)
-        attestation = _SDKExecutedCode(
-            identity_sha256=self.identity_sha256,
-            source_sha256=self.source_sha256,
-            origin=str(Path(self.path)),
-            code=code,
-            code_ids=_compiled_code_ids(code),
-            loader=self,
-        )
-        global _SDK_EXECUTED_MODULES
-        current = dict(_SDK_EXECUTED_MODULES)
-        current[module.__name__] = attestation
-        _SDK_EXECUTED_MODULES = MappingProxyType(current)
-
-
-def _source_for_sdk_module(
-    fullname: str, identity: Mapping[str, Any],
-) -> tuple[str, Path, bool] | None:
-    if fullname == "copilot":
-        candidates = ("copilot/__init__.py",)
-    else:
-        suffix = fullname.removeprefix("copilot.").replace(".", "/")
-        candidates = (f"copilot/{suffix}.py", f"copilot/{suffix}/__init__.py")
-    hashes = identity.get("source_sha256")
-    if isinstance(hashes, Mapping):
-        for relative in candidates:
-            if relative in hashes:
-                is_package = relative.endswith("/__init__.py") or relative == "copilot/__init__.py"
-                return relative, _verified_source_path(identity, relative), is_package
-    return None
-
-
-class _VerifiedCopilotFinder(importlib.abc.MetaPathFinder):
-    """Keep every SDK import inside the signed source closure."""
-
-    def __init__(self, identity: Mapping[str, Any]):
-        self.identity = dict(identity)
-        self.identity_sha256 = _sdk_identity_sha256(identity)
-        self.hashes = dict(identity["source_sha256"])
-        self.root = Path(str(identity["package_origin"])).resolve(strict=True)
-
-    def find_spec(self, fullname: str, path: Any = None, target: Any = None):
-        if fullname != "copilot" and not fullname.startswith("copilot."):
-            return None
-        source = _source_for_sdk_module(fullname, self.identity)
-        if source is not None:
-            relative, source_path, is_package = source
-            loader = _VerifiedSDKSourceLoader(fullname, source_path, self.identity, relative)
-            locations = [str(source_path.parent)] if is_package else None
-            return importlib.util.spec_from_file_location(
-                fullname, str(source_path), loader=loader,
-                submodule_search_locations=locations,
-            )
-        suffix = "" if fullname == "copilot" else fullname.removeprefix("copilot.").replace(".", "/")
-        relative_directory = "copilot" + (f"/{suffix}" if suffix else "")
-        directory = self.root.joinpath(*Path(relative_directory).parts[1:])
-        prefix = relative_directory.rstrip("/") + "/"
-        if (fullname != "copilot" and directory.is_dir()
-                and directory.resolve(strict=True) == directory
-                and any(name.startswith(prefix) for name in self.hashes)):
-            spec = importlib.machinery.ModuleSpec(fullname, loader=None, is_package=True)
-            spec.submodule_search_locations = [str(directory)]
-            return spec
-        raise ModuleNotFoundError(
-            f"Copilot SDK module {fullname!r} is outside the reviewed executable closure",
-            name=fullname,
-        )
-
-
-def _install_verified_sdk_importer(identity: Mapping[str, Any]) -> None:
-    global _SDK_IMPORT_FINDER
-    with _SDK_IMPORT_LOCK:
-        identity_digest = _sdk_identity_sha256(identity)
-        if _SDK_IMPORT_FINDER is None:
-            _SDK_IMPORT_FINDER = _VerifiedCopilotFinder(identity)
-        elif _SDK_IMPORT_FINDER.identity_sha256 != identity_digest:
-            raise CopilotSDKError("another Copilot SDK identity already controls this process")
-        if _SDK_IMPORT_FINDER in sys.meta_path:
-            sys.meta_path.remove(_SDK_IMPORT_FINDER)
-        sys.meta_path.insert(0, _SDK_IMPORT_FINDER)
-
-
-def _verify_import_finder(identity: Mapping[str, Any], *, required: bool) -> None:
-    finder = _SDK_IMPORT_FINDER
-    if finder is None:
-        if required:
-            raise CopilotSDKError("controlled Copilot SDK source loader is not installed")
-        return
-    if (finder.identity_sha256 != _sdk_identity_sha256(identity)
-            or not sys.meta_path or sys.meta_path[0] is not finder):
-        raise CopilotSDKError("controlled Copilot SDK source loader was replaced or bypassed")
-
-
-def sdk_import_identity_fingerprint(
-    *, require_installed: bool = False, require_clean: bool = False,
-) -> dict[str, Any] | None:
-    """Fingerprint every executable Python file in the installed SDK package.
-
-    Resolve the package with the standard path finder before importing it. This
-    binds the review to the installed wheel tree and makes a script-directory,
-    PYTHONPATH, or preloaded-module shadow fail closed. ``require_clean`` also
-    arms the source-only finder before a later import can consult cached bytecode.
-    """
-    try:
-        distribution = importlib.metadata.distribution("github-copilot-sdk")
-    except importlib.metadata.PackageNotFoundError as exc:
-        if require_installed or any(name == "copilot" or name.startswith("copilot.") for name in sys.modules):
-            raise CopilotSDKError("pinned Copilot SDK distribution is unavailable") from exc
-        return None
-    try:
-        package_path = Path(distribution.locate_file("copilot"))
-        package_root = package_path.resolve(strict=True)
-        if (package_path != package_root or not package_root.is_dir()
-                or package_root.name != "copilot"):
-            raise CopilotSDKError("installed Copilot SDK package origin is not canonical")
-        package_init = package_root / "__init__.py"
-        spec = importlib.machinery.PathFinder.find_spec("copilot", sys.path)
-        if (spec is None or spec.origin is None
-                or Path(spec.origin).resolve(strict=True) != package_init
-                or tuple(Path(path).resolve(strict=True) for path in (spec.submodule_search_locations or ()))
-                != (package_root,)):
-            raise CopilotSDKError("Copilot SDK import would resolve outside its pinned package")
-
-        source_hashes: dict[str, str] = {}
-        for entry in distribution.files or ():
-            parts = Path(str(entry)).parts
-            if len(parts) < 2 or parts[0] != "copilot" or Path(parts[-1]).suffix != ".py":
-                continue
-            relative = "copilot/" + "/".join(parts[1:])
-            expected_path = package_root.joinpath(*parts[1:])
-            path = Path(distribution.locate_file(entry))
-            info = path.lstat()
-            if (path.resolve(strict=True) != expected_path or not stat.S_ISREG(info.st_mode)
-                    or stat.S_ISLNK(info.st_mode)):
-                raise CopilotSDKError("installed Copilot SDK source file is not canonical")
-            source_hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-        required = {
-            "copilot/__init__.py", "copilot/client.py", "copilot/_cli_download.py",
-            "copilot/_cli_version.py", "copilot/_sdk_protocol_version.py",
-            "copilot/_jsonrpc.py", "copilot/rpc.py", "copilot/session.py",
-        }
-        if not required.issubset(source_hashes) or not any(
-            name.startswith("copilot/generated/") for name in source_hashes
-        ):
-            raise CopilotSDKError("installed Copilot SDK executable package closure is incomplete")
-        identity = {
-            "installed_version": distribution.version,
-            "package_origin": str(package_root),
-            "source_sha256": dict(sorted(source_hashes.items())),
-        }
-        _verify_loaded_sdk_modules(identity, require_clean=require_clean)
-        if require_clean:
-            _install_verified_sdk_importer(identity)
-        return identity
-    except CopilotSDKError:
-        raise
-    except (OSError, RuntimeError, ValueError, TypeError) as exc:
-        raise CopilotSDKError("pinned Copilot SDK executable identity is unavailable") from exc
-
-
-def _verify_loaded_sdk_modules(identity: Mapping[str, Any], *, require_clean: bool = False) -> None:
-    root = Path(str(identity.get("package_origin") or ""))
-    hashes = identity.get("source_sha256")
-    if not isinstance(hashes, Mapping):
-        raise CopilotSDKError("reviewed Copilot SDK source identity is malformed")
-    loaded = [
-        (name, module) for name, module in tuple(sys.modules.items())
-        if name == "copilot" or name.startswith("copilot.")
-    ]
-    if require_clean and loaded:
-        raise CopilotSDKError("Copilot SDK modules were loaded before the reviewed import")
-    _verify_import_finder(identity, required=bool(loaded))
-    if type(_SDK_EXECUTED_MODULES) is not type(MappingProxyType({})):
-        raise CopilotSDKError("in-process Copilot SDK code attestations are mutable")
-    identity_digest = _sdk_identity_sha256(identity)
-    for name, module in loaded:
-        if not isinstance(module, types.ModuleType):
-            raise CopilotSDKError("preloaded Copilot SDK module is not an importable module")
-        spec = getattr(module, "__spec__", None)
-        loader = getattr(spec, "loader", None)
-        origin = getattr(spec, "origin", None)
-        module_file = getattr(module, "__file__", None)
-        if (getattr(module, "__name__", None) != name
-                or getattr(spec, "name", None) != name):
-            raise CopilotSDKError("loaded Copilot SDK module identity is inconsistent")
-        if loader is None and origin is None and module_file is None and hasattr(module, "__path__"):
-            suffix = "" if name == "copilot" else name.removeprefix("copilot.").replace(".", "/")
-            relative_directory = "copilot" + (f"/{suffix}" if suffix else "")
-            directory = root.joinpath(*Path(relative_directory).parts[1:])
-            prefix = relative_directory.rstrip("/") + "/"
-            actual_paths = tuple(str(Path(item).resolve(strict=True)) for item in module.__path__)
-            if (name == "copilot" or not directory.is_dir()
-                    or directory.resolve(strict=True) != directory
-                    or actual_paths != (str(directory),)
-                    or not any(item.startswith(prefix) for item in hashes)):
-                raise CopilotSDKError("loaded Copilot SDK namespace package path is unsupported")
-            continue
-        if (type(loader) is not _VerifiedSDKSourceLoader
-                or getattr(module, "__loader__", None) is not loader
-                or not isinstance(origin, str) or not isinstance(module_file, str)):
-            raise CopilotSDKError("loaded Copilot SDK module did not use the controlled source loader")
-        path = Path(origin).resolve(strict=True)
-        if Path(module_file).resolve(strict=True) != path or root not in path.parents:
-            raise CopilotSDKError("loaded Copilot SDK module origin differs from the pinned package")
-        relative = "copilot/" + path.relative_to(root).as_posix()
-        expected_path = _verified_source_path(identity, relative)
-        expected_hash = hashes.get(relative)
-        source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        attestation = _SDK_EXECUTED_MODULES.get(name)
-        if (path != expected_path or not isinstance(expected_hash, str)
-                or source_hash != expected_hash or attestation is None
-                or attestation.identity_sha256 != identity_digest
-                or attestation.source_sha256 != expected_hash
-                or attestation.origin != str(path)
-                or attestation.loader is not loader
-                or loader.identity_sha256 != identity_digest
-                or loader.source_sha256 != expected_hash
-                or loader.relative != relative
-                or attestation.code.co_filename != str(path)
-                or id(attestation.code) not in attestation.code_ids
-                or _compiled_code_ids(attestation.code) != attestation.code_ids):
-            raise CopilotSDKError("loaded Copilot SDK code differs from its immutable source attestation")
-        if hasattr(module, "__path__"):
-            expected_package_path = str(path.parent)
-            actual_paths = tuple(str(Path(item).resolve(strict=True)) for item in module.__path__)
-            if actual_paths != (expected_package_path,):
-                raise CopilotSDKError("loaded Copilot SDK package search path is unsupported")
-
-
-def verify_sdk_import_identity(
-    expected: Mapping[str, Any] | None, *, require_clean: bool = False,
-) -> dict[str, Any]:
-    """Compare current import resolution and loaded SDK code with signed review identity."""
-    if not isinstance(expected, Mapping):
-        raise CopilotSDKError("authenticated review has no pinned Copilot SDK import identity")
-    actual = sdk_import_identity_fingerprint(require_installed=True)
-    if actual != dict(expected):
-        raise CopilotSDKError("loaded Copilot SDK package differs from its reviewed identity")
-    if actual["installed_version"] != SUPPORTED_SDK_VERSION:
-        raise CopilotSDKError("installed Copilot SDK version is unsupported")
-    _verify_loaded_sdk_modules(actual, require_clean=require_clean)
-    return actual
-
-
-def _sdk_components(expected_identity: Mapping[str, Any]) -> tuple[Any, Any, Any]:
-    """Import the reviewed SDK only after checking path and preloaded modules."""
-    verify_sdk_import_identity(expected_identity, require_clean=True)
-    _install_verified_sdk_importer(expected_identity)
+def _sdk_components() -> tuple[Any, Any, Any]:
+    """Import the optional SDK only after this route is explicitly selected."""
     try:
         from copilot import CopilotClient, RuntimeConnection
         from copilot._cli_version import CLI_VERSION
@@ -946,7 +615,6 @@ def _sdk_components(expected_identity: Mapping[str, Any]) -> tuple[Any, Any, Any
         or SDK_PROTOCOL_VERSION != SUPPORTED_RUNTIME_PROTOCOL_VERSION
     ):
         raise CopilotSDKError("installed Copilot SDK or declared CLI release is unsupported")
-    verify_sdk_import_identity(expected_identity)
     return (CopilotClient, RuntimeConnection, PermissionDecisionReject)
 
 
@@ -1071,19 +739,21 @@ def _remaining(deadline: float) -> float:
 
 
 def create_proof_client(
-    *, base_directory: Path, workspace_root: Path, sdk_identity: Mapping[str, Any],
+    *, base_directory: Path, workspace_root: Path, github_token: str,
 ) -> _PreparedProofClient:
     """Create a managed, pinned SDK client with no ambient tools or plugins.
 
-    Authentication is supplied later to the pinned SDK's per-session RPC
-    field. The client constructor never receives a provider credential.
+    The caller obtains ``github_token`` from an already-authorized source and
+    passes it in memory. This function never writes it to the environment or
+    the proof ledger.
     """
+    if not isinstance(github_token, str) or not github_token:
+        raise CopilotSDKError("an existing Copilot-compatible credential is required")
     configured = [name for name in _RUNTIME_OVERRIDES if os.environ.get(name)]
     if configured:
         raise CopilotSDKError("Copilot proof cannot use a runtime override")
-    client_type, connection_type, _reject = _sdk_components(sdk_identity)
+    client_type, connection_type, _reject = _sdk_components()
     runtime_pin = _prepare_runtime_pin()
-    verify_sdk_import_identity(sdk_identity)
     _verify_runtime_pin(runtime_pin)
     private_home = _private_empty_directory(Path(base_directory), Path(workspace_root))
     try:
@@ -1096,11 +766,11 @@ def create_proof_client(
             mode="empty",
             base_directory=str(private_home),
             working_directory=str(private_home),
+            github_token=github_token,
             use_logged_in_user=False,
             enable_remote_sessions=False,
             builtin_plugin_directories=[],
         )
-        verify_sdk_import_identity(sdk_identity)
         return _PreparedProofClient(client=client, runtime_pin=runtime_pin)
     except CopilotSDKError:
         raise
@@ -1449,28 +1119,17 @@ class CopilotProofRun:
         base_directory: Path,
         workspace_root: Path,
         github_token: str,
-        sdk_identity: Mapping[str, Any],
-        deadline_epoch: float | None = None,
     ) -> "CopilotProofRun":
         """Start a fresh managed session and attach before any model request."""
         if not isinstance(protected_ledger, ProtectedCopilotLedger):
             raise CopilotSDKError("Copilot proof run requires a protected controller ledger")
-        if not isinstance(github_token, str) or not github_token:
-            raise CopilotSDKError("an existing Copilot-compatible credential is required")
         if protected_ledger.identity != identity:
             raise CopilotSDKError("Copilot protected ledger belongs to another launch")
-        remaining = MAX_PROOF_SECONDS
-        if deadline_epoch is not None:
-            if isinstance(deadline_epoch, bool) or not isinstance(deadline_epoch, (int, float)):
-                raise CopilotSDKError("Copilot proof deadline is invalid")
-            remaining = min(remaining, float(deadline_epoch) - time.time())
-        if remaining <= 0:
-            raise CopilotSDKError("Copilot proof first-attempt deadline expired; do not retry")
-        deadline = time.monotonic() + remaining
+        deadline = time.monotonic() + MAX_PROOF_SECONDS
         prepared = create_proof_client(
             base_directory=base_directory,
             workspace_root=workspace_root,
-            sdk_identity=sdk_identity,
+            github_token=github_token,
         )
         client = prepared.client
         collector = CopilotUsageCollector(
@@ -1481,7 +1140,6 @@ class CopilotProofRun:
         try:
             collector.record_runtime_pin()
             _verify_runtime_pin(prepared.runtime_pin)
-            verify_sdk_import_identity(sdk_identity)
             await asyncio.wait_for(client.start(), timeout=_remaining(deadline))
             api_release_version, protocol_version = await cls._verify_runtime_status(client, deadline)
             collector.record_runtime_status(api_release_version, protocol_version)
@@ -1504,7 +1162,6 @@ class CopilotProofRun:
                     enable_skills=False,
                     included_builtin_skills=[],
                     on_permission_request=collector.deny_permission,
-                    github_token=github_token,
                 ),
                 timeout=_remaining(deadline),
             )
