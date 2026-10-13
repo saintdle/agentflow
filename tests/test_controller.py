@@ -529,6 +529,118 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(cp.read_bytes(), before_checkpoint)
             self.assertEqual(state_path.read_bytes(), before_state)
 
+    def test_empty_cause_continuations_allow_distinct_retired_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+
+            def retired_checkpoint(task: str, launch: str, ready: str) -> dict[str, Any]:
+                document = controller._load_checkpoint()
+                document.update({
+                    "task": "root", "phase": "controller", "root": "root", "controller": "one",
+                    "actor": "", "claim_id": "", "session_id": "",
+                    "epoch": lease.epoch, "lease_token": lease.token,
+                    "state": "blocked", "status": "blocked", "terminal": True,
+                    "terminal_reason": f"cancelled preidentity launch {launch}",
+                    "last_check": f"cancelled expired preidentity launch {launch} for {task}",
+                    "next_action": "explicitly continue with a distinct ready task",
+                    "active_tasks": [], "drain_causes": [], "pending_continuation_task": "",
+                })
+                checkpoint.write_checkpoint(controller.checkpoint_path, document)
+                return self._resolution_authorization(
+                    controller, lease, "workflow", task, ready,
+                )
+
+            first = retired_checkpoint("old-1", "launch-1", "ready-1")
+            first_checkpoint_digest = first["retired_checkpoint_sha256"]
+            first_context = {
+                "workflow_root": "workflow", "cancelled_task": "old-1", "ready_task": "ready-1",
+            }
+            lease = self._finish_test_continuation(
+                controller, lease, first, "workflow", "old-1", "ready-1",
+            )
+            second = retired_checkpoint("old-2", "launch-2", "ready-2")
+            second_context = {
+                "workflow_root": "workflow", "cancelled_task": "old-2", "ready_task": "ready-2",
+            }
+            self.assertNotEqual(first_checkpoint_digest, second["retired_checkpoint_sha256"])
+            self._finish_test_continuation(
+                controller, lease, second, "workflow", "old-2", "ready-2",
+            )
+
+            audit = controller_module._read_json(controller.state_path)["drain_audit"]
+            self.assertEqual(len(audit), 2)
+            self.assertEqual([entry["cause_ids"] for entry in audit], [[], []])
+            self.assertEqual(
+                [entry["resolution_authorization"]["retired_checkpoint_sha256"] for entry in audit],
+                [first_checkpoint_digest, second["retired_checkpoint_sha256"]],
+            )
+            self.assertEqual(
+                [entry["context"] for entry in audit], [first_context, second_context],
+            )
+
+    def test_empty_cause_archive_retry_is_idempotent_and_same_checkpoint_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+            document = controller._load_checkpoint()
+            document.update({
+                "task": "root", "phase": "controller", "root": "root", "controller": "one",
+                "actor": "", "claim_id": "", "session_id": "",
+                "epoch": lease.epoch, "lease_token": lease.token,
+                "state": "blocked", "status": "blocked", "terminal": True,
+                "terminal_reason": "cancelled preidentity launch launch-1",
+                "last_check": "cancelled expired preidentity launch launch-1 for old-1",
+                "next_action": "explicitly continue with a distinct ready task",
+                "active_tasks": [], "drain_causes": [], "pending_continuation_task": "",
+            })
+            checkpoint.write_checkpoint(controller.checkpoint_path, document)
+            first = self._resolution_authorization(
+                controller, lease, "workflow", "old-1", "ready-1",
+            )
+            first_context = {
+                "workflow_root": "workflow", "cancelled_task": "old-1", "ready_task": "ready-1",
+            }
+
+            def archive(authorization: Mapping[str, Any], context: Mapping[str, str]) -> None:
+                controller._archive_resolved_drain_causes(
+                    controller._load_checkpoint(), lease,
+                    resolution="authenticated_continuation", context=context,
+                    authority_secret=self._authority_secret,
+                    resolution_authorization=authorization,
+                )
+
+            archive(first, first_context)
+            archive(first, first_context)
+            self.assertEqual(len(controller_module._read_json(controller.state_path)["drain_audit"]), 1)
+
+            conflict = self._resolution_authorization(
+                controller, lease, "workflow", "old-1", "other-ready",
+            )
+            conflict_context = {
+                "workflow_root": "workflow", "cancelled_task": "old-1", "ready_task": "other-ready",
+            }
+            state_before_conflict = controller.state_path.read_bytes()
+            with self.assertRaisesRegex(ControllerError, "different resolution intent"):
+                archive(conflict, conflict_context)
+            self.assertEqual(controller.state_path.read_bytes(), state_before_conflict)
+
+            corrupted = controller_module._read_json(controller.state_path)
+            corrupted["drain_audit"][0]["resolution_authorization"][
+                "retired_checkpoint_sha256"
+            ] = "invalid"
+            controller._write_state(corrupted)
+            state_before_invalid_binding = controller.state_path.read_bytes()
+            with self.assertRaises(ControllerError):
+                archive(conflict, conflict_context)
+            self.assertEqual(controller.state_path.read_bytes(), state_before_invalid_binding)
+
     def test_cancelled_preidentity_reopen_archives_and_clears_typed_causes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             controller, lease = self._controller_with_pending_continuation(Path(tmp))

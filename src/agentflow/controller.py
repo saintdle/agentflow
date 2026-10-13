@@ -2415,6 +2415,47 @@ class RootController:
             known_ids.add(expected_id)
             if copied.get("causes_sha256") == identity["causes_sha256"]:
                 if expected_id != audit_id:
+                    if not causes and resolution == "authenticated_continuation":
+                        archived_authorization = copied.get("resolution_authorization")
+                        archived_context = copied.get("context")
+                        if (
+                            copied.get("resolution") != "authenticated_continuation"
+                            or copied.get("cause_ids") != []
+                            or not isinstance(archived_authorization, Mapping)
+                            or not isinstance(archived_context, Mapping)
+                        ):
+                            raise ControllerError(
+                                "empty-cause audit conflict lacks a valid signed retired checkpoint binding"
+                            )
+                        archived_epoch = archived_authorization.get("lease_epoch")
+                        archived_token = archived_authorization.get("lease_token")
+                        validated_archived_authorization = _validate_drain_resolution_authorization(
+                            archived_authorization, authority_secret,
+                            root=self.root, controller=self.controller,
+                            workflow_root=str(archived_context.get("workflow_root", "")),
+                            continuity_id=str(archived_authorization.get("continuity_id", "")),
+                            cancelled_task=str(archived_context.get("cancelled_task", "")),
+                            ready_task=str(archived_context.get("ready_task", "")),
+                            causes=[], current_epoch=archived_epoch, current_token=archived_token,
+                        )
+                        archived_record = dict(copied)
+                        supplied_mac = str(archived_record.pop("authority_hmac", ""))
+                        if not hmac.compare_digest(
+                            supplied_mac,
+                            _authority_mac(
+                                authority_secret, archived_record,
+                                domain="controller-drain-audit-v2",
+                            ),
+                        ):
+                            raise ControllerError(
+                                "empty-cause audit conflict has an invalid signed retired checkpoint binding"
+                            )
+                        if (
+                            validated_archived_authorization["retired_checkpoint_sha256"]
+                            != resolution_authorization["retired_checkpoint_sha256"]
+                        ):
+                            audit.append(copied)
+                            continue
                     raise ControllerError("drain cause set already has a different resolution intent")
                 same_cause_resolution = True
                 if any(copied.get(key) != value for key, value in identity.items()):
