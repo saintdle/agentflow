@@ -2324,7 +2324,7 @@ class RootController:
         or changing the resolution.
         """
         causes = checkpoint._check_drain_causes(document.get("drain_causes"))
-        if not causes:
+        if not causes and resolution != "authenticated_continuation":
             return ""
         if any(cause["kind"] == "unknown" for cause in causes):
             raise ControllerError("cannot archive unresolved or opaque drain causes")
@@ -2627,6 +2627,114 @@ class RootController:
                 "terminal_reason": terminal_reason,
                 "next_action": "drain active task results" if rows else "finalize blocked root after draining",
                 "active_tasks": rows,
+            })
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
+            return self._result(saved, resumed=True)
+
+    def begin_identity_pending_drain(
+        self,
+        task_id: str,
+        claim_id: str,
+        reason: str,
+        *,
+        lease: Lease | str | None = None,
+    ) -> ResumeResult:
+        """Stop admission while retaining one exact unresolved identity reservation."""
+        task_id = str(task_id).strip()
+        claim_id = str(claim_id).strip()
+        reason = str(reason).strip()
+        if not task_id or not claim_id or not reason:
+            raise ControllerError("identity-pending drain requires the exact task, claim, and reason")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            checkpoint._check_drain_causes(document.get("drain_causes"))
+            pointer_is_task = (
+                str(document.get("task") or "") == task_id
+                and document.get("actor") == self.controller
+                and document.get("claim_id") == claim_id
+                and not document.get("session_id")
+            )
+            pointer_is_root = (
+                str(document.get("task") or "") == self.root
+                and not document.get("actor")
+                and not document.get("claim_id")
+                and not document.get("session_id")
+            )
+            if (
+                checkpoint.admission_phase(document) not in {"open", "draining"}
+                or document.get("terminal") is not False
+                or str(document.get("root") or "") != self.root
+                or str(document.get("controller") or "") != self.controller
+                or len(rows) != 1
+                or rows[0].get("task") != task_id
+                or rows[0].get("actor") != self.controller
+                or rows[0].get("claim_id") != claim_id
+                or rows[0].get("state") != "identity_pending"
+                or rows[0].get("session_id")
+                or not (pointer_is_task or pointer_is_root)
+            ):
+                raise ControllerError(
+                    "checkpoint is not the exact single identity-pending reservation"
+                )
+            prior_reason = str(document.get("terminal_reason") or "").strip()
+            terminal_reason = (
+                f"{prior_reason}; {reason}" if prior_reason and reason not in prior_reason
+                else prior_reason or reason
+            )[:checkpoint.FIELD_MAX]
+            document.update({
+                "task": self.root,
+                "phase": "controller",
+                "root": self.root,
+                "controller": self.controller,
+                "actor": "",
+                "claim_id": "",
+                "session_id": "",
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "draining",
+                "status": "draining",
+                "terminal": False,
+                "terminal_reason": terminal_reason,
+                "next_action": "retire identity-pending task only after signed pane-absence proof",
+                "active_tasks": rows,
+            })
+            saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
+            return self._result(saved, resumed=True)
+
+    def finalize_draining(self, reason: str, *, lease: Lease | str | None = None) -> ResumeResult:
+        """Finalize an already recorded drain without creating another cause."""
+        reason = str(reason).strip()
+        if not reason:
+            raise ControllerError("drain finalization reason is required")
+        with self.fence(lease) as current:
+            document = self._load_checkpoint()
+            causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+            rows = _active_tasks_from_checkpoint(document, self.root)
+            if (
+                checkpoint.admission_phase(document) != "draining"
+                or document.get("state") != "draining"
+                or document.get("terminal") is not False
+                or not causes
+                or str(document.get("root") or "") != self.root
+                or str(document.get("controller") or "") != self.controller
+                or str(document.get("task") or "") != self.root
+                or rows or document.get("active_tasks")
+                or document.get("actor") or document.get("claim_id") or document.get("session_id")
+            ):
+                raise ControllerError(
+                    "checkpoint is not an empty drain with a validated recorded cause"
+                )
+            document.update({
+                "root": self.root,
+                "controller": self.controller,
+                "epoch": current.epoch,
+                "lease_token": current.token,
+                "state": "blocked",
+                "status": "blocked",
+                "terminal": True,
+                "terminal_reason": reason,
+                "next_action": "no further scheduling",
             })
             saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
             return self._result(saved, resumed=True)

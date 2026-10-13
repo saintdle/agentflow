@@ -274,6 +274,91 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual([cause["kind"] for cause in causes], sequence)
                 self.assertEqual(len({cause["cause_id"] for cause in causes}), 3)
 
+    def test_identity_pending_drain_retains_exact_task_and_blocks_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": "pending", "root": "root", "actor": "one", "claim_id": "claim-pending",
+            }, lease=lease)
+            controller.bind_active_task(
+                "pending", session_id="", state="identity_pending", lease=lease,
+            )
+            before = controller.checkpoint_path.read_bytes()
+            with self.assertRaisesRegex(ControllerError, "exact single identity-pending"):
+                controller.begin_identity_pending_drain(
+                    "pending", "wrong-claim", "USER_ACTION_REQUIRED: identity unresolved", lease=lease,
+                )
+            self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+
+            draining = controller.begin_identity_pending_drain(
+                "pending", "claim-pending", "USER_ACTION_REQUIRED: identity unresolved", lease=lease,
+            )
+            dispatch = mock.Mock(return_value={"session_id": "unexpected"})
+            resumed = controller.resume(
+                [{"task": "ready-task", "root": "root", "claim_id": "claim-ready"}],
+                dispatch=dispatch, lease=lease,
+            )
+
+            self.assertEqual(draining.state, "draining")
+            self.assertFalse(draining.terminal)
+            self.assertEqual(resumed.state, "draining")
+            self.assertEqual(
+                resumed.checkpoint["active_tasks"],
+                [{
+                    "task": "pending", "phase": "dispatch", "actor": "one",
+                    "claim_id": "claim-pending", "session_id": "", "state": "identity_pending",
+                }],
+            )
+            self.assertEqual(resumed.checkpoint["drain_causes"], [])
+            dispatch.assert_not_called()
+
+    def test_finalize_draining_preserves_the_exact_recorded_cause_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+            started = controller.begin_draining(
+                "authenticated task failure", cause_kind="managed_task_failure",
+                cause_provenance="authenticated_task_outcome",
+                cause_task="failed-task", cause_launch="launch-1", lease=lease,
+            )
+            original = started.checkpoint["drain_causes"]
+
+            finalized = controller.finalize_draining("authenticated task failure", lease=lease)
+
+            self.assertEqual(finalized.state, "blocked")
+            self.assertEqual(finalized.checkpoint["drain_causes"], original)
+
+    def test_generic_halt_appends_unknown_after_an_existing_typed_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+            first = controller.begin_draining(
+                "authenticated task failure", failed_task="failed-task",
+                cause_kind="managed_task_failure",
+                cause_provenance="authenticated_task_outcome",
+                cause_task="failed-task", cause_launch="launch-1", lease=lease,
+            )
+            original_id = first.checkpoint["drain_causes"][0]["cause_id"]
+
+            halted = controller.halt("blocked", "independent generic halt", lease=lease)
+
+            self.assertEqual(
+                [cause["kind"] for cause in halted.checkpoint["drain_causes"]],
+                ["managed_task_failure", "unknown"],
+            )
+            self.assertEqual(halted.checkpoint["drain_causes"][0]["cause_id"], original_id)
+            self.assertNotEqual(halted.checkpoint["drain_causes"][1]["cause_id"], original_id)
+
     def test_draining_cause_overflow_is_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cp = Path(tmp) / "checkpoint.json"

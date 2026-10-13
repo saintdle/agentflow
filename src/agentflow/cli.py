@@ -1797,8 +1797,18 @@ def _controller_step_serial(
                     # stranded, and never a relaunch while the pane may
                     # still be live (the reservation's own collision
                     # check keeps blocking that regardless).
-                    result = controller.halt(
-                        "blocked",
+                    active = controller.active_tasks()
+                    if (
+                        len(active) != 1
+                        or active[0].get("task") != in_flight_task
+                        or active[0].get("state") != "identity_pending"
+                        or active[0].get("session_id")
+                    ):
+                        raise controller_backend.ControllerError(
+                            "identity deadline requires the exact single pending task reservation"
+                        )
+                    result = controller.begin_identity_pending_drain(
+                        in_flight_task, active[0].get("claim_id", ""),
                         f"USER_ACTION_REQUIRED: task {in_flight_task} provider identity never "
                         f"resolved within {deadline_seconds:.0f}s; the Herdr pane may still be "
                         "live -- inspect it directly before any further action, do not relaunch",
@@ -2285,11 +2295,24 @@ def _controller_step_parallel(
                     except ValueError:
                         pass
                 if expired:
-                    note_failure(
-                        task_id,
+                    reason = (
                         f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
-                        f"{deadline_seconds:.0f}s; inspect the live pane before further action",
+                        f"{deadline_seconds:.0f}s; inspect the live pane before further action"
                     )
+                    active_rows = controller.active_tasks()
+                    if (
+                        len(active_rows) == 1
+                        and active_rows[0].get("task") == task_id
+                        and active_rows[0].get("state") == "identity_pending"
+                        and not active_rows[0].get("session_id")
+                    ):
+                        result = controller.begin_identity_pending_drain(
+                            task_id, active_rows[0].get("claim_id", ""), reason, lease=lease,
+                        )
+                        draining = True
+                        drain_reason = str((result.checkpoint or {}).get("terminal_reason") or reason)
+                    else:
+                        note_failure(task_id, reason)
                     continue
 
         _collect_codex_app_server_result(
@@ -2419,8 +2442,8 @@ def _controller_step_parallel(
 
     active = controller.active_tasks()
     if draining and not active:
-        result = controller.halt(
-            "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
+        result = controller.finalize_draining(
+            drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
             lease=lease,
         )
         stop_reason = "USER_ACTION_REQUIRED" if "USER_ACTION_REQUIRED:" in drain_reason else "TASK_BLOCKED"
@@ -2638,8 +2661,8 @@ def _controller_step_parallel(
             response["action_required"] = launch_attention_required
         return response, False
     if draining:
-        result = controller.halt(
-            "blocked", drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
+        result = controller.finalize_draining(
+            drain_reason or "USER_ACTION_REQUIRED: a worker failed during parallel execution",
             lease=lease,
         )
         stop_reason = "USER_ACTION_REQUIRED" if "USER_ACTION_REQUIRED:" in drain_reason else "TASK_BLOCKED"

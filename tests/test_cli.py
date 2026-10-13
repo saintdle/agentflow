@@ -2752,7 +2752,7 @@ def _run_controller_json(func, args) -> dict:
 
 
 def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict, Path, dict]:
-    """Create one real signed identity-pending launch and its halted checkpoint."""
+    """Create one real signed identity-pending launch and its non-admitting drain."""
     fixture = ValidLaunch(base / "workspace", seed_lease=False)
     fixture.task_issue["status"] = "in_progress"
     fixture.task_issue["metadata"]["agentflow"]["launch"]["execution_limits"] = {
@@ -2816,13 +2816,9 @@ def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict,
     controller.bind_active_task(
         fixture.task_id, session_id="", state="identity_pending", lease=fixture.lease,
     )
-    controller.halt(
-        "blocked",
+    controller.begin_identity_pending_drain(
+        fixture.task_id, "claim-1",
         f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within 1800s",
-        drain_cause_kind="managed_task_failure",
-        drain_cause_provenance="signed_negative_retirement",
-        drain_cause_task=fixture.task_id,
-        drain_cause_launch=str(record.get("launch_id") or ""),
         lease=fixture.lease,
     )
     return fixture, controller, contract, ledger_path, {"attempts": attempts, "state_path": state_path}
@@ -3188,6 +3184,14 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 fixture, controller, _contract, _ledger, baseline = _expired_preidentity_fixture(base)
                 fixture.contract = _contract
+                controller.begin_draining(
+                    "independent authenticated prior failure",
+                    cause_kind="managed_task_failure",
+                    cause_provenance="signed_negative_retirement",
+                    cause_task="task-prior-standard",
+                    cause_launch="launch-prior-standard",
+                    lease=fixture.lease,
+                )
                 retired, _probe = self._run_recovery(fixture, self._args(fixture))
                 self.assertTrue(retired["ok"], retired)
                 fixture.task_issue["status"] = "blocked"
@@ -3216,6 +3220,14 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
             base = Path(temporary).resolve()
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                controller.begin_draining(
+                    "independent authenticated prior legacy failure",
+                    cause_kind="managed_task_failure",
+                    cause_provenance="signed_negative_retirement",
+                    cause_task="task-prior-legacy",
+                    cause_launch="launch-prior-legacy",
+                    lease=fixture.lease,
+                )
                 retired, _probe = self._run_recovery(
                     fixture, self._args(fixture), legacy_scope=True,
                 )
@@ -3777,6 +3789,13 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 fixture.contract = contract
                 old_attempts = baseline["attempts"]
                 checkpoint_before_cancel = controller._load_checkpoint()
+                self.assertEqual(checkpoint_before_cancel["state"], "draining")
+                self.assertFalse(checkpoint_before_cancel["terminal"])
+                self.assertEqual(checkpoint_before_cancel["drain_causes"], [])
+                self.assertEqual(
+                    [row["task"] for row in checkpoint_before_cancel["active_tasks"]],
+                    [fixture.task_id],
+                )
                 # Exercise the pre-dormant legacy state: clean release had no
                 # stored proof hash, so recovery must use only the exact
                 # signed launch plus the protected canonical credential.
@@ -3901,6 +3920,35 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(resumed["result"]["checkpoint"]["task"], "task-2")
                 self.assertNotEqual(resumed["result"]["checkpoint"]["task"], fixture.task_id)
                 self.assertEqual(current_lease.continuity_id, resumed["lease"]["continuity_id"])
+
+    def test_identity_drain_preserves_unrelated_unknown_cause_and_blocks_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, _baseline = _expired_preidentity_fixture(base)
+                controller.begin_draining("independent unclassified stop", lease=fixture.lease)
+                original_ids = [
+                    cause["cause_id"] for cause in controller._load_checkpoint()["drain_causes"]
+                ]
+
+                retired, _probe = self._run_recovery(fixture, self._args(fixture))
+
+                self.assertTrue(retired["ok"], retired)
+                checkpoint = controller._load_checkpoint()
+                self.assertEqual(
+                    [cause["cause_id"] for cause in checkpoint["drain_causes"]],
+                    original_ids,
+                )
+                self.assertEqual([cause["kind"] for cause in checkpoint["drain_causes"]], ["unknown"])
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                lease = cli.controller_backend.Lease.from_dict(state["lease"])
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError, "unknown drain cause",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, "distinct-ready",
+                        controller, lease, authority_secret=fixture.authority_secret,
+                    )
 
     def test_recovery_rejects_unknown_panes_missing_ledger_and_wrong_task_binding_without_clearing(self) -> None:
         cases = (
@@ -7391,15 +7439,25 @@ class ControllerRunTests(unittest.TestCase):
                 },
             )
             root_issue = self._issue("wf-root")
-            with mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(root / "state-home")}), \
+                 mock.patch.object(cli.beads_backend, "get_issue", return_value=root_issue), \
                  mock.patch.object(cli, "_provider_command", return_value=None):
                 payload = _run_controller_json(cli.controller_resume, args)
             self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
-            self.assertTrue(payload["result"]["terminal"])
-            self.assertEqual(payload["result"]["state"], "blocked")
+            self.assertFalse(payload["result"]["terminal"])
+            self.assertEqual(payload["result"]["state"], "draining")
+            self.assertEqual(
+                payload["result"]["checkpoint"]["active_tasks"],
+                [{
+                    "task": "task-1", "phase": "dispatch", "actor": "agentflow-controller",
+                    "claim_id": "wf-root/task-1/agentflow-controller", "session_id": "",
+                    "state": "identity_pending",
+                }],
+            )
+            self.assertEqual(payload["result"]["checkpoint"]["drain_causes"], [])
 
-            # The reservation is still identity_pending (nothing cleared,
-            # nothing relaunched); a retry attempt still collides.
+            # The reservation stays durable and non-admitting until signed
+            # absent-pane retirement; no failure cause is invented.
             state = json.loads((root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))
             self.assertEqual(state["sessions"]["task-1"]["status"], "identity_pending")
 
@@ -9522,10 +9580,24 @@ class ControllerParallelDispatchTests(unittest.TestCase):
 
             def session_record(_root, task_id):
                 ids = first_ids if task_id == "task-1" else second_ids
+                launch_id = f"launch-{task_id}"
                 status = "failed" if task_id == "task-1" else "completed" if result_state[task_id] else "launched"
-                return {"status": status, "return_channel": {
-                    "state": "consumed", "acceptance_ids": list(ids), "approved_waivers": [],
-                }}
+                result = (
+                    {"outcome": "failed", "error": failure_reason[task_id]}
+                    if task_id == "task-1" else result_state[task_id]
+                )
+                return {
+                    "status": status,
+                    "task_id": task_id,
+                    "root": str(fixture.root),
+                    "workflow_root": fixture.workflow_root,
+                    "launch_id": launch_id,
+                    "result": result,
+                    "binding": {"task_id": task_id, "root": str(fixture.root), "launch_id": launch_id},
+                    "return_channel": {
+                        "state": "consumed", "acceptance_ids": list(ids), "approved_waivers": [],
+                    },
+                }
 
             def task_result(_root, task_id):
                 if task_id == "task-1":
@@ -9540,6 +9612,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                                    fixture.root_issue if issue_id == fixture.workflow_root else tasks[issue_id]), \
                  mock.patch.object(cli.beads_backend, "root_descendants", return_value=list(tasks.values())), \
                  mock.patch.object(cli, "_herdr_session_record", side_effect=session_record), \
+                 mock.patch.object(cli, "_has_authenticated_causal_herdr_result", return_value=True), \
                  mock.patch.object(cli, "_ingest_submitted_result", return_value=cli._SubmissionIngestion("consumed")), \
                  mock.patch.object(cli, "_herdr_task_result", side_effect=task_result), \
                  mock.patch.object(cli.beads_backend, "add_comment", side_effect=lambda _cwd, task_id, text:
@@ -9580,6 +9653,9 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                 self.assertEqual(resumed_checkpoint["status"], "incomplete")
                 self.assertEqual(resumed_checkpoint["state"], "draining")
 
+                cause_ids_before_finalization = [
+                    cause["cause_id"] for cause in resumed_checkpoint["drain_causes"]
+                ]
                 result_state["task-2"] = {
                     "outcome": "completed",
                     "acceptance_results": [{
@@ -9600,7 +9676,63 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             self.assertIn("failed", final_payload["result"]["checkpoint"]["terminal_reason"])
             self.assertEqual(final_payload["result"]["checkpoint"]["terminal_reason"], first_reason)
             self.assertEqual(final_payload["result"]["checkpoint"]["active_tasks"], [])
+            self.assertEqual(
+                [cause["cause_id"] for cause in final_payload["result"]["checkpoint"]["drain_causes"]],
+                cause_ids_before_finalization,
+            )
+            self.assertNotIn(
+                "unknown", [cause["kind"] for cause in final_payload["result"]["checkpoint"]["drain_causes"]]
+            )
             self.assertEqual(closed, ["task-2"])
+            claim_ready.assert_not_called()
+
+    def test_parallel_identity_deadline_preserves_single_pending_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            task = fixture.task_issue
+            task.update(status="in_progress", assignee=fixture.controller)
+            state_path = fixture.root / ".agentflow/controller/state.json"
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller, state_path=state_path,
+                checkpoint_path=state_path.with_name("checkpoint.json"),
+            )
+            lease = controller.acquire()
+            controller.reserve_active_task({
+                "task": "task-1", "root": str(fixture.root), "actor": fixture.controller,
+                "claim_id": "claim-task-1",
+            }, lease=lease)
+            controller.bind_active_task(
+                "task-1", session_id="", state="identity_pending", lease=lease,
+            )
+            long_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat(timespec="seconds")
+            args = argparse.Namespace(
+                workflow_root=fixture.workflow_root, _authority_secret="test-secret",
+                identity_deadline=0.01,
+            )
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                   fixture.root_issue if issue_id == fixture.workflow_root else task), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task]), \
+                 mock.patch.object(cli.beads_backend, "claim_ready", return_value=None) as claim_ready, \
+                 mock.patch.object(cli, "_herdr_session_record", return_value={
+                     "status": "identity_pending", "identity_pending_since": long_ago,
+                     "pane_id": "pane-pending", "root": str(fixture.root), "task_id": "task-1",
+                 }), \
+                 mock.patch.object(cli, "_resolve_pending_identity"):
+                payload, stop = cli._controller_step_parallel(
+                    args, controller, fixture.root, lease, operation="resume",
+                    policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                )
+
+            self.assertTrue(stop)
+            self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")
+            self.assertFalse(payload["result"]["terminal"])
+            self.assertEqual(payload["result"]["state"], "draining")
+            self.assertEqual(payload["result"]["checkpoint"]["drain_causes"], [])
+            self.assertEqual(
+                [(row["task"], row["claim_id"], row["state"]) for row in controller.active_tasks()],
+                [("task-1", "claim-task-1", "identity_pending")],
+            )
             claim_ready.assert_not_called()
 
     def test_orphaned_launching_record_does_not_become_stuck_identity_pending(self) -> None:
