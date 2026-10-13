@@ -19,7 +19,9 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 import zipfile
+from typing import Any, Mapping
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -50,6 +52,34 @@ def _seed_controller_lease(root: Path, *, controller: str = "agentflow-controlle
     lease = rc.acquire()
     _controller_authority(root, workflow_root, lease)
     return lease
+
+
+def _signed_resolution_authorization(
+    controller, lease, workflow_root: str, cancelled_task: str, ready_task: str,
+    authority_secret: str, *, launch_id: str = "old-launch",
+) -> dict[str, Any]:
+    causes = cli.checkpoint_backend._check_drain_causes(controller._load_checkpoint().get("drain_causes"))
+    payload: dict[str, Any] = {
+        "schema": cli.controller_backend.DRAIN_RESOLUTION_AUTH_SCHEMA,
+        "root": controller.root,
+        "controller": controller.controller,
+        "workflow_root": workflow_root,
+        "continuity_id": lease.continuity_id,
+        "lease_epoch": lease.epoch,
+        "lease_token": lease.token,
+        "cause_ids": [cause["cause_id"] for cause in causes],
+        "causes_sha256": cli.controller_backend._drain_causes_digest(causes),
+        "cancelled_task": cancelled_task,
+        "launch_id": launch_id,
+        "receipt_sha256": "a" * 64,
+        "contract_sha256": "b" * 64,
+        "ready_task": ready_task,
+        "intent_id": uuid.uuid4().hex,
+    }
+    payload["authority_hmac"] = cli._authority_mac(
+        authority_secret, payload, domain="drain-resolution-authorization-v1",
+    )
+    return payload
 
 
 # A real Herdr 0.7.4 agent_started response body (pane + provider session id).
@@ -3952,14 +3982,19 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
                      mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
                      mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                    resolution_authorization_out = {}
                     selected = cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id,
                         "distinct-ready-task", controller, current_lease,
                         authority_secret=fixture.authority_secret,
+                        resolution_authorization_out=resolution_authorization_out,
                     )
                 self.assertEqual(selected, "distinct-ready-task")
                 controller.acknowledge_cancelled_preidentity_halt(
-                    fixture.workflow_root, fixture.task_id, "distinct-ready-task", lease=current_lease,
+                    fixture.workflow_root, fixture.task_id, "distinct-ready-task",
+                    authority_secret=fixture.authority_secret,
+                    resolution_authorization=resolution_authorization_out["authorization"],
+                    lease=current_lease,
                 )
                 checkpoint = controller._load_checkpoint()
                 self.assertEqual(checkpoint["pending_continuation_task"], "distinct-ready-task")
@@ -4301,10 +4336,23 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 "result": result.to_dict(),
             }, True)
 
+        def verified(*verify_args, **verify_kwargs):
+            root, workflow, cancelled, ready, controller, lease = verify_args[:6]
+            authorization = verify_kwargs.get("resolution_authorization")
+            if not isinstance(authorization, Mapping):
+                authorization = _signed_resolution_authorization(
+                    controller, lease, workflow, cancelled, ready,
+                    verify_kwargs["authority_secret"],
+                )
+            output = verify_kwargs.get("resolution_authorization_out")
+            if isinstance(output, dict):
+                output["authorization"] = dict(authorization)
+            return ready
+
         with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"}), \
              mock.patch.object(
                  cli, "_verify_cancelled_preidentity_continuation",
-                 return_value=args.continue_task,
+                 side_effect=verified,
              ), \
              mock.patch.object(cli, "_bind_current_controller_sessions"), \
              mock.patch.object(cli, "_controller_step", side_effect=one_step):
@@ -4349,10 +4397,16 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 initial_epoch = json.loads(controller.state_path.read_text())["epoch"]
                 verified: list[str] = []
 
-                def verify(_root, _workflow, _cancelled, ready, *_rest, **_kwargs):
+                def verify(_root, _workflow, _cancelled, ready, *rest, **verify_kwargs):
                     verified.append(ready)
                     if ready == "bad-ready-task":
                         raise ValueError("ready task is invalid")
+                    controller_value, lease_value = rest[:2]
+                    auth = _signed_resolution_authorization(
+                        controller_value, lease_value, _workflow, _cancelled, ready,
+                        verify_kwargs["authority_secret"],
+                    )
+                    verify_kwargs["resolution_authorization_out"]["authorization"] = auth
                     return ready
 
                 def one_step(step_args, current, root, current_lease, *, operation):
@@ -4787,8 +4841,13 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             halted = controller._load_checkpoint()
             halted["last_check"] = "cancelled expired preidentity launch old-launch for old"
             cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, halted)
+            authority_secret = "test-authority"
+            resolution_authorization = _signed_resolution_authorization(
+                controller, lease, "wf", "old", "target", authority_secret,
+            )
             controller.acknowledge_cancelled_preidentity_halt(
-                "wf", "old", "target", lease=lease,
+                "wf", "old", "target", authority_secret=authority_secret,
+                resolution_authorization=resolution_authorization, lease=lease,
             )
             issue = {
                 "id": "target", "status": "open", "assignee": "",
@@ -4799,7 +4858,7 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 issue,
             )
             args = argparse.Namespace(
-                workflow_root="wf", _authority_secret="test-authority",
+                workflow_root="wf", _authority_secret=authority_secret,
                 _continuation_task="target",
             )
             policy = cli.execution_backend.ExecutionPolicy(max_parallel_workers=2)

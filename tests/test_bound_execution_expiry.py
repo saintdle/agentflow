@@ -380,17 +380,21 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                      return_value=[fixture.task_issue, ready],
                  ), \
                  mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                resolution_authorization_out = {}
                 self.assertEqual(
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
                         controller, lease, authority_secret=args._authority_secret,
                         expected_retirement_kind="expired_execution",
+                        resolution_authorization_out=resolution_authorization_out,
                     ),
                     ready["id"],
                 )
                 controller.acknowledge_cancelled_preidentity_halt(
                     fixture.workflow_root, fixture.task_id, ready["id"],
-                    authority_secret=args._authority_secret, lease=lease,
+                    authority_secret=args._authority_secret,
+                    resolution_authorization=resolution_authorization_out["authorization"],
+                    lease=lease,
                 )
                 # The target checkpoint is durable. Replaying after the
                 # simulated crash must take the staged/open path, not reject
@@ -401,6 +405,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         controller, lease, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="expired_execution",
+                        resolution_authorization=resolution_authorization_out["authorization"],
                     ),
                     ready["id"],
                 )
@@ -410,10 +415,12 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         controller, lease, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="cancelled_preidentity",
+                        resolution_authorization=resolution_authorization_out["authorization"],
                     )
                 checkpoint = controller._load_checkpoint()
                 self.assertEqual(checkpoint["drain_causes"], [])
                 state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                signed_archive = json.loads(json.dumps(state["drain_audit"][0]))
                 state["drain_audit"][0]["cause_ids"] = ["forged-cause-id"]
                 cli._private_atomic_json(controller.state_path, state)
                 with self.assertRaisesRegex(
@@ -425,6 +432,31 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         controller, lease, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="expired_execution",
+                        resolution_authorization=resolution_authorization_out["authorization"],
+                    )
+                legacy_archive = {
+                    key: value for key, value in signed_archive.items()
+                    if key not in {"intent_id", "resolution_authorization", "authority_hmac"}
+                }
+                legacy_identity = {
+                    key: legacy_archive[key] for key in (
+                        "schema", "cause_ids", "causes_sha256", "resolution", "context",
+                    )
+                }
+                legacy_archive["audit_id"] = cli._canonical_json_digest(legacy_identity)
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                state["drain_audit"] = [legacy_archive]
+                cli._private_atomic_json(controller.state_path, state)
+                with self.assertRaisesRegex(
+                    cli.controller_backend.ControllerError,
+                    "current checkpoint drain causes differ from the signed expiry receipt",
+                ):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                        controller, lease, authority_secret=args._authority_secret,
+                        allow_staged_selection=True,
+                        expected_retirement_kind="expired_execution",
+                        resolution_authorization=resolution_authorization_out["authorization"],
                     )
 
             with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:

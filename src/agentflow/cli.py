@@ -2765,7 +2765,9 @@ def _has_matching_drain_resolution_audit(
     workflow_root: str,
     cancelled_task: str,
     ready_task: str,
-    causes: list[dict[str, str]],
+    causes: list[dict[str, str]] | None,
+    resolution_authorization: Mapping[str, Any],
+    authority_secret: str,
 ) -> bool:
     """Verify the protected archive for a cause set cleared by continuation.
 
@@ -2781,11 +2783,16 @@ def _has_matching_drain_resolution_audit(
         if (
             not isinstance(audit, list)
             or len(audit) > controller_backend.MAX_DRAIN_AUDIT_ENTRIES
-            or not causes
         ):
             return False
-        cause_ids = [cause["cause_id"] for cause in causes]
-        causes_sha256 = controller_backend._drain_causes_digest(causes)
+        cause_ids = (
+            [cause["cause_id"] for cause in causes]
+            if causes is not None else list(resolution_authorization.get("cause_ids") or [])
+        )
+        causes_sha256 = (
+            controller_backend._drain_causes_digest(causes)
+            if causes is not None else str(resolution_authorization.get("causes_sha256") or "")
+        )
         expected_context = {
             "workflow_root": workflow_root,
             "cancelled_task": cancelled_task,
@@ -2793,12 +2800,14 @@ def _has_matching_drain_resolution_audit(
         }
         fields = {
             "schema", "cause_ids", "causes_sha256", "resolution", "context",
-            "audit_id", "resolved_epoch", "resolved_at",
+            "intent_id", "audit_id", "resolved_epoch", "resolved_at",
+            "resolution_authorization", "authority_hmac",
         }
         known_ids: set[str] = set()
         match = False
         for item in audit:
-            if not isinstance(item, Mapping) or set(item) != fields:
+            legacy_fields = fields - {"intent_id", "resolution_authorization", "authority_hmac"}
+            if not isinstance(item, Mapping) or frozenset(item) not in {frozenset(fields), frozenset(legacy_fields)}:
                 return False
             identity = {key: item[key] for key in (
                 "schema", "cause_ids", "causes_sha256", "resolution", "context",
@@ -2825,6 +2834,8 @@ def _has_matching_drain_resolution_audit(
                 or item["resolved_at"] < 0
             ):
                 return False
+            if "intent_id" in item:
+                identity["intent_id"] = item["intent_id"]
             audit_id = hashlib.sha256(
                 json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
@@ -2832,6 +2843,18 @@ def _has_matching_drain_resolution_audit(
                 return False
             known_ids.add(audit_id)
             if (
+                "intent_id" in item
+                and item.get("resolution_authorization") == dict(resolution_authorization)
+                and item.get("intent_id") == resolution_authorization.get("intent_id")
+                and hmac.compare_digest(
+                    str(item.get("authority_hmac") or ""),
+                    _authority_mac(
+                        authority_secret,
+                        {key: value for key, value in item.items() if key != "authority_hmac"},
+                        domain="controller-drain-audit-v2",
+                    ),
+                )
+                and
                 item["resolved_epoch"] == lease.epoch
                 and item["cause_ids"] == cause_ids
                 and item["causes_sha256"] == causes_sha256
@@ -2840,6 +2863,137 @@ def _has_matching_drain_resolution_audit(
             ):
                 match = True
         return match
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return False
+
+
+def _new_drain_resolution_authorization(
+    *,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    causes: list[dict[str, str]],
+    authority_secret: str,
+) -> dict[str, Any]:
+    disposition = (
+        record.get("execution_disposition")
+        if record.get("status") == "expired_execution"
+        else record.get("recovery_disposition")
+    )
+    if not isinstance(disposition, Mapping):
+        raise controller_backend.ControllerError("retired launch has no signed negative receipt")
+    payload: dict[str, Any] = {
+        "schema": controller_backend.DRAIN_RESOLUTION_AUTH_SCHEMA,
+        "root": controller.root,
+        "controller": controller.controller,
+        "workflow_root": workflow_root,
+        "continuity_id": lease.continuity_id,
+        "lease_epoch": lease.epoch,
+        "lease_token": lease.token,
+        "cause_ids": [cause["cause_id"] for cause in causes],
+        "causes_sha256": controller_backend._drain_causes_digest(causes),
+        "cancelled_task": cancelled_task,
+        "launch_id": str(record.get("launch_id") or ""),
+        "receipt_sha256": _canonical_json_digest(disposition),
+        "contract_sha256": _canonical_json_digest(contract),
+        "ready_task": ready_task,
+        "intent_id": uuid.uuid4().hex,
+    }
+    payload["authority_hmac"] = _authority_mac(
+        authority_secret, payload, domain="drain-resolution-authorization-v1",
+    )
+    return payload
+
+
+def _verify_drain_resolution_authorization(
+    authorization: Mapping[str, Any],
+    *,
+    controller: controller_backend.RootController,
+    lease: controller_backend.Lease,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    causes: list[dict[str, str]],
+    authority_secret: str,
+    staged_selection: bool,
+) -> bool:
+    try:
+        payload = dict(authorization)
+        supplied = str(payload.pop("authority_hmac", ""))
+        state = _read_json_value(str(controller.state_path))
+        pending = state.get("continuation_reattach") if isinstance(state, Mapping) else None
+        disposition = (
+            record.get("execution_disposition")
+            if record.get("status") == "expired_execution"
+            else record.get("recovery_disposition")
+        )
+        if not isinstance(disposition, Mapping):
+            return False
+        expected = {
+            "schema": controller_backend.DRAIN_RESOLUTION_AUTH_SCHEMA,
+            "root": controller.root,
+            "controller": controller.controller,
+            "workflow_root": workflow_root,
+            "continuity_id": lease.continuity_id,
+            "cancelled_task": cancelled_task,
+            "launch_id": str(record.get("launch_id") or ""),
+            "receipt_sha256": _canonical_json_digest(disposition),
+            "contract_sha256": _canonical_json_digest(contract),
+            "ready_task": ready_task,
+        }
+        rotated = bool(
+            staged_selection and isinstance(pending, Mapping)
+            and pending.get("drain_resolution_authorization") == dict(authorization)
+            and pending.get("previous_epoch") == payload.get("lease_epoch")
+            and pending.get("epoch") == lease.epoch
+            and pending.get("continuity_id") == lease.continuity_id
+            and pending.get("token") == lease.token
+        )
+        epoch_ok = (
+            payload.get("lease_epoch") == lease.epoch
+            and payload.get("lease_token") == lease.token
+        ) or (
+            isinstance(pending, Mapping)
+            and pending.get("drain_resolution_authorization") == dict(authorization)
+            and pending.get("previous_epoch") == payload.get("lease_epoch")
+            and pending.get("epoch") == lease.epoch
+            and pending.get("continuity_id") == lease.continuity_id
+            and pending.get("token") == lease.token
+        )
+        return bool(
+            set(payload) == {
+                "schema", "root", "controller", "workflow_root", "continuity_id",
+                "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
+                "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
+                "ready_task", "intent_id",
+            }
+            and all(payload.get(key) == value for key, value in expected.items())
+            and isinstance(payload.get("lease_epoch"), int)
+            and not isinstance(payload.get("lease_epoch"), bool)
+            and isinstance(payload.get("lease_token"), str)
+            and re.fullmatch(r"[0-9a-f]{32}", str(payload.get("intent_id") or ""))
+            and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("receipt_sha256") or ""))
+            and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("contract_sha256") or ""))
+            and (
+                staged_selection
+                or (
+                    payload.get("cause_ids") == [cause["cause_id"] for cause in causes]
+                    and payload.get("causes_sha256") == controller_backend._drain_causes_digest(causes)
+                    and not any(cause["kind"] == "unknown" for cause in causes)
+                )
+            )
+            and epoch_ok
+            and hmac.compare_digest(
+                supplied,
+                _authority_mac(authority_secret, payload, domain="drain-resolution-authorization-v1"),
+            )
+        )
     except (OSError, ValueError, TypeError, KeyError, OverflowError):
         return False
 
@@ -2855,6 +3009,8 @@ def _verify_cancelled_preidentity_continuation(
     authority_secret: str,
     allow_staged_selection: bool = False,
     expected_retirement_kind: str = "cancelled_preidentity",
+    resolution_authorization: Mapping[str, Any] | None = None,
+    resolution_authorization_out: dict[str, Any] | None = None,
 ) -> str:
     """Prove a signed retired launch and one distinct, currently ready child."""
     if not cancelled_task or not ready_task or ready_task == cancelled_task:
@@ -2973,10 +3129,13 @@ def _verify_cancelled_preidentity_continuation(
             ) from exc
         cleared_by_authenticated_ack = bool(
             staged_selection and prior_causes and not current_causes
+            and isinstance(resolution_authorization, Mapping)
             and _has_matching_drain_resolution_audit(
                 controller, lease, workflow_root=workflow_root,
                 cancelled_task=cancelled_task, ready_task=ready_task,
                 causes=prior_causes,
+                resolution_authorization=resolution_authorization,
+                authority_secret=authority_secret,
             )
         )
         if current_causes != prior_causes and not cleared_by_authenticated_ack:
@@ -3000,6 +3159,13 @@ def _verify_cancelled_preidentity_continuation(
         root, workflow_root, cancelled_task, authority_secret=authority_secret,
     ):
         raise controller_backend.ControllerError("cancelled task has no authenticated retirement record")
+    else:
+        try:
+            prior_causes = checkpoint_backend._check_drain_causes(document.get("drain_causes"))
+        except checkpoint_backend.CheckpointError as exc:
+            raise controller_backend.ControllerError("current checkpoint has malformed drain causes") from exc
+        if any(cause["kind"] == "unknown" for cause in prior_causes):
+            raise controller_backend.ControllerError("preidentity continuation has an unknown drain cause")
     assert isinstance(record, Mapping)
     legacy_scope = not bound_expired and retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
     channel = record.get("return_channel")
@@ -3017,7 +3183,7 @@ def _verify_cancelled_preidentity_continuation(
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
     claim_token = str(agentflow.get("claim_token") or "")
     if (
-        str(cancelled_issue.get("status") or "").lower() != ("blocked" if legacy_scope else "in_progress")
+        str(cancelled_issue.get("status") or "").lower() != ("in_progress" if bound_expired else "blocked")
         or str(cancelled_issue.get("assignee") or "") != lease.controller
         or str(agentflow.get("root") or "") != workflow_root
         or str(agentflow.get("task") or "") != cancelled_task
@@ -3029,12 +3195,12 @@ def _verify_cancelled_preidentity_continuation(
         )
     ):
         raise controller_backend.ControllerError("cancelled task no longer has its exact signed Beads claim")
-    if not legacy_scope:
+    if bound_expired:
         beads_backend.verify_task_ancestry_and_ownership(
             root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
         )
     elif str(cancelled_issue.get("parent") or "") != workflow_root:
-        raise controller_backend.ControllerError("blocked legacy task is no longer under the exact workflow root")
+        raise controller_backend.ControllerError("blocked preidentity task is no longer under the exact workflow root")
 
     root_issue = beads_backend.get_issue(root, workflow_root)
     if (
@@ -3047,7 +3213,7 @@ def _verify_cancelled_preidentity_continuation(
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
     resolved_failure_tasks: set[str] = set()
-    if bound_expired:
+    if prior_causes:
         for cause in prior_causes:
             kind = cause["kind"]
             if kind == "no_ready_work":
@@ -3101,16 +3267,19 @@ def _verify_cancelled_preidentity_continuation(
                 if isinstance(causal_channel, Mapping) else None
             )
             causal_claim_token = str(causal_agentflow.get("claim_token") or "")
-            exact_launch = (
+            exact_record = (
                 causal_record.get("task_id") == causal_task
                 and causal_record.get("root") == str(root)
                 and causal_record.get("workflow_root") == workflow_root
                 and causal_record.get("launch_id") == causal_launch
+                and causal_record.get("claim_id") == causal_agentflow.get("claim_id")
+            )
+            exact_bound_launch = (
+                exact_record
                 and isinstance(causal_binding, Mapping)
                 and causal_binding.get("launch_id") == causal_launch
                 and isinstance(causal_contract, Mapping)
                 and causal_contract.get("launch_id") == causal_launch
-                and causal_record.get("claim_id") == causal_agentflow.get("claim_id")
                 and causal_contract.get("claim_id") == causal_agentflow.get("claim_id")
                 and bool(causal_claim_token)
                 and hmac.compare_digest(
@@ -3119,7 +3288,7 @@ def _verify_cancelled_preidentity_continuation(
                 )
             )
             authenticated_outcome = bool(
-                exact_launch and cause["provenance"] == "authenticated_task_outcome"
+                exact_bound_launch and cause["provenance"] == "authenticated_task_outcome"
                 and _has_authenticated_causal_herdr_result(
                     causal_record, root=root, workflow_root=workflow_root,
                     authority_secret=authority_secret,
@@ -3128,12 +3297,15 @@ def _verify_cancelled_preidentity_continuation(
                 and str(causal_result.get("outcome") or "") not in {"", "completed"}
             )
             authenticated_retirement = bool(
-                exact_launch and cause["provenance"] == "signed_negative_retirement"
+                cause["provenance"] == "signed_negative_retirement"
                 and (
-                    _authenticated_causal_preidentity_retirement(
+                    exact_record and causal_record.get("status") == "cancelled_preidentity"
+                    and _authenticated_causal_preidentity_retirement(
                         root, workflow_root, causal_task, causal_launch,
                         causal_issue, lease, authority_secret=authority_secret,
-                    ) or _authenticated_expired_bound_execution(
+                    )
+                    or exact_bound_launch and causal_record.get("status") == "expired_execution"
+                    and _authenticated_expired_bound_execution(
                         root, workflow_root, causal_task, authority_secret=authority_secret,
                     )
                 )
@@ -3143,11 +3315,11 @@ def _verify_cancelled_preidentity_continuation(
                     f"causal failure task lacks its exact authenticated outcome: {causal_task}"
                 )
             resolved_failure_tasks.add(causal_task)
-    expected_cancelled_status = "blocked" if legacy_scope else "in_progress"
+    expected_cancelled_status = "in_progress" if bound_expired else "blocked"
     if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
-    if legacy_scope and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
-        raise controller_backend.ControllerError("blocked legacy task owner changed before continuation")
+    if not bound_expired and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
+        raise controller_backend.ControllerError("blocked preidentity task owner changed before continuation")
     for row in descendants:
         task_id = str(row.get("id") or "")
         status = str(row.get("status") or "").lower()
@@ -3211,6 +3383,38 @@ def _verify_cancelled_preidentity_continuation(
         rows = rows_for(shared)
     if len(rows) != 1 or not isinstance(rows[0], Mapping) or str(rows[0].get("id") or "") != ready_task:
         raise controller_backend.ControllerError("requested continuation is not the exact current ready task")
+    try:
+        active_causes = checkpoint_backend._check_drain_causes(document.get("drain_causes"))
+    except checkpoint_backend.CheckpointError as exc:
+        raise controller_backend.ControllerError("current checkpoint has malformed drain causes") from exc
+    authorization_causes = prior_causes if bound_expired else active_causes
+    if resolution_authorization is None:
+        if staged_selection:
+            raise controller_backend.ControllerError("staged continuation has no signed drain-resolution authorization")
+        resolution_authorization = _new_drain_resolution_authorization(
+            controller=controller, lease=lease, workflow_root=workflow_root,
+            cancelled_task=cancelled_task, ready_task=ready_task,
+            record=record, contract=contract, causes=authorization_causes,
+            authority_secret=authority_secret,
+        )
+    if staged_selection and resolution_authorization.get("cause_ids"):
+        if not _has_matching_drain_resolution_audit(
+            controller, lease, workflow_root=workflow_root,
+            cancelled_task=cancelled_task, ready_task=ready_task,
+            causes=None, resolution_authorization=resolution_authorization,
+            authority_secret=authority_secret,
+        ):
+            raise controller_backend.ControllerError("staged continuation has no authenticated drain-resolution archive")
+    if not _verify_drain_resolution_authorization(
+        resolution_authorization, controller=controller, lease=lease,
+        workflow_root=workflow_root, cancelled_task=cancelled_task,
+        ready_task=ready_task, record=record, contract=contract,
+        causes=authorization_causes, authority_secret=authority_secret,
+        staged_selection=staged_selection,
+    ):
+        raise controller_backend.ControllerError("continuation has no authenticated exact cause snapshot")
+    if resolution_authorization_out is not None:
+        resolution_authorization_out["authorization"] = dict(resolution_authorization)
     return ready_task
 
 
@@ -3749,13 +3953,25 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                         # A retry after the signed target checkpoint is already
                         # durable may finish the staged transaction without
                         # selecting or dispatching a different task.
+                        resolution_authorization_out: dict[str, Any] = {}
+                        staged_resolution_authorization = (
+                            continuation_intent.get("drain_resolution_authorization")
+                            if isinstance(continuation_intent, Mapping) else None
+                        )
                         _verify_cancelled_preidentity_continuation(
                             root, workflow_root, continue_cancelled_task,
                             continue_ready_task, controller, previous,
                             authority_secret=credentials["authority_secret"],
                             allow_staged_selection=continuation_already_selected,
                             expected_retirement_kind=continuation_kind,
+                            resolution_authorization=staged_resolution_authorization,
+                            resolution_authorization_out=resolution_authorization_out,
                         )
+                        drain_resolution_authorization = resolution_authorization_out.get("authorization")
+                        if not isinstance(drain_resolution_authorization, Mapping):
+                            raise controller_backend.ControllerError(
+                                "continuation verification did not produce its signed cause snapshot"
+                            )
                         if continuation_already_selected:
                             lease = controller.authorize_explicit_continuation(
                                 workflow_root=workflow_root,
@@ -3772,6 +3988,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                                 checkpoint_epoch=checkpoint_epoch_value,
                                 authority_secret=credentials["authority_secret"],
                                 resume_proof=resume_proof,
+                                drain_resolution_authorization=drain_resolution_authorization,
                                 persist_credentials=lambda candidate: _controller_credentials(
                                     args, candidate, key_path=key_path,
                                 ),
@@ -3802,7 +4019,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                 if not continuation_already_selected:
                     controller.acknowledge_cancelled_preidentity_halt(
                         workflow_root, continue_cancelled_task, ready_task,
-                        authority_secret=credentials["authority_secret"], lease=lease,
+                        authority_secret=credentials["authority_secret"],
+                        resolution_authorization=drain_resolution_authorization,
+                        lease=lease,
                     )
                 controller.clear_explicit_continuation(
                     workflow_root=workflow_root,
@@ -5303,7 +5522,10 @@ def _authenticated_causal_preidentity_retirement(
         if (
             not isinstance(contract, Mapping)
             or not isinstance(disposition, Mapping)
-            or disposition.get("reason") not in {"superseded_legacy_scope", "owner_abandoned_epoch"}
+            or disposition.get("reason") not in {
+                "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+                "superseded_legacy_scope", "owner_abandoned_epoch",
+            }
             or str(contract.get("controller_id") or "") != lease.controller
             or str(contract.get("continuity_id") or "") != lease.continuity_id
             or not isinstance(contract.get("lease_epoch"), int)

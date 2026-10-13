@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from typing import Any, Mapping
 from unittest import mock
 
@@ -37,6 +38,35 @@ class Clock:
 
 
 class ControllerTests(unittest.TestCase):
+    _authority_secret = "unit-test-controller-authority"
+
+    def _resolution_authorization(
+        self, controller: RootController, lease: Lease,
+        workflow_root: str, cancelled_task: str, ready_task: str,
+    ) -> dict[str, Any]:
+        causes = checkpoint._check_drain_causes(controller._load_checkpoint().get("drain_causes"))
+        payload: dict[str, Any] = {
+            "schema": controller_module.DRAIN_RESOLUTION_AUTH_SCHEMA,
+            "root": controller.root,
+            "controller": controller.controller,
+            "workflow_root": workflow_root,
+            "continuity_id": lease.continuity_id,
+            "lease_epoch": lease.epoch,
+            "lease_token": lease.token,
+            "cause_ids": [cause["cause_id"] for cause in causes],
+            "causes_sha256": controller_module._drain_causes_digest(causes),
+            "cancelled_task": cancelled_task,
+            "launch_id": "old-launch",
+            "receipt_sha256": "a" * 64,
+            "contract_sha256": "b" * 64,
+            "ready_task": ready_task,
+            "intent_id": uuid.uuid4().hex,
+        }
+        payload["authority_hmac"] = controller_module._authority_mac(
+            self._authority_secret, payload, domain="drain-resolution-authorization-v1",
+        )
+        return payload
+
     def _controller_with_pending_continuation(self, base: Path) -> tuple[RootController, Lease]:
         state = base / "controller.json"
         cp = base / "checkpoint.json"
@@ -53,8 +83,10 @@ class ControllerTests(unittest.TestCase):
         document = controller._load_checkpoint()
         document["last_check"] = "cancelled expired preidentity launch old-launch for old"
         checkpoint.write_checkpoint(cp, document)
+        authorization = self._resolution_authorization(controller, lease, "workflow", "old", "ready-task")
         controller.acknowledge_cancelled_preidentity_halt(
-            "workflow", "old", "ready-task", lease=lease,
+            "workflow", "old", "ready-task", authority_secret=self._authority_secret,
+            resolution_authorization=authorization, lease=lease,
         )
         return controller, lease
 
@@ -320,6 +352,42 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(
                 state["drain_audit"][0]["resolution"], "authenticated_continuation",
             )
+
+    def test_final_ack_rejects_a_cause_added_after_authorization_byte_preservingly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state, checkpoint_path=cp)
+            lease = controller.acquire()
+            controller.halt(
+                "blocked", "USER_ACTION_REQUIRED: old launch retired",
+                drain_cause_kind="managed_task_failure",
+                drain_cause_provenance="signed_negative_retirement",
+                drain_cause_task="old", drain_cause_launch="old-launch", lease=lease,
+            )
+            document = controller._load_checkpoint()
+            document["last_check"] = "cancelled expired preidentity launch old-launch for old"
+            checkpoint.write_checkpoint(cp, document)
+            authorization = self._resolution_authorization(
+                controller, lease, "workflow", "old", "ready-task",
+            )
+            raced = controller._load_checkpoint()
+            controller_module._append_drain_cause(
+                raced, kind="managed_task_failure",
+                provenance="authenticated_task_outcome", task_id="other-task",
+                launch_id="other-launch",
+            )
+            checkpoint.write_checkpoint(cp, raced)
+            state_before, checkpoint_before = state.read_bytes(), cp.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "exact cause snapshot"):
+                controller.acknowledge_cancelled_preidentity_halt(
+                    "workflow", "old", "ready-task",
+                    authority_secret=self._authority_secret,
+                    resolution_authorization=authorization, lease=lease,
+                )
+            self.assertEqual(state.read_bytes(), state_before)
+            self.assertEqual(cp.read_bytes(), checkpoint_before)
 
     def test_bound_expiry_rejects_nonexact_draining_reservations_without_checkpoint_change(self) -> None:
         for case in ("wrong-claim", "wrong-session", "stale-lease", "sibling"):
@@ -1019,8 +1087,10 @@ class ControllerTests(unittest.TestCase):
             document = controller._load_checkpoint()
             document["last_check"] = "cancelled expired preidentity launch old-launch for old"
             checkpoint.write_checkpoint(cp, document)
+            authorization = self._resolution_authorization(controller, lease, "workflow", "old", "ready-task")
             controller.acknowledge_cancelled_preidentity_halt(
-                "workflow", "old", "ready-task", lease=lease,
+                "workflow", "old", "ready-task", authority_secret=self._authority_secret,
+                resolution_authorization=authorization, lease=lease,
             )
             before = cp.read_bytes()
 
@@ -1055,8 +1125,10 @@ class ControllerTests(unittest.TestCase):
             document = first._load_checkpoint()
             document["last_check"] = "cancelled expired preidentity launch old-launch for old"
             checkpoint.write_checkpoint(cp, document)
+            authorization = self._resolution_authorization(first, lease, "workflow", "old", "ready-task")
             first.acknowledge_cancelled_preidentity_halt(
-                "workflow", "old", "ready-task", lease=lease,
+                "workflow", "old", "ready-task", authority_secret=self._authority_secret,
+                resolution_authorization=authorization, lease=lease,
             )
             second = RootController("root", "one", state_path=state, checkpoint_path=cp)
             barrier = threading.Barrier(2)

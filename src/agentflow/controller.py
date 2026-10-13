@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import tempfile
 import time
@@ -29,6 +30,7 @@ from agentflow import session_control
 TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "terminal"})
 MAX_DRAIN_AUDIT_ENTRIES = 16
 DRAIN_AUDIT_SCHEMA = "agentflow.controller-drain-audit@1"
+DRAIN_RESOLUTION_AUTH_SCHEMA = "agentflow.controller-drain-resolution-authorization@1"
 
 
 def checkpoint_digest(document: Mapping[str, Any]) -> str:
@@ -40,6 +42,72 @@ def checkpoint_digest(document: Mapping[str, Any]) -> str:
 def _drain_causes_digest(causes: list[Mapping[str, Any]]) -> str:
     encoded = json.dumps(causes, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validate_drain_resolution_authorization(
+    authorization: Mapping[str, Any],
+    authority_secret: str,
+    *,
+    root: str,
+    controller: str,
+    workflow_root: str,
+    continuity_id: str,
+    cancelled_task: str,
+    ready_task: str,
+    causes: list[Mapping[str, Any]],
+    current_epoch: int,
+    current_token: str,
+    pending: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify CLI-issued continuation authority against the final cause snapshot."""
+    payload = dict(authorization)
+    supplied = str(payload.pop("authority_hmac", ""))
+    expected_fields = {
+        "schema", "root", "controller", "workflow_root", "continuity_id",
+        "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
+        "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
+        "ready_task", "intent_id",
+    }
+    clean_causes = checkpoint._check_drain_causes(causes)
+    ids = [cause["cause_id"] for cause in clean_causes]
+    epoch = payload.get("lease_epoch")
+    rotated = bool(
+        isinstance(pending, Mapping)
+        and pending.get("drain_resolution_authorization") == dict(authorization)
+        and pending.get("previous_epoch") == epoch
+        and pending.get("epoch") == current_epoch
+        and isinstance(epoch, int) and not isinstance(epoch, bool)
+        and current_epoch == epoch + 1
+        and pending.get("continuity_id") == continuity_id
+        and pending.get("token") == current_token
+    )
+    if (
+        set(payload) != expected_fields
+        or payload.get("schema") != DRAIN_RESOLUTION_AUTH_SCHEMA
+        or payload.get("root") != root
+        or payload.get("controller") != controller
+        or payload.get("workflow_root") != workflow_root
+        or payload.get("continuity_id") != continuity_id
+        or payload.get("cancelled_task") != cancelled_task
+        or payload.get("ready_task") != ready_task
+        or not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0
+        or not isinstance(payload.get("lease_token"), str) or not payload["lease_token"]
+        or not isinstance(payload.get("cause_ids"), list)
+        or payload.get("cause_ids") != ids
+        or payload.get("causes_sha256") != _drain_causes_digest(clean_causes)
+        or any(cause["kind"] == "unknown" for cause in clean_causes)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("receipt_sha256") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("contract_sha256") or ""))
+        or not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("intent_id") or ""))
+        or not isinstance(payload.get("launch_id"), str) or not payload["launch_id"]
+        or not (epoch == current_epoch and payload["lease_token"] == current_token or rotated)
+        or not hmac.compare_digest(
+            supplied,
+            _authority_mac(authority_secret, payload, domain="drain-resolution-authorization-v1"),
+        )
+    ):
+        raise LeaseConflict("continuation does not authenticate the exact cause snapshot and lease")
+    return {**payload, "authority_hmac": supplied}
 
 
 def _append_drain_cause(
@@ -1330,6 +1398,7 @@ class RootController:
         checkpoint_epoch: int,
         authority_secret: str,
         resume_proof: str,
+        drain_resolution_authorization: Mapping[str, Any] | None = None,
         persist_credentials: Callable[[Lease], Any],
     ) -> Lease:
         """Rotate credentials under a signed, exact-target retry intent."""
@@ -1337,6 +1406,8 @@ class RootController:
             raise LeaseConflict("explicit continuation reattach is missing an authenticated identity")
         if cancelled_task == ready_task:
             raise LeaseConflict("continuation target must differ from the cancelled task")
+        if not isinstance(drain_resolution_authorization, Mapping):
+            raise LeaseConflict("explicit continuation requires its signed drain-resolution authorization")
         with self._locked():
             state = _read_json(self.state_path)
             active = self._read_lease(state)
@@ -1368,6 +1439,8 @@ class RootController:
                     )
                 ):
                     raise LeaseConflict("staged continuation does not authenticate this exact target")
+                if pending.get("drain_resolution_authorization") != dict(drain_resolution_authorization):
+                    raise LeaseConflict("staged continuation changed its drain-resolution authorization")
                 self._verify_staged_owner_receipt_link(
                     state, pending_value, workflow_root=workflow_root,
                     cancelled_task=cancelled_task, authority_secret=authority_secret,
@@ -1437,6 +1510,14 @@ class RootController:
                 or not previous.continuity_id
             ):
                 raise LeaseConflict("explicit continuation requires its exact current protected credential")
+            causes = checkpoint._check_drain_causes(self._load_checkpoint().get("drain_causes"))
+            _validate_drain_resolution_authorization(
+                drain_resolution_authorization, authority_secret,
+                root=self.root, controller=self.controller,
+                workflow_root=workflow_root, continuity_id=previous.continuity_id,
+                cancelled_task=cancelled_task, ready_task=ready_task, causes=causes,
+                current_epoch=previous.epoch, current_token=previous.token,
+            )
             now = float(self.clock())
             epoch = previous.epoch + 1
             secret = secrets.token_urlsafe(32)
@@ -1455,6 +1536,7 @@ class RootController:
                 "token": candidate.token, "acquired_at": candidate.acquired_at,
                 "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
                 "resume_secret_hash": candidate.resume_secret_hash,
+                "drain_resolution_authorization": dict(drain_resolution_authorization),
             }
             if owner_receipt_hash:
                 payload["owner_repair_receipt_sha256"] = owner_receipt_hash
@@ -1873,6 +1955,8 @@ class RootController:
         *,
         resolution: str,
         context: Mapping[str, str],
+        authority_secret: str = "",
+        resolution_authorization: Mapping[str, Any] | None = None,
     ) -> str:
         """Durably archive one fully resolved typed set before clearing it.
 
@@ -1895,6 +1979,21 @@ class RootController:
             "resolution": resolution,
             "context": clean_context,
         }
+        if resolution == "authenticated_continuation":
+            if not isinstance(resolution_authorization, Mapping):
+                raise ControllerError("continuation requires its signed drain-resolution authorization")
+            state = _read_json(self.state_path)
+            resolution_authorization = _validate_drain_resolution_authorization(
+                resolution_authorization, authority_secret,
+                root=self.root, controller=self.controller,
+                workflow_root=clean_context.get("workflow_root", ""),
+                continuity_id=current.continuity_id,
+                cancelled_task=clean_context.get("cancelled_task", ""),
+                ready_task=clean_context.get("ready_task", ""),
+                causes=causes, current_epoch=current.epoch, current_token=current.token,
+                pending=state.get("continuation_reattach") if isinstance(state, Mapping) else None,
+            )
+            identity["intent_id"] = resolution_authorization["intent_id"]
         audit_id = hashlib.sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -1904,6 +2003,11 @@ class RootController:
             "resolved_epoch": current.epoch,
             "resolved_at": float(self.clock()),
         }
+        if resolution_authorization is not None:
+            record["resolution_authorization"] = dict(resolution_authorization)
+            record["authority_hmac"] = _authority_mac(
+                authority_secret, record, domain="controller-drain-audit-v2",
+            )
 
         state = _read_json(self.state_path)
         stored_lease = self._read_lease(state)
@@ -1916,14 +2020,18 @@ class RootController:
         known_ids: set[str] = set()
         same_cause_resolution = False
         for item in raw_audit:
-            fields = {
+            legacy_fields = {
                 "schema", "cause_ids", "causes_sha256", "resolution", "context",
                 "audit_id", "resolved_epoch", "resolved_at",
             }
-            if not isinstance(item, Mapping) or set(item) != fields:
+            signed_fields = legacy_fields | {"intent_id", "resolution_authorization", "authority_hmac"}
+            if not isinstance(item, Mapping) or frozenset(item) not in {frozenset(legacy_fields), frozenset(signed_fields)}:
                 raise ControllerError("controller drain audit entry is malformed")
             copied = dict(item)
-            item_identity = {key: copied[key] for key in identity}
+            item_identity_keys = list(legacy_fields & {"schema", "cause_ids", "causes_sha256", "resolution", "context"})
+            item_identity = {key: copied[key] for key in item_identity_keys}
+            if "intent_id" in copied:
+                item_identity["intent_id"] = copied["intent_id"]
             expected_id = hashlib.sha256(
                 json.dumps(item_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
@@ -1942,6 +2050,11 @@ class RootController:
                 or not isinstance(copied.get("resolved_at"), (int, float))
             ):
                 raise ControllerError("controller drain audit entry failed validation")
+            if "intent_id" in copied and (
+                not isinstance(copied.get("resolution_authorization"), Mapping)
+                or not isinstance(copied.get("authority_hmac"), str)
+            ):
+                raise ControllerError("signed controller drain audit entry failed validation")
             known_ids.add(expected_id)
             if copied.get("causes_sha256") == identity["causes_sha256"]:
                 if expected_id != audit_id:
@@ -1949,6 +2062,17 @@ class RootController:
                 same_cause_resolution = True
                 if any(copied.get(key) != value for key, value in identity.items()):
                     raise ControllerError("controller drain audit identity changed during retry")
+                if "intent_id" in identity:
+                    expected_record = dict(copied)
+                    supplied_mac = str(expected_record.pop("authority_hmac", ""))
+                    if (
+                        copied.get("resolution_authorization") != dict(resolution_authorization or {})
+                        or not hmac.compare_digest(
+                            supplied_mac,
+                            _authority_mac(authority_secret, expected_record, domain="controller-drain-audit-v2"),
+                        )
+                    ):
+                        raise ControllerError("controller drain audit authorization failed retry validation")
             audit.append(copied)
 
         if not same_cause_resolution:
@@ -2732,6 +2856,7 @@ class RootController:
         ready_task: str,
         *,
         authority_secret: str = "",
+        resolution_authorization: Mapping[str, Any] | None = None,
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Reopen only a signed cancelled-preidentity halt for distinct ready work."""
@@ -2740,17 +2865,29 @@ class RootController:
             raise ControllerError("workflow root, cancelled task, and ready descendant are required")
         if ready_task == cancelled_task:
             raise ControllerError("continuation must select a task distinct from the cancelled launch")
+        if not isinstance(resolution_authorization, Mapping):
+            raise ControllerError("continuation requires its signed drain-resolution authorization")
         with self.fence(
             lease,
             _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
         ) as current:
             document = self._load_checkpoint()
+            state = _read_json(self.state_path)
             causes = document.get("drain_causes")
             if not isinstance(causes, list) or any(
                 not isinstance(cause, Mapping) or cause.get("kind") == "unknown"
                 for cause in causes
             ):
                 raise ControllerError("checkpoint has unresolved or opaque drain causes")
+            _validate_drain_resolution_authorization(
+                resolution_authorization, authority_secret,
+                root=self.root, controller=self.controller,
+                workflow_root=workflow_root, continuity_id=current.continuity_id,
+                cancelled_task=cancelled_task, ready_task=ready_task,
+                causes=checkpoint._check_drain_causes(causes),
+                current_epoch=current.epoch, current_token=current.token,
+                pending=state.get("continuation_reattach") if isinstance(state, Mapping) else None,
+            )
             if (
                 checkpoint.admission_phase(document) != "terminal"
                 or checkpoint.resume_state(document) != "blocked"
@@ -2776,6 +2913,8 @@ class RootController:
                     "cancelled_task": cancelled_task,
                     "ready_task": ready_task,
                 },
+                authority_secret=authority_secret,
+                resolution_authorization=resolution_authorization,
             )
             document.update({
                 "task": self.root,
