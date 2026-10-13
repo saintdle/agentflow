@@ -164,6 +164,10 @@ class ControlledReworkFormulaTests(unittest.TestCase):
                     "XDG_CONFIG_HOME": str(private_home / "config"),
                     "BEADS_DIR": str(workspace / ".beads"),
                     "BD_NON_INTERACTIVE": "1",
+                    # The CLI's detached metrics flusher can recreate this lock
+                    # while TemporaryDirectory is removing the disposable home.
+                    "BD_DISABLE_METRICS": "1",
+                    "BD_DISABLE_EVENT_FLUSH": "1",
                     "DOLT_DISABLE_EVENT_FLUSH": "1",
                     "PYTHONPATH": str(ROOT / "src"),
                 }
@@ -288,6 +292,10 @@ class ControlledReworkFormulaTests(unittest.TestCase):
             self.assertIn(
                 f"CLAIMED Controller: coordinate CLI Gate Probe sub-primary writers ({dispatch_id})",
                 dispatch_claim,
+            )
+            self.assertFalse(
+                (private_home / ".beads" / "eventsData" / "eventkit.lock").exists(),
+                "the disposable Beads metrics flusher must not outlive its home",
             )
 
 
