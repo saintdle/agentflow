@@ -81,6 +81,30 @@ class ActionGrantStoreTests(unittest.TestCase):
         self.assertEqual(legacy.mode, "legacy")
         self.assertFalse(legacy.available)
 
+    def test_empty_store_is_authenticated_and_protected_issue_never_recreates_it(self) -> None:
+        store = self.store()
+        store.initialize_empty()
+        document = json.loads(self.store_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema"], "agentflow.action-grants@2")
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(document["grants"], {})
+        self.assertRegex(document["hmac"], r"^[0-9a-f]{64}$")
+        self.assertTrue(store.status().available)
+
+        self.store_path.unlink()
+        with self.assertRaises(ActionGrantUnavailable):
+            store.issue(self.request(), initialize_if_missing=False)
+        self.assertFalse(self.store_path.exists())
+
+        store.initialize_empty()
+        document = json.loads(self.store_path.read_text(encoding="utf-8"))
+        document["grants"] = {"injected": {}}
+        self.store_path.write_text(json.dumps(document), encoding="utf-8")
+        os.chmod(self.store_path, 0o600)
+        self.assertFalse(store.status().available)
+        with self.assertRaises(ActionGrantDenied):
+            store.require(self.request())
+
     def test_status_accepts_an_absent_lock_without_creating_it(self) -> None:
         store = self.store()
         request = self.request()

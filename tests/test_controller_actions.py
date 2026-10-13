@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import secrets
 import stat
 import sys
@@ -13,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow import action_grants
+from agentflow import action_grants, controller_actions as controller_actions_module
 from agentflow.action_grants import ActionGrantRequest
 from agentflow.controller import RootController
 from agentflow.controller_actions import (
@@ -269,11 +270,67 @@ class ControllerActionAuthorityTests(unittest.TestCase):
 
     def test_status_is_read_only_when_protected_mode_has_no_grants(self) -> None:
         self._activate()
-        self.assertFalse(self.authority.grants_path.exists())
+        self.assertTrue(self.authority.grants_path.exists())
+        before = self.authority.grants_path.read_bytes()
         status = self.authority.status()
         self.assertEqual(status.mode, "protected")
         self.assertTrue(status.available)
+        self.assertEqual(json.loads(self.authority.grants_path.read_text()), {
+            "schema": action_grants.SCHEMA,
+            "version": 2,
+            "grants": {},
+            "hmac": json.loads(before)["hmac"],
+        })
+        self.assertEqual(self.authority.grants_path.read_bytes(), before)
+
+    def test_activated_state_loss_never_recreates_grants_or_protected_metadata(self) -> None:
+        self._activate()
+        request = self._request()
+        self.authority.issue(request)
+        self.authority.grants_path.unlink()
+
+        self.assertEqual(self.authority.status().mode, "unavailable")
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.issue(self._request(task="task-2"))
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.require(request)
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.execute(request, lambda: self.fail("callback ran after store loss"))
         self.assertFalse(self.authority.grants_path.exists())
+
+        self.authority.mode_path.unlink()
+        self.authority.activation_path.unlink()
+        self.authority.registry_path.unlink()
+        shutil.rmtree(self.authority.state_directory)
+
+        self.assertEqual(self.authority.status().mode, "unavailable")
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.register_worktrees((self.worktree,))
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.activate()
+        self.assertFalse(self.authority.state_directory.exists())
+
+    def test_crash_after_pending_anchor_cannot_resume_or_reinitialize_activation(self) -> None:
+        self.authority.register_worktrees((self.worktree,))
+        original_write = controller_actions_module._atomic_private_json
+
+        def fail_mode_write(path, value):
+            if path == self.authority.mode_path:
+                raise OSError("injected activation crash")
+            original_write(path, value)
+
+        with mock.patch("agentflow.controller_actions._atomic_private_json", side_effect=fail_mode_write):
+            with self.assertRaises(ControllerActionUnavailable):
+                self.authority.activate()
+
+        credentials = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+        self.assertEqual(credentials["protected_action_anchor"]["state"], "pending")
+        self.assertFalse(self.authority.mode_path.exists())
+        self.assertEqual(self.authority.status().mode, "unavailable")
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.register_worktrees((self.worktree,))
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.activate()
 
 
 if __name__ == "__main__":

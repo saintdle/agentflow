@@ -25,6 +25,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import time
@@ -45,7 +46,9 @@ from agentflow.controller import FencedLease, Lease, RootController
 _MODE_SCHEMA = "agentflow.controller-action-mode@1"
 _REGISTRY_SCHEMA = "agentflow.controller-worktree-registry@1"
 _ACTIVATION_SCHEMA = "agentflow.controller-action-activation@1"
+_ANCHOR_SCHEMA = "agentflow.controller-action-anchor@1"
 _AUTH_DOMAIN = b"agentflow:controller-action-state-v1:\0"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _T = TypeVar("_T")
 
 
@@ -121,9 +124,54 @@ def _verify_signed(secret: str, value: Any) -> dict[str, Any]:
     supplied = value.get("authority_hmac")
     payload = dict(value)
     payload.pop("authority_hmac", None)
-    if not isinstance(supplied, str) or not hmac.compare_digest(supplied, _mac(secret, payload)):
+    try:
+        expected = _mac(secret, payload)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ControllerActionUnavailable("protected controller action state is malformed") from exc
+    if not isinstance(supplied, str) or not hmac.compare_digest(supplied, expected):
         raise ControllerActionUnavailable("protected controller action state authentication failed")
     return payload
+
+
+def validate_credential_action_anchor(
+    anchor: Any,
+    *,
+    authority_secret: str,
+    workspace_root: str,
+    workflow_root: str,
+    controller_id: str,
+    continuity_id: str,
+) -> dict[str, Any] | None:
+    """Validate the credential-resident proof of protected activation.
+
+    ``None`` means the credential predates protected activation. Any present
+    value must be a complete authenticated commitment for this exact
+    controller incarnation.
+    """
+
+    if anchor is None:
+        return None
+    payload = _verify_signed(authority_secret, anchor)
+    expected = {
+        "schema", "version", "state", "workspace_root", "workflow_root",
+        "controller_id", "continuity_id", "registry_sha256", "mode_sha256",
+    }
+    if (
+        set(payload) != expected
+        or payload.get("schema") != _ANCHOR_SCHEMA
+        or payload.get("version") != 1
+        or payload.get("state") not in {"pending", "active"}
+        or payload.get("workspace_root") != workspace_root
+        or payload.get("workflow_root") != workflow_root
+        or payload.get("controller_id") != controller_id
+        or payload.get("continuity_id") != continuity_id
+        or not isinstance(payload.get("registry_sha256"), str)
+        or not _SHA256.fullmatch(payload["registry_sha256"])
+        or not isinstance(payload.get("mode_sha256"), str)
+        or not _SHA256.fullmatch(payload["mode_sha256"])
+    ):
+        raise ControllerActionUnavailable("protected controller activation anchor is malformed or foreign")
+    return dict(anchor)
 
 
 def _canonical_external_file(value: Path | str, *, label: str) -> Path:
@@ -213,6 +261,49 @@ def _atomic_private_json(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
+@contextmanager
+def credential_write_lock(path: Path | str) -> Iterator[None]:
+    """Serialize canonical credential read/validate/write transactions."""
+
+    credential = Path(path).expanduser()
+    parent = credential.parent
+    try:
+        action_grants._reject_symlink_ancestors(parent)
+        if not parent.exists():
+            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(parent, 0o700)
+        info = parent.stat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or (os.name == "posix" and info.st_uid != os.geteuid())
+            or (os.name == "posix" and stat.S_IMODE(info.st_mode) != 0o700)
+        ):
+            raise OSError("credential directory is not private")
+        lock_path = credential.with_name(f".{credential.name}.credential.lock")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        lock_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or (os.name == "posix" and lock_info.st_uid != os.geteuid())
+            or (os.name == "posix" and stat.S_IMODE(lock_info.st_mode) != 0o600)
+        ):
+            os.close(descriptor)
+            raise OSError("credential lock is not private")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except (OSError, ActionGrantError) as exc:
+        raise ControllerActionUnavailable("canonical controller credential lock is unavailable") from exc
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 class ControllerActionAuthority:
     """Authenticate an owned root controller before protected action access.
 
@@ -284,6 +375,7 @@ class ControllerActionAuthority:
         for root in canonical_roots:
             for protected_path in (
                 self.credential_path,
+                self.credential_path.with_name(f".{self.credential_path.name}.credential.lock"),
                 self.state_directory,
                 self.mode_path,
                 self.activation_path,
@@ -330,7 +422,7 @@ class ControllerActionAuthority:
                 raise ControllerActionUnavailable("protected action storage parent ownership or permissions are unsafe")
         return tuple(canonical_roots)
 
-    def _credentials(self, current: Lease) -> tuple[str, Path]:
+    def _credentials(self, current: Lease) -> tuple[str, Path, dict[str, Any] | None]:
         path = self._canonical_credentials_path()
         credentials = _read_private_json(path, label="controller credential")
         if (
@@ -349,10 +441,22 @@ class ControllerActionAuthority:
             or not isinstance(authority_secret, str) or not authority_secret
         ):
             raise ControllerActionUnavailable("canonical controller credential does not authenticate the current lease")
-        return authority_secret, path
+        anchor = None
+        if "protected_action_anchor" in credentials:
+            if credentials["protected_action_anchor"] is None:
+                raise ControllerActionUnavailable("protected controller activation anchor is malformed")
+            anchor = validate_credential_action_anchor(
+                credentials["protected_action_anchor"],
+                authority_secret=authority_secret,
+                workspace_root=str(self._workspace),
+                workflow_root=self.workflow_root,
+                controller_id=current.controller,
+                continuity_id=current.continuity_id,
+            )
+        return authority_secret, path, anchor
 
     @contextmanager
-    def _authenticated_fence(self) -> Iterator[tuple[Lease, str]]:
+    def _authenticated_fence(self) -> Iterator[tuple[Lease, str, dict[str, Any] | None]]:
         try:
             with self.controller.fence(self.lease) as current:
                 if (
@@ -363,8 +467,8 @@ class ControllerActionAuthority:
                     or current.continuity_id != self.lease.continuity_id
                 ):
                     raise ControllerActionUnavailable("controller lease identity is not current")
-                secret, _path = self._credentials(current)
-                yield current, secret
+                secret, _path, anchor = self._credentials(current)
+                yield current, secret, anchor
         except FencedLease as exc:
             raise ControllerActionUnavailable("controller lease is no longer current") from exc
 
@@ -443,6 +547,76 @@ class ControllerActionAuthority:
             "continuity_id": current.continuity_id,
         }
 
+    def _activation_anchor(
+        self,
+        secret: str,
+        current: Lease,
+        *,
+        state: str,
+        registry_digest: str,
+        mode_digest: str,
+    ) -> dict[str, Any]:
+        return _signed(secret, {
+            "schema": _ANCHOR_SCHEMA,
+            "version": 1,
+            "state": state,
+            **self._scope(current),
+            "registry_sha256": registry_digest,
+            "mode_sha256": mode_digest,
+        })
+
+    def _persist_activation_anchor(
+        self,
+        secret: str,
+        current: Lease,
+        anchor: dict[str, Any],
+    ) -> None:
+        path = self._canonical_credentials_path()
+        with credential_write_lock(path):
+            credentials = _read_private_json(path, label="controller credential")
+            if (
+                credentials.get("schema") != "agentflow.controller_credentials"
+                or credentials.get("version") != 2
+                or credentials.get("workspace_root") != str(self._workspace)
+                or credentials.get("workflow_root") != self.workflow_root
+                or credentials.get("continuity_id") != current.continuity_id
+                or credentials.get("authority_secret") != secret
+            ):
+                raise ControllerActionUnavailable("canonical controller credential changed during activation")
+            existing = None
+            if "protected_action_anchor" in credentials:
+                if credentials["protected_action_anchor"] is None:
+                    raise ControllerActionUnavailable("protected controller activation anchor is malformed")
+                existing = validate_credential_action_anchor(
+                    credentials["protected_action_anchor"],
+                    authority_secret=secret,
+                    workspace_root=str(self._workspace),
+                    workflow_root=self.workflow_root,
+                    controller_id=current.controller,
+                    continuity_id=current.continuity_id,
+                )
+            target_payload = _verify_signed(secret, anchor)
+            if target_payload.get("state") == "pending":
+                if existing is not None:
+                    raise ControllerActionUnavailable("protected controller activation is already committed")
+            elif target_payload.get("state") == "active":
+                if existing is None:
+                    raise ControllerActionUnavailable("pending protected controller activation anchor is missing")
+                existing_payload = _verify_signed(secret, existing)
+                if (
+                    existing_payload.get("state") != "pending"
+                    or {
+                        key: value for key, value in existing_payload.items() if key != "state"
+                    } != {
+                        key: value for key, value in target_payload.items() if key != "state"
+                    }
+                ):
+                    raise ControllerActionUnavailable("pending protected controller activation anchor changed")
+            else:
+                raise ControllerActionUnavailable("protected controller activation state is malformed")
+            credentials["protected_action_anchor"] = anchor
+            _atomic_private_json(path, credentials)
+
     def _read_registry(self, secret: str, current: Lease) -> tuple[dict[str, Any], tuple[str, ...]]:
         value = _read_json_record(self.registry_path, label="protected worktree registry")
         if value is None:
@@ -480,7 +654,16 @@ class ControllerActionAuthority:
             raise ControllerActionUnavailable("complete protected worktree registry is not canonical")
         return payload, roots
 
-    def _require_mode(self, secret: str, current: Lease) -> tuple[tuple[str, ...], ActionGrantStore]:
+    def _require_mode(
+        self,
+        secret: str,
+        current: Lease,
+        anchor: dict[str, Any] | None,
+        *,
+        allow_pending: bool = False,
+    ) -> tuple[tuple[str, ...], ActionGrantStore]:
+        if anchor is None:
+            raise ControllerActionUnavailable("protected controller activation anchor is missing")
         registry_payload, roots = self._read_registry(secret, current)
         mode_value = _read_json_record(self.mode_path, label="protected controller mode marker")
         activation_value = _read_json_record(self.activation_path, label="protected controller activation receipt")
@@ -516,6 +699,14 @@ class ControllerActionAuthority:
             or activation_payload.get("mode_sha256") != mode_digest
         ):
             raise ControllerActionUnavailable("protected controller activation receipt is malformed or downgraded")
+        anchor_payload = _verify_signed(secret, anchor)
+        allowed_states = {"active", "pending"} if allow_pending else {"active"}
+        if (
+            anchor_payload.get("state") not in allowed_states
+            or anchor_payload.get("registry_sha256") != registry_digest
+            or anchor_payload.get("mode_sha256") != mode_digest
+        ):
+            raise ControllerActionUnavailable("protected controller activation anchor does not match its metadata")
         self._validate_storage_location(roots)
         authority = AuthenticatedGrantAuthority(
             workspace_root=self._workspace,
@@ -529,6 +720,9 @@ class ControllerActionAuthority:
             store = ActionGrantStore(self.grants_path, authority)
         except ActionGrantError as exc:
             raise ControllerActionUnavailable("protected action grant storage is unavailable") from exc
+        store_status = store.status()
+        if not store_status.available:
+            raise ControllerActionUnavailable("protected action grant storage is unavailable")
         return roots, store
 
     @staticmethod
@@ -557,7 +751,13 @@ class ControllerActionAuthority:
             raise ControllerActionDenied("worktree registration must provide the complete root iterable") from exc
         if not raw_roots:
             raise ControllerActionDenied("complete worktree registration must contain at least one root")
-        with self._authenticated_fence() as (current, secret):
+        with self._authenticated_fence() as (current, secret, anchor):
+            protected_roots = None
+            if anchor is not None:
+                anchor_payload = _verify_signed(secret, anchor)
+                if anchor_payload.get("state") != "active":
+                    raise ControllerActionUnavailable("pending protected controller activation cannot be reinitialized")
+                protected_roots, _store = self._require_mode(secret, current, anchor)
             canonical: list[str] = []
             try:
                 for raw_root in raw_roots:
@@ -574,6 +774,10 @@ class ControllerActionAuthority:
                     if first_path in second_path.parents or second_path in first_path.parents:
                         raise ControllerActionDenied("complete worktree registration must not contain overlapping roots")
             roots = tuple(sorted(canonical))
+            if protected_roots is not None:
+                if protected_roots != roots:
+                    raise ControllerActionDenied("protected worktree registry is immutable")
+                return protected_roots
             self._validate_storage_location(roots)
             had_state_directory = self.state_directory.exists()
             with self._metadata_lock(roots, create=True):
@@ -590,7 +794,7 @@ class ControllerActionAuthority:
                     if existing != roots:
                         raise ControllerActionDenied("protected worktree registry is immutable")
                     if mode_value is not None or activation_value is not None:
-                        self._require_mode(secret, current)
+                        self._require_mode(secret, current, anchor)
                     return existing
                 if mode_value is not None or activation_value is not None or grants_exists:
                     raise ControllerActionUnavailable("orphaned protected state prevents registry registration")
@@ -632,7 +836,13 @@ class ControllerActionAuthority:
     def activate(self) -> None:
         """Make protected mode sticky for this controller incarnation."""
 
-        with self._authenticated_fence() as (current, secret):
+        with self._authenticated_fence() as (current, secret, anchor):
+            if anchor is not None:
+                anchor_payload = _verify_signed(secret, anchor)
+                if anchor_payload.get("state") == "active":
+                    self._require_mode(secret, current, anchor)
+                    return
+                raise ControllerActionUnavailable("pending protected controller activation cannot be resumed")
             registry_payload, roots = self._read_registry(secret, current)
             self._validate_storage_location(roots)
             with self._metadata_lock(roots, create=False):
@@ -641,48 +851,71 @@ class ControllerActionAuthority:
                     self.activation_path, label="protected controller activation receipt"
                 )
                 if existing is not None or activation_receipt is not None:
-                    self._require_mode(secret, current)
-                    return
+                    self._require_mode(secret, current, anchor)
                 self._fresh_root_before_activation()
                 if self.grants_path.exists() or self.grants_path.is_symlink():
                     raise ControllerActionUnavailable("orphaned action grants prevent protected mode activation")
+                registry_digest = hashlib.sha256(
+                    _canonical_json(_signed(secret, registry_payload))
+                ).hexdigest()
                 payload = {
                     "schema": _MODE_SCHEMA,
                     "version": 1,
                     "mode": "protected",
                     **self._scope(current),
-                    "registry_sha256": hashlib.sha256(
-                        _canonical_json(_signed(secret, registry_payload))
-                    ).hexdigest(),
+                    "registry_sha256": registry_digest,
                     "activated_at": float(time.time()),
                 }
                 signed_mode = _signed(secret, payload)
+                mode_digest = hashlib.sha256(_canonical_json(signed_mode)).hexdigest()
+                pending_anchor = self._activation_anchor(
+                    secret, current, state="pending",
+                    registry_digest=registry_digest, mode_digest=mode_digest,
+                )
+                self._persist_activation_anchor(secret, current, pending_anchor)
                 _atomic_private_json(self.mode_path, signed_mode)
                 receipt = {
                     "schema": _ACTIVATION_SCHEMA,
                     "version": 1,
                     **self._scope(current),
-                    "mode_sha256": hashlib.sha256(_canonical_json(signed_mode)).hexdigest(),
+                    "mode_sha256": mode_digest,
                 }
                 _atomic_private_json(self.activation_path, _signed(secret, receipt))
+                grant_authority = AuthenticatedGrantAuthority(
+                    workspace_root=self._workspace,
+                    workflow_root=self.workflow_root,
+                    controller_id=current.controller,
+                    continuity_id=current.continuity_id,
+                    authority_secret=secret,
+                    bound_worktree_roots=roots,
+                )
+                store = ActionGrantStore(self.grants_path, grant_authority)
+                store.initialize_empty()
+                self._require_mode(secret, current, pending_anchor, allow_pending=True)
+                active_anchor = self._activation_anchor(
+                    secret, current, state="active",
+                    registry_digest=registry_digest, mode_digest=mode_digest,
+                )
+                self._persist_activation_anchor(secret, current, active_anchor)
+                self._require_mode(secret, current, active_anchor)
 
     def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Explicitly issue one exact action grant under the current root fence."""
 
-        with self._authenticated_fence() as (current, secret):
-            roots, store = self._require_mode(secret, current)
+        with self._authenticated_fence() as (current, secret, anchor):
+            roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             self._validate_storage_location(roots)
             try:
-                return store.issue(request)
+                return store.issue(request, initialize_if_missing=False)
             except ActionGrantError as exc:
                 raise ControllerActionDenied(str(exc)) from exc
 
     def require(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Require an existing exact action grant while holding the root fence."""
 
-        with self._authenticated_fence() as (current, secret):
-            roots, store = self._require_mode(secret, current)
+        with self._authenticated_fence() as (current, secret, anchor):
+            roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             try:
                 return store.require(request)
@@ -698,8 +931,8 @@ class ControllerActionAuthority:
 
         if not callable(operation):
             raise TypeError("protected action operation must be callable")
-        with self._authenticated_fence() as (current, secret):
-            roots, store = self._require_mode(secret, current)
+        with self._authenticated_fence() as (current, secret, anchor):
+            roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             try:
                 store.require(request)
@@ -711,7 +944,7 @@ class ControllerActionAuthority:
         """Return a read-only, secret-free projection of mode and stored scopes."""
 
         try:
-            with self._authenticated_fence() as (current, secret):
+            with self._authenticated_fence() as (current, secret, anchor):
                 self._validate_storage_location()
                 registry_value = _read_json_record(self.registry_path, label="protected worktree registry")
                 mode_value = _read_json_record(self.mode_path, label="protected controller mode marker")
@@ -723,6 +956,7 @@ class ControllerActionAuthority:
                 if (
                     registry_value is None and mode_value is None and activation_value is None
                     and not grants_exists and not lock_exists and not self.state_directory.exists()
+                    and anchor is None
                 ):
                     return ControllerActionStatus(
                         mode="legacy", available=False,
@@ -730,13 +964,7 @@ class ControllerActionAuthority:
                     )
                 if registry_value is None or mode_value is None:
                     raise ControllerActionUnavailable("protected controller action state is incomplete")
-                roots, store = self._require_mode(secret, current)
-                if not self.grants_path.exists():
-                    return ControllerActionStatus(
-                        mode="protected", available=True,
-                        reason="protected mode is active; no action grants have been issued",
-                        registered_worktree_roots=roots,
-                    )
+                roots, store = self._require_mode(secret, current, anchor)
                 try:
                     document = store._read(required=True)
                     summaries: list[GrantedActionStatus] = []
@@ -776,4 +1004,5 @@ class ControllerActionAuthority:
 __all__ = [
     "ControllerActionAuthority", "ControllerActionDenied", "ControllerActionError",
     "ControllerActionStatus", "ControllerActionUnavailable", "GrantedActionStatus",
+    "validate_credential_action_anchor",
 ]

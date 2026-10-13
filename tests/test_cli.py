@@ -5707,6 +5707,56 @@ class ControllerResumeCredentialTests(unittest.TestCase):
             self.assertTrue(credentials["resume_secret"])
             self.assertTrue(credentials["authority_secret"])
 
+    def test_protected_action_anchor_survives_rotation_and_rejects_corruption_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            root = base / "workspace"
+            worker = base / "worker"
+            root.mkdir()
+            worker.mkdir()
+            args = _controller_args(root, workflow_root="wf")
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                controller, _ = cli._controller_instance(args)
+                lease = controller.acquire()
+                credential_path, credentials = cli._controller_credentials(args, lease)
+                authority = cli.controller_actions_backend.ControllerActionAuthority(
+                    controller, lease, workflow_root="wf", credential_path=credential_path,
+                )
+                authority.register_worktrees((worker,))
+                authority.activate()
+                anchor = cli._read_controller_credentials(credential_path)["protected_action_anchor"]
+                self.assertEqual(anchor["state"], "active")
+
+                _path, rotated = cli._controller_credentials(args, lease)
+                self.assertEqual(rotated["protected_action_anchor"], anchor)
+                self.assertEqual(credentials["authority_secret"], rotated["authority_secret"])
+
+                for kind in ("tampered", "foreign-continuity"):
+                    with self.subTest(kind=kind):
+                        value = json.loads(credential_path.read_text(encoding="utf-8"))
+                        replacement = dict(anchor)
+                        if kind == "tampered":
+                            replacement["mode_sha256"] = "0" * 64
+                        else:
+                            payload = dict(replacement)
+                            payload.pop("authority_hmac")
+                            payload["continuity_id"] = "foreign-continuity"
+                            replacement = cli.controller_actions_backend._signed(
+                                rotated["authority_secret"], payload,
+                            )
+                        value["protected_action_anchor"] = replacement
+                        cli._private_atomic_json(credential_path, value)
+                        before = credential_path.read_bytes()
+                        with self.assertRaises(cli.controller_backend.ControllerError):
+                            cli._controller_credentials(args, lease)
+                        self.assertEqual(credential_path.read_bytes(), before)
+
+                credential_path.write_text("{ truncated", encoding="utf-8")
+                before = credential_path.read_bytes()
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._controller_credentials(args, lease)
+                self.assertEqual(credential_path.read_bytes(), before)
+
 
 def _spawn_provider_report(fixture, argv: list, *, report_delay: float,
                            report_done: threading.Event, threads: list,

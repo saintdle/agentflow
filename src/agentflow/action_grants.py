@@ -27,9 +27,11 @@ import time
 from typing import Any, Iterable, Iterator, Mapping
 
 
-SCHEMA = "agentflow.action-grants@1"
+SCHEMA = "agentflow.action-grants@2"
+_LEGACY_SCHEMA = "agentflow.action-grants@1"
 GRANT_SCHEMA = "agentflow.action-grant@1"
 _DOMAIN = b"agentflow:action-grant-v1:\0"
+_STORE_DOMAIN = b"agentflow:action-grant-store-v2:\0"
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")
 _WILDCARD = re.compile(r"[*?\[\]{}]")
 
@@ -165,6 +167,10 @@ def _canonical_json(value: Mapping[str, Any]) -> bytes:
 
 def _mac(secret: bytes, payload: Mapping[str, Any]) -> str:
     return hmac.new(secret, _DOMAIN + _canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def _store_mac(secret: bytes, payload: Mapping[str, Any]) -> str:
+    return hmac.new(secret, _STORE_DOMAIN + _canonical_json(payload), hashlib.sha256).hexdigest()
 
 
 def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -434,7 +440,7 @@ class ActionGrantStore:
         if not self.path.exists():
             if required:
                 raise ActionGrantUnavailable("protected action-grant store is missing")
-            return {"schema": SCHEMA, "version": 1, "grants": {}}
+            return {"schema": SCHEMA, "version": 2, "grants": {}}
         try:
             flags = os.O_RDONLY
             if hasattr(os, "O_NOFOLLOW"):
@@ -454,23 +460,44 @@ class ActionGrantStore:
                 os.close(descriptor)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise ActionGrantUnavailable("protected action-grant store cannot be read") from exc
-        if (
-            not isinstance(value, dict)
-            or set(value) != {"schema", "version", "grants"}
-            or value.get("schema") != SCHEMA
-            or value.get("version") != 1
-            or not isinstance(value.get("grants"), dict)
-        ):
+        if not isinstance(value, dict) or not isinstance(value.get("grants"), dict):
             raise ActionGrantUnavailable("protected action-grant store is malformed")
-        return value
+        if (
+            set(value) == {"schema", "version", "grants", "hmac"}
+            and value.get("schema") == SCHEMA
+            and value.get("version") == 2
+        ):
+            payload = dict(value)
+            supplied = payload.pop("hmac")
+            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, _store_mac(self._secret, payload)):
+                raise ActionGrantDenied("protected action-grant store authentication failed")
+            return payload
+        # Older stores authenticate each nonempty grant individually. Accept
+        # those records for verification and let the next issue upgrade the
+        # envelope. An unsigned empty document carries no authenticated
+        # history and cannot stand in for an activated store.
+        if (
+            set(value) == {"schema", "version", "grants"}
+            and value.get("schema") == _LEGACY_SCHEMA
+            and value.get("version") == 1
+            and value["grants"]
+        ):
+            return value
+        raise ActionGrantUnavailable("protected action-grant store is malformed or unauthenticated")
 
     def _write(self, value: Mapping[str, Any]) -> None:
+        payload = {
+            "schema": SCHEMA,
+            "version": 2,
+            "grants": dict(value.get("grants", {})),
+        }
+        signed = {**payload, "hmac": _store_mac(self._secret, payload)}
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         temporary = Path(temporary_name)
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(_canonical_json(value).decode("utf-8"))
+                handle.write(_canonical_json(signed).decode("utf-8"))
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -483,6 +510,14 @@ class ActionGrantStore:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+
+    def initialize_empty(self) -> None:
+        """Create the authenticated empty store exactly once during activation."""
+
+        with self._locked(create_directory=True):
+            if self.path.exists() or self.path.is_symlink():
+                raise ActionGrantUnavailable("protected action-grant store already exists")
+            self._write({"grants": {}})
 
     def _scope(self, request: ActionGrantRequest) -> dict[str, Any]:
         worktree_root = _canonical_worktree(self.workspace, request.worktree_root)
@@ -562,7 +597,9 @@ class ActionGrantStore:
         self._validate_store_location(create_directory=False)
         return payload
 
-    def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
+    def issue(
+        self, request: ActionGrantRequest, *, initialize_if_missing: bool = True,
+    ) -> ActionGrantSummary:
         """Sign and atomically retain one exact scope grant.
 
         The controller must hold its fence around this call and its later
@@ -574,7 +611,7 @@ class ActionGrantStore:
         payload = {"schema": GRANT_SCHEMA, "grant_id": secrets.token_hex(24), **scope}
         payload["hmac"] = _mac(self._secret, payload)
         with self._locked(create_directory=True):
-            document = self._read(required=False)
+            document = self._read(required=not initialize_if_missing)
             for grant_id, raw in document["grants"].items():
                 self._validated_payload(grant_id, raw)
             document["grants"][payload["grant_id"]] = payload
