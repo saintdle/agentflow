@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import dataclasses
 import datetime as dt
 import fcntl
@@ -32,7 +32,6 @@ from agentflow import audit as audit_backend
 from agentflow import beads as beads_backend
 from agentflow import checkpoint as checkpoint_backend
 from agentflow import controller as controller_backend
-from agentflow import controller_actions as controller_actions_backend
 from agentflow import config_commands as config_commands_backend
 from agentflow import context_budget as context_budget_backend
 from agentflow import context_delivery as context_delivery_backend
@@ -355,7 +354,7 @@ def _legacy_resume_key_path(args: argparse.Namespace) -> Path | None:
     ) / "resume.key"
 
 
-def _read_controller_credentials(path: Path) -> dict[str, Any]:
+def _read_controller_credentials(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
@@ -364,74 +363,13 @@ def _read_controller_credentials(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(value, dict):
         return {}
-    credentials: dict[str, Any] = {
+    return {
         "resume_secret": str(value.get("resume_secret") or ""),
         "authority_secret": str(value.get("authority_secret") or ""),
         "continuity_id": str(value.get("continuity_id") or ""),
         "workspace_root": str(value.get("workspace_root") or ""),
         "workflow_root": str(value.get("workflow_root") or ""),
     }
-    if "protected_action_anchor" in value:
-        credentials["protected_action_anchor"] = value["protected_action_anchor"]
-    return credentials
-
-
-def _credential_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate credential JSON key")
-        result[key] = value
-    return result
-
-
-def _read_credential_for_rotation(path: Path) -> dict[str, Any]:
-    """Read an existing credential strictly before a serializer overwrite."""
-
-    if path.is_symlink():
-        raise controller_backend.ControllerError(
-            "canonical controller credential cannot be a symlink"
-        )
-    if not path.exists():
-        return {}
-    if not path.is_file():
-        raise controller_backend.ControllerError(
-            "canonical controller credential is not a regular file"
-        )
-    try:
-        value = json.loads(
-            path.read_text(encoding="utf-8"), object_pairs_hook=_credential_json_object,
-        )
-    except (OSError, ValueError) as exc:
-        raise controller_backend.ControllerError(
-            "existing canonical controller credential is malformed"
-        ) from exc
-    if not isinstance(value, dict):
-        raise controller_backend.ControllerError(
-            "existing canonical controller credential is malformed"
-        )
-    if (
-        value.get("schema") == "agentflow.controller_credentials"
-        and value.get("version") == 2
-        and set(value) <= {
-            "schema", "version", "resume_secret", "authority_secret", "continuity_id",
-            "workspace_root", "workflow_root", "protected_action_anchor",
-        }
-        and all(isinstance(value.get(key), str) for key in (
-            "resume_secret", "authority_secret", "continuity_id", "workspace_root", "workflow_root",
-        ))
-    ):
-        return _read_controller_credentials(path)
-    if (
-        value.get("schema") == "agentflow.controller_resume_key"
-        and value.get("version") == 1
-        and set(value) == {"schema", "version", "resume_secret"}
-        and isinstance(value.get("resume_secret"), str)
-    ):
-        return _read_controller_credentials(path)
-    raise controller_backend.ControllerError(
-        "existing canonical controller credential is malformed"
-    )
 
 
 def _read_resume_key(path: Path) -> str:
@@ -446,7 +384,6 @@ def _write_resume_key(
     continuity_id: str = "",
     workspace_root: str = "",
     workflow_root: str = "",
-    protected_action_anchor: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist controller credentials to one protected 0600 file.
 
@@ -454,7 +391,7 @@ def _write_resume_key(
     records only.  The signing secret is kept with the resume credential
     outside that workspace by default.
     """
-    credentials: dict[str, Any] = {
+    _private_atomic_json(path, {
         "schema": "agentflow.controller_credentials",
         "version": 2,
         "resume_secret": secret,
@@ -462,10 +399,7 @@ def _write_resume_key(
         "continuity_id": continuity_id,
         "workspace_root": workspace_root,
         "workflow_root": workflow_root,
-    }
-    if protected_action_anchor is not None:
-        credentials["protected_action_anchor"] = dict(protected_action_anchor)
-    _private_atomic_json(path, credentials)
+    })
 
 
 def _accounting_key_archive_path(canonical_path: Path, continuity_id: str) -> Path:
@@ -633,42 +567,10 @@ def _controller_credentials(
     key_path: Path | None = None,
     expected_resume_secret: str | None = None,
     expected_authority_secret: str | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    """Serialize and persist one canonical controller credential transaction."""
-
-    root = _root_arg(args)
-    workflow_root = str(getattr(args, "workflow_root", "") or "")
-    canonical_args = argparse.Namespace(
-        root=str(root), workflow_root=workflow_root, resume_key_file=""
-    )
-    canonical_path = _resume_key_path(canonical_args)
-    path = key_path or _resume_key_path(args)
-    lock_paths = [path]
-    if path == canonical_path or canonical_path.exists():
-        lock_paths.append(canonical_path)
-    with ExitStack() as locks:
-        for lock_path in sorted(set(lock_paths), key=str):
-            locks.enter_context(controller_actions_backend.credential_write_lock(lock_path))
-        return _controller_credentials_unlocked(
-            args,
-            lease,
-            key_path=key_path,
-            expected_resume_secret=expected_resume_secret,
-            expected_authority_secret=expected_authority_secret,
-        )
-
-
-def _controller_credentials_unlocked(
-    args: argparse.Namespace,
-    lease: controller_backend.Lease,
-    *,
-    key_path: Path | None = None,
-    expected_resume_secret: str | None = None,
-    expected_authority_secret: str | None = None,
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, str]]:
     """Rotate resume proof while preserving one incarnation signing key."""
     path = key_path or _resume_key_path(args)
-    credentials = _read_credential_for_rotation(path)
+    credentials = _read_controller_credentials(path)
     if (
         expected_resume_secret is not None
         and not hmac.compare_digest(
@@ -692,100 +594,27 @@ def _controller_credentials_unlocked(
     legacy = _legacy_resume_key_path(args)
     if not credentials and legacy is not None and legacy.is_file():
         credentials = _read_controller_credentials(legacy)
+    authority_secret = credentials.get("authority_secret", "")
+    if (
+        not authority_secret
+        or credentials.get("continuity_id", "") != lease.continuity_id
+    ):
+        authority_secret = secrets.token_urlsafe(48)
+    resume_secret = lease.resume_secret or credentials.get("resume_secret", "")
+    if not lease.verify_resume_proof(resume_secret):
+        raise controller_backend.ControllerError(
+            "protected controller resume credential is unavailable or does not match this lease"
+        )
     root = _root_arg(args)
     workflow_root = str(getattr(args, "workflow_root", "") or "")
     canonical_args = argparse.Namespace(
         root=str(root), workflow_root=workflow_root, resume_key_file=""
     )
     canonical_path = _resume_key_path(canonical_args)
-    canonical_credentials = _read_credential_for_rotation(canonical_path)
-    workspace_root = str(root.resolve())
-
-    def validate_anchor(record: Mapping[str, Any]) -> dict[str, Any] | None:
-        if "protected_action_anchor" not in record:
-            return None
-        if record["protected_action_anchor"] is None:
-            raise controller_backend.ControllerError(
-                "protected controller activation anchor is malformed"
-            )
-        try:
-            return controller_actions_backend.validate_credential_action_anchor(
-                record["protected_action_anchor"],
-                authority_secret=str(record.get("authority_secret") or ""),
-                workspace_root=workspace_root,
-                workflow_root=workflow_root,
-                controller_id=lease.controller,
-                continuity_id=lease.continuity_id,
-            )
-        except controller_actions_backend.ControllerActionUnavailable as exc:
-            raise controller_backend.ControllerError(
-                "protected controller activation anchor is malformed, foreign, or tampered"
-            ) from exc
-
-    path_anchor = validate_anchor(credentials)
-    canonical_anchor = validate_anchor(canonical_credentials)
-    if (
-        path_anchor != canonical_anchor
-        or ("protected_action_anchor" in credentials)
-        != ("protected_action_anchor" in canonical_credentials)
-    ):
-        raise controller_backend.ControllerError(
-            "selected and canonical controller activation anchors are missing or conflicting"
-        )
-    activation_anchor = path_anchor
-    current_path_credentials = _read_credential_for_rotation(path)
-    if validate_anchor(current_path_credentials) != path_anchor:
-        raise controller_backend.LeaseConflict(
-            "canonical controller activation anchor changed before candidate write"
-        )
-    current_canonical_credentials = (
-        current_path_credentials if canonical_path == path
-        else _read_credential_for_rotation(canonical_path)
+    canonical_credentials = (
+        {} if canonical_path.is_symlink()
+        else _read_controller_credentials(canonical_path)
     )
-    if validate_anchor(current_canonical_credentials) != canonical_anchor:
-        raise controller_backend.LeaseConflict(
-            "canonical controller activation anchor changed before candidate write"
-        )
-
-    path_secret = str(credentials.get("authority_secret") or "")
-    canonical_secret = str(canonical_credentials.get("authority_secret") or "")
-    if (
-        path_secret
-        and canonical_secret
-        and credentials.get("continuity_id", "") == lease.continuity_id
-        and canonical_credentials.get("continuity_id", "") == lease.continuity_id
-        and not hmac.compare_digest(path_secret, canonical_secret)
-    ):
-        raise controller_backend.ControllerError(
-            "selected and canonical controller authority credentials conflict"
-        )
-    if path_secret and credentials.get("continuity_id", "") == lease.continuity_id:
-        authority_secret = path_secret
-    elif canonical_secret and canonical_credentials.get("continuity_id", "") == lease.continuity_id:
-        authority_secret = canonical_secret
-    else:
-        authority_secret = secrets.token_urlsafe(48)
-    if activation_anchor is not None:
-        anchor_record = credentials if path_anchor is not None else canonical_credentials
-        anchor_secret = str(anchor_record.get("authority_secret") or "")
-        if not hmac.compare_digest(anchor_secret, authority_secret):
-            raise controller_backend.ControllerError(
-                "protected controller authority credential cannot change after activation"
-            )
-        for record in (credentials, canonical_credentials):
-            record_secret = str(record.get("authority_secret") or "")
-            if record_secret and record.get("continuity_id") == lease.continuity_id and not hmac.compare_digest(
-                record_secret, authority_secret
-            ):
-                raise controller_backend.ControllerError(
-                    "protected controller authority credential conflicts with its activation anchor"
-                )
-
-    resume_secret = lease.resume_secret or credentials.get("resume_secret", "")
-    if not lease.verify_resume_proof(resume_secret):
-        raise controller_backend.ControllerError(
-            "protected controller resume credential is unavailable or does not match this lease"
-        )
     prior_canonical_secret = str(canonical_credentials.get("authority_secret") or "")
     if prior_canonical_secret and (
         canonical_credentials.get("continuity_id") != lease.continuity_id
@@ -796,7 +625,7 @@ def _controller_credentials_unlocked(
             workspace_root=str(root.resolve()), workflow_root=workflow_root,
         )
     if expected_resume_secret is not None or expected_authority_secret is not None:
-        current_credentials = _read_credential_for_rotation(path)
+        current_credentials = _read_controller_credentials(path)
         if path.is_symlink() or (
             expected_resume_secret is not None
             and not hmac.compare_digest(
@@ -822,26 +651,30 @@ def _controller_credentials_unlocked(
         resume_secret,
         authority_secret=authority_secret,
         continuity_id=lease.continuity_id,
-        workspace_root=workspace_root,
+        workspace_root=str(root),
         workflow_root=workflow_root,
-        protected_action_anchor=activation_anchor,
     )
-    # A custom selected key does not create its default authority mirror
-    # here: its complete worktree roots are not yet known. Registration
-    # validates both credential locations before creating the canonical
-    # authority-only copy and activation anchor.
+    if canonical_path != path:
+        # Result/waiver verification never follows a worker-controlled path.
+        # Keep a canonical authority-only copy outside the workspace even
+        # when an operator chooses a custom resume-key location.
+        _write_resume_key(
+            canonical_path,
+            "",
+            authority_secret=authority_secret,
+            continuity_id=lease.continuity_id,
+            workspace_root=str(root),
+            workflow_root=workflow_root,
+        )
     if legacy is not None and legacy != path and legacy.is_file():
         legacy.unlink()
-    result: dict[str, Any] = {
+    return path, {
         "resume_secret": resume_secret,
         "authority_secret": authority_secret,
         "continuity_id": lease.continuity_id,
-        "workspace_root": workspace_root,
+        "workspace_root": str(root),
         "workflow_root": workflow_root,
     }
-    if activation_anchor is not None:
-        result["protected_action_anchor"] = activation_anchor
-    return path, result
 
 
 def _authority_secret(
