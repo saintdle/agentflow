@@ -39,6 +39,42 @@ def checkpoint_digest(document: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _build_explicit_continuation_checkpoint(
+    document: Mapping[str, Any],
+    current: Lease,
+    *,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    root: str,
+    controller_id: str,
+) -> dict[str, Any]:
+    """Construct the exact normalized checkpoint committed by continuation acknowledgement."""
+    acknowledgement = (
+        f"authenticated cancelled-preidentity continuation for {workflow_root}; "
+        f"ready descendant {ready_task} after {cancelled_task}"
+    )
+    if len(acknowledgement) > checkpoint.FIELD_MAX:
+        raise ControllerError("workflow and task IDs are too long to acknowledge safely")
+    staged = dict(document)
+    staged["drain_causes"] = []
+    staged.update({
+        "task": root,
+        "phase": "controller",
+        "root": root,
+        "controller": controller_id,
+        "epoch": current.epoch,
+        "lease_token": current.token,
+        "state": "advancing",
+        "status": "advancing",
+        "terminal": False,
+        "next_action": "select explicitly verified ready descendant",
+        "last_check": acknowledgement,
+        "pending_continuation_task": ready_task,
+    })
+    return checkpoint.build_checkpoint(staged)
+
+
 def _drain_causes_digest(causes: list[Mapping[str, Any]]) -> str:
     encoded = json.dumps(causes, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -1371,12 +1407,16 @@ class RootController:
         ):
             return False
 
+        staged_digest = str(pending.get("staged_checkpoint_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", staged_digest):
+            raise LeaseConflict("staged continuation has no authenticated complete checkpoint commitment")
         expected_check = (
             f"authenticated cancelled-preidentity continuation for {pending.get('workflow_root')}; "
             f"ready descendant {pending.get('ready_task')} after {pending.get('cancelled_task')}"
         )
         staged = bool(
             hashlib.sha256(raw).hexdigest() != pending.get("retired_checkpoint_sha256")
+            and checkpoint_digest(document) == staged_digest
             and checkpoint.admission_phase(document) == "open"
             and checkpoint.resume_state(document) == "advancing"
             and document.get("state") == "advancing"
@@ -1542,6 +1582,7 @@ class RootController:
         authority_secret: str,
         resume_proof: str,
         drain_resolution_authorization: Mapping[str, Any] | None = None,
+        readiness_verifier: Callable[[Lease], str],
         persist_credentials: Callable[[Lease], Any],
     ) -> Lease:
         """Rotate credentials under a signed, exact-target retry intent."""
@@ -1551,6 +1592,8 @@ class RootController:
             raise LeaseConflict("continuation target must differ from the cancelled task")
         if not isinstance(drain_resolution_authorization, Mapping):
             raise LeaseConflict("explicit continuation requires its signed drain-resolution authorization")
+        if not callable(readiness_verifier):
+            raise LeaseConflict("explicit continuation requires a final fenced readiness verifier")
         with self._locked():
             state = _read_json(self.state_path)
             active = self._read_lease(state)
@@ -1615,6 +1658,8 @@ class RootController:
                     candidate = self._continuation_lease_from_record(pending_value, resume_proof)
                     if not self._lease_matches(active, candidate):
                         raise LeaseConflict("staged continuation lease no longer matches protected state")
+                    if readiness_verifier(candidate) != ready_task:
+                        raise LeaseConflict("continuation target is no longer the exact current ready task")
                     self._lease = candidate
                     return candidate
                 if candidate_hash and hmac.compare_digest(
@@ -1629,6 +1674,8 @@ class RootController:
                     ):
                         raise LeaseConflict("staged continuation no longer matches its original incarnation")
                     candidate = self._continuation_lease_from_record(pending, resume_proof)
+                    if readiness_verifier(candidate) != ready_task:
+                        raise LeaseConflict("continuation target is no longer the exact current ready task")
                     state["epoch"] = candidate.epoch
                     state["lease"] = candidate.to_storage_dict()
                     state.pop("dormant_lease", None)
@@ -1682,6 +1729,12 @@ class RootController:
                 previous.acquired_at, now, self.owner_id, secret, _hash_secret(secret),
                 continuity_id=previous.continuity_id,
             )
+            staged_document = _build_explicit_continuation_checkpoint(
+                retired_document, candidate,
+                workflow_root=workflow_root, cancelled_task=cancelled_task,
+                ready_task=ready_task, root=self.root, controller_id=self.controller,
+            )
+            staged_checkpoint_sha256 = checkpoint_digest(staged_document)
             payload = {
                 "schema": "agentflow.continuation-reattach@1",
                 "root": self.root, "controller": self.controller,
@@ -1697,6 +1750,7 @@ class RootController:
                 "token": candidate.token, "acquired_at": candidate.acquired_at,
                 "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
                 "resume_secret_hash": candidate.resume_secret_hash,
+                "staged_checkpoint_sha256": staged_checkpoint_sha256,
                 "drain_resolution_authorization": dict(drain_resolution_authorization),
             }
             if owner_receipt_hash:
@@ -1704,6 +1758,8 @@ class RootController:
             payload["authority_hmac"] = _authority_mac(
                 authority_secret, payload, domain="continuation-reattach-v1",
             )
+            if readiness_verifier(candidate) != ready_task:
+                raise LeaseConflict("continuation target is no longer the exact current ready task")
             state["continuation_reattach"] = payload
             self._write_state(state)
             persist_credentials(candidate)
@@ -1722,8 +1778,11 @@ class RootController:
         ready_task: str,
         authority_secret: str,
         lease: Lease | str,
+        readiness_verifier: Callable[[Lease], str],
     ) -> None:
         """Clear a staged continuation only after its target is checkpointed."""
+        if not callable(readiness_verifier):
+            raise LeaseConflict("continuation clearing requires a final fenced readiness verifier")
         with self.fence(
             lease,
             _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
@@ -1772,6 +1831,8 @@ class RootController:
                 or checkpoint.get("lease_token") != current.token
             ):
                 raise LeaseConflict("staged continuation cannot be cleared before its exact target is durable")
+            if readiness_verifier(current) != ready_task:
+                raise LeaseConflict("continuation target is no longer the exact current ready task")
             state.pop("continuation_reattach", None)
             receipt_hash = str(payload.get("owner_repair_receipt_sha256") or "")
             if receipt_hash:
@@ -2657,7 +2718,9 @@ class RootController:
             return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document))
 
     def acknowledge_no_ready_halt(
-        self, workflow_root: str, ready_task: str, *, lease: Lease | str | None = None,
+        self, workflow_root: str, ready_task: str, *,
+        lease: Lease | str | None = None,
+        readiness_verifier: Callable[[Lease], str],
     ) -> ResumeResult:
         """Reopen only the known no-ready-work halt after a caller proves readiness.
 
@@ -2666,6 +2729,8 @@ class RootController:
         """
         if not workflow_root or not ready_task:
             raise ControllerError("workflow root and ready descendant are required")
+        if not callable(readiness_verifier):
+            raise ControllerError("no-ready acknowledgement requires a final fenced readiness verifier")
         with self.fence(lease) as current:
             document = self._load_checkpoint()
             causes = document.get("drain_causes")
@@ -2699,6 +2764,8 @@ class RootController:
             if len(acknowledgement) > checkpoint.FIELD_MAX:
                 raise ControllerError("workflow and ready task IDs are too long to acknowledge safely")
             prior_check = str(document.get("last_check") or "")
+            if readiness_verifier(current) != ready_task:
+                raise ControllerError("no-ready acknowledgement target is no longer the exact current ready task")
             prior_budget = checkpoint.FIELD_MAX - len(acknowledgement) - 2
             last_check = (
                 f"{prior_check[:prior_budget]}; {acknowledgement}"
@@ -3019,6 +3086,7 @@ class RootController:
         authority_secret: str = "",
         resolution_authorization: Mapping[str, Any] | None = None,
         lease: Lease | str | None = None,
+        readiness_verifier: Callable[[Lease], str],
     ) -> ResumeResult:
         """Reopen only a signed cancelled-preidentity halt for distinct ready work."""
 
@@ -3028,6 +3096,8 @@ class RootController:
             raise ControllerError("continuation must select a task distinct from the cancelled launch")
         if not isinstance(resolution_authorization, Mapping):
             raise ControllerError("continuation requires its signed drain-resolution authorization")
+        if not callable(readiness_verifier):
+            raise ControllerError("continuation requires a final fenced readiness verifier")
         with self.fence(
             lease,
             _continuation_authority=(workflow_root, cancelled_task, ready_task, authority_secret),
@@ -3059,6 +3129,17 @@ class RootController:
                 current_epoch=current.epoch, current_token=current.token,
                 pending=state.get("continuation_reattach") if isinstance(state, Mapping) else None,
             )
+            pending = state.get("continuation_reattach")
+            if not isinstance(pending, Mapping):
+                raise ControllerError("continuation acknowledgement requires its signed pending intent")
+            expected_staged = _build_explicit_continuation_checkpoint(
+                retired_document, current,
+                workflow_root=workflow_root, cancelled_task=cancelled_task,
+                ready_task=ready_task, root=self.root, controller_id=self.controller,
+            )
+            expected_staged_digest = checkpoint_digest(expected_staged)
+            if pending.get("staged_checkpoint_sha256") != expected_staged_digest:
+                raise ControllerError("pending continuation does not bind the exact staged checkpoint")
             if (
                 checkpoint.admission_phase(document) != "terminal"
                 or checkpoint.resume_state(document) != "blocked"
@@ -3077,6 +3158,8 @@ class RootController:
             )
             if len(acknowledgement) > checkpoint.FIELD_MAX:
                 raise ControllerError("workflow and task IDs are too long to acknowledge safely")
+            if readiness_verifier(current) != ready_task:
+                raise ControllerError("continuation target is no longer the exact current ready task")
             self._archive_resolved_drain_causes(
                 document, current, resolution="authenticated_continuation",
                 context={
@@ -3101,6 +3184,8 @@ class RootController:
                 "last_check": acknowledgement,
                 "pending_continuation_task": ready_task,
             })
+            if checkpoint_digest(checkpoint.build_checkpoint(document)) != expected_staged_digest:
+                raise ControllerError("acknowledgement does not match the signed staged checkpoint commitment")
             return self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
 
     def complete(self, *, reason: str = "", lease: Lease | str | None = None) -> ResumeResult:

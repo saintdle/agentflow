@@ -71,6 +71,41 @@ class ControllerTests(unittest.TestCase):
         )
         return payload
 
+    def _reattach_for_test(
+        self, controller: RootController, lease: Lease,
+        authorization: Mapping[str, Any], workflow: str = "workflow",
+        cancelled: str = "old", ready: str = "ready-task",
+    ) -> Lease:
+        return controller.reattach_for_explicit_continuation(
+            workflow_root=workflow, cancelled_task=cancelled, ready_task=ready,
+            checkpoint_epoch=lease.epoch, authority_secret=self._authority_secret,
+            resume_proof=lease.resume_secret,
+            drain_resolution_authorization=authorization,
+            readiness_verifier=lambda _current: ready,
+            persist_credentials=lambda _candidate: None,
+        )
+
+    def _finish_test_continuation(
+        self, controller: RootController, lease: Lease,
+        authorization: Mapping[str, Any], workflow: str = "workflow",
+        cancelled: str = "old", ready: str = "ready-task",
+    ) -> Lease:
+        candidate = self._reattach_for_test(
+            controller, lease, authorization, workflow, cancelled, ready,
+        )
+        verifier = lambda _current: ready
+        controller.acknowledge_cancelled_preidentity_halt(
+            workflow, cancelled, ready, authority_secret=self._authority_secret,
+            resolution_authorization=authorization, lease=candidate,
+            readiness_verifier=verifier,
+        )
+        controller.clear_explicit_continuation(
+            workflow_root=workflow, cancelled_task=cancelled, ready_task=ready,
+            authority_secret=self._authority_secret, lease=candidate,
+            readiness_verifier=verifier,
+        )
+        return candidate
+
     def _controller_with_pending_continuation(self, base: Path) -> tuple[RootController, Lease]:
         state = base / "controller.json"
         cp = base / "checkpoint.json"
@@ -88,10 +123,7 @@ class ControllerTests(unittest.TestCase):
         document["last_check"] = "cancelled expired preidentity launch old-launch for old"
         checkpoint.write_checkpoint(cp, document)
         authorization = self._resolution_authorization(controller, lease, "workflow", "old", "ready-task")
-        controller.acknowledge_cancelled_preidentity_halt(
-            "workflow", "old", "ready-task", authority_secret=self._authority_secret,
-            resolution_authorization=authorization, lease=lease,
-        )
+        lease = self._finish_test_continuation(controller, lease, authorization)
         return controller, lease
 
     def test_supervisor_lock_is_exclusive_per_root_and_released_on_exit(self) -> None:
@@ -284,13 +316,19 @@ class ControllerTests(unittest.TestCase):
 
             with mock.patch.object(checkpoint, "write_checkpoint", side_effect=fail_once):
                 with self.assertRaisesRegex(OSError, "simulated checkpoint crash"):
-                    controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+                    controller.acknowledge_no_ready_halt(
+                        "workflow", "ready-task", lease=lease,
+                        readiness_verifier=lambda _current: "ready-task",
+                    )
                 archived_state = controller_module._read_json(state_path)
                 self.assertEqual(len(archived_state["drain_audit"]), 1)
                 self.assertEqual(archived_state["independent_helper"], {"retain": "across audit writes"})
                 self.assertEqual(cp.read_bytes(), checkpoint_before)
 
-                resolved = controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+                resolved = controller.acknowledge_no_ready_halt(
+                        "workflow", "ready-task", lease=lease,
+                        readiness_verifier=lambda _current: "ready-task",
+                    )
 
             self.assertEqual(resolved.checkpoint["drain_causes"], [])
             self.assertIn(archived_state["drain_audit"][0]["causes_sha256"], resolved.checkpoint["last_check"])
@@ -302,7 +340,31 @@ class ControllerTests(unittest.TestCase):
             stale = controller.halt("blocked", "unrelated later failure", lease=lease)
             self.assertEqual([item["kind"] for item in stale.checkpoint["drain_causes"]], ["unknown"])
             with self.assertRaisesRegex(ControllerError, "eligible no-ready-work halt"):
-                controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+                controller.acknowledge_no_ready_halt(
+                        "workflow", "ready-task", lease=lease,
+                        readiness_verifier=lambda _current: "ready-task",
+                    )
+
+    def test_no_ready_acknowledgement_rechecks_readiness_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "controller.json"
+            cp = Path(tmp) / "checkpoint.json"
+            controller = RootController("root", "one", state_path=state_path, checkpoint_path=cp)
+            lease = controller.acquire()
+            controller.halt(
+                "blocked", "no ready work",
+                drain_cause_kind="no_ready_work",
+                drain_cause_provenance="scheduler_no_ready_work",
+                lease=lease,
+            )
+            state_before, checkpoint_before = state_path.read_bytes(), cp.read_bytes()
+            with self.assertRaisesRegex(ControllerError, "no longer the exact current ready task"):
+                controller.acknowledge_no_ready_halt(
+                    "workflow", "ready-task", lease=lease,
+                    readiness_verifier=lambda _current: "different-ready-task",
+                )
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(cp.read_bytes(), checkpoint_before)
 
     def test_drain_audit_overflow_denies_clear_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,7 +403,10 @@ class ControllerTests(unittest.TestCase):
             before_state = state_path.read_bytes()
 
             with self.assertRaisesRegex(ControllerError, "audit is full"):
-                controller.acknowledge_no_ready_halt("workflow", "ready-task", lease=lease)
+                controller.acknowledge_no_ready_halt(
+                        "workflow", "ready-task", lease=lease,
+                        readiness_verifier=lambda _current: "ready-task",
+                    )
 
             self.assertEqual(cp.read_bytes(), before_checkpoint)
             self.assertEqual(state_path.read_bytes(), before_state)
@@ -375,6 +440,7 @@ class ControllerTests(unittest.TestCase):
             authorization = self._resolution_authorization(
                 controller, lease, "workflow", "old", "ready-task",
             )
+            candidate = self._reattach_for_test(controller, lease, authorization)
             raced = controller._load_checkpoint()
             controller_module._append_drain_cause(
                 raced, kind="managed_task_failure",
@@ -384,11 +450,12 @@ class ControllerTests(unittest.TestCase):
             checkpoint.write_checkpoint(cp, raced)
             state_before, checkpoint_before = state.read_bytes(), cp.read_bytes()
 
-            with self.assertRaisesRegex(ControllerError, "exact cause snapshot"):
+            with self.assertRaisesRegex(ControllerError, "checkpoint|cause snapshot"):
                 controller.acknowledge_cancelled_preidentity_halt(
                     "workflow", "old", "ready-task",
                     authority_secret=self._authority_secret,
-                    resolution_authorization=authorization, lease=lease,
+                    resolution_authorization=authorization, lease=candidate,
+                    readiness_verifier=lambda _current: "ready-task",
                 )
             self.assertEqual(state.read_bytes(), state_before)
             self.assertEqual(cp.read_bytes(), checkpoint_before)
@@ -1092,10 +1159,7 @@ class ControllerTests(unittest.TestCase):
             document["last_check"] = "cancelled expired preidentity launch old-launch for old"
             checkpoint.write_checkpoint(cp, document)
             authorization = self._resolution_authorization(controller, lease, "workflow", "old", "ready-task")
-            controller.acknowledge_cancelled_preidentity_halt(
-                "workflow", "old", "ready-task", authority_secret=self._authority_secret,
-                resolution_authorization=authorization, lease=lease,
-            )
+            lease = self._finish_test_continuation(controller, lease, authorization)
             before = cp.read_bytes()
 
             with self.assertRaisesRegex(ControllerError, "durable continuation target"):
@@ -1130,10 +1194,7 @@ class ControllerTests(unittest.TestCase):
             document["last_check"] = "cancelled expired preidentity launch old-launch for old"
             checkpoint.write_checkpoint(cp, document)
             authorization = self._resolution_authorization(first, lease, "workflow", "old", "ready-task")
-            first.acknowledge_cancelled_preidentity_halt(
-                "workflow", "old", "ready-task", authority_secret=self._authority_secret,
-                resolution_authorization=authorization, lease=lease,
-            )
+            lease = self._finish_test_continuation(first, lease, authorization)
             second = RootController("root", "one", state_path=state, checkpoint_path=cp)
             barrier = threading.Barrier(2)
             dispatched: list[str] = []

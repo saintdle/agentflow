@@ -2656,6 +2656,64 @@ def _controller_step(
     return _controller_step_serial(args, controller, root, lease, operation=operation)
 
 
+def _verify_current_ready_continuation_target(
+    root: Path,
+    workflow_root: str,
+    ready_task: str,
+    controller: controller_backend.RootController,
+) -> str:
+    """Re-read root, descendant ownership and the exact ready queue at the final fence."""
+    root_issue = beads_backend.get_issue(root, workflow_root)
+    if (
+        str(root_issue.get("id") or "") != workflow_root
+        or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
+    ):
+        raise controller_backend.ControllerError("workflow root is missing, mismatched, or terminal")
+    descendants = beads_backend.root_descendants(root, workflow_root)
+    rows = [row for row in descendants if str(row.get("id") or "") == ready_task]
+    if len(rows) != 1:
+        raise controller_backend.ControllerError("continuation target is no longer an exact descendant")
+    target = beads_backend.get_issue(root, ready_task)
+    row = rows[0]
+    for key in ("id", "status", "assignee", "parent"):
+        if str(row.get(key) or "") != str(target.get(key) or ""):
+            raise controller_backend.ControllerError("continuation target changed during final ancestry verification")
+    if str(target.get("workflow_root") or workflow_root) != workflow_root:
+        raise controller_backend.ControllerError("continuation target ancestry changed")
+    try:
+        beads_backend._validate_exact_issue(
+            root, target, task=ready_task, root=workflow_root,
+            actor=controller.controller, labels=set(),
+        )
+    except beads_backend.BeadsError as exc:
+        raise controller_backend.ControllerError(
+            "continuation target is no longer ready under the exact workflow root"
+        ) from exc
+    common = ["ready", "--parent", workflow_root, "--limit", "1", "--sort", "priority"]
+    assigned = beads_backend._json_output(
+        beads_backend.run(root, *common, "--assignee", controller.controller, "--json"),
+        "bd ready --assignee",
+    )
+    def ready_rows(value: Any) -> list[Any]:
+        if isinstance(value, Mapping):
+            if isinstance(value.get("issues"), list):
+                return value["issues"]
+            return [value] if value.get("id") else []
+        if isinstance(value, list):
+            return value
+        raise beads_backend.BeadsError("bd ready returned an unexpected JSON shape")
+    ready = ready_rows(assigned)
+    if not ready:
+        shared = beads_backend._json_output(
+            beads_backend.run(root, *common, "--unassigned", "--json"),
+            "bd ready --unassigned",
+        )
+        ready = ready_rows(shared)
+    if len(ready) != 1 or not isinstance(ready[0], Mapping) or str(ready[0].get("id") or "") != ready_task:
+        raise controller_backend.ControllerError("continuation target is no longer the unique exact ready task")
+    return ready_task
+
+
 def _verify_no_ready_ack_candidate(
     root: Path, workflow_root: str,
     controller: controller_backend.RootController,
@@ -2673,8 +2731,9 @@ def _verify_no_ready_ack_candidate(
         raise controller_backend.ControllerError("checkpoint has no complete typed no-ready cause set")
     if controller.active_tasks():
         raise controller_backend.ControllerError("cannot acknowledge while controller workers remain active")
-    ledger = controller.session_ledger()
-    if ledger.get("blocked"):
+    state_snapshot = _read_json_value(str(controller.state_path))
+    ledger = state_snapshot.get("session_control") if isinstance(state_snapshot, Mapping) else None
+    if isinstance(ledger, Mapping) and ledger.get("blocked"):
         raise controller_backend.ControllerError("cannot acknowledge a repeated-approach blocked controller")
     current_root = beads_backend.get_issue(root, workflow_root)
     if (
@@ -4046,6 +4105,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                                 authority_secret=credentials["authority_secret"],
                                 resume_proof=resume_proof,
                                 drain_resolution_authorization=drain_resolution_authorization,
+                                readiness_verifier=lambda current: _verify_current_ready_continuation_target(
+                                    root, workflow_root, continue_ready_task, controller,
+                                ),
                                 persist_credentials=lambda candidate: _controller_credentials(
                                     args, candidate, key_path=key_path,
                                 ),
@@ -4070,7 +4132,12 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             args._authority_secret = credentials["authority_secret"]
             if acknowledge_no_ready:
                 ready_task = _verify_no_ready_ack_candidate(root, workflow_root, controller, lease)
-                controller.acknowledge_no_ready_halt(workflow_root, ready_task, lease=lease)
+                controller.acknowledge_no_ready_halt(
+                    workflow_root, ready_task, lease=lease,
+                    readiness_verifier=lambda current: _verify_no_ready_ack_candidate(
+                        root, workflow_root, controller, current,
+                    ),
+                )
             if continue_cancelled_task:
                 ready_task = continue_ready_task
                 if not continuation_already_selected:
@@ -4079,6 +4146,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                         authority_secret=credentials["authority_secret"],
                         resolution_authorization=drain_resolution_authorization,
                         lease=lease,
+                        readiness_verifier=lambda current: _verify_current_ready_continuation_target(
+                            root, workflow_root, ready_task, controller,
+                        ),
                     )
                 controller.clear_explicit_continuation(
                     workflow_root=workflow_root,
@@ -4086,6 +4156,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     ready_task=ready_task,
                     authority_secret=credentials["authority_secret"],
                     lease=lease,
+                    readiness_verifier=lambda current: _verify_current_ready_continuation_target(
+                        root, workflow_root, ready_task, controller,
+                    ),
                 )
                 args._continuation_task = ready_task
             _bind_current_controller_sessions(root, workflow_root, lease)

@@ -472,11 +472,21 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                     ),
                     ready["id"],
                 )
+                candidate = controller.reattach_for_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id, ready_task=ready["id"],
+                    checkpoint_epoch=lease.epoch, authority_secret=args._authority_secret,
+                    resume_proof=cli._read_controller_credentials(cli._resume_key_path(args))["resume_secret"],
+                    drain_resolution_authorization=resolution_authorization_out["authorization"],
+                    readiness_verifier=lambda _current: ready["id"],
+                    persist_credentials=lambda _candidate: None,
+                )
                 controller.acknowledge_cancelled_preidentity_halt(
                     fixture.workflow_root, fixture.task_id, ready["id"],
                     authority_secret=args._authority_secret,
                     resolution_authorization=resolution_authorization_out["authorization"],
-                    lease=lease,
+                    lease=candidate,
+                    readiness_verifier=lambda _current: ready["id"],
                 )
                 # The target checkpoint is durable. Replaying after the
                 # simulated crash must take the staged/open path, not reject
@@ -484,7 +494,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 self.assertEqual(
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
-                        controller, lease, authority_secret=args._authority_secret,
+                        controller, candidate, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="expired_execution",
                         resolution_authorization=resolution_authorization_out["authorization"],
@@ -494,7 +504,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 with self.assertRaisesRegex(cli.controller_backend.ControllerError, "does not match"):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
-                        controller, lease, authority_secret=args._authority_secret,
+                        controller, candidate, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="cancelled_preidentity",
                         resolution_authorization=resolution_authorization_out["authorization"],
@@ -511,7 +521,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 ):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
-                        controller, lease, authority_secret=args._authority_secret,
+                        controller, candidate, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="expired_execution",
                         resolution_authorization=resolution_authorization_out["authorization"],
@@ -535,7 +545,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 ):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
-                        controller, lease, authority_secret=args._authority_secret,
+                        controller, candidate, authority_secret=args._authority_secret,
                         allow_staged_selection=True,
                         expected_retirement_kind="expired_execution",
                         resolution_authorization=resolution_authorization_out["authorization"],

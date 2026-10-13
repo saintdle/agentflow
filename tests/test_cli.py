@@ -4172,6 +4172,7 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                     authority_secret=fixture.authority_secret,
                     resolution_authorization=resolution_authorization_out["authorization"],
                     lease=current_lease,
+                    readiness_verifier=lambda _current: "distinct-ready-task",
                 )
                 checkpoint = controller._load_checkpoint()
                 self.assertEqual(checkpoint["pending_continuation_task"], "distinct-ready-task")
@@ -4505,7 +4506,24 @@ class ControllerPendingContinuationTests(unittest.TestCase):
         cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, halted)
         return args, controller, lease
 
-    def _run_continuation_once(self, args):
+    def _run_continuation_once(
+        self, args, *, current_ready_verifier=None, initial_verifier=None, beads_fixture=None,
+    ):
+        if beads_fixture is None:
+            ready = {
+                "id": str(args.continue_task), "status": "open", "assignee": "",
+                "parent": str(args.workflow_root), "metadata": {"agentflow": {}}, "labels": [],
+            }
+            def get_issue(_root, task_id):
+                return {"id": task_id, "status": "open"} if task_id == args.workflow_root else ready
+            def descendants(_root, _workflow):
+                return [ready]
+            def run(_root, *argv):
+                rows = [] if "--assignee" in argv else [dict(ready)]
+                return subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+            beads_fixture = (get_issue, descendants, run)
+        get_issue, descendants, beads_run = beads_fixture
+
         def one_step(step_args, current, root, current_lease, *, operation):
             result = current.resume([], lease=current_lease)
             return ({
@@ -4526,10 +4544,18 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 output["authorization"] = dict(authorization)
             return ready
 
-        with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"}), \
+        with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+             mock.patch.object(cli.beads_backend, "root_descendants", side_effect=descendants), \
+             mock.patch.object(cli.beads_backend, "run", side_effect=beads_run), \
+             mock.patch.object(
+                 cli, "_verify_current_ready_continuation_target",
+                 side_effect=current_ready_verifier or (
+                     lambda _root, _workflow, selected, _controller: selected
+                 ),
+             ), \
              mock.patch.object(
                  cli, "_verify_cancelled_preidentity_continuation",
-                 side_effect=verified,
+                 side_effect=initial_verifier or verified,
              ), \
              mock.patch.object(cli, "_bind_current_controller_sessions"), \
              mock.patch.object(cli, "_controller_step", side_effect=one_step):
@@ -4595,6 +4621,7 @@ class ControllerPendingContinuationTests(unittest.TestCase):
 
                 with mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "wf", "status": "open"}), \
                      mock.patch.object(cli, "_verify_cancelled_preidentity_continuation", side_effect=verify), \
+                     mock.patch.object(cli, "_verify_current_ready_continuation_target", side_effect=lambda _root, _workflow, selected, _controller: selected), \
                      mock.patch.object(cli, "_bind_current_controller_sessions"), \
                      mock.patch.object(cli, "_controller_step", side_effect=one_step):
                     first = _run_controller_json(cli.controller_resume, args)
@@ -4678,6 +4705,125 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 retry = self._run_continuation_once(args)
                 self.assertTrue(retry["ok"], retry)
                 self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_staged_continuation_retry_rejects_any_changed_checkpoint_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, _lease = self._continuation_fixture(base)
+                writer = cli.checkpoint_backend.write_checkpoint
+
+                def write_then_crash(path, document):
+                    saved = writer(path, document)
+                    if Path(path) == controller.checkpoint_path and document.get("pending_continuation_task"):
+                        raise OSError("checkpoint crash after full staged write")
+                    return saved
+
+                with mock.patch.object(cli.checkpoint_backend, "write_checkpoint", side_effect=write_then_crash):
+                    crashed = self._run_continuation_once(args)
+                self.assertIn("checkpoint crash", crashed["error"])
+                exact_staged = controller.checkpoint_path.read_bytes()
+                tampered = json.loads(exact_staged)
+                tampered["next_action"] = "changed after signed staging"
+                writer(controller.checkpoint_path, tampered)
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credentials_path = cli._resume_key_path(args)
+                credentials_before = credentials_path.read_bytes()
+
+                denied = self._run_continuation_once(args)
+
+                self.assertFalse(denied["ok"], denied)
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(credentials_path.read_bytes(), credentials_before)
+                controller.checkpoint_path.write_bytes(exact_staged)
+                retried = self._run_continuation_once(args)
+                self.assertTrue(retried["ok"], retried)
+
+    def _beads_readiness_fixture(self, ready):
+        root_issue = {"id": "wf", "status": "open"}
+        def get_issue(_root, task_id):
+            if task_id == "wf":
+                return root_issue
+            if task_id == ready["id"]:
+                return ready
+            raise AssertionError(f"unexpected issue lookup: {task_id}")
+        def run(_root, *argv):
+            rows = [{"id": ready["id"]}] if ready["status"] == "open" and "--unassigned" in argv else []
+            return subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+        return get_issue, lambda _root, _workflow: [dict(ready)], run
+
+    def test_public_resume_rechecks_target_before_first_fenced_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, _lease = self._continuation_fixture(base)
+                ready = {"id": "ready-task", "status": "open", "assignee": "",
+                         "parent": "wf", "metadata": {"agentflow": {}}}
+                get_issue, descendants, run = self._beads_readiness_fixture(ready)
+                real_readiness_verifier = cli._verify_current_ready_continuation_target
+
+                def retire_between_checks(*verify_args, **verify_kwargs):
+                    root, workflow, cancelled, selected, current, old_lease = verify_args[:6]
+                    authorization = _signed_resolution_authorization(
+                        current, old_lease, workflow, cancelled, selected,
+                        verify_kwargs["authority_secret"],
+                    )
+                    verify_kwargs["resolution_authorization_out"]["authorization"] = authorization
+                    ready["status"] = "blocked"
+                    return selected
+
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credentials_path = cli._resume_key_path(args)
+                credentials_before = credentials_path.read_bytes()
+                result = self._run_continuation_once(
+                    args, initial_verifier=retire_between_checks,
+                    current_ready_verifier=lambda root, workflow, task, current:
+                        real_readiness_verifier(root, workflow, task, current),
+                    beads_fixture=(get_issue, descendants, run),
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("no longer ready", result["error"])
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(credentials_path.read_bytes(), credentials_before)
+
+    def test_public_resume_preserves_pending_intent_when_target_changes_before_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, old_lease = self._continuation_fixture(base)
+                ready = {"id": "ready-task", "status": "open", "assignee": "",
+                         "parent": "wf", "metadata": {"agentflow": {}}}
+                get_issue, descendants, run = self._beads_readiness_fixture(ready)
+                real_readiness_verifier = cli._verify_current_ready_continuation_target
+                checks = 0
+                pending_state = b""
+
+                def readiness(root, workflow, task, current):
+                    nonlocal checks, pending_state
+                    checks += 1
+                    if checks == 2:
+                        pending_state = controller.state_path.read_bytes()
+                        ready["status"] = "blocked"
+                    return real_readiness_verifier(root, workflow, task, current)
+
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                result = self._run_continuation_once(
+                    args, current_ready_verifier=readiness,
+                    beads_fixture=(get_issue, descendants, run),
+                )
+                self.assertFalse(result["ok"], result)
+                self.assertIn("no longer ready", result["error"])
+                self.assertEqual(checks, 2)
+                self.assertEqual(controller.state_path.read_bytes(), pending_state)
+                self.assertNotEqual(pending_state, state_before)
+                self.assertEqual(controller._load_checkpoint()["epoch"], old_lease.epoch)
+                self.assertIn("continuation_reattach", json.loads(controller.state_path.read_text()))
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
 
     def test_plain_resume_is_fenced_at_each_staged_continuation_crash_point(self) -> None:
         for phase in ("credential-before", "credential-after", "state-commit", "checkpoint-commit"):
@@ -5022,9 +5168,23 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             resolution_authorization = _signed_resolution_authorization(
                 controller, lease, "wf", "old", "target", authority_secret,
             )
+            lease = controller.reattach_for_explicit_continuation(
+                workflow_root="wf", cancelled_task="old", ready_task="target",
+                checkpoint_epoch=lease.epoch, authority_secret=authority_secret,
+                resume_proof=lease.resume_secret,
+                drain_resolution_authorization=resolution_authorization,
+                readiness_verifier=lambda _current: "target",
+                persist_credentials=lambda _candidate: None,
+            )
             controller.acknowledge_cancelled_preidentity_halt(
                 "wf", "old", "target", authority_secret=authority_secret,
                 resolution_authorization=resolution_authorization, lease=lease,
+                readiness_verifier=lambda _current: "target",
+            )
+            controller.clear_explicit_continuation(
+                workflow_root="wf", cancelled_task="old", ready_task="target",
+                authority_secret=authority_secret, lease=lease,
+                readiness_verifier=lambda _current: "target",
             )
             issue = {
                 "id": "target", "status": "open", "assignee": "",
@@ -5592,7 +5752,10 @@ class ControllerRunTests(unittest.TestCase):
                 lease = controller.acquire()
                 controller.halt(state, "USER_ACTION_REQUIRED: a worker may still be live", lease=lease)
                 with self.assertRaises(cli.controller_backend.ControllerError):
-                    controller.acknowledge_no_ready_halt(fixture.workflow_root, "task-1", lease=lease)
+                    controller.acknowledge_no_ready_halt(
+                        fixture.workflow_root, "task-1", lease=lease,
+                        readiness_verifier=lambda _current: "task-1",
+                    )
 
     def test_acknowledgement_fails_closed_on_unresolved_or_unknown_herdr_lifecycle(self) -> None:
         for status in ("launching", "identity_pending", "failed", "unknown", "completed"):
