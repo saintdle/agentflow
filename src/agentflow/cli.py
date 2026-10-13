@@ -2886,6 +2886,8 @@ def _new_drain_resolution_authorization(
     )
     if not isinstance(disposition, Mapping):
         raise controller_backend.ControllerError("retired launch has no signed negative receipt")
+    retired_raw = controller.checkpoint_path.read_bytes()
+    retired_checkpoint = controller._load_checkpoint()
     payload: dict[str, Any] = {
         "schema": controller_backend.DRAIN_RESOLUTION_AUTH_SCHEMA,
         "root": controller.root,
@@ -2902,6 +2904,10 @@ def _new_drain_resolution_authorization(
         "contract_sha256": _canonical_json_digest(contract),
         "ready_task": ready_task,
         "intent_id": uuid.uuid4().hex,
+        "retired_checkpoint_sha256": hashlib.sha256(retired_raw).hexdigest(),
+        "retired_checkpoint_epoch": retired_checkpoint.get("epoch"),
+        "retired_checkpoint_token": retired_checkpoint.get("lease_token"),
+        "retired_checkpoint_last_check": retired_checkpoint.get("last_check"),
     }
     payload["authority_hmac"] = _authority_mac(
         authority_secret, payload, domain="drain-resolution-authorization-v1",
@@ -2935,6 +2941,22 @@ def _verify_drain_resolution_authorization(
         )
         if not isinstance(disposition, Mapping):
             return False
+        if isinstance(pending, Mapping):
+            retired_fields = {
+                "retired_checkpoint_sha256": pending.get("retired_checkpoint_sha256"),
+                "retired_checkpoint_epoch": pending.get("retired_checkpoint_epoch"),
+                "retired_checkpoint_token": pending.get("retired_checkpoint_token"),
+                "retired_checkpoint_last_check": pending.get("retired_checkpoint_last_check"),
+            }
+        else:
+            retired_raw = controller.checkpoint_path.read_bytes()
+            retired_checkpoint = controller._load_checkpoint()
+            retired_fields = {
+                "retired_checkpoint_sha256": hashlib.sha256(retired_raw).hexdigest(),
+                "retired_checkpoint_epoch": retired_checkpoint.get("epoch"),
+                "retired_checkpoint_token": retired_checkpoint.get("lease_token"),
+                "retired_checkpoint_last_check": retired_checkpoint.get("last_check"),
+            }
         expected = {
             "schema": controller_backend.DRAIN_RESOLUTION_AUTH_SCHEMA,
             "root": controller.root,
@@ -2946,6 +2968,7 @@ def _verify_drain_resolution_authorization(
             "receipt_sha256": _canonical_json_digest(disposition),
             "contract_sha256": _canonical_json_digest(contract),
             "ready_task": ready_task,
+            **retired_fields,
         }
         rotated = bool(
             staged_selection and isinstance(pending, Mapping)
@@ -2971,7 +2994,9 @@ def _verify_drain_resolution_authorization(
                 "schema", "root", "controller", "workflow_root", "continuity_id",
                 "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
                 "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
-                "ready_task", "intent_id",
+                "ready_task", "intent_id", "retired_checkpoint_sha256",
+                "retired_checkpoint_epoch", "retired_checkpoint_token",
+                "retired_checkpoint_last_check",
             }
             and all(payload.get(key) == value for key, value in expected.items())
             and isinstance(payload.get("lease_epoch"), int)
@@ -3010,6 +3035,7 @@ def _verify_cancelled_preidentity_continuation(
     allow_staged_selection: bool = False,
     expected_retirement_kind: str = "cancelled_preidentity",
     resolution_authorization: Mapping[str, Any] | None = None,
+    pending_continuation: Mapping[str, Any] | None = None,
     resolution_authorization_out: dict[str, Any] | None = None,
 ) -> str:
     """Prove a signed retired launch and one distinct, currently ready child."""
@@ -3067,13 +3093,35 @@ def _verify_cancelled_preidentity_continuation(
         and document.get("epoch") == lease.epoch
         and document.get("lease_token") == lease.token
     )
+    pending_authorization = (
+        pending_continuation.get("drain_resolution_authorization")
+        if isinstance(pending_continuation, Mapping) else None
+    )
+    pending_old_checkpoint = bool(
+        isinstance(pending_continuation, Mapping)
+        and isinstance(pending_authorization, Mapping)
+        and pending_continuation.get("epoch") == lease.epoch
+        and pending_continuation.get("token") == lease.token
+        and pending_continuation.get("previous_epoch") == document.get("epoch")
+        and pending_continuation.get("previous_token") == document.get("lease_token")
+        and pending_continuation.get("retired_checkpoint_epoch") == document.get("epoch")
+        and pending_continuation.get("retired_checkpoint_token") == document.get("lease_token")
+        and pending_continuation.get("retired_checkpoint_last_check") == document.get("last_check")
+        and pending_continuation.get("retired_checkpoint_sha256")
+        == hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest()
+        and pending_authorization.get("retired_checkpoint_sha256")
+        == pending_continuation.get("retired_checkpoint_sha256")
+        and pending_authorization.get("retired_checkpoint_epoch") == document.get("epoch")
+        and pending_authorization.get("retired_checkpoint_token") == document.get("lease_token")
+        and pending_authorization.get("retired_checkpoint_last_check") == document.get("last_check")
+    )
     if (
         not staged_selection and (
         checkpoint_backend.admission_phase(document) != "terminal"
         or checkpoint_backend.resume_state(document) != "blocked"
         or document.get("terminal") is not True
-        or document.get("epoch") != lease.epoch
-        or document.get("lease_token") != lease.token
+        or (not pending_old_checkpoint and document.get("epoch") != lease.epoch)
+        or (not pending_old_checkpoint and document.get("lease_token") != lease.token)
         or document.get("last_check") != retired_check
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
@@ -3227,9 +3275,17 @@ def _verify_cancelled_preidentity_continuation(
             causal_task = cause["task_id"]
             causal_launch = cause["launch_id"]
             causal_row = by_id.get(causal_task)
+            causal_status = str(causal_row.get("status") or "").lower() if causal_row else ""
+            blocked_signed_retirement = (
+                causal_status == "blocked"
+                and cause["provenance"] == "signed_negative_retirement"
+            )
             if (
                 not causal_row
-                or str(causal_row.get("status") or "").lower() not in reconciliation_backend.TERMINAL
+                or (
+                    causal_status not in reconciliation_backend.TERMINAL
+                    and not blocked_signed_retirement
+                )
             ):
                 raise controller_backend.ControllerError(
                     f"causal failure task remains unresolved: {causal_task}"
@@ -3965,6 +4021,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                             allow_staged_selection=continuation_already_selected,
                             expected_retirement_kind=continuation_kind,
                             resolution_authorization=staged_resolution_authorization,
+                            pending_continuation=continuation_intent,
                             resolution_authorization_out=resolution_authorization_out,
                         )
                         drain_resolution_authorization = resolution_authorization_out.get("authorization")

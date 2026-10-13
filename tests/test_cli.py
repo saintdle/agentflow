@@ -75,6 +75,10 @@ def _signed_resolution_authorization(
         "contract_sha256": "b" * 64,
         "ready_task": ready_task,
         "intent_id": uuid.uuid4().hex,
+        "retired_checkpoint_sha256": hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest(),
+        "retired_checkpoint_epoch": controller._load_checkpoint().get("epoch"),
+        "retired_checkpoint_token": controller._load_checkpoint().get("lease_token"),
+        "retired_checkpoint_last_check": controller._load_checkpoint().get("last_check"),
     }
     payload["authority_hmac"] = cli._authority_mac(
         authority_secret, payload, domain="drain-resolution-authorization-v1",
@@ -3027,6 +3031,87 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
             }},
         }
 
+    def _install_signed_standard_retirement(
+        self, fixture: ValidLaunch, baseline: dict, *, task_id: str,
+        claim_id: str, claim_token: str,
+    ) -> dict:
+        """Mint a second independently signed standard-deadline retirement."""
+        state_path = baseline["state_path"]
+        herdr = json.loads(state_path.read_text(encoding="utf-8"))
+        source = herdr["sessions"][fixture.task_id]
+        record = json.loads(json.dumps(source))
+        contract = json.loads(json.dumps(source["return_channel"]["contract_binding"]))
+        launch_id = f"launch-{task_id}"
+        lease_id = f"lease-{task_id}"
+        contract_dir = cli._runtime_launch_dir(fixture.root, fixture.workflow_root, launch_id)
+        contract_path = contract_dir / "return.contract.json"
+        contract.update({
+            "task_id": task_id, "claim_id": claim_id,
+            "claim_token_sha256": hashlib.sha256(claim_token.encode()).hexdigest(),
+            "lease_id": lease_id,
+            "lease_token_sha256": hashlib.sha256(lease_id.encode()).hexdigest(),
+            "launch_id": launch_id,
+            "contract_path": str(contract_path.resolve()),
+            "result_path": str((contract_dir / "result.json").resolve()),
+            "submission_file": str((contract_dir / "submitted.json").resolve()),
+        })
+        contract["authority_hmac"] = cli._authority_mac(
+            fixture.authority_secret, contract, domain="return-contract-v1",
+        )
+        cli._private_atomic_json(contract_path, contract)
+        pane_id = f"pane-{task_id}"
+        disposition = cli._preidentity_disposition(
+            contract, pane_id=pane_id, authority_secret=fixture.authority_secret,
+        )
+        record.update({
+            "task_id": task_id, "claim_id": claim_id, "lease_id": lease_id,
+            "launch_id": launch_id, "pane_id": pane_id,
+            "status": "cancelled_preidentity", "binding": None, "result": None,
+            "attempt": contract["attempt"], "deadline_epoch": contract["deadline_epoch"],
+            "execution_limits": contract["execution_limits"],
+            "max_attempts": contract["max_attempts"],
+            "recovery_disposition": disposition,
+        })
+        channel = record["return_channel"]
+        channel.update({
+            "contract_path": str(contract_path.resolve()),
+            "contract_binding": contract,
+            "contract_sha256": cli._canonical_json_digest(contract),
+            "result_path": contract["result_path"],
+            "submission_file": contract["submission_file"],
+            "state": "revoked", "revoked_at": disposition["recorded_at"],
+            "revocation": disposition,
+        })
+        key = cli._execution_ledger_key(fixture.root, fixture.workflow_root, task_id)
+        with cli._execution_limit_ledger_transaction(
+            cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root)
+        ) as ledger:
+            source_key = cli._execution_ledger_key(fixture.root, fixture.workflow_root, fixture.task_id)
+            entry = json.loads(json.dumps(ledger["entries"][source_key]))
+            entry["launch_identity"] = {
+                "workspace_root": str(fixture.root.resolve()),
+                "workflow_root": fixture.workflow_root, "task_id": task_id,
+                "claim_id": claim_id, "lease_id": lease_id, "launch_id": launch_id,
+                "controller_id": fixture.controller,
+                "continuity_id": contract["continuity_id"],
+                "lease_epoch": contract["lease_epoch"],
+            }
+            entry["authority_hmac"] = cli._authority_mac(
+                fixture.authority_secret, entry, domain="execution-limit-ledger-v1",
+            )
+            ledger["entries"][key] = entry
+        with cli._herdr_transaction(state_path) as state:
+            state["sessions"][task_id] = record
+        return {
+            "id": task_id, "status": "blocked", "assignee": fixture.controller,
+            "parent": fixture.workflow_root,
+            "metadata": {"agentflow": {
+                "root": fixture.workflow_root, "task": task_id,
+                "actor": fixture.controller, "claim_id": claim_id,
+                "claim_token": claim_token,
+            }},
+        }
+
     def _rewrite_signed_legacy_sibling(
         self, fixture: ValidLaunch, baseline: dict, *, contract_updates: dict | None = None,
         disposition_updates: dict | None = None, record_updates: dict | None = None,
@@ -3062,6 +3147,98 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 channel["revocation"] = record["recovery_disposition"]
             if record_updates:
                 record.update(record_updates)
+
+    def _run_public_preidentity_continuation(
+        self, fixture: ValidLaunch, controller, cancelled_issue: dict,
+        causal_issue: dict, ready: dict,
+    ) -> dict:
+        issues = {
+            fixture.workflow_root: fixture.root_issue,
+            fixture.task_id: cancelled_issue,
+            str(causal_issue["id"]): causal_issue,
+            str(ready["id"]): ready,
+        }
+        args = _controller_args(
+            fixture.root, workflow_root=fixture.workflow_root,
+            continue_after_cancelled_preidentity=fixture.task_id,
+            continue_task=str(ready["id"]),
+        )
+        def one_step(_args, _controller, root, _lease, *, operation):
+            return ({"operation": operation, "ok": True, "root": str(root)}, True)
+        def run_beads(_cwd, *argv):
+            rows = [] if "--assignee" in argv else [{"id": ready["id"]}]
+            return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+        with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _root, key: issues[key]), \
+             mock.patch.object(cli.beads_backend, "root_descendants", return_value=[cancelled_issue, causal_issue, ready]), \
+             mock.patch.object(cli.beads_backend, "run", side_effect=run_beads), \
+             mock.patch.object(cli, "_bind_current_controller_sessions"), \
+             mock.patch.object(cli, "_controller_step", side_effect=one_step):
+            return _run_controller_json(cli.controller_resume, args)
+
+    def _set_causal_checkpoint_row(self, controller, task_id: str, launch_id: str) -> None:
+        document = controller._load_checkpoint()
+        causes = document["drain_causes"]
+        causes[0]["task_id"] = task_id
+        causes[0]["launch_id"] = launch_id
+        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, document)
+
+    def test_public_resume_accepts_two_signed_standard_deadline_preidentity_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, baseline = _expired_preidentity_fixture(base)
+                fixture.contract = _contract
+                retired, _probe = self._run_recovery(fixture, self._args(fixture))
+                self.assertTrue(retired["ok"], retired)
+                fixture.task_issue["status"] = "blocked"
+                causal = self._install_signed_standard_retirement(
+                    fixture, baseline, task_id="task-prior-standard",
+                    claim_id="claim-prior-standard",
+                    claim_token="opaque-prior-standard-claim-token-0123456789abcdef",
+                )
+                record = cli._herdr_session_record(fixture.root, causal["id"])
+                self.assertTrue(cli._authenticated_causal_preidentity_retirement(
+                    fixture.root, fixture.workflow_root, causal["id"], record["launch_id"],
+                    causal, controller._current_lease(), authority_secret=fixture.authority_secret,
+                ))
+                self._set_causal_checkpoint_row(controller, causal["id"], record["launch_id"])
+                ready = {"id": "ready-after-two-standard", "status": "open", "assignee": "",
+                         "parent": fixture.workflow_root, "metadata": {"agentflow": {}}}
+                result = self._run_public_preidentity_continuation(
+                    fixture, controller, fixture.task_issue, causal, ready,
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(controller._load_checkpoint()["drain_causes"], [])
+                self.assertTrue(json.loads(controller.state_path.read_text())["drain_audit"])
+
+    def test_public_resume_accepts_two_signed_legacy_preidentity_launches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                retired, _probe = self._run_recovery(
+                    fixture, self._args(fixture), legacy_scope=True,
+                )
+                self.assertTrue(retired["ok"], retired)
+                causal = self._install_signed_legacy_retirement(
+                    fixture, baseline, task_id="task-prior-legacy",
+                    claim_id="claim-prior-legacy",
+                    claim_token="opaque-prior-legacy-claim-token-0123456789abcdef",
+                    lease_epoch=0, owner_abandoned_epoch=True,
+                )
+                record = cli._herdr_session_record(fixture.root, causal["id"])
+                self.assertTrue(cli._authenticated_causal_preidentity_retirement(
+                    fixture.root, fixture.workflow_root, causal["id"], record["launch_id"],
+                    causal, controller._current_lease(), authority_secret=fixture.authority_secret,
+                ))
+                self._set_causal_checkpoint_row(controller, causal["id"], record["launch_id"])
+                ready = {"id": "ready-after-two-legacy", "status": "open", "assignee": "",
+                         "parent": fixture.workflow_root, "metadata": {"agentflow": {}}}
+                result = self._run_public_preidentity_continuation(
+                    fixture, controller, fixture.task_issue, causal, ready,
+                )
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(controller._load_checkpoint()["drain_causes"], [])
 
     def test_signed_blocked_preidentity_retirement_is_unbound_and_not_bound_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

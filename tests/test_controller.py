@@ -61,6 +61,10 @@ class ControllerTests(unittest.TestCase):
             "contract_sha256": "b" * 64,
             "ready_task": ready_task,
             "intent_id": uuid.uuid4().hex,
+            "retired_checkpoint_sha256": hashlib.sha256(controller.checkpoint_path.read_bytes()).hexdigest(),
+            "retired_checkpoint_epoch": controller._load_checkpoint().get("epoch"),
+            "retired_checkpoint_token": controller._load_checkpoint().get("lease_token"),
+            "retired_checkpoint_last_check": controller._load_checkpoint().get("last_check"),
         }
         payload["authority_hmac"] = controller_module._authority_mac(
             self._authority_secret, payload, domain="drain-resolution-authorization-v1",

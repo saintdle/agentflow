@@ -84,6 +84,88 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertEqual(current["status"], "launched")
             self.assertEqual(current["return_channel"]["state"], "issued")
 
+    def test_public_resume_retries_signed_state_commit_before_checkpoint_and_rejects_altered_old_checkpoint(self) -> None:
+        with self._expired_draining_execution(
+            "typed no-ready before bound expiry",
+            cause_kind="no_ready_work", cause_provenance="scheduler_no_ready_work",
+        ) as (fixture, args, controller, old_lease, _record):
+            ready = {
+                "id": "ready-task", "status": "open", "assignee": "",
+                "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+            }
+
+            def get_issue(_root, task_id):
+                return {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                }[task_id]
+
+            def ready_command(_root, *argv):
+                rows = [] if "--assignee" in argv else [{"id": ready["id"]}]
+                return subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+
+            def one_step(_args, current, root, lease, *, operation):
+                result = current.resume([], lease=lease)
+                return ({"operation": operation, "ok": True, "root": str(root), "result": result.to_dict()}, True)
+
+            args.continue_after_expired_task = fixture.task_id
+            args.continue_task = ready["id"]
+            old_checkpoint = controller.checkpoint_path.read_bytes()
+            writer = cli.controller_backend.RootController._write_state
+            writes = 0
+
+            def crash_after_candidate_commit(instance, state):
+                nonlocal writes
+                writes += 1
+                writer(instance, state)
+                if writes == 2:
+                    raise OSError("crash after active lease write")
+
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command), \
+                 mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                 mock.patch.object(cli, "_controller_step", side_effect=one_step), \
+                 mock.patch.object(cli.controller_backend.RootController, "_write_state", new=crash_after_candidate_commit):
+                crashed = _run_controller_json(cli.controller_resume, args)
+            self.assertEqual(crashed["error"], "crash after active lease write")
+            staged = json.loads(controller.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(staged["epoch"], old_lease.epoch + 1)
+            self.assertIn("continuation_reattach", staged)
+            self.assertEqual(controller.checkpoint_path.read_bytes(), old_checkpoint)
+
+            for field, value in (("last_check", "altered retired marker"), ("lease_token", "foreign-old-token")):
+                with self.subTest(field=field):
+                    controller.checkpoint_path.write_bytes(old_checkpoint)
+                    altered = json.loads(old_checkpoint)
+                    altered[field] = value
+                    cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, altered)
+                    altered_bytes = controller.checkpoint_path.read_bytes()
+                    state_before = controller.state_path.read_bytes()
+                    with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                         mock.patch.object(cli.beads_backend, "run", side_effect=ready_command), \
+                         mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                         mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                        denied = _run_controller_json(cli.controller_resume, args)
+                    self.assertFalse(denied["ok"], denied)
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), altered_bytes)
+
+            controller.checkpoint_path.write_bytes(old_checkpoint)
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_command), \
+                 mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                 mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                retried = _run_controller_json(cli.controller_resume, args)
+            self.assertTrue(retried["ok"], retried)
+            final_state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(final_state["epoch"], old_lease.epoch + 1)
+            self.assertNotIn("continuation_reattach", final_state)
+            self.assertEqual(controller._load_checkpoint()["pending_continuation_task"], ready["id"])
+
     def test_due_result_race_refuses_expiry_without_revoking(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             channel = record["return_channel"]

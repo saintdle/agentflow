@@ -66,7 +66,9 @@ def _validate_drain_resolution_authorization(
         "schema", "root", "controller", "workflow_root", "continuity_id",
         "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
         "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
-        "ready_task", "intent_id",
+        "ready_task", "intent_id", "retired_checkpoint_sha256",
+        "retired_checkpoint_epoch", "retired_checkpoint_token",
+        "retired_checkpoint_last_check",
     }
     clean_causes = checkpoint._check_drain_causes(causes)
     ids = [cause["cause_id"] for cause in clean_causes]
@@ -80,6 +82,10 @@ def _validate_drain_resolution_authorization(
         and current_epoch == epoch + 1
         and pending.get("continuity_id") == continuity_id
         and pending.get("token") == current_token
+        and pending.get("retired_checkpoint_sha256") == payload.get("retired_checkpoint_sha256")
+        and pending.get("retired_checkpoint_epoch") == payload.get("retired_checkpoint_epoch")
+        and pending.get("previous_token") == payload.get("retired_checkpoint_token")
+        and pending.get("retired_checkpoint_last_check") == payload.get("retired_checkpoint_last_check")
     )
     if (
         set(payload) != expected_fields
@@ -99,6 +105,14 @@ def _validate_drain_resolution_authorization(
         or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("receipt_sha256") or ""))
         or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("contract_sha256") or ""))
         or not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("intent_id") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("retired_checkpoint_sha256") or ""))
+        or not isinstance(payload.get("retired_checkpoint_epoch"), int)
+        or isinstance(payload.get("retired_checkpoint_epoch"), bool)
+        or payload.get("retired_checkpoint_epoch") != epoch
+        or not isinstance(payload.get("retired_checkpoint_token"), str)
+        or payload.get("retired_checkpoint_token") != payload.get("lease_token")
+        or not isinstance(payload.get("retired_checkpoint_last_check"), str)
+        or not payload.get("retired_checkpoint_last_check")
         or not isinstance(payload.get("launch_id"), str) or not payload["launch_id"]
         or not (epoch == current_epoch and payload["lease_token"] == current_token or rotated)
         or not hmac.compare_digest(
@@ -108,6 +122,36 @@ def _validate_drain_resolution_authorization(
     ):
         raise LeaseConflict("continuation does not authenticate the exact cause snapshot and lease")
     return {**payload, "authority_hmac": supplied}
+
+
+def _checkpoint_matches_retired_binding(
+    document: Mapping[str, Any], raw: bytes, authorization: Mapping[str, Any],
+    *, root: str, controller: str,
+) -> bool:
+    """Check the exact signed terminal checkpoint that began a continuation."""
+    try:
+        causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+        return bool(
+            hashlib.sha256(raw).hexdigest() == authorization.get("retired_checkpoint_sha256")
+            and checkpoint.admission_phase(document) == "terminal"
+            and checkpoint.resume_state(document) == "blocked"
+            and document.get("terminal") is True
+            and document.get("root") == root
+            and document.get("controller") == controller
+            and document.get("task") == root
+            and document.get("epoch") == authorization.get("retired_checkpoint_epoch")
+            and document.get("lease_token") == authorization.get("retired_checkpoint_token")
+            and document.get("last_check") == authorization.get("retired_checkpoint_last_check")
+            and not document.get("active_tasks")
+            and not document.get("actor")
+            and not document.get("claim_id")
+            and not document.get("session_id")
+            and [cause["cause_id"] for cause in causes] == authorization.get("cause_ids")
+            and _drain_causes_digest(causes) == authorization.get("causes_sha256")
+            and not any(cause["kind"] == "unknown" for cause in causes)
+        )
+    except (checkpoint.CheckpointError, TypeError, ValueError):
+        return False
 
 
 def _append_drain_cause(
@@ -1264,6 +1308,9 @@ class RootController:
                 or payload.get("token") != f"{self.root}/{self.controller}/{candidate_epoch}"
             ):
                 raise LeaseConflict("staged continuation no longer matches its protected incarnation")
+            self._verify_pending_continuation_checkpoint(
+                state, pending, authority_secret=authority_secret,
+            )
             active = self._read_lease(state)
             dormant_value = state.get("dormant_lease")
             dormant = self._read_lease({"lease": dormant_value}) if isinstance(dormant_value, Mapping) else None
@@ -1293,6 +1340,99 @@ class RootController:
                 ):
                     raise LeaseConflict("staged continuation requires its exact committed credential")
             return dict(pending)
+
+    def _verify_pending_continuation_checkpoint(
+        self, state: Mapping[str, Any], pending: Mapping[str, Any], *,
+        authority_secret: str,
+    ) -> bool:
+        """Accept only the signed retired checkpoint or its exact committed target."""
+        authorization = pending.get("drain_resolution_authorization")
+        if not isinstance(authorization, Mapping):
+            raise LeaseConflict("staged continuation has no signed drain-resolution authorization")
+        try:
+            raw = self.checkpoint_path.read_bytes()
+            document = json.loads(raw)
+            previous_epoch = int(pending["previous_epoch"])
+            candidate_epoch = int(pending["epoch"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise LeaseConflict("staged continuation checkpoint is missing or malformed") from exc
+        old_fields = (
+            pending.get("retired_checkpoint_sha256") == authorization.get("retired_checkpoint_sha256")
+            and pending.get("retired_checkpoint_epoch") == previous_epoch
+            and authorization.get("retired_checkpoint_epoch") == previous_epoch
+            and pending.get("previous_token") == authorization.get("retired_checkpoint_token")
+            and pending.get("retired_checkpoint_token") == pending.get("previous_token")
+            and pending.get("retired_checkpoint_last_check") == authorization.get("retired_checkpoint_last_check")
+        )
+        if not old_fields:
+            raise LeaseConflict("staged continuation changed its retired checkpoint binding")
+        if _checkpoint_matches_retired_binding(
+            document, raw, authorization, root=self.root, controller=self.controller,
+        ):
+            return False
+
+        expected_check = (
+            f"authenticated cancelled-preidentity continuation for {pending.get('workflow_root')}; "
+            f"ready descendant {pending.get('ready_task')} after {pending.get('cancelled_task')}"
+        )
+        staged = bool(
+            hashlib.sha256(raw).hexdigest() != pending.get("retired_checkpoint_sha256")
+            and checkpoint.admission_phase(document) == "open"
+            and checkpoint.resume_state(document) == "advancing"
+            and document.get("state") == "advancing"
+            and document.get("status") == "advancing"
+            and document.get("terminal") is False
+            and document.get("root") == self.root
+            and document.get("controller") == self.controller
+            and document.get("task") == self.root
+            and document.get("epoch") == candidate_epoch
+            and document.get("lease_token") == pending.get("token")
+            and document.get("last_check") == expected_check
+            and document.get("pending_continuation_task") == pending.get("ready_task")
+            and not document.get("active_tasks")
+            and not document.get("actor")
+            and not document.get("claim_id")
+            and not document.get("session_id")
+            and checkpoint._check_drain_causes(document.get("drain_causes")) == []
+        )
+        if not staged:
+            raise LeaseConflict("staged continuation checkpoint is neither the exact retired nor staged checkpoint")
+        context = {
+            "workflow_root": str(pending.get("workflow_root") or ""),
+            "cancelled_task": str(pending.get("cancelled_task") or ""),
+            "ready_task": str(pending.get("ready_task") or ""),
+        }
+        expected_identity = {
+            "schema": DRAIN_AUDIT_SCHEMA,
+            "cause_ids": authorization.get("cause_ids"),
+            "causes_sha256": authorization.get("causes_sha256"),
+            "resolution": "authenticated_continuation",
+            "context": context,
+            "intent_id": authorization.get("intent_id"),
+        }
+        expected_audit_id = hashlib.sha256(
+            json.dumps(expected_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        audit = state.get("drain_audit")
+        if not isinstance(audit, list) or len(audit) > MAX_DRAIN_AUDIT_ENTRIES:
+            raise LeaseConflict("staged continuation has no authenticated drain archive")
+        for item in audit:
+            if not isinstance(item, Mapping):
+                continue
+            record = dict(item)
+            supplied = str(record.pop("authority_hmac", ""))
+            if (
+                item.get("audit_id") == expected_audit_id
+                and item.get("intent_id") == authorization.get("intent_id")
+                and item.get("resolution_authorization") == dict(authorization)
+                and all(item.get(key) == value for key, value in expected_identity.items())
+                and item.get("resolved_epoch") == candidate_epoch
+                and hmac.compare_digest(
+                    supplied, _authority_mac(authority_secret, record, domain="controller-drain-audit-v2"),
+                )
+            ):
+                return True
+        raise LeaseConflict("staged continuation checkpoint has no matching signed drain archive")
 
     def _continuity_for_staged_state(
         self, state: Mapping[str, Any], previous_epoch: int, candidate_epoch: int,
@@ -1342,6 +1482,9 @@ class RootController:
         self._verify_staged_owner_receipt_link(
             state, pending, workflow_root=workflow_root,
             cancelled_task=cancelled_task, authority_secret=authority_secret,
+        )
+        self._verify_pending_continuation_checkpoint(
+            state, pending, authority_secret=authority_secret,
         )
         try:
             previous_epoch = int(payload["previous_epoch"])
@@ -1457,6 +1600,9 @@ class RootController:
                     previous_epoch, candidate_epoch,
                 }:
                     raise LeaseConflict("staged continuation epochs no longer match the protected lease")
+                self._verify_pending_continuation_checkpoint(
+                    state, pending_value, authority_secret=authority_secret,
+                )
                 if (
                     active is not None and active.epoch == candidate_epoch
                     and active.root == self.root and active.controller == self.controller
@@ -1518,6 +1664,16 @@ class RootController:
                 cancelled_task=cancelled_task, ready_task=ready_task, causes=causes,
                 current_epoch=previous.epoch, current_token=previous.token,
             )
+            try:
+                retired_raw = self.checkpoint_path.read_bytes()
+                retired_document = json.loads(retired_raw)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise LeaseConflict("retired checkpoint is missing or malformed") from exc
+            if not _checkpoint_matches_retired_binding(
+                retired_document, retired_raw, drain_resolution_authorization,
+                root=self.root, controller=self.controller,
+            ):
+                raise LeaseConflict("continuation does not bind the exact retired checkpoint")
             now = float(self.clock())
             epoch = previous.epoch + 1
             secret = secrets.token_urlsafe(32)
@@ -1533,6 +1689,11 @@ class RootController:
                 "cancelled_task": cancelled_task, "ready_task": ready_task,
                 "continuity_id": previous.continuity_id,
                 "previous_epoch": previous.epoch, "epoch": epoch,
+                "previous_token": previous.token,
+                "retired_checkpoint_sha256": drain_resolution_authorization["retired_checkpoint_sha256"],
+                "retired_checkpoint_epoch": drain_resolution_authorization["retired_checkpoint_epoch"],
+                "retired_checkpoint_token": drain_resolution_authorization["retired_checkpoint_token"],
+                "retired_checkpoint_last_check": drain_resolution_authorization["retired_checkpoint_last_check"],
                 "token": candidate.token, "acquired_at": candidate.acquired_at,
                 "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
                 "resume_secret_hash": candidate.resume_secret_hash,
@@ -2873,6 +3034,16 @@ class RootController:
         ) as current:
             document = self._load_checkpoint()
             state = _read_json(self.state_path)
+            try:
+                retired_raw = self.checkpoint_path.read_bytes()
+                retired_document = json.loads(retired_raw)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise ControllerError("retired checkpoint is missing or malformed") from exc
+            if not _checkpoint_matches_retired_binding(
+                retired_document, retired_raw, resolution_authorization,
+                root=self.root, controller=self.controller,
+            ):
+                raise ControllerError("continuation does not bind the exact cause snapshot or retired checkpoint")
             causes = document.get("drain_causes")
             if not isinstance(causes, list) or any(
                 not isinstance(cause, Mapping) or cause.get("kind") == "unknown"
