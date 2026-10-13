@@ -602,7 +602,8 @@ class CopilotControllerContinuityTests(unittest.TestCase):
         self.assertEqual(ledger_path.read_bytes(), before)
 
     def test_missing_reviewed_sdk_identity_fails_before_credential_input(self) -> None:
-        self.issue()
+        with mock.patch.object(copilot_controller, "sdk_import_identity_fingerprint", return_value=None):
+            self.issue()
         args = SimpleNamespace(
             prepare_manifest=False, verify_only=False, workspace_root=self.workspace,
             workflow_root=self.workflow_root, manifest=self.manifest_path,

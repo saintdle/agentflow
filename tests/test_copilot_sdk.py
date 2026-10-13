@@ -70,6 +70,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
             mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            mock.patch.object(copilot_sdk, "_install_verified_sdk_importer"),
         ):
             self.assertEqual(copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)[2], reject)
 
@@ -86,6 +87,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
             mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            mock.patch.object(copilot_sdk, "_install_verified_sdk_importer"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
             copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
@@ -102,6 +104,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 copilot_sdk.importlib.metadata, "version", return_value="1.0.16"
             ),
             mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            mock.patch.object(copilot_sdk, "_install_verified_sdk_importer"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
             copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
@@ -119,9 +122,108 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
             mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            mock.patch.object(copilot_sdk, "_install_verified_sdk_importer"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
             copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
+
+    def test_poisoned_timestamp_valid_pyc_never_executes(self) -> None:
+        source_root = Path(__file__).resolve().parents[1] / "src"
+        script = r"""
+import importlib.metadata
+import importlib.util
+import os
+import py_compile
+import sys
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
+from unittest import mock
+
+from agentflow import copilot_sdk
+
+class FakeDistribution:
+    version = "1.0.17"
+    def __init__(self, root, names):
+        self.root = root
+        self.files = tuple(PurePosixPath("copilot") / name for name in names)
+    def locate_file(self, entry):
+        return self.root / str(entry)
+
+with TemporaryDirectory() as raw:
+    root = Path(raw).resolve()
+    package = root / "copilot"
+    generated = package / "generated"
+    generated.mkdir(parents=True)
+    names = (
+        "__init__.py", "client.py", "_cli_download.py", "_cli_version.py",
+        "_sdk_protocol_version.py", "_jsonrpc.py", "rpc.py", "session.py",
+        "generated/__init__.py", "generated/rpc.py", "generated/session_events.py",
+    )
+    files = {
+        "__init__.py": 'VALUE = "ordinary"\nclass CopilotClient: pass\nclass RuntimeConnection: pass\n',
+        "_cli_version.py": 'CLI_VERSION = "1.0.93"\n',
+        "_sdk_protocol_version.py": 'SDK_PROTOCOL_VERSION = 3\n',
+        "rpc.py": 'class PermissionDecisionReject: pass\n',
+    }
+    for name in names:
+        path = package / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(files.get(name, "SAFE_MARKER = True\n"), encoding="utf-8")
+
+    target = package / "__init__.py"
+    clean = target.read_bytes()
+    poisoned = clean.replace(b"ordinary", b"evilcode")
+    assert len(poisoned) == len(clean)
+    target.write_bytes(poisoned)
+    os.utime(target, (1700000000, 1700000000))
+    py_compile.compile(str(target), doraise=True)
+    target.write_bytes(clean)
+    os.utime(target, (1700000000, 1700000000))
+    assert Path(importlib.util.cache_from_source(str(target))).is_file()
+
+    distribution = FakeDistribution(root, names)
+    with (
+        mock.patch.object(importlib.metadata, "distribution", return_value=distribution),
+        mock.patch.object(importlib.metadata, "version", return_value="1.0.17"),
+        mock.patch.object(sys, "path", [str(root), *sys.path]),
+    ):
+        identity = copilot_sdk.sdk_import_identity_fingerprint(
+            require_installed=True, require_clean=True,
+        )
+        client_type, connection_type, _ = copilot_sdk._sdk_components(identity)
+        import copilot
+        assert copilot.VALUE == "ordinary", copilot.VALUE
+        assert client_type is copilot.CopilotClient
+        assert connection_type is copilot.RuntimeConnection
+        assert Path(copilot.__cached__).is_file(), "the poisoned cache should remain untouched"
+        import importlib
+        events = importlib.import_module("copilot.generated.session_events")
+        assert type(events.__loader__) is copilot_sdk._VerifiedSDKSourceLoader
+        assert copilot_sdk.verify_sdk_import_identity(identity) == identity
+        attested = copilot_sdk._SDK_EXECUTED_MODULES
+        copilot_sdk._SDK_EXECUTED_MODULES = dict(attested)
+        try:
+            try:
+                copilot_sdk.verify_sdk_import_identity(identity)
+            except copilot_sdk.CopilotSDKError:
+                pass
+            else:
+                raise AssertionError("mutable executable-code attestation was accepted")
+        finally:
+            copilot_sdk._SDK_EXECUTED_MODULES = attested
+print("controlled_source_import=ordinary")
+"""
+        env = {
+            "PATH": os.defpath,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(source_root),
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", script], env=env, check=False,
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("controlled_source_import=ordinary", result.stdout)
 
     def test_installed_pinned_sdk_and_runtime_artifact_verify_offline(self) -> None:
         raw_env = os.environ.get("AGENTFLOW_COPILOT_SDK_ENV")
