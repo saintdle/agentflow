@@ -22,6 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agentflow import copilot_sdk
 
 
+_FAKE_SDK_IDENTITY = {
+    "installed_version": copilot_sdk.SUPPORTED_SDK_VERSION,
+    "package_origin": "/fixture/copilot",
+    "source_sha256": {"copilot/__init__.py": "a" * 64},
+}
+
+
 def _fake_runtime_pin() -> copilot_sdk.CopilotRuntimePin:
     cache = "/private/managed-cache"
     runtime_dir = f"{cache}/prebuilds/darwin-arm64"
@@ -62,8 +69,9 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 copilot_sdk.importlib.metadata, "version",
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
+            mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
         ):
-            self.assertEqual(copilot_sdk._sdk_components()[2], reject)
+            self.assertEqual(copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)[2], reject)
 
         version_module.CLI_VERSION = "1.0.93-4"
         with (
@@ -77,9 +85,10 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 copilot_sdk.importlib.metadata, "version",
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
+            mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
-            copilot_sdk._sdk_components()
+            copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
 
         version_module.CLI_VERSION = copilot_sdk.SUPPORTED_CLI_RELEASE_VERSION
         with (
@@ -92,9 +101,10 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             mock.patch.object(
                 copilot_sdk.importlib.metadata, "version", return_value="1.0.16"
             ),
+            mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
-            copilot_sdk._sdk_components()
+            copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
 
         protocol_module.SDK_PROTOCOL_VERSION = 2
         with (
@@ -108,9 +118,10 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                 copilot_sdk.importlib.metadata, "version",
                 return_value=copilot_sdk.SUPPORTED_SDK_VERSION,
             ),
+            mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
             self.assertRaises(copilot_sdk.CopilotSDKError),
         ):
-            copilot_sdk._sdk_components()
+            copilot_sdk._sdk_components(_FAKE_SDK_IDENTITY)
 
     def test_installed_pinned_sdk_and_runtime_artifact_verify_offline(self) -> None:
         raw_env = os.environ.get("AGENTFLOW_COPILOT_SDK_ENV")
@@ -122,18 +133,87 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             python = sdk_env / "Scripts" / "python.exe"
         self.assertTrue(python.is_file(), "private SDK environment has no Python executable")
         source_root = Path(__file__).resolve().parents[1] / "src"
-        script = (
-            "import importlib.metadata; "
-            "from copilot._cli_version import CLI_VERSION; "
-            "from copilot._sdk_protocol_version import SDK_PROTOCOL_VERSION; "
-            "from copilot import RuntimeConnection; "
-            "from agentflow.copilot_sdk import _sdk_components, _prepare_runtime_pin; "
-            "client_type, _, _ = _sdk_components(); "
-            "assert callable(getattr(client_type, 'get_status', None)); "
-            "assert 'path' in __import__('inspect').signature(RuntimeConnection.for_stdio).parameters; "
-            "pin = _prepare_runtime_pin(); "
-            "print(importlib.metadata.version('github-copilot-sdk') + ':' + CLI_VERSION + ':' + str(SDK_PROTOCOL_VERSION) + ':' + pin.published_release + ':' + pin.published_asset)"
-        )
+        script = """
+import importlib.metadata
+import inspect
+import sys
+import tempfile
+from pathlib import Path
+from agentflow.copilot_sdk import (
+    CopilotSDKError, _prepare_runtime_pin, _sdk_components,
+    sdk_import_identity_fingerprint, verify_sdk_import_identity,
+)
+
+identity = sdk_import_identity_fingerprint(require_installed=True)
+with tempfile.TemporaryDirectory() as raw:
+    shadow = Path(raw) / "copilot"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(
+        "class CopilotClient: pass\\nclass RuntimeConnection: pass\\n",
+        encoding="utf-8",
+    )
+    for position in (0, 1):
+        sys.path.insert(position, raw)
+        try:
+            try:
+                verify_sdk_import_identity(identity, require_clean=True)
+            except CopilotSDKError:
+                pass
+            else:
+                raise AssertionError("script/PYTHONPATH shadow was accepted")
+            assert "copilot" not in sys.modules
+        finally:
+            sys.path.remove(raw)
+
+verify_sdk_import_identity(identity, require_clean=True)
+client_type, connection_type, _ = _sdk_components(identity)
+assert callable(getattr(client_type, "get_status", None))
+assert "path" in inspect.signature(connection_type.for_stdio).parameters
+verify_sdk_import_identity(identity)
+loaded = sys.modules["copilot"]
+sys.modules["copilot"] = object()
+try:
+    try:
+        verify_sdk_import_identity(identity)
+    except CopilotSDKError:
+        pass
+    else:
+        raise AssertionError("sys.modules injection was accepted")
+finally:
+    sys.modules["copilot"] = loaded
+
+client_module = sys.modules["copilot.client"]
+original_origin = client_module.__file__
+client_module.__file__ = "/tmp/shadow/copilot/client.py"
+try:
+    verify_sdk_import_identity(identity)
+except CopilotSDKError:
+    pass
+else:
+    raise AssertionError("loaded SDK origin drift was accepted")
+finally:
+    client_module.__file__ = original_origin
+
+read_bytes = Path.read_bytes
+client_path = Path(original_origin).resolve()
+def drifted_read_bytes(path):
+    data = read_bytes(path)
+    return data + b"# drift after signed review\\n" if Path(path).resolve() == client_path else data
+from unittest import mock
+with mock.patch.object(Path, "read_bytes", drifted_read_bytes):
+    try:
+        verify_sdk_import_identity(identity)
+    except CopilotSDKError:
+        pass
+    else:
+        raise AssertionError("loaded SDK byte drift was accepted")
+
+pin = _prepare_runtime_pin()
+print(
+    importlib.metadata.version("github-copilot-sdk") + ":" + pin.published_release
+    + ":" + pin.published_asset
+)
+"""
         env = {
             "PATH": os.defpath,
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -148,7 +228,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr[-1200:])
-        self.assertEqual(result.stdout.strip(), "1.0.17:1.0.93:3:v1.0.93:github-copilot-1.0.93-darwin-arm64.tgz")
+        self.assertEqual(result.stdout.strip(), "1.0.17:v1.0.93:github-copilot-1.0.93-darwin-arm64.tgz")
 
     def test_pinned_sdk_routes_token_only_through_session_rpc(self) -> None:
         try:
@@ -321,7 +401,10 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             workspace = parent / "checkout"
             home = parent / "private-home"
             workspace.mkdir()
-            with mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)):
+            with (
+                mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)),
+                mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            ):
                 with mock.patch.object(copilot_sdk, "_prepare_runtime_pin", return_value=_fake_runtime_pin()):
                     with mock.patch.object(copilot_sdk, "_verify_runtime_pin"):
                         with mock.patch.dict("os.environ", {
@@ -331,6 +414,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                             prepared = copilot_sdk.create_proof_client(
                                 base_directory=home,
                                 workspace_root=workspace,
+                                sdk_identity=_FAKE_SDK_IDENTITY,
                             )
             client = prepared.client
             self.assertIs(client.kwargs["connection"], RuntimeConnection.connection)
@@ -433,6 +517,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                         copilot_sdk, "create_proof_client",
                         return_value=copilot_sdk._PreparedProofClient(client, pin),
                     ),
+                    mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
                     mock.patch.object(copilot_sdk, "_verify_runtime_pin"),
                 ):
                     run = await copilot_sdk.CopilotProofRun.open(
@@ -442,6 +527,7 @@ class CopilotSDKOptionalTests(unittest.TestCase):
                         base_directory=Path("/tmp/private-proof-home"),
                         workspace_root=Path("/tmp/workspace"),
                         github_token="ephemeral-test-credential",
+                        sdk_identity=_FAKE_SDK_IDENTITY,
                     )
                 report = await run.send_once("Reply with a short acknowledgement.")
                 await run.close()
@@ -479,19 +565,24 @@ class CopilotSDKOptionalTests(unittest.TestCase):
             parent = Path(raw)
             workspace = parent / "checkout"
             workspace.mkdir()
-            with mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)):
+            with (
+                mock.patch.object(copilot_sdk, "_sdk_components", return_value=(Client, RuntimeConnection, object)),
+                mock.patch.object(copilot_sdk, "verify_sdk_import_identity"),
+            ):
                 with mock.patch.object(copilot_sdk, "_prepare_runtime_pin", return_value=_fake_runtime_pin()):
                     with mock.patch.object(copilot_sdk, "_verify_runtime_pin"):
                         with self.assertRaises(copilot_sdk.CopilotSDKError):
                             copilot_sdk.create_proof_client(
                                 base_directory=workspace / ".copilot",
                                 workspace_root=workspace,
+                                sdk_identity=_FAKE_SDK_IDENTITY,
                             )
                     with mock.patch.dict("os.environ", {"COPILOT_CLI_PATH": "/tmp/unpinned-copilot"}):
                         with self.assertRaises(copilot_sdk.CopilotSDKError):
                             copilot_sdk.create_proof_client(
                                 base_directory=parent / "private-home",
                                 workspace_root=workspace,
+                                sdk_identity=_FAKE_SDK_IDENTITY,
                             )
 
 

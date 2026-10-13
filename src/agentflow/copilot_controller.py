@@ -36,6 +36,8 @@ from agentflow.copilot_sdk import (
     CopilotUsageReport,
     ProtectedCopilotLedger,
     derive_evidence_key,
+    sdk_import_identity_fingerprint,
+    verify_sdk_import_identity,
 )
 from agentflow import checkpoint
 
@@ -138,6 +140,7 @@ def _source_fingerprint() -> dict[str, Any]:
                 name: hashlib.sha256(path.read_bytes()).hexdigest()
                 for name, path in sdk_sources.items()
             }
+        sdk_import_identity = sdk_import_identity_fingerprint(require_clean=True)
         try:
             source_sha = subprocess.run(
                 ["git", "-C", str(artifact_root), "rev-parse", "HEAD"], check=True,
@@ -159,6 +162,7 @@ def _source_fingerprint() -> dict[str, Any]:
             "required_version": "1.0.17",
             "installed_version": sdk_version,
             "source_sha256": sdk_hashes,
+            "import_identity": sdk_import_identity,
         },
     }
 
@@ -382,6 +386,7 @@ class AuthenticatedCopilotProofManifest:
     deadline_epoch: float
     execution_reservation_digest: str
     review_attestation_digest: str
+    source_fingerprint: Mapping[str, Any]
     manifest_path: Path = field(repr=False)
     review_attestation_path: Path = field(repr=False)
     authority: _ControllerAuthority = field(repr=False)
@@ -873,7 +878,7 @@ def issue_copilot_proof_manifest(
     return AuthenticatedCopilotProofManifest(
         identity, authority.workspace_root, workflow_root, claim,
         float(budget["deadline_epoch"]), document["execution_reservation_digest"], review_digest,
-        manifest_path, Path(document["review_attestation_path"]), authority,
+        source_before, manifest_path, Path(document["review_attestation_path"]), authority,
     )
 
 
@@ -904,6 +909,17 @@ def load_authenticated_proof_manifest(
     review_digest = _verify_review_attestation(
         attestation_path, authority, identity, claim, allow_reserved=True,
     )
+    review_document = _private_json(
+        _review_attestation_path(attestation_path, authority.workspace_root, must_exist=True),
+        workspace_root=authority.workspace_root,
+    )
+    source_fingerprint = review_document.get("source")
+    if (
+        hashlib.sha256(_canonical(review_document)).hexdigest() != review_digest
+        or not isinstance(source_fingerprint, Mapping)
+        or _source_fingerprint() != dict(source_fingerprint)
+    ):
+        raise CopilotSDKError("Copilot reviewed source changed while loading the proof manifest")
     lease = document.get("lease")
     budget = document.get("budget")
     preflight = document.get("preflight")
@@ -971,7 +987,7 @@ def load_authenticated_proof_manifest(
     return AuthenticatedCopilotProofManifest(
         identity, authority.workspace_root, workflow_root, dict(claim),
         float(budget["deadline_epoch"]), str(document["execution_reservation_digest"]), review_digest,
-        manifest_path, attestation_path, authority,
+        dict(source_fingerprint), manifest_path, attestation_path, authority,
     )
 
 
@@ -1436,6 +1452,10 @@ class CopilotControllerContinuity:
             )
             if review_digest != self.context.review_attestation_digest:
                 raise CopilotSDKError("Copilot accepted-review authority changed before provider startup")
+            if _source_fingerprint() != dict(self.context.source_fingerprint):
+                raise CopilotSDKError("Copilot reviewed source changed before provider startup")
+            sdk_identity = self.context.source_fingerprint.get("sdk", {}).get("import_identity")
+            verify_sdk_import_identity(sdk_identity, require_clean=True)
             cli = _cli_backend()
             reservation = cli._read_any_execution_ledger_entry(
                 authority.workspace_root, authority.workflow_root, self.identity.task_id,
@@ -1472,6 +1492,7 @@ class CopilotControllerContinuity:
                 base_directory=base_directory,
                 workspace_root=self.store.workspace_root,
                 github_token=github_token,
+                sdk_identity=sdk_identity,
                 deadline_epoch=self.context.deadline_epoch,
             ) as run:
                 report = await run.send_once(COPILOT_NEGATIVE_CONTROL_PROMPT)

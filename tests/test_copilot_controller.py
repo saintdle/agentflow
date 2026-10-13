@@ -526,6 +526,8 @@ class CopilotControllerContinuityTests(unittest.TestCase):
             mock.patch.object(copilot_controller.SQLiteCopilotControllerStore, "assert_unused", rotate_on_second_check),
             mock.patch.object(copilot_proof_runner, "_provider_credential", return_value="fixture-placeholder"),
             mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=observe_open),
+            mock.patch.object(copilot_proof_runner, "verify_sdk_import_identity"),
+            mock.patch.object(copilot_controller, "verify_sdk_import_identity"),
         ):
             with self.assertRaises(copilot_sdk.CopilotSDKError):
                 asyncio.run(copilot_proof_runner._run(args))
@@ -598,6 +600,37 @@ class CopilotControllerContinuityTests(unittest.TestCase):
             with mock.patch.object(copilot_sdk.CopilotProofRun, "open", side_effect=AssertionError("SDK startup")):
                 self.assertEqual(asyncio.run(copilot_proof_runner._run(args)), 0)
         self.assertEqual(ledger_path.read_bytes(), before)
+
+    def test_missing_reviewed_sdk_identity_fails_before_credential_input(self) -> None:
+        self.issue()
+        args = SimpleNamespace(
+            prepare_manifest=False, verify_only=False, workspace_root=self.workspace,
+            workflow_root=self.workflow_root, manifest=self.manifest_path,
+            task_id=None, claim_id=None, launch_id=None, role=None, model=None,
+            effort=None, review_attestation=None, credential_fd=None,
+        )
+        with mock.patch.object(
+            copilot_proof_runner, "_provider_credential", side_effect=AssertionError("credential prompt"),
+        ):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                asyncio.run(copilot_proof_runner._run(args))
+
+    def test_preloaded_sdk_injection_fails_before_credential_input(self) -> None:
+        self.issue()
+        args = SimpleNamespace(
+            prepare_manifest=False, verify_only=False, workspace_root=self.workspace,
+            workflow_root=self.workflow_root, manifest=self.manifest_path,
+            task_id=None, claim_id=None, launch_id=None, role=None, model=None,
+            effort=None, review_attestation=None, credential_fd=None,
+        )
+        with (
+            mock.patch.dict(sys.modules, {"copilot": object()}),
+            mock.patch.object(
+                copilot_proof_runner, "_provider_credential", side_effect=AssertionError("credential prompt"),
+            ),
+        ):
+            with self.assertRaises(copilot_sdk.CopilotSDKError):
+                asyncio.run(copilot_proof_runner._run(args))
 
     def test_head_tampering_fails_authentication(self) -> None:
         context = self.issue()

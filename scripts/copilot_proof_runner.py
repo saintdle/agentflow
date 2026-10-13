@@ -21,7 +21,7 @@ from agentflow.copilot_controller import (  # noqa: E402
     issue_copilot_proof_manifest,
     load_authenticated_proof_manifest,
 )
-from agentflow.copilot_sdk import CopilotSDKError  # noqa: E402
+from agentflow.copilot_sdk import CopilotSDKError, verify_sdk_import_identity  # noqa: E402
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -139,6 +139,8 @@ async def _run(args: argparse.Namespace) -> int:
         }, sort_keys=True))
         return 0
 
+    sdk_identity = context.source_fingerprint.get("sdk", {}).get("import_identity")
+    verify_sdk_import_identity(sdk_identity, require_clean=True)
     continuity = CopilotControllerContinuity(context)
     continuity.store.assert_unused()
     github_token = _provider_credential(args.credential_fd)
