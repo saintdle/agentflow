@@ -253,6 +253,69 @@ def _authority_mac(secret: str, value: Mapping[str, Any], *, domain: str) -> str
     return hmac.new(secret.encode("utf-8"), encoded, hashlib.sha256).hexdigest()
 
 
+_CONTINUATION_CANDIDATE_DERIVATION = "agentflow.continuation-candidate-proof@1"
+
+
+def _validate_continuation_candidate_derivation(pending: Mapping[str, Any]) -> bool:
+    """Validate signed derivation metadata; return False only for old-format intents."""
+    keys = ("candidate_proof_derivation", "candidate_proof_nonce", "previous_resume_secret_hash")
+    present = [key in pending for key in keys]
+    if not any(present):
+        return False
+    if (
+        not all(present)
+        or pending.get("candidate_proof_derivation") != _CONTINUATION_CANDIDATE_DERIVATION
+        or not re.fullmatch(r"[0-9a-f]{64}", str(pending.get("candidate_proof_nonce") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(pending.get("previous_resume_secret_hash") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(pending.get("resume_secret_hash") or ""))
+    ):
+        raise LeaseConflict("staged continuation candidate proof derivation is malformed")
+    return True
+
+
+def _derive_continuation_candidate_proof(
+    authority_secret: str,
+    previous_resume_proof: str,
+    *,
+    nonce: str,
+    root: str,
+    controller: str,
+    workflow_root: str,
+    continuity_id: str,
+    previous_epoch: int,
+    previous_token: str,
+    candidate_epoch: int,
+    candidate_token: str,
+    cancelled_task: str,
+    ready_task: str,
+    authorization_intent_id: str,
+    retired_checkpoint_sha256: str,
+) -> str:
+    """Derive one retry-stable candidate proof from its old protected proof and signed intent."""
+    context = {
+        "schema": "agentflow.continuation-candidate-proof-derivation@1",
+        "previous_resume_proof": previous_resume_proof,
+        "nonce": nonce,
+        "root": root,
+        "controller": controller,
+        "workflow_root": workflow_root,
+        "continuity_id": continuity_id,
+        "previous_epoch": previous_epoch,
+        "previous_token": previous_token,
+        "candidate_epoch": candidate_epoch,
+        "candidate_token": candidate_token,
+        "cancelled_task": cancelled_task,
+        "ready_task": ready_task,
+        "authorization_intent_id": authorization_intent_id,
+        "retired_checkpoint_sha256": retired_checkpoint_sha256,
+    }
+    encoded = (
+        b"agentflow:continuation-resume-proof-derivation-v1:"
+        + json.dumps(context, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return hmac.new(authority_secret.encode("utf-8"), encoded, hashlib.sha256).hexdigest()
+
+
 @dataclass(frozen=True)
 class Lease:
     root: str
@@ -1327,6 +1390,7 @@ class RootController:
                 )
             ):
                 raise LeaseConflict("staged continuation does not authenticate this exact target")
+            _validate_continuation_candidate_derivation(payload)
             self._verify_staged_owner_receipt_link(
                 state, pending, workflow_root=workflow_root,
                 cancelled_task=cancelled_task, authority_secret=authority_secret,
@@ -1519,6 +1583,7 @@ class RootController:
             )
         ):
             raise LeaseConflict("staged continuation does not authenticate this exact target")
+        _validate_continuation_candidate_derivation(payload)
         self._verify_staged_owner_receipt_link(
             state, pending, workflow_root=workflow_root,
             cancelled_task=cancelled_task, authority_secret=authority_secret,
@@ -1625,6 +1690,7 @@ class RootController:
                     )
                 ):
                     raise LeaseConflict("staged continuation does not authenticate this exact target")
+                has_candidate_derivation = _validate_continuation_candidate_derivation(pending)
                 if pending.get("drain_resolution_authorization") != dict(drain_resolution_authorization):
                     raise LeaseConflict("staged continuation changed its drain-resolution authorization")
                 self._verify_staged_owner_receipt_link(
@@ -1643,7 +1709,7 @@ class RootController:
                     previous_epoch, candidate_epoch,
                 }:
                     raise LeaseConflict("staged continuation epochs no longer match the protected lease")
-                self._verify_pending_continuation_checkpoint(
+                checkpoint_is_staged = self._verify_pending_continuation_checkpoint(
                     state, pending_value, authority_secret=authority_secret,
                 )
                 if (
@@ -1676,6 +1742,56 @@ class RootController:
                     candidate = self._continuation_lease_from_record(pending, resume_proof)
                     if readiness_verifier(candidate) != ready_task:
                         raise LeaseConflict("continuation target is no longer the exact current ready task")
+                    state["epoch"] = candidate.epoch
+                    state["lease"] = candidate.to_storage_dict()
+                    state.pop("dormant_lease", None)
+                    self._write_state(state)
+                    self._lease = candidate
+                    return candidate
+                if has_candidate_derivation and int(state.get("epoch", -1)) == previous_epoch:
+                    previous = active or dormant
+                    authorization = pending.get("drain_resolution_authorization")
+                    old_proof_hash = str(pending.get("previous_resume_secret_hash") or "")
+                    if (
+                        checkpoint_is_staged
+                        or previous is None or previous.root != self.root
+                        or previous.controller != self.controller
+                        or previous.epoch != previous_epoch
+                        or previous.continuity_id != pending.get("continuity_id")
+                        or previous.token != pending.get("previous_token")
+                        or pending.get("token") != f"{self.root}/{self.controller}/{candidate_epoch}"
+                        or previous.resume_secret_hash != old_proof_hash
+                        or not previous.verify_resume_proof(resume_proof)
+                        or not isinstance(authorization, Mapping)
+                    ):
+                        raise LeaseConflict("staged continuation requires its exact old protected credential and retired checkpoint")
+                    retired_document = self._load_checkpoint()
+                    causes = checkpoint._check_drain_causes(retired_document.get("drain_causes"))
+                    _validate_drain_resolution_authorization(
+                        authorization, authority_secret,
+                        root=self.root, controller=self.controller,
+                        workflow_root=workflow_root, continuity_id=previous.continuity_id,
+                        cancelled_task=cancelled_task, ready_task=ready_task, causes=causes,
+                        current_epoch=previous_epoch, current_token=previous.token,
+                    )
+                    candidate_proof = _derive_continuation_candidate_proof(
+                        authority_secret, resume_proof,
+                        nonce=str(pending["candidate_proof_nonce"]),
+                        root=self.root, controller=self.controller,
+                        workflow_root=workflow_root,
+                        continuity_id=previous.continuity_id,
+                        previous_epoch=previous_epoch, previous_token=previous.token,
+                        candidate_epoch=candidate_epoch, candidate_token=str(pending.get("token") or ""),
+                        cancelled_task=cancelled_task, ready_task=ready_task,
+                        authorization_intent_id=str(authorization.get("intent_id") or ""),
+                        retired_checkpoint_sha256=str(pending.get("retired_checkpoint_sha256") or ""),
+                    )
+                    if not hmac.compare_digest(_hash_secret(candidate_proof), candidate_hash):
+                        raise LeaseConflict("staged continuation candidate proof does not match its signed intent")
+                    candidate = self._continuation_lease_from_record(pending, candidate_proof)
+                    if readiness_verifier(candidate) != ready_task:
+                        raise LeaseConflict("continuation target is no longer the exact current ready task")
+                    persist_credentials(candidate)
                     state["epoch"] = candidate.epoch
                     state["lease"] = candidate.to_storage_dict()
                     state.pop("dormant_lease", None)
@@ -1726,9 +1842,22 @@ class RootController:
                 raise LeaseConflict("continuation does not bind the exact retired checkpoint")
             now = float(self.clock())
             epoch = previous.epoch + 1
-            secret = secrets.token_urlsafe(32)
+            candidate_token = f"{self.root}/{self.controller}/{epoch}"
+            candidate_nonce = secrets.token_hex(32)
+            secret = _derive_continuation_candidate_proof(
+                authority_secret, resume_proof,
+                nonce=candidate_nonce,
+                root=self.root, controller=self.controller,
+                workflow_root=workflow_root,
+                continuity_id=previous.continuity_id,
+                previous_epoch=previous.epoch, previous_token=previous.token,
+                candidate_epoch=epoch, candidate_token=candidate_token,
+                cancelled_task=cancelled_task, ready_task=ready_task,
+                authorization_intent_id=str(drain_resolution_authorization.get("intent_id") or ""),
+                retired_checkpoint_sha256=str(drain_resolution_authorization.get("retired_checkpoint_sha256") or ""),
+            )
             candidate = Lease(
-                self.root, self.controller, epoch, f"{self.root}/{self.controller}/{epoch}",
+                self.root, self.controller, epoch, candidate_token,
                 previous.acquired_at, now, self.owner_id, secret, _hash_secret(secret),
                 continuity_id=previous.continuity_id,
             )
@@ -1753,6 +1882,9 @@ class RootController:
                 "token": candidate.token, "acquired_at": candidate.acquired_at,
                 "heartbeat_at": candidate.heartbeat_at, "owner_id": candidate.owner_id,
                 "resume_secret_hash": candidate.resume_secret_hash,
+                "candidate_proof_derivation": _CONTINUATION_CANDIDATE_DERIVATION,
+                "candidate_proof_nonce": candidate_nonce,
+                "previous_resume_secret_hash": previous.resume_secret_hash,
                 "staged_checkpoint_sha256": staged_checkpoint_sha256,
                 "drain_resolution_authorization": dict(drain_resolution_authorization),
             }

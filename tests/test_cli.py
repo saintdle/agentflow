@@ -4678,23 +4678,48 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 args, controller, lease = self._continuation_fixture(base)
                 initial_epoch = lease.epoch
-                original_credentials = cli._controller_credentials
+                def fail_before_write(*call_args, **call_kwargs):
+                    raise OSError("credential write failed before candidate proof")
 
-                def write_then_fail(*call_args, **call_kwargs):
-                    original_credentials(*call_args, **call_kwargs)
-                    raise OSError("credential write failed after candidate proof")
-
-                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_fail):
+                credential_path = cli._resume_key_path(args)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=fail_before_write):
                     first = self._run_continuation_once(args)
-                self.assertEqual(first["error"], "credential write failed after candidate proof")
-                staged = json.loads(controller.state_path.read_text())
+                self.assertEqual(first["error"], "credential write failed before candidate proof")
+                state_after_first = controller.state_path.read_bytes()
+                checkpoint_after_first = controller.checkpoint_path.read_bytes()
+                credentials_after_first = credential_path.read_bytes()
+                staged = json.loads(state_after_first)
                 self.assertEqual(staged["epoch"], initial_epoch)
                 self.assertIn("continuation_reattach", staged)
                 self.assertEqual(controller._load_checkpoint()["epoch"], initial_epoch)
+                original = cli._read_controller_credentials(credential_path)
+                self.assertTrue(lease.verify_resume_proof(original["resume_secret"]))
+                pending = staged["continuation_reattach"]
+                self.assertEqual(pending["candidate_proof_derivation"], "agentflow.continuation-candidate-proof@1")
+                self.assertRegex(pending["candidate_proof_nonce"], r"^[0-9a-f]{64}$")
+                candidate_hash = pending["resume_secret_hash"]
+                self.assertRegex(
+                    pending["drain_resolution_authorization"]["intent_id"], r"^[0-9a-f]{32}$",
+                )
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=fail_before_write):
+                    repeated = self._run_continuation_once(args)
+                self.assertEqual(repeated["error"], "credential write failed before candidate proof")
+                self.assertEqual(controller.state_path.read_bytes(), state_after_first)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_after_first)
+                self.assertEqual(credential_path.read_bytes(), credentials_after_first)
 
                 second = self._run_continuation_once(args)
                 self.assertTrue(second["ok"], second)
                 self._assert_continuation_committed(args, controller, "ready-task")
+                final_credentials = cli._read_controller_credentials(credential_path)
+                self.assertEqual(
+                    hashlib.sha256(final_credentials["resume_secret"].encode("utf-8")).hexdigest(),
+                    candidate_hash,
+                )
+                self.assertEqual(json.loads(controller.state_path.read_text())["epoch"], initial_epoch + 1)
+                self.assertNotIn(final_credentials["resume_secret"], controller.state_path.read_text())
+                self.assertNotIn(final_credentials["resume_secret"], controller.checkpoint_path.read_text())
 
     def test_staged_continuation_rejects_changed_target_and_stale_proof_without_losing_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4767,6 +4792,77 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 self.assertEqual(controller.state_path.read_bytes(), state_before)
                 self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
                 self.assertEqual(credentials_path.read_bytes(), credentials_before)
+
+    def test_candidate_credential_write_rechecks_the_canonical_old_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, lease = self._continuation_fixture(base)
+                credential_path = cli._resume_key_path(args)
+                original_credentials = json.loads(credential_path.read_text(encoding="utf-8"))
+
+                def replace_credential_before_write(_root, _workflow, selected, _controller):
+                    changed = dict(original_credentials)
+                    changed["resume_secret"] = "concurrent-credential-change"
+                    cli._private_atomic_json(credential_path, changed)
+                    return selected
+
+                result = self._run_continuation_once(
+                    args, current_ready_verifier=replace_credential_before_write,
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertIn("canonical controller resume credential changed before candidate write", result["error"])
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                self.assertIn("continuation_reattach", state)
+                self.assertEqual(state["epoch"], lease.epoch)
+                self.assertEqual(controller._load_checkpoint()["epoch"], lease.epoch)
+                pending_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+
+                cli._private_atomic_json(credential_path, original_credentials)
+                retried = self._run_continuation_once(args)
+
+                self.assertTrue(retried["ok"], retried)
+                self.assertNotEqual(controller.state_path.read_bytes(), pending_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes() != checkpoint_before, True)
+                self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_prewrite_candidate_derivation_rejects_malformed_signed_metadata_byte_preservingly(self) -> None:
+        for field, value in (
+            ("candidate_proof_nonce", "malformed"),
+            ("candidate_proof_derivation", "unknown-derivation"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    args, controller, _lease = self._continuation_fixture(base)
+                    with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("prewrite crash")):
+                        first = self._run_continuation_once(args)
+                    self.assertEqual(first["error"], "prewrite crash")
+
+                    state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                    pending = state["continuation_reattach"]
+                    pending[field] = value
+                    authority_secret = cli._read_controller_credentials(
+                        cli._resume_key_path(args),
+                    )["authority_secret"]
+                    pending["authority_hmac"] = cli._authority_mac(
+                        authority_secret, pending, domain="continuation-reattach-v1",
+                    )
+                    cli._private_atomic_json(controller.state_path, state)
+                    state_before = controller.state_path.read_bytes()
+                    checkpoint_before = controller.checkpoint_path.read_bytes()
+                    credential_path = cli._resume_key_path(args)
+                    credentials_before = credential_path.read_bytes()
+
+                    denied = self._run_continuation_once(args)
+
+                    self.assertFalse(denied["ok"], denied)
+                    self.assertIn("candidate proof derivation is malformed", denied["error"])
+                    self.assertEqual(controller.state_path.read_bytes(), state_before)
+                    self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                    self.assertEqual(credential_path.read_bytes(), credentials_before)
 
     def test_staged_continuation_retry_rejects_any_changed_checkpoint_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4958,13 +5054,6 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                     args.continue_after_cancelled_preidentity = "old-task"
                     args.continue_task = "ready-task"
                     retry = self._run_continuation_once(args)
-                    if phase == "credential-before":
-                        self.assertFalse(retry["ok"], retry)
-                        self.assertIn("exact current or rotated credential", retry["error"])
-                        self.assertEqual(controller.state_path.read_bytes(), state_before)
-                        self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
-                        self.assertEqual(credential_path.read_bytes(), credential_before)
-                        continue
                     self.assertTrue(retry["ok"], retry)
                     self._assert_continuation_committed(args, controller, "ready-task")
 

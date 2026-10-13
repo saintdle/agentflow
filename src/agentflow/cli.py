@@ -565,10 +565,32 @@ def _controller_credentials(
     lease: controller_backend.Lease,
     *,
     key_path: Path | None = None,
+    expected_resume_secret: str | None = None,
+    expected_authority_secret: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     """Rotate resume proof while preserving one incarnation signing key."""
     path = key_path or _resume_key_path(args)
     credentials = _read_controller_credentials(path)
+    if (
+        expected_resume_secret is not None
+        and not hmac.compare_digest(
+            credentials.get("resume_secret", "").encode("utf-8"),
+            expected_resume_secret.encode("utf-8"),
+        )
+    ):
+        raise controller_backend.LeaseConflict(
+            "canonical controller resume credential changed before candidate write"
+        )
+    if (
+        expected_authority_secret is not None
+        and not hmac.compare_digest(
+            credentials.get("authority_secret", "").encode("utf-8"),
+            expected_authority_secret.encode("utf-8"),
+        )
+    ):
+        raise controller_backend.LeaseConflict(
+            "canonical controller authority credential changed before candidate write"
+        )
     legacy = _legacy_resume_key_path(args)
     if not credentials and legacy is not None and legacy.is_file():
         credentials = _read_controller_credentials(legacy)
@@ -602,6 +624,28 @@ def _controller_credentials(
             canonical_path, canonical_credentials,
             workspace_root=str(root.resolve()), workflow_root=workflow_root,
         )
+    if expected_resume_secret is not None or expected_authority_secret is not None:
+        current_credentials = _read_controller_credentials(path)
+        if path.is_symlink() or (
+            expected_resume_secret is not None
+            and not hmac.compare_digest(
+                current_credentials.get("resume_secret", "").encode("utf-8"),
+                expected_resume_secret.encode("utf-8"),
+            )
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller resume credential changed before candidate write"
+            )
+        if (
+            expected_authority_secret is not None
+            and not hmac.compare_digest(
+                current_credentials.get("authority_secret", "").encode("utf-8"),
+                expected_authority_secret.encode("utf-8"),
+            )
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller authority credential changed before candidate write"
+            )
     _write_resume_key(
         path,
         resume_secret,
@@ -4110,6 +4154,8 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                                 ),
                                 persist_credentials=lambda candidate: _controller_credentials(
                                     args, candidate, key_path=key_path,
+                                    expected_resume_secret=resume_proof,
+                                    expected_authority_secret=credentials["authority_secret"],
                                 ),
                             )
                     else:
