@@ -1382,6 +1382,9 @@ class RootController:
         authority_secret: str,
     ) -> bool:
         """Accept only the signed retired checkpoint or its exact committed target."""
+        staged_digest = pending.get("staged_checkpoint_sha256")
+        if not isinstance(staged_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", staged_digest):
+            raise LeaseConflict("staged continuation has no authenticated complete checkpoint commitment")
         authorization = pending.get("drain_resolution_authorization")
         if not isinstance(authorization, Mapping):
             raise LeaseConflict("staged continuation has no signed drain-resolution authorization")
@@ -1407,9 +1410,6 @@ class RootController:
         ):
             return False
 
-        staged_digest = str(pending.get("staged_checkpoint_sha256") or "")
-        if not re.fullmatch(r"[0-9a-f]{64}", staged_digest):
-            raise LeaseConflict("staged continuation has no authenticated complete checkpoint commitment")
         expected_check = (
             f"authenticated cancelled-preidentity continuation for {pending.get('workflow_root')}; "
             f"ready descendant {pending.get('ready_task')} after {pending.get('cancelled_task')}"
@@ -1682,6 +1682,9 @@ class RootController:
                     self._write_state(state)
                     self._lease = candidate
                     return candidate
+                raise LeaseConflict(
+                    "staged continuation retry requires its exact current or rotated credential"
+                )
             else:
                 receipt = self._verify_owner_receipt_for_new_continuation(
                     state, workflow_root=workflow_root,

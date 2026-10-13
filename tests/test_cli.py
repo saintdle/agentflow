@@ -3850,6 +3850,8 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertTrue(retried["ok"], retried)
                 self.assertEqual(retry_probe.call_count, 0)
                 self.assertEqual(controller._load_checkpoint()["active_tasks"], [])
+                # Preserve the exact blocked Beads claim authenticated by the retirement.
+                fixture.task_issue["status"] = "blocked"
 
                 # Explicit reopening identifies one distinct ready child;
                 # stale in-progress work is ignored only while its signed
@@ -4051,8 +4053,9 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 released = json.loads(controller.state_path.read_text(encoding="utf-8"))
                 released.pop("dormant_lease", None)
                 cli._private_atomic_json(controller.state_path, released)
+                args = self._args(fixture)
                 result, pane_probe = self._run_recovery(
-                    fixture, self._args(fixture), legacy_scope=True,
+                    fixture, args, legacy_scope=True,
                 )
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(result["operation"], "retire-superseded-legacy-preidentity")
@@ -4167,6 +4170,18 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                         resolution_authorization_out=resolution_authorization_out,
                     )
                 self.assertEqual(selected, "distinct-ready-task")
+                current_proof = cli._read_controller_credentials(
+                    cli._resume_key_path(args),
+                )["resume_secret"]
+                current_lease = controller.reattach_for_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id, ready_task="distinct-ready-task",
+                    checkpoint_epoch=current_lease.epoch,
+                    authority_secret=fixture.authority_secret, resume_proof=current_proof,
+                    drain_resolution_authorization=resolution_authorization_out["authorization"],
+                    readiness_verifier=lambda _current: "distinct-ready-task",
+                    persist_credentials=lambda candidate: cli._controller_credentials(args, candidate),
+                )
                 controller.acknowledge_cancelled_preidentity_halt(
                     fixture.workflow_root, fixture.task_id, "distinct-ready-task",
                     authority_secret=fixture.authority_secret,
@@ -4663,9 +4678,15 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 args, controller, lease = self._continuation_fixture(base)
                 initial_epoch = lease.epoch
-                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write failed")):
+                original_credentials = cli._controller_credentials
+
+                def write_then_fail(*call_args, **call_kwargs):
+                    original_credentials(*call_args, **call_kwargs)
+                    raise OSError("credential write failed after candidate proof")
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_fail):
                     first = self._run_continuation_once(args)
-                self.assertEqual(first["error"], "credential write failed")
+                self.assertEqual(first["error"], "credential write failed after candidate proof")
                 staged = json.loads(controller.state_path.read_text())
                 self.assertEqual(staged["epoch"], initial_epoch)
                 self.assertIn("continuation_reattach", staged)
@@ -4680,9 +4701,15 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             base = Path(temporary).resolve()
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 args, controller, lease = self._continuation_fixture(base)
-                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential write failed")):
+                original_credentials = cli._controller_credentials
+
+                def write_then_fail(*call_args, **call_kwargs):
+                    original_credentials(*call_args, **call_kwargs)
+                    raise OSError("credential write failed after candidate proof")
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_fail):
                     first = self._run_continuation_once(args)
-                self.assertEqual(first["error"], "credential write failed")
+                self.assertEqual(first["error"], "credential write failed after candidate proof")
                 staged_before = controller.state_path.read_bytes()
                 checkpoint_before = controller.checkpoint_path.read_bytes()
 
@@ -4705,6 +4732,41 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                 retry = self._run_continuation_once(args)
                 self.assertTrue(retry["ok"], retry)
                 self._assert_continuation_committed(args, controller, "ready-task")
+
+    def test_public_retry_rejects_signed_old_pending_without_staged_digest_byte_preservingly(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args, controller, _lease = self._continuation_fixture(base)
+                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("state1 crash")):
+                    first = self._run_continuation_once(args)
+                self.assertFalse(first["ok"], first)
+                self.assertEqual(first["error"], "state1 crash")
+
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                pending = state["continuation_reattach"]
+                self.assertEqual(state["epoch"], _lease.epoch)
+                self.assertEqual(controller._load_checkpoint()["epoch"], _lease.epoch)
+                pending.pop("staged_checkpoint_sha256")
+                authority_secret = cli._read_controller_credentials(
+                    cli._resume_key_path(args),
+                )["authority_secret"]
+                pending["authority_hmac"] = cli._authority_mac(
+                    authority_secret, pending, domain="continuation-reattach-v1",
+                )
+                cli._private_atomic_json(controller.state_path, state)
+
+                state_before = controller.state_path.read_bytes()
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                credentials_path = cli._resume_key_path(args)
+                credentials_before = credentials_path.read_bytes()
+                denied = self._run_continuation_once(args)
+
+                self.assertFalse(denied["ok"], denied)
+                self.assertIn("complete checkpoint commitment", denied["error"])
+                self.assertEqual(controller.state_path.read_bytes(), state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(credentials_path.read_bytes(), credentials_before)
 
     def test_staged_continuation_retry_rejects_any_changed_checkpoint_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4896,6 +4958,13 @@ class ControllerPendingContinuationTests(unittest.TestCase):
                     args.continue_after_cancelled_preidentity = "old-task"
                     args.continue_task = "ready-task"
                     retry = self._run_continuation_once(args)
+                    if phase == "credential-before":
+                        self.assertFalse(retry["ok"], retry)
+                        self.assertIn("exact current or rotated credential", retry["error"])
+                        self.assertEqual(controller.state_path.read_bytes(), state_before)
+                        self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                        self.assertEqual(credential_path.read_bytes(), credential_before)
+                        continue
                     self.assertTrue(retry["ok"], retry)
                     self._assert_continuation_committed(args, controller, "ready-task")
 
@@ -4904,7 +4973,13 @@ class ControllerPendingContinuationTests(unittest.TestCase):
             base = Path(temporary).resolve()
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
                 args, controller, lease = self._continuation_fixture(base)
-                with mock.patch.object(cli, "_controller_credentials", side_effect=OSError("credential crash")):
+                original_credentials = cli._controller_credentials
+
+                def write_then_fail(*call_args, **call_kwargs):
+                    original_credentials(*call_args, **call_kwargs)
+                    raise OSError("credential crash after candidate proof")
+
+                with mock.patch.object(cli, "_controller_credentials", side_effect=write_then_fail):
                     staged = self._run_continuation_once(args)
                 self.assertFalse(staged["ok"])
                 state_before = controller.state_path.read_bytes()
