@@ -22,6 +22,7 @@ from pathlib import Path, PurePath
 import re
 import secrets
 import stat
+import sys
 import tempfile
 import time
 from typing import Any, Iterable, Iterator, Mapping
@@ -214,7 +215,24 @@ def _existing_ancestor(path: Path) -> Path:
         current = parent
 
 
+def _canonical_system_alias(path: Path | str) -> Path:
+    """Normalize only macOS's fixed ``/var -> /private/var`` system alias."""
+
+    candidate = Path(path).expanduser()
+    if sys.platform != "darwin" or not candidate.is_absolute():
+        return candidate
+    system_var = Path("/var")
+    try:
+        if not system_var.is_symlink() or system_var.resolve(strict=True) != Path("/private/var"):
+            return candidate
+        relative = candidate.relative_to(system_var)
+    except (OSError, RuntimeError, ValueError):
+        return candidate
+    return Path("/private/var") / relative
+
+
 def _reject_symlink_ancestors(path: Path) -> None:
+    path = _canonical_system_alias(path)
     current = _existing_ancestor(path)
     while True:
         if current.is_symlink():
@@ -231,6 +249,8 @@ def _is_within_filesystem_root(path: Path, root: Path) -> bool:
     case-insensitive filesystem. Walk existing ancestors and compare their
     filesystem identities with the canonical root before creating anything.
     """
+    path = _canonical_system_alias(path)
+    root = _canonical_system_alias(root)
     try:
         path.relative_to(root)
         return True
@@ -252,7 +272,7 @@ def _is_within_filesystem_root(path: Path, root: Path) -> bool:
 
 
 def _canonical_workspace(path: Path | str) -> Path:
-    candidate = Path(path).expanduser()
+    candidate = _canonical_system_alias(path)
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
@@ -279,7 +299,7 @@ def _canonical_worktree(workspace: Path, value: Path | str | None) -> Path:
     if not isinstance(raw, str) or not raw or "\x00" in raw or _WILDCARD.search(raw):
         raise ActionGrantError("worktree root is malformed or contains a wildcard")
     _reject_lexical_alias(raw, label="worktree root")
-    candidate = Path(raw).expanduser()
+    candidate = _canonical_system_alias(Path(raw).expanduser())
     if not candidate.is_absolute():
         raise ActionGrantError("explicit worktree root must be an absolute canonical path")
     _reject_symlink_ancestors(candidate)
@@ -325,12 +345,18 @@ def _canonical_paths(bound_root: Path, values: Iterable[str | Path]) -> tuple[st
 class ActionGrantStore:
     """A private, external store of HMAC-authenticated exact-scope grants."""
 
-    def __init__(self, path: Path | str, authority: AuthenticatedGrantAuthority) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        authority: AuthenticatedGrantAuthority,
+        *,
+        require_authenticated_envelope: bool = False,
+    ) -> None:
         raw_path = os.fspath(path)
         if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
             raise ActionGrantError("protected grant store path is malformed")
         _reject_lexical_alias(raw_path, label="protected grant store path")
-        self.path = Path(raw_path).expanduser()
+        self.path = _canonical_system_alias(Path(raw_path).expanduser())
         if not self.path.is_absolute():
             raise ActionGrantError("protected grant store path must be absolute")
         if any(part in {".", ".."} for part in self.path.parts):
@@ -354,6 +380,7 @@ class ActionGrantStore:
         if not isinstance(secret, bytes) or not secret:
             raise ActionGrantError("authenticated controller authority is required")
         self._secret = secret
+        self._require_authenticated_envelope = require_authenticated_envelope
         self._validate_store_location(create_directory=False)
 
     @property
@@ -481,6 +508,7 @@ class ActionGrantStore:
             and value.get("schema") == _LEGACY_SCHEMA
             and value.get("version") == 1
             and value["grants"]
+            and not self._require_authenticated_envelope
         ):
             return value
         raise ActionGrantUnavailable("protected action-grant store is malformed or unauthenticated")

@@ -16,7 +16,7 @@ tries to acquire the same non-reentrant lock again.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -182,7 +182,7 @@ def _canonical_external_file(value: Path | str, *, label: str) -> Path:
         action_grants._reject_lexical_alias(raw, label=label)
     except ActionGrantError as exc:
         raise ControllerActionUnavailable(f"canonical {label} path is not normalized") from exc
-    candidate = Path(raw).expanduser()
+    candidate = action_grants._canonical_system_alias(Path(raw).expanduser())
     if not candidate.is_absolute() or any(part in {".", ".."} for part in candidate.parts):
         raise ControllerActionUnavailable(f"canonical {label} path must be absolute and normalized")
     try:
@@ -265,7 +265,7 @@ def _atomic_private_json(path: Path, value: Mapping[str, Any]) -> None:
 def credential_write_lock(path: Path | str) -> Iterator[None]:
     """Serialize canonical credential read/validate/write transactions."""
 
-    credential = Path(path).expanduser()
+    credential = action_grants._canonical_system_alias(Path(path).expanduser())
     parent = credential.parent
     try:
         action_grants._reject_symlink_ancestors(parent)
@@ -321,13 +321,19 @@ class ControllerActionAuthority:
         *,
         workflow_root: str,
         credential_path: Path | str,
+        canonical_credential_path: Path | str | None = None,
     ) -> None:
         if not isinstance(controller, RootController) or not isinstance(lease, Lease):
             raise TypeError("a RootController and its current Lease are required")
         self.controller = controller
         self.lease = lease
         self.workflow_root = workflow_root
-        self.credential_path = Path(credential_path).expanduser()
+        self.selected_credential_path = action_grants._canonical_system_alias(
+            Path(credential_path).expanduser()
+        )
+        self.credential_path = action_grants._canonical_system_alias(
+            Path(canonical_credential_path or credential_path).expanduser()
+        )
         self._workspace = action_grants._canonical_workspace(controller.root)
         if not isinstance(workflow_root, str) or not workflow_root or workflow_root.strip() != workflow_root:
             raise ControllerActionUnavailable("workflow root identity is malformed")
@@ -358,6 +364,11 @@ class ControllerActionAuthority:
             raise ControllerActionUnavailable("canonical controller credential must be outside the worker workspace")
         return path
 
+    def _canonical_selected_credentials_path(self) -> Path:
+        return _canonical_external_file(
+            self.selected_credential_path, label="selected controller credential"
+        )
+
     def _validate_storage_location(self, roots: Iterable[Path | str] = ()) -> tuple[Path, ...]:
         canonical_roots = [self._workspace]
         try:
@@ -376,6 +387,10 @@ class ControllerActionAuthority:
             for protected_path in (
                 self.credential_path,
                 self.credential_path.with_name(f".{self.credential_path.name}.credential.lock"),
+                self.selected_credential_path,
+                self.selected_credential_path.with_name(
+                    f".{self.selected_credential_path.name}.credential.lock"
+                ),
                 self.state_directory,
                 self.mode_path,
                 self.activation_path,
@@ -393,10 +408,16 @@ class ControllerActionAuthority:
                 except ActionGrantError as exc:
                     raise ControllerActionUnavailable("protected storage filesystem identity is unavailable") from exc
 
-        try:
+        self._canonical_selected_credentials_path()
+        if self.credential_path.exists() and not self.credential_path.is_symlink():
             self._canonical_credentials_path()
-        except ControllerActionUnavailable:
-            raise
+        else:
+            try:
+                if self.credential_path.is_symlink():
+                    raise ControllerActionUnavailable("canonical controller credential must not be a symlink")
+                action_grants._reject_symlink_ancestors(self.credential_path.parent)
+            except ActionGrantError as exc:
+                raise ControllerActionUnavailable("canonical controller credential path is unsafe") from exc
         if self.state_directory.exists():
             try:
                 info = self.state_directory.lstat()
@@ -422,41 +443,98 @@ class ControllerActionAuthority:
                 raise ControllerActionUnavailable("protected action storage parent ownership or permissions are unsafe")
         return tuple(canonical_roots)
 
-    def _credentials(self, current: Lease) -> tuple[str, Path, dict[str, Any] | None]:
-        path = self._canonical_credentials_path()
-        credentials = _read_private_json(path, label="controller credential")
+    def _credentials(
+        self,
+        current: Lease,
+        *,
+        allow_missing_canonical: bool = False,
+    ) -> tuple[str, Path, dict[str, Any] | None, bool]:
+        selected_path = self._canonical_selected_credentials_path()
+        selected = _read_private_json(selected_path, label="selected controller credential")
+
+        def validate_record(record: Mapping[str, Any], *, selected_record: bool) -> dict[str, Any] | None:
+            if (
+                record.get("schema") != "agentflow.controller_credentials"
+                or record.get("version") != 2
+                or record.get("workspace_root") != str(self._workspace)
+                or record.get("workflow_root") != self.workflow_root
+                or record.get("continuity_id") != current.continuity_id
+            ):
+                raise ControllerActionUnavailable("controller credential does not match the current workflow incarnation")
+            if not isinstance(record.get("authority_secret"), str) or not record.get("authority_secret"):
+                raise ControllerActionUnavailable("controller authority credential is unavailable")
+            anchor = None
+            if "protected_action_anchor" in record:
+                if record["protected_action_anchor"] is None:
+                    raise ControllerActionUnavailable("protected controller activation anchor is malformed")
+                anchor = validate_credential_action_anchor(
+                    record["protected_action_anchor"],
+                    authority_secret=str(record["authority_secret"]),
+                    workspace_root=str(self._workspace),
+                    workflow_root=self.workflow_root,
+                    controller_id=current.controller,
+                    continuity_id=current.continuity_id,
+                )
+            if selected_record:
+                resume_secret = record.get("resume_secret")
+                proof_is_current = (
+                    isinstance(resume_secret, str)
+                    and bool(resume_secret)
+                    and current.verify_resume_proof(resume_secret)
+                )
+                authority_only = (
+                    resume_secret == ""
+                    and anchor is not None
+                    and anchor.get("state") == "active"
+                )
+                if not proof_is_current and not authority_only:
+                    raise ControllerActionUnavailable("selected controller credential does not authenticate the current lease")
+            return anchor
+
+        selected_anchor = validate_record(selected, selected_record=True)
+        if selected_path == self.credential_path:
+            return str(selected["authority_secret"]), selected_path, selected_anchor, False
+
+        try:
+            self.credential_path.lstat()
+        except FileNotFoundError:
+            if not allow_missing_canonical or selected_anchor is not None:
+                raise ControllerActionUnavailable("canonical controller credential is missing")
+            if any(
+                path.exists() or path.is_symlink()
+                for path in (self.mode_path, self.activation_path, self.grants_path)
+            ):
+                raise ControllerActionUnavailable("canonical credential is missing after protected state exists")
+            if self.registry_path.exists() or self.registry_path.is_symlink():
+                # Registration writes the signed immutable root set before
+                # creating a custom-key mirror. Only that exact pre-activation
+                # state can be resumed if the mirror write was interrupted.
+                self._read_registry(str(selected["authority_secret"]), current)
+            elif self.state_directory.exists() or self.state_directory.is_symlink():
+                raise ControllerActionUnavailable("partial protected action state prevents canonical credential recovery")
+            return str(selected["authority_secret"]), self.credential_path, None, True
+        except OSError as exc:
+            raise ControllerActionUnavailable("canonical controller credential cannot be inspected") from exc
+
+        canonical_path = self._canonical_credentials_path()
+        canonical = _read_private_json(canonical_path, label="canonical controller credential")
+        canonical_anchor = validate_record(canonical, selected_record=False)
         if (
-            credentials.get("schema") != "agentflow.controller_credentials"
-            or credentials.get("version") != 2
-            or credentials.get("workspace_root") != str(self._workspace)
-            or credentials.get("workflow_root") != self.workflow_root
-            or credentials.get("continuity_id") != current.continuity_id
-        ):
-            raise ControllerActionUnavailable("canonical controller credential does not match the current workflow incarnation")
-        resume_secret = credentials.get("resume_secret")
-        authority_secret = credentials.get("authority_secret")
-        if (
-            not isinstance(resume_secret, str) or not resume_secret
-            or not current.verify_resume_proof(resume_secret)
-            or not isinstance(authority_secret, str) or not authority_secret
-        ):
-            raise ControllerActionUnavailable("canonical controller credential does not authenticate the current lease")
-        anchor = None
-        if "protected_action_anchor" in credentials:
-            if credentials["protected_action_anchor"] is None:
-                raise ControllerActionUnavailable("protected controller activation anchor is malformed")
-            anchor = validate_credential_action_anchor(
-                credentials["protected_action_anchor"],
-                authority_secret=authority_secret,
-                workspace_root=str(self._workspace),
-                workflow_root=self.workflow_root,
-                controller_id=current.controller,
-                continuity_id=current.continuity_id,
+            not hmac.compare_digest(
+                str(selected["authority_secret"]), str(canonical["authority_secret"]),
             )
-        return authority_secret, path, anchor
+            or selected_anchor != canonical_anchor
+            or ("protected_action_anchor" in selected) != ("protected_action_anchor" in canonical)
+        ):
+            raise ControllerActionUnavailable("selected and canonical controller credentials disagree")
+        return str(canonical["authority_secret"]), canonical_path, canonical_anchor, False
 
     @contextmanager
-    def _authenticated_fence(self) -> Iterator[tuple[Lease, str, dict[str, Any] | None]]:
+    def _authenticated_fence(
+        self,
+        *,
+        allow_missing_canonical: bool = False,
+    ) -> Iterator[tuple[Lease, str, dict[str, Any] | None, bool]]:
         try:
             with self.controller.fence(self.lease) as current:
                 if (
@@ -467,10 +545,54 @@ class ControllerActionAuthority:
                     or current.continuity_id != self.lease.continuity_id
                 ):
                     raise ControllerActionUnavailable("controller lease identity is not current")
-                secret, _path, anchor = self._credentials(current)
-                yield current, secret, anchor
+                secret, _path, anchor, missing_canonical = self._credentials(
+                    current, allow_missing_canonical=allow_missing_canonical,
+                )
+                yield current, secret, anchor, missing_canonical
         except FencedLease as exc:
             raise ControllerActionUnavailable("controller lease is no longer current") from exc
+
+    def _persist_initial_canonical_credential(self, current: Lease, secret: str) -> None:
+        """Create the authority-only default copy after roots passed preflight."""
+
+        canonical = self.credential_path
+        selected = self._canonical_selected_credentials_path()
+        if canonical == selected:
+            return
+        with ExitStack() as locks:
+            for path in sorted((canonical, selected), key=str):
+                locks.enter_context(credential_write_lock(path))
+            try:
+                canonical.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ControllerActionUnavailable("canonical controller credential appeared during registration")
+            credentials = _read_private_json(selected, label="selected controller credential")
+            if (
+                credentials.get("schema") != "agentflow.controller_credentials"
+                or credentials.get("version") != 2
+                or credentials.get("workspace_root") != str(self._workspace)
+                or credentials.get("workflow_root") != self.workflow_root
+                or credentials.get("continuity_id") != current.continuity_id
+                or credentials.get("authority_secret") != secret
+                or "protected_action_anchor" in credentials
+                or not isinstance(credentials.get("resume_secret"), str)
+                or not current.verify_resume_proof(credentials["resume_secret"])
+            ):
+                raise ControllerActionUnavailable("selected controller credential changed during registration")
+            try:
+                _atomic_private_json(canonical, {
+                    "schema": "agentflow.controller_credentials",
+                    "version": 2,
+                    "resume_secret": "",
+                    "authority_secret": secret,
+                    "continuity_id": current.continuity_id,
+                    "workspace_root": str(self._workspace),
+                    "workflow_root": self.workflow_root,
+                })
+            except OSError as exc:
+                raise ControllerActionUnavailable("canonical controller credential could not be committed") from exc
 
     def _ensure_directory(self, roots: Iterable[Path | str]) -> None:
         self._validate_storage_location(roots)
@@ -571,38 +693,65 @@ class ControllerActionAuthority:
         current: Lease,
         anchor: dict[str, Any],
     ) -> None:
-        path = self._canonical_credentials_path()
-        with credential_write_lock(path):
-            credentials = _read_private_json(path, label="controller credential")
-            if (
-                credentials.get("schema") != "agentflow.controller_credentials"
-                or credentials.get("version") != 2
-                or credentials.get("workspace_root") != str(self._workspace)
-                or credentials.get("workflow_root") != self.workflow_root
-                or credentials.get("continuity_id") != current.continuity_id
-                or credentials.get("authority_secret") != secret
-            ):
-                raise ControllerActionUnavailable("canonical controller credential changed during activation")
-            existing = None
-            if "protected_action_anchor" in credentials:
-                if credentials["protected_action_anchor"] is None:
+        canonical_path = self._canonical_credentials_path()
+        selected_path = self._canonical_selected_credentials_path()
+        paths = tuple(sorted(set((canonical_path, selected_path)), key=str))
+        with ExitStack() as locks:
+            for path in paths:
+                locks.enter_context(credential_write_lock(path))
+            canonical = _read_private_json(canonical_path, label="canonical controller credential")
+            selected = (
+                canonical
+                if selected_path == canonical_path
+                else _read_private_json(selected_path, label="selected controller credential")
+            )
+
+            def validate(record: Mapping[str, Any], *, selected_record: bool) -> dict[str, Any] | None:
+                if (
+                    record.get("schema") != "agentflow.controller_credentials"
+                    or record.get("version") != 2
+                    or record.get("workspace_root") != str(self._workspace)
+                    or record.get("workflow_root") != self.workflow_root
+                    or record.get("continuity_id") != current.continuity_id
+                    or record.get("authority_secret") != secret
+                ):
+                    raise ControllerActionUnavailable("controller credential changed during activation")
+                if selected_record and (
+                    not isinstance(record.get("resume_secret"), str)
+                    or not current.verify_resume_proof(record["resume_secret"])
+                ):
+                    raise ControllerActionUnavailable("selected controller credential changed during activation")
+                if "protected_action_anchor" not in record:
+                    return None
+                if record["protected_action_anchor"] is None:
                     raise ControllerActionUnavailable("protected controller activation anchor is malformed")
-                existing = validate_credential_action_anchor(
-                    credentials["protected_action_anchor"],
+                return validate_credential_action_anchor(
+                    record["protected_action_anchor"],
                     authority_secret=secret,
                     workspace_root=str(self._workspace),
                     workflow_root=self.workflow_root,
                     controller_id=current.controller,
                     continuity_id=current.continuity_id,
                 )
+
+            canonical_anchor = validate(canonical, selected_record=canonical_path == selected_path)
+            selected_anchor = canonical_anchor if canonical_path == selected_path else validate(
+                selected, selected_record=True,
+            )
+            if (
+                canonical_anchor != selected_anchor
+                or ("protected_action_anchor" in canonical)
+                != ("protected_action_anchor" in selected)
+            ):
+                raise ControllerActionUnavailable("selected and canonical activation anchors disagree")
             target_payload = _verify_signed(secret, anchor)
             if target_payload.get("state") == "pending":
-                if existing is not None:
+                if canonical_anchor is not None or selected_anchor is not None:
                     raise ControllerActionUnavailable("protected controller activation is already committed")
             elif target_payload.get("state") == "active":
-                if existing is None:
+                if canonical_anchor is None or selected_anchor is None:
                     raise ControllerActionUnavailable("pending protected controller activation anchor is missing")
-                existing_payload = _verify_signed(secret, existing)
+                existing_payload = _verify_signed(secret, canonical_anchor)
                 if (
                     existing_payload.get("state") != "pending"
                     or {
@@ -614,8 +763,12 @@ class ControllerActionAuthority:
                     raise ControllerActionUnavailable("pending protected controller activation anchor changed")
             else:
                 raise ControllerActionUnavailable("protected controller activation state is malformed")
-            credentials["protected_action_anchor"] = anchor
-            _atomic_private_json(path, credentials)
+
+            canonical["protected_action_anchor"] = anchor
+            _atomic_private_json(canonical_path, canonical)
+            if selected_path != canonical_path:
+                selected["protected_action_anchor"] = anchor
+                _atomic_private_json(selected_path, selected)
 
     def _read_registry(self, secret: str, current: Lease) -> tuple[dict[str, Any], tuple[str, ...]]:
         value = _read_json_record(self.registry_path, label="protected worktree registry")
@@ -717,7 +870,11 @@ class ControllerActionAuthority:
             bound_worktree_roots=roots,
         )
         try:
-            store = ActionGrantStore(self.grants_path, authority)
+            store = ActionGrantStore(
+                self.grants_path,
+                authority,
+                require_authenticated_envelope=True,
+            )
         except ActionGrantError as exc:
             raise ControllerActionUnavailable("protected action grant storage is unavailable") from exc
         store_status = store.status()
@@ -751,7 +908,7 @@ class ControllerActionAuthority:
             raise ControllerActionDenied("worktree registration must provide the complete root iterable") from exc
         if not raw_roots:
             raise ControllerActionDenied("complete worktree registration must contain at least one root")
-        with self._authenticated_fence() as (current, secret, anchor):
+        with self._authenticated_fence(allow_missing_canonical=True) as (current, secret, anchor, missing_canonical):
             protected_roots = None
             if anchor is not None:
                 anchor_payload = _verify_signed(secret, anchor)
@@ -778,7 +935,17 @@ class ControllerActionAuthority:
                 if protected_roots != roots:
                     raise ControllerActionDenied("protected worktree registry is immutable")
                 return protected_roots
+            if self.registry_path.exists() or self.registry_path.is_symlink():
+                _payload, registered_roots = self._read_registry(secret, current)
+                if registered_roots != roots:
+                    raise ControllerActionDenied("protected worktree registry is immutable")
             self._validate_storage_location(roots)
+            if missing_canonical:
+                # Create only the already-validated canonical credential
+                # directory/lock before the metadata directory; the signed
+                # registry still precedes the first secret mirror write.
+                with credential_write_lock(self.credential_path):
+                    pass
             had_state_directory = self.state_directory.exists()
             with self._metadata_lock(roots, create=True):
                 registry_value = _read_json_record(self.registry_path, label="protected worktree registry")
@@ -795,6 +962,10 @@ class ControllerActionAuthority:
                         raise ControllerActionDenied("protected worktree registry is immutable")
                     if mode_value is not None or activation_value is not None:
                         self._require_mode(secret, current, anchor)
+                    if missing_canonical:
+                        if grants_exists or mode_value is not None or activation_value is not None:
+                            raise ControllerActionUnavailable("canonical credential cannot be recovered after activation state exists")
+                        self._persist_initial_canonical_credential(current, secret)
                     return existing
                 if mode_value is not None or activation_value is not None or grants_exists:
                     raise ControllerActionUnavailable("orphaned protected state prevents registry registration")
@@ -811,6 +982,8 @@ class ControllerActionAuthority:
                     "roots": list(roots),
                 }
                 _atomic_private_json(self.registry_path, _signed(secret, payload))
+                if missing_canonical:
+                    self._persist_initial_canonical_credential(current, secret)
                 return roots
 
     def _fresh_root_before_activation(self) -> None:
@@ -836,7 +1009,7 @@ class ControllerActionAuthority:
     def activate(self) -> None:
         """Make protected mode sticky for this controller incarnation."""
 
-        with self._authenticated_fence() as (current, secret, anchor):
+        with self._authenticated_fence() as (current, secret, anchor, _missing_canonical):
             if anchor is not None:
                 anchor_payload = _verify_signed(secret, anchor)
                 if anchor_payload.get("state") == "active":
@@ -902,7 +1075,7 @@ class ControllerActionAuthority:
     def issue(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Explicitly issue one exact action grant under the current root fence."""
 
-        with self._authenticated_fence() as (current, secret, anchor):
+        with self._authenticated_fence() as (current, secret, anchor, _missing_canonical):
             roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             self._validate_storage_location(roots)
@@ -914,7 +1087,7 @@ class ControllerActionAuthority:
     def require(self, request: ActionGrantRequest) -> ActionGrantSummary:
         """Require an existing exact action grant while holding the root fence."""
 
-        with self._authenticated_fence() as (current, secret, anchor):
+        with self._authenticated_fence() as (current, secret, anchor, _missing_canonical):
             roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             try:
@@ -931,7 +1104,7 @@ class ControllerActionAuthority:
 
         if not callable(operation):
             raise TypeError("protected action operation must be callable")
-        with self._authenticated_fence() as (current, secret, anchor):
+        with self._authenticated_fence() as (current, secret, anchor, _missing_canonical):
             roots, store = self._require_mode(secret, current, anchor)
             self._registered_request_root(request, self._workspace, roots)
             try:
@@ -944,7 +1117,7 @@ class ControllerActionAuthority:
         """Return a read-only, secret-free projection of mode and stored scopes."""
 
         try:
-            with self._authenticated_fence() as (current, secret, anchor):
+            with self._authenticated_fence() as (current, secret, anchor, _missing_canonical):
                 self._validate_storage_location()
                 registry_value = _read_json_record(self.registry_path, label="protected worktree registry")
                 mode_value = _read_json_record(self.mode_path, label="protected controller mode marker")

@@ -332,6 +332,165 @@ class ControllerActionAuthorityTests(unittest.TestCase):
         with self.assertRaises(ControllerActionUnavailable):
             self.authority.activate()
 
+    def test_anchored_helper_rejects_downgraded_v1_store_before_any_action(self) -> None:
+        self._activate()
+        request = self._request()
+        self.authority.issue(request)
+        legacy = json.loads(self.authority.grants_path.read_text(encoding="utf-8"))
+        legacy.pop("hmac")
+        legacy["schema"] = "agentflow.action-grants@1"
+        legacy["version"] = 1
+        self.authority.grants_path.write_text(json.dumps(legacy), encoding="utf-8")
+        os.chmod(self.authority.grants_path, 0o600)
+
+        self.assertEqual(self.authority.status().mode, "unavailable")
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.issue(self._request(task="new-task"))
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.require(request)
+        calls = []
+        with self.assertRaises(ControllerActionUnavailable):
+            self.authority.execute(request, lambda: calls.append("ran"))
+        self.assertEqual(calls, [])
+
+    def test_custom_and_canonical_credential_anchors_must_remain_equal(self) -> None:
+        selected_path = self.credentials_dir / "selected.json"
+        selected_path.write_bytes(self.credentials_path.read_bytes())
+        os.chmod(selected_path, 0o600)
+        authority = ControllerActionAuthority(
+            self.controller,
+            self.lease,
+            workflow_root="workflow-root",
+            credential_path=selected_path,
+            canonical_credential_path=self.credentials_path,
+        )
+        authority.register_worktrees((self.worktree,))
+        authority.activate()
+        canonical = json.loads(self.credentials_path.read_text(encoding="utf-8"))
+        selected = json.loads(selected_path.read_text(encoding="utf-8"))
+        self.assertEqual(canonical["protected_action_anchor"], selected["protected_action_anchor"])
+        self.assertEqual(authority.status().mode, "protected")
+        default_authority = ControllerActionAuthority(
+            self.controller,
+            self.lease,
+            workflow_root="workflow-root",
+            credential_path=self.credentials_path,
+        )
+        self.assertEqual(default_authority.status().mode, "protected")
+
+        selected.pop("protected_action_anchor")
+        selected_path.write_text(json.dumps(selected), encoding="utf-8")
+        os.chmod(selected_path, 0o600)
+        self.assertEqual(authority.status().mode, "unavailable")
+        with self.assertRaises(ControllerActionUnavailable):
+            authority.activate()
+
+    def test_custom_mirror_crash_preserves_the_signed_registration_root_set(self) -> None:
+        selected_path = self.credentials_dir / "selected.json"
+        selected_path.write_bytes(self.credentials_path.read_bytes())
+        os.chmod(selected_path, 0o600)
+        self.credentials_path.unlink()
+        authority = ControllerActionAuthority(
+            self.controller,
+            self.lease,
+            workflow_root="workflow-root",
+            credential_path=selected_path,
+            canonical_credential_path=self.credentials_path,
+        )
+        original_write = controller_actions_module._atomic_private_json
+
+        def fail_canonical_mirror(path, value):
+            if path == self.credentials_path and value.get("schema") == "agentflow.controller_credentials":
+                raise OSError("injected canonical mirror crash")
+            original_write(path, value)
+
+        with mock.patch.object(
+            controller_actions_module,
+            "_atomic_private_json",
+            side_effect=fail_canonical_mirror,
+        ):
+            with self.assertRaises(ControllerActionUnavailable):
+                authority.register_worktrees((self.worktree,))
+
+        self.assertTrue(authority.registry_path.is_file())
+        self.assertFalse(self.credentials_path.exists())
+        alternate = self.base / "worker-two"
+        alternate.mkdir()
+        with self.assertRaises(ControllerActionDenied):
+            authority.register_worktrees((alternate,))
+        self.assertEqual(authority.register_worktrees((self.worktree,)), (str(self.worktree),))
+        self.assertTrue(self.credentials_path.is_file())
+
+    def test_custom_activation_crashes_at_each_anchor_write_boundary_fail_closed(self) -> None:
+        phases = (
+            ("pending-canonical", "pending", "canonical", True),
+            ("pending-selected", "pending", "selected", False),
+            ("active-canonical", "active", "canonical", False),
+            ("active-selected", "active", "selected", False),
+        )
+        for label, anchor_state, target_path, retry_allowed in phases:
+            with self.subTest(phase=label), tempfile.TemporaryDirectory() as temp:
+                base = Path(temp).resolve()
+                workspace = base / "workspace"
+                worker = base / "worker"
+                control = base / "control"
+                credentials_dir = base / "credentials"
+                for directory in (workspace, worker, control, credentials_dir):
+                    directory.mkdir(mode=0o700)
+                canonical_path = credentials_dir / "canonical.json"
+                selected_path = credentials_dir / "selected.json"
+                controller = RootController(
+                    workspace,
+                    "controller-1",
+                    state_path=control / "state.json",
+                    checkpoint_path=control / "checkpoint.json",
+                )
+                lease = controller.acquire()
+                secret = secrets.token_urlsafe(32)
+                self._write_credentials(
+                    canonical_path,
+                    workspace=workspace,
+                    workflow="workflow-root",
+                    lease=lease,
+                    authority_secret=secret,
+                )
+                selected_path.write_bytes(canonical_path.read_bytes())
+                os.chmod(selected_path, 0o600)
+                authority = ControllerActionAuthority(
+                    controller,
+                    lease,
+                    workflow_root="workflow-root",
+                    credential_path=selected_path,
+                    canonical_credential_path=canonical_path,
+                )
+                authority.register_worktrees((worker,))
+                original_write = controller_actions_module._atomic_private_json
+
+                def fail_selected_boundary(path, value):
+                    anchor = value.get("protected_action_anchor") if isinstance(value, dict) else None
+                    target = canonical_path if target_path == "canonical" else selected_path
+                    if path == target and isinstance(anchor, dict) and anchor.get("state") == anchor_state:
+                        raise OSError("injected credential anchor crash")
+                    original_write(path, value)
+
+                with mock.patch.object(
+                    controller_actions_module,
+                    "_atomic_private_json",
+                    side_effect=fail_selected_boundary,
+                ):
+                    with self.assertRaises(ControllerActionUnavailable):
+                        authority.activate()
+
+                self.assertEqual(authority.status().mode, "unavailable")
+                with self.assertRaises(ControllerActionUnavailable):
+                    authority.issue(self._request())
+                if retry_allowed:
+                    authority.activate()
+                    self.assertEqual(authority.status().mode, "protected")
+                else:
+                    with self.assertRaises(ControllerActionUnavailable):
+                        authority.activate()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agentflow import action_grants
 from agentflow.action_grants import (
     ActionGrantDenied,
     ActionGrantError,
@@ -407,6 +408,20 @@ class ActionGrantStoreTests(unittest.TestCase):
             store.issue(self.request(
                 paths=("result.txt",), worktree_root=f"{approved}/.",
             ))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS system alias behavior")
+    def test_macos_var_alias_is_allowed_but_arbitrary_symlink_ancestors_are_rejected(self) -> None:
+        var = Path("/var")
+        if not var.is_symlink() or var.resolve() != Path("/private/var"):
+            self.skipTest("host does not expose the standard /var -> /private/var alias")
+        action_grants._reject_symlink_ancestors(Path("/var/folders"))
+
+        target = self.base / "real-state"
+        target.mkdir()
+        alias = self.base / "arbitrary-state-alias"
+        alias.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ActionGrantError, "symlink"):
+            action_grants._reject_symlink_ancestors(alias / "nested")
 
     def test_repeated_and_trailing_separators_are_rejected_before_normalization(self) -> None:
         store = self.store()

@@ -5757,6 +5757,81 @@ class ControllerResumeCredentialTests(unittest.TestCase):
                     cli._controller_credentials(args, lease)
                 self.assertEqual(credential_path.read_bytes(), before)
 
+    def test_custom_resume_key_defers_default_secret_mirror_until_root_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            root = base / "workspace"
+            worker = base / "worker"
+            root.mkdir()
+            worker.mkdir()
+            selected = base / "selected-credential.json"
+            args = _controller_args(root, workflow_root="wf", resume_key_file=str(selected))
+            unsafe_state_home = worker / "agent-state"
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(unsafe_state_home)}):
+                canonical_args = argparse.Namespace(
+                    root=str(root), workflow_root="wf", resume_key_file="",
+                )
+                canonical = cli._resume_key_path(canonical_args)
+                controller, _ = cli._controller_instance(args)
+                lease = controller.acquire()
+                credential_path, credentials = cli._controller_credentials(args, lease)
+                self.assertEqual(credential_path, selected)
+                self.assertTrue(credentials["authority_secret"])
+                self.assertFalse(canonical.exists())
+
+                authority = cli.controller_actions_backend.ControllerActionAuthority(
+                    controller,
+                    lease,
+                    workflow_root="wf",
+                    credential_path=selected,
+                    canonical_credential_path=canonical,
+                )
+                with self.assertRaises(cli.controller_actions_backend.ControllerActionUnavailable):
+                    authority.register_worktrees((worker,))
+                self.assertFalse(canonical.exists())
+
+    def test_custom_and_default_activation_commitments_cannot_be_repaired_by_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            root = base / "workspace"
+            worker = base / "worker"
+            root.mkdir()
+            worker.mkdir()
+            selected = base / "selected-credential.json"
+            args = _controller_args(root, workflow_root="wf", resume_key_file=str(selected))
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                canonical_args = argparse.Namespace(
+                    root=str(root), workflow_root="wf", resume_key_file="",
+                )
+                canonical = cli._resume_key_path(canonical_args)
+                controller, _ = cli._controller_instance(args)
+                lease = controller.acquire()
+                cli._controller_credentials(args, lease)
+                authority = cli.controller_actions_backend.ControllerActionAuthority(
+                    controller,
+                    lease,
+                    workflow_root="wf",
+                    credential_path=selected,
+                    canonical_credential_path=canonical,
+                )
+                authority.register_worktrees((worker,))
+                authority.activate()
+                canonical_record = cli._read_controller_credentials(canonical)
+                selected_record = cli._read_controller_credentials(selected)
+                self.assertEqual(
+                    canonical_record["protected_action_anchor"],
+                    selected_record["protected_action_anchor"],
+                )
+                self.assertEqual(canonical_record["protected_action_anchor"]["state"], "active")
+
+                selected_record.pop("protected_action_anchor")
+                cli._private_atomic_json(selected, selected_record)
+                before = selected.read_bytes()
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._controller_credentials(args, lease)
+                self.assertEqual(selected.read_bytes(), before)
+                self.assertEqual(authority.status().mode, "unavailable")
+
 
 def _spawn_provider_report(fixture, argv: list, *, report_delay: float,
                            report_done: threading.Event, threads: list,

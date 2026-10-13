@@ -643,11 +643,11 @@ def _controller_credentials(
     )
     canonical_path = _resume_key_path(canonical_args)
     path = key_path or _resume_key_path(args)
-    lock_paths = [canonical_path]
-    if path != canonical_path:
-        lock_paths.append(path)
+    lock_paths = [path]
+    if path == canonical_path or canonical_path.exists():
+        lock_paths.append(canonical_path)
     with ExitStack() as locks:
-        for lock_path in sorted(lock_paths, key=str):
+        for lock_path in sorted(set(lock_paths), key=str):
             locks.enter_context(controller_actions_backend.credential_write_lock(lock_path))
         return _controller_credentials_unlocked(
             args,
@@ -724,11 +724,15 @@ def _controller_credentials_unlocked(
 
     path_anchor = validate_anchor(credentials)
     canonical_anchor = validate_anchor(canonical_credentials)
-    if path_anchor is not None and canonical_anchor is not None and path_anchor != canonical_anchor:
+    if (
+        path_anchor != canonical_anchor
+        or ("protected_action_anchor" in credentials)
+        != ("protected_action_anchor" in canonical_credentials)
+    ):
         raise controller_backend.ControllerError(
-            "canonical controller activation anchors conflict"
+            "selected and canonical controller activation anchors are missing or conflicting"
         )
-    activation_anchor = path_anchor if path_anchor is not None else canonical_anchor
+    activation_anchor = path_anchor
     current_path_credentials = _read_credential_for_rotation(path)
     if validate_anchor(current_path_credentials) != path_anchor:
         raise controller_backend.LeaseConflict(
@@ -745,6 +749,16 @@ def _controller_credentials_unlocked(
 
     path_secret = str(credentials.get("authority_secret") or "")
     canonical_secret = str(canonical_credentials.get("authority_secret") or "")
+    if (
+        path_secret
+        and canonical_secret
+        and credentials.get("continuity_id", "") == lease.continuity_id
+        and canonical_credentials.get("continuity_id", "") == lease.continuity_id
+        and not hmac.compare_digest(path_secret, canonical_secret)
+    ):
+        raise controller_backend.ControllerError(
+            "selected and canonical controller authority credentials conflict"
+        )
     if path_secret and credentials.get("continuity_id", "") == lease.continuity_id:
         authority_secret = path_secret
     elif canonical_secret and canonical_credentials.get("continuity_id", "") == lease.continuity_id:
@@ -812,19 +826,10 @@ def _controller_credentials_unlocked(
         workflow_root=workflow_root,
         protected_action_anchor=activation_anchor,
     )
-    if canonical_path != path:
-        # Result/waiver verification never follows a worker-controlled path.
-        # Keep a canonical authority-only copy outside the workspace even
-        # when an operator chooses a custom resume-key location.
-        _write_resume_key(
-            canonical_path,
-            "",
-            authority_secret=authority_secret,
-            continuity_id=lease.continuity_id,
-            workspace_root=workspace_root,
-            workflow_root=workflow_root,
-            protected_action_anchor=activation_anchor,
-        )
+    # A custom selected key does not create its default authority mirror
+    # here: its complete worktree roots are not yet known. Registration
+    # validates both credential locations before creating the canonical
+    # authority-only copy and activation anchor.
     if legacy is not None and legacy != path and legacy.is_file():
         legacy.unlink()
     result: dict[str, Any] = {
