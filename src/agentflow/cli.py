@@ -2300,14 +2300,14 @@ def _controller_step_parallel(
                         f"{deadline_seconds:.0f}s; inspect the live pane before further action"
                     )
                     active_rows = controller.active_tasks()
+                    pending_rows = [row for row in active_rows if row.get("task") == task_id]
                     if (
-                        len(active_rows) == 1
-                        and active_rows[0].get("task") == task_id
-                        and active_rows[0].get("state") == "identity_pending"
-                        and not active_rows[0].get("session_id")
+                        len(pending_rows) == 1
+                        and pending_rows[0].get("state") == "identity_pending"
+                        and not pending_rows[0].get("session_id")
                     ):
                         result = controller.begin_identity_pending_drain(
-                            task_id, active_rows[0].get("claim_id", ""), reason, lease=lease,
+                            task_id, pending_rows[0].get("claim_id", ""), reason, lease=lease,
                         )
                         draining = True
                         drain_reason = str((result.checkpoint or {}).get("terminal_reason") or reason)

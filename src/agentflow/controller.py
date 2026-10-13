@@ -2661,21 +2661,21 @@ class RootController:
                 and not document.get("claim_id")
                 and not document.get("session_id")
             )
+            matches = [row for row in rows if row.get("task") == task_id]
             if (
                 checkpoint.admission_phase(document) not in {"open", "draining"}
                 or document.get("terminal") is not False
                 or str(document.get("root") or "") != self.root
                 or str(document.get("controller") or "") != self.controller
-                or len(rows) != 1
-                or rows[0].get("task") != task_id
-                or rows[0].get("actor") != self.controller
-                or rows[0].get("claim_id") != claim_id
-                or rows[0].get("state") != "identity_pending"
-                or rows[0].get("session_id")
+                or len(matches) != 1
+                or matches[0].get("actor") != self.controller
+                or matches[0].get("claim_id") != claim_id
+                or matches[0].get("state") != "identity_pending"
+                or matches[0].get("session_id")
                 or not (pointer_is_task or pointer_is_root)
             ):
                 raise ControllerError(
-                    "checkpoint is not the exact single identity-pending reservation"
+                    "checkpoint lacks the exact identity-pending reservation"
                 )
             prior_reason = str(document.get("terminal_reason") or "").strip()
             terminal_reason = (

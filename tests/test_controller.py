@@ -288,7 +288,7 @@ class ControllerTests(unittest.TestCase):
                 "pending", session_id="", state="identity_pending", lease=lease,
             )
             before = controller.checkpoint_path.read_bytes()
-            with self.assertRaisesRegex(ControllerError, "exact single identity-pending"):
+            with self.assertRaisesRegex(ControllerError, "exact identity-pending reservation"):
                 controller.begin_identity_pending_drain(
                     "pending", "wrong-claim", "USER_ACTION_REQUIRED: identity unresolved", lease=lease,
                 )
@@ -315,6 +315,39 @@ class ControllerTests(unittest.TestCase):
             )
             self.assertEqual(resumed.checkpoint["drain_causes"], [])
             dispatch.assert_not_called()
+
+    def test_identity_pending_drain_preserves_exact_sibling_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller = RootController(
+                "root", "one", state_path=Path(tmp) / "state.json",
+                checkpoint_path=Path(tmp) / "checkpoint.json",
+            )
+            lease = controller.acquire()
+            for task, claim in (("pending", "claim-pending"), ("sibling", "claim-sibling")):
+                controller.reserve_active_task({
+                    "task": task, "root": "root", "actor": "one", "claim_id": claim,
+                }, lease=lease)
+            controller.bind_active_task(
+                "pending", session_id="", state="identity_pending", lease=lease,
+            )
+            controller.bind_active_task("sibling", session_id="session-sibling", lease=lease)
+            rows_before = controller.active_tasks()
+            checkpoint_before = controller.checkpoint_path.read_bytes()
+
+            with self.assertRaisesRegex(ControllerError, "exact identity-pending reservation"):
+                controller.begin_identity_pending_drain(
+                    "pending", "wrong-claim", "USER_ACTION_REQUIRED: identity unresolved", lease=lease,
+                )
+            self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+
+            result = controller.begin_identity_pending_drain(
+                "pending", "claim-pending", "USER_ACTION_REQUIRED: identity unresolved", lease=lease,
+            )
+
+            self.assertEqual(result.state, "draining")
+            self.assertFalse(result.terminal)
+            self.assertEqual(result.checkpoint["active_tasks"], rows_before)
+            self.assertEqual(result.checkpoint["drain_causes"], [])
 
     def test_finalize_draining_preserves_the_exact_recorded_cause_set(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

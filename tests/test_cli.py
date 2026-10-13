@@ -2751,8 +2751,10 @@ def _run_controller_json(func, args) -> dict:
     return json.loads(buffer.getvalue())
 
 
-def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict, Path, dict]:
-    """Create one real signed identity-pending launch and its non-admitting drain."""
+def _expired_preidentity_fixture(
+    base: Path, *, begin_drain: bool = True,
+) -> tuple[ValidLaunch, object, dict, Path, dict]:
+    """Create a signed identity-pending launch, optionally already draining."""
     fixture = ValidLaunch(base / "workspace", seed_lease=False)
     fixture.task_issue["status"] = "in_progress"
     fixture.task_issue["metadata"]["agentflow"]["launch"]["execution_limits"] = {
@@ -2816,11 +2818,12 @@ def _expired_preidentity_fixture(base: Path) -> tuple[ValidLaunch, object, dict,
     controller.bind_active_task(
         fixture.task_id, session_id="", state="identity_pending", lease=fixture.lease,
     )
-    controller.begin_identity_pending_drain(
-        fixture.task_id, "claim-1",
-        f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within 1800s",
-        lease=fixture.lease,
-    )
+    if begin_drain:
+        controller.begin_identity_pending_drain(
+            fixture.task_id, "claim-1",
+            f"USER_ACTION_REQUIRED: task {fixture.task_id} provider identity never resolved within 1800s",
+            lease=fixture.lease,
+        )
     return fixture, controller, contract, ledger_path, {"attempts": attempts, "state_path": state_path}
 
 
@@ -3781,13 +3784,106 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                     self.assertIn("abandoned_epoch_repair_receipt", final)
                     self.assertTrue(controller._load_checkpoint()["terminal"])
 
-    def test_recovery_revokes_channel_then_clears_pointer_and_allows_only_explicit_distinct_continuation(self) -> None:
+    def test_parallel_identity_with_sibling_retires_and_allows_distinct_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
-                fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(base)
+                fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(
+                    base, begin_drain=False,
+                )
                 fixture.contract = contract
                 old_attempts = baseline["attempts"]
+                sibling = json.loads(json.dumps(fixture.task_issue))
+                sibling.update(id="task-sibling", title="Running sibling", status="in_progress")
+                sibling["metadata"]["agentflow"].update(
+                    task="task-sibling", claim_id="claim-sibling",
+                    claim_token="opaque-sibling-claim-token-0123456789abcdef",
+                )
+                sibling["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-sibling"
+                controller.reserve_active_task({
+                    "task": "task-sibling", "root": str(fixture.root),
+                    "actor": fixture.controller, "claim_id": "claim-sibling",
+                }, lease=fixture.lease)
+                controller.bind_active_task(
+                    "task-sibling", session_id="session-sibling", lease=fixture.lease,
+                )
+                sibling_acceptance_ids = cli._bound_acceptance_ids(sibling, "task-sibling")
+                sibling_finished = {"value": False}
+                sibling_result = {
+                    "outcome": "completed", "session_id": "session-sibling",
+                    "acceptance_results": [{
+                        "acceptance_id": acceptance_id, "status": "passed",
+                        "evidence": "verified sibling result", "source": "provider",
+                    } for acceptance_id in sibling_acceptance_ids],
+                }
+                pending_record = cli._herdr_session_record(fixture.root, fixture.task_id)
+
+                def session_record(_root, task_id):
+                    if task_id == fixture.task_id:
+                        return pending_record
+                    return {
+                        "status": "completed" if sibling_finished["value"] else "running",
+                        "return_channel": {
+                            "state": "consumed" if sibling_finished["value"] else "issued",
+                            "acceptance_ids": list(sibling_acceptance_ids), "approved_waivers": [],
+                        },
+                    }
+
+                def task_result(_root, task_id):
+                    return sibling_result if task_id == "task-sibling" and sibling_finished["value"] else None
+
+                def close_sibling(_cwd, task_id, _reason):
+                    self.assertEqual(task_id, "task-sibling")
+                    sibling["status"] = "closed"
+                args = argparse.Namespace(
+                    workflow_root=fixture.workflow_root, _authority_secret=fixture.authority_secret,
+                    identity_deadline=0.01,
+                )
+                claim_ready = mock.Mock()
+                dispatch = mock.Mock()
+                active_before_deadline = controller.active_tasks()
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, issue_id:
+                                       fixture.root_issue if issue_id == fixture.workflow_root
+                                       else fixture.task_issue if issue_id == fixture.task_id else sibling), \
+                     mock.patch.object(cli.beads_backend, "root_descendants",
+                                       return_value=[fixture.task_issue, sibling]), \
+                     mock.patch.object(cli.beads_backend, "claim_ready", claim_ready), \
+                     mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
+                     mock.patch.object(cli.beads_backend, "close_issue", side_effect=close_sibling), \
+                     mock.patch.object(cli, "_herdr_session_record", side_effect=session_record), \
+                     mock.patch.object(cli, "_resolve_pending_identity"), \
+                     mock.patch.object(cli, "_codex_trust_attention", return_value=None), \
+                     mock.patch.object(cli, "_collect_codex_app_server_result"), \
+                     mock.patch.object(cli, "_ingest_submitted_result", side_effect=lambda *_a, **_k:
+                                       cli._SubmissionIngestion(
+                                           "consumed" if sibling_finished["value"] else "pending")), \
+                     mock.patch.object(cli, "_herdr_task_result", side_effect=task_result), \
+                     mock.patch.object(cli, "_validate_acceptance_results", side_effect=lambda rows, *_a, **_k: rows), \
+                     mock.patch.object(cli, "_dispatch_via_herdr", return_value=dispatch):
+                    first_payload, first_stop = cli._controller_step_parallel(
+                        args, controller, fixture.root, fixture.lease, operation="resume",
+                        policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                    )
+                    self.assertFalse(first_stop)
+                    self.assertEqual(first_payload["result"]["state"], "draining")
+                    self.assertEqual(first_payload["result"]["checkpoint"]["drain_causes"], [])
+                    self.assertEqual(controller.active_tasks(), active_before_deadline)
+                    sibling_finished["value"] = True
+                    final_payload, final_stop = cli._controller_step_parallel(
+                        args, controller, fixture.root, fixture.lease, operation="resume",
+                        policy=cli.execution_backend.ExecutionPolicy(max_parallel_workers=2),
+                    )
+                self.assertTrue(final_stop)
+                self.assertEqual(final_payload["stop_reason"], "USER_ACTION_REQUIRED")
+                self.assertEqual(sibling["status"], "closed")
+                self.assertEqual(final_payload["result"]["checkpoint"]["drain_causes"], [])
+                self.assertEqual(
+                    [(row["task"], row["claim_id"], row["state"])
+                     for row in controller.active_tasks()],
+                    [(fixture.task_id, "claim-1", "identity_pending")],
+                )
+                claim_ready.assert_not_called()
+                dispatch.assert_not_called()
                 checkpoint_before_cancel = controller._load_checkpoint()
                 self.assertEqual(checkpoint_before_cancel["state"], "draining")
                 self.assertFalse(checkpoint_before_cancel["terminal"])
