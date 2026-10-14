@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-10-14
+
+### Added
+
+- Added task-linked feedback intake, dispositions, and reports that link
+  accepted items to a Beads acceptance row, require passed evidence to mark them
+  fixed, and detect later changes to linked evidence and artifacts. This tracks
+  workflow evidence; provider proofs and output-quality gains are not
+  established.
+- The controlled-rework workflow now blocks broad writer dispatch until a
+  bounded pilot passes independent controller validation against project-owned
+  criteria and declared checks.
+
+### Changed
+
+- Controller drain causes now persist through task draining and expiry recovery,
+  then are archived with an authenticated resolution before continuation.
+
 ### Removed
 
 - The obsolete `agentflow migrate legacy` dry-run/apply/rollback cutover and
@@ -304,7 +322,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.10...HEAD
+[0.0.10]: https://github.com/saintdle/agentflow/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/saintdle/agentflow/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/saintdle/agentflow/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/saintdle/agentflow/compare/v0.0.6...v0.0.7
