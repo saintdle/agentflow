@@ -1,15 +1,82 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agentflow.launch_recovery import reduce_incomplete_launch
+from agentflow.launch_recovery import (
+    herdr_pane_is_definitively_absent,
+    reduce_incomplete_launch,
+)
 
 
 class LaunchRecoveryReducerTests(unittest.TestCase):
+    def test_only_structured_herdr_pane_not_found_proves_absence(self) -> None:
+        response = json.dumps({
+            "error": {"code": "pane_not_found", "message": "pane pane-1 not found"},
+            "id": "cli:pane:get",
+        })
+        self.assertTrue(herdr_pane_is_definitively_absent(1, response, pane_id="pane-1"))
+        self.assertFalse(herdr_pane_is_definitively_absent(
+            1, '{"error":{"code":"daemon_offline"}}', pane_id="pane-1",
+        ))
+        self.assertFalse(herdr_pane_is_definitively_absent(
+            1, response.replace("pane_not_found", "unknown"), pane_id="pane-1",
+        ))
+        self.assertFalse(herdr_pane_is_definitively_absent(0, response, pane_id="pane-1"))
+        self.assertFalse(herdr_pane_is_definitively_absent(1, "not JSON", pane_id="pane-1"))
+        self.assertFalse(herdr_pane_is_definitively_absent(
+            1, response, pane_id="other-pane",
+        ))
+
+    def test_pane_not_found_is_accepted_from_either_single_exact_output_stream(self) -> None:
+        response = json.dumps({
+            "error": {"code": "pane_not_found", "message": "pane pane-1 not found"},
+            "id": "cli:pane:get",
+        })
+        self.assertTrue(herdr_pane_is_definitively_absent(1, response, pane_id="pane-1"))
+        self.assertTrue(herdr_pane_is_definitively_absent(1, "", response, pane_id="pane-1"))
+
+    def test_ambiguous_or_conflicting_herdr_streams_do_not_prove_absence(self) -> None:
+        absent = json.dumps({
+            "error": {"code": "pane_not_found", "message": "pane pane-1 not found"},
+            "id": "cli:pane:get",
+        })
+        success = json.dumps({"result": {"pane_id": "pane-1"}, "id": "cli:pane:get"})
+        for stdout, stderr in (
+            (success, absent),
+            (absent, success),
+            (absent, absent),
+            (absent, absent + "\nwarning"),
+            ("prefix " + absent, ""),
+            ("", absent + "\nextra output"),
+        ):
+            with self.subTest(stdout=stdout[:20], stderr=stderr[:20]):
+                self.assertFalse(herdr_pane_is_definitively_absent(
+                    1, stdout, stderr, pane_id="pane-1",
+                ))
+
+    def test_duplicate_json_keys_never_prove_pane_absence(self) -> None:
+        duplicates = (
+            '{"error":{"code":"transport_error"},'
+            '"error":{"code":"pane_not_found","message":"pane pane-1 not found"},'
+            '"id":"cli:pane:get"}',
+            '{"error":{"code":"pane_not_found","message":"pane pane-1 not found"},'
+            '"id":"other","id":"cli:pane:get"}',
+            '{"error":{"code":"transport_error","code":"pane_not_found",'
+            '"message":"pane pane-1 not found"},"id":"cli:pane:get"}',
+            '{"error":{"code":"pane_not_found","message":"other",'
+            '"message":"pane pane-1 not found"},"id":"cli:pane:get"}',
+        )
+        for response in duplicates:
+            with self.subTest(response=response):
+                self.assertFalse(herdr_pane_is_definitively_absent(
+                    1, "", response, pane_id="pane-1",
+                ))
+
     def test_ambiguous_timeout_is_operator_action_not_a_failed_or_retryable_launch(self) -> None:
         decision = reduce_incomplete_launch(
             "claimed_no_session",

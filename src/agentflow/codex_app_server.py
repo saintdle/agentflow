@@ -268,21 +268,22 @@ def _safe_window(window: Any) -> dict[str, int | None] | None:
 def permission_for_profile(
     tool_profile: str, *, cwd: str, output_boundary: str, sterile: bool = False,
 ) -> dict[str, Any]:
-    """Fail closed until named-profile enforcement is provable through the pinned SDK.
+    """Fail closed until the pinned SDK runtime proves the required boundary.
 
-    The current SDK exposes only legacy sandbox fields on thread start and does
-    not return active-permission-profile provenance. Passing those fields would
-    silently select the older sandbox implementation, so no app-server worker
-    may be started until a supported typed profile route and enforcement check
-    are available.
+    SDK 0.160.1 can pass thread configuration and reports active permission
+    profile metadata. Its generated schema does not prove profile enforcement,
+    enumerate the complete effective tool inventory, or establish same-user
+    isolation from controller authority, so profile metadata alone is not
+    sufficient evidence to admit a worker.
     """
     if sterile:
         raise CodexAppServerError("Codex App Server cannot preserve the sterile outbound boundary")
     if tool_profile != "shell-readonly":
         raise CodexAppServerError(f"Codex App Server does not support tool profile {tool_profile!r}")
     raise CodexAppServerError(
-        "Codex App Server launch blocked: pinned SDK cannot yet prove the named read-only "
-        "permission profile without falling back to legacy sandbox settings"
+        "Codex App Server launch blocked: active permission-profile metadata is available, but "
+        "profile enforcement, complete effective-tool inventory, and same-user isolation from "
+        "controller authority remain unverified"
     )
 
 

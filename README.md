@@ -196,6 +196,7 @@ For a newly created project configuration, memory is enabled in metadata-only
 mode and prompt recall stays off; pass `--no-memory` to keep a new project
 config disabled. Existing and legacy config values are not changed. See
 [governed memory](docs/MEMORY.md).
+
 The default Beads setup is local/stealth. Choose tracked or shared-server state
 only when that collaboration model is intentional.
 
@@ -212,11 +213,10 @@ record completion evidence. See the [provider compatibility matrix](docs/PROVIDE
 for supported lanes, Claude/Copilot boundaries, and the guarded opt-in live-smoke
 procedure.
 
-If you prefer to work entirely through a ChatGPT/Codex or Claude chat, or a
+To work through a ChatGPT/Codex or Claude chat, or a
 [GitHub Copilot Chat agent-mode session](https://docs.github.com/en/copilot/how-tos/chat-with-copilot/chat-in-ide)
-in an IDE that can access the workspace and terminal, use the
-[chat-first workflow guide](docs/CHAT_WORKFLOWS.md). It provides copy/paste
-prompts for planning without launch, explicit approval, autonomous persistent
+with workspace and terminal access, use the
+[chat-first workflow guide](docs/CHAT_WORKFLOWS.md). It provides copy/paste prompts for planning without launch, explicit approval, autonomous persistent
 execution, reconnect-safe resume, read-only status, and bounded PR delivery.
 
 For local optimization evidence, `agentflow usage optimize --codeburn <report>`
@@ -294,8 +294,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 - [Agent-led installation and setup](AGENT_SETUP.md)
 - [Chat-first workflows and copy/paste prompts](docs/CHAT_WORKFLOWS.md)
-- [Installation, upgrades, and legacy migration](docs/INSTALLATION.md)
-- [Transactional legacy cutover and rollback](docs/MIGRATION.md)
+- [Installation and upgrades](docs/INSTALLATION.md)
 - [First workflow tutorial](docs/FIRST_WORKFLOW.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [Local session history and context audit](docs/HISTORY.md)

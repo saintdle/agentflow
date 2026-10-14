@@ -172,6 +172,7 @@ class SessionControlTests(unittest.TestCase):
                     "controller", "resume", "--root", str(root),
                     "--workflow-root", "af-root", "--once", "--json",
                 ])
+                args._supervisor_lock_path = Path(tmp) / "supervisor.lock"
                 controller, _ = cli._controller_instance(args)
                 lease = controller.acquire()
                 cli._controller_credentials(args, lease)

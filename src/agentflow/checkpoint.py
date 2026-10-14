@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
@@ -13,9 +14,9 @@ class CheckpointError(RuntimeError):
 
 
 SCHEMA = "agentflow.checkpoint"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_SCHEMA_VERSION = 1
-SUPPORTED_SCHEMA_VERSIONS = frozenset({LEGACY_SCHEMA_VERSION, 2, SCHEMA_VERSION})
+SUPPORTED_SCHEMA_VERSIONS = frozenset({LEGACY_SCHEMA_VERSION, 2, 3, SCHEMA_VERSION})
 
 # The schema is closed: only these keys are accepted. Rejecting unknown keys is
 # what keeps transcripts, prompts, and free-form context out of the checkpoint.
@@ -26,6 +27,7 @@ TEXT_FIELDS = (
     "next_action",
     "blocker",
     "last_check",
+    "pending_continuation_task",
     "remaining_risk",
     "session_hash",
 )
@@ -43,13 +45,24 @@ STATE_TEXT_FIELDS = (
 )
 REQUIRED_FIELDS = ("task", "phase", "next_action")
 LIST_FIELDS = ("changed_files",)
-ALL_FIELDS = TEXT_FIELDS + STATE_TEXT_FIELDS + LIST_FIELDS + ("epoch", "terminal", "active_tasks")
+ALL_FIELDS = TEXT_FIELDS + STATE_TEXT_FIELDS + LIST_FIELDS + (
+    "epoch", "terminal", "active_tasks", "drain_causes",
+)
 
 FIELD_MAX = 500
 SESSION_HASH_MAX = 128
 MAX_CHANGED_FILES = 50
 CHANGED_FILE_MAX = 240
 MAX_ACTIVE_TASKS = 8
+MAX_DRAIN_CAUSES = 8
+MAX_DRAIN_CAUSE_ID = 128
+MAX_DRAIN_CAUSE_PROVENANCE = frozenset({
+    "authenticated_task_outcome",
+    "controller_unclassified",
+    "legacy_checkpoint",
+    "scheduler_no_ready_work",
+    "signed_negative_retirement",
+})
 ACTIVE_TASK_FIELDS = frozenset({"task", "phase", "actor", "claim_id", "session_id", "state"})
 ACTIVE_TASK_STATES = frozenset({"claimed_no_session", "running", "launched", "identity_pending"})
 MAX_TOTAL_BYTES = 4096
@@ -178,6 +191,98 @@ def _check_active_tasks(value: Any) -> list[dict[str, str]]:
     return tasks
 
 
+def _check_drain_causes(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CheckpointError("field 'drain_causes' must be a list")
+    if len(value) > MAX_DRAIN_CAUSES:
+        raise CheckpointError(
+            f"field 'drain_causes' exceeds {MAX_DRAIN_CAUSES} entries ({len(value)})"
+        )
+    fields = {
+        "cause_id", "kind", "provenance", "task_id", "launch_id", "diagnostic_sha256",
+    }
+    causes: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value, 1):
+        if not isinstance(raw, dict):
+            raise CheckpointError(f"drain_causes entry {index} must be an object")
+        unknown = sorted(set(raw) - fields)
+        if unknown or set(raw) != fields:
+            detail = f"unknown field(s): {', '.join(unknown)}" if unknown else "required fields are missing"
+            raise CheckpointError(f"drain_causes entry {index} {detail}")
+        cause = {
+            field: _check_text(
+                f"drain_causes[{index}].{field}", raw.get(field),
+                required=field in {"cause_id", "kind", "provenance"},
+            )
+            for field in ("cause_id", "kind", "provenance", "task_id", "launch_id", "diagnostic_sha256")
+        }
+        if len(cause["cause_id"]) > MAX_DRAIN_CAUSE_ID:
+            raise CheckpointError(f"drain_causes entry {index} has an oversized cause ID")
+        if cause["cause_id"] in seen:
+            raise CheckpointError("drain_causes contains duplicate cause IDs")
+        seen.add(cause["cause_id"])
+        kind = cause["kind"]
+        provenance = cause["provenance"]
+        if provenance not in MAX_DRAIN_CAUSE_PROVENANCE:
+            raise CheckpointError(f"drain_causes entry {index} has unsupported provenance")
+        digest = cause["diagnostic_sha256"]
+        if digest and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise CheckpointError(f"drain_causes entry {index} has an invalid diagnostic digest")
+        if kind == "no_ready_work":
+            if (
+                provenance != "scheduler_no_ready_work"
+                or cause["task_id"] or cause["launch_id"] or digest
+            ):
+                raise CheckpointError(f"drain_causes entry {index} has invalid no-ready provenance")
+        elif kind == "managed_task_failure":
+            if (
+                provenance not in {"authenticated_task_outcome", "signed_negative_retirement"}
+                or not cause["task_id"] or not cause["launch_id"] or digest
+            ):
+                raise CheckpointError(f"drain_causes entry {index} has incomplete task-failure identity")
+        elif kind == "unknown":
+            if provenance not in {"controller_unclassified", "legacy_checkpoint"}:
+                raise CheckpointError(f"drain_causes entry {index} has invalid unknown provenance")
+            if provenance == "legacy_checkpoint" and not digest:
+                raise CheckpointError(f"drain_causes entry {index} lacks its legacy diagnostic digest")
+            if cause["launch_id"]:
+                raise CheckpointError(f"drain_causes entry {index} gives unknown cause launch authority")
+        else:
+            raise CheckpointError(f"drain_causes entry {index} has unsupported kind {kind!r}")
+        causes.append(cause)
+    return causes
+
+
+def _legacy_drain_context(data: dict[str, Any]) -> bool:
+    status = str(data.get("status") or data.get("state") or "").lower()
+    state = str(data.get("state") or "").lower()
+    return (
+        state == "draining" or status == "draining"
+        or state in {"blocked", "halted"} or status in {"blocked", "halted"}
+    )
+
+
+def _legacy_unknown_drain_cause(data: dict[str, Any]) -> dict[str, str]:
+    diagnostic = {
+        key: data.get(key)
+        for key in ("phase", "state", "status", "terminal", "terminal_reason", "last_check")
+    }
+    digest = hashlib.sha256(
+        json.dumps(diagnostic, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "cause_id": f"legacy-{digest}",
+        "kind": "unknown",
+        "provenance": "legacy_checkpoint",
+        "task_id": "",
+        "launch_id": "",
+        "diagnostic_sha256": digest,
+    }
+
+
 def build_checkpoint(data: Any) -> dict[str, Any]:
     """Validate ``data`` and return a normalized, current-version document.
 
@@ -210,6 +315,7 @@ def build_checkpoint(data: Any) -> dict[str, Any]:
         document[field] = _check_text(field, data.get(field), required=False)
     document["changed_files"] = _check_changed_files(data.get("changed_files"))
     document["active_tasks"] = _check_active_tasks(data.get("active_tasks"))
+    document["drain_causes"] = _check_drain_causes(data.get("drain_causes"))
 
     epoch = data.get("epoch", 0)
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
@@ -295,9 +401,17 @@ def load_checkpoint(path: Path, *, migrate: bool = True) -> dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CheckpointError(f"cannot read checkpoint: {exc}") from exc
-    document = build_checkpoint(raw)
+    if not isinstance(raw, dict):
+        raise CheckpointError("checkpoint payload must be an object")
+    normalized_input = dict(raw)
+    missing_drain_causes = "drain_causes" not in raw
+    if missing_drain_causes:
+        normalized_input["drain_causes"] = (
+            [_legacy_unknown_drain_cause(raw)] if _legacy_drain_context(raw) else []
+        )
+    document = build_checkpoint(normalized_input)
     legacy_version = raw.get("version", LEGACY_SCHEMA_VERSION)
-    if migrate and legacy_version != SCHEMA_VERSION:
+    if migrate and (legacy_version != SCHEMA_VERSION or missing_drain_causes):
         try:
             write_checkpoint(path, document)
         except OSError as exc:

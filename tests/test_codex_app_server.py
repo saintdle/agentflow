@@ -150,8 +150,8 @@ class CodexDiagnosticsTests(unittest.TestCase):
 
 
 class CodexPermissionAndTurnTests(unittest.TestCase):
-    def test_shell_readonly_fails_closed_without_verified_named_profile(self) -> None:
-        with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+    def test_shell_readonly_fails_closed_without_full_runtime_boundary_proof(self) -> None:
+        with self.assertRaisesRegex(app_server.CodexAppServerError, "complete effective-tool inventory"):
             app_server.permission_for_profile(
                 "shell-readonly", cwd="/workspace", output_boundary=".",
             )
@@ -165,7 +165,7 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
 
     def test_turn_start_is_blocked_before_sdk_client_or_spend(self) -> None:
         with mock.patch.object(app_server, "_sdk_modules") as sdk:
-            with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+            with self.assertRaisesRegex(app_server.CodexAppServerError, "complete effective-tool inventory"):
                 app_server.start_background_turn(
                     cwd="/workspace", model="gpt-6-luna", effort="medium", instruction="exact",
                     skills=[], tool_profile="shell-readonly", output_boundary=".", sterile=False,
@@ -178,7 +178,7 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             app_server, "_sdk_modules",
         ) as sdk:
-            with self.assertRaisesRegex(app_server.CodexAppServerError, "cannot yet prove"):
+            with self.assertRaisesRegex(app_server.CodexAppServerError, "complete effective-tool inventory"):
                 app_server.start_supervised_turn(
                     runtime_dir=Path(temporary) / "runtime", request_id="launch",
                     cwd=temporary, model="gpt-6-luna", effort="medium", instruction="exact",
