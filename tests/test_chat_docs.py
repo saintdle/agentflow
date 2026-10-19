@@ -55,8 +55,8 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertIn('AGENTFLOW_INTEGRATION: "1"', ci)
         self.assertIn('CGO_ENABLED: "1"', ci)
         self.assertIn('GOFLAGS: "-tags=gms_pure_go"', ci)
-        self.assertIn('go-version: "1.26.2"', ci)
-        self.assertIn("go install github.com/steveyegge/beads/cmd/bd@v1.1.0", ci)
+        self.assertIn('go-version: "1.26.7"', ci)
+        self.assertIn("go install github.com/steveyegge/beads/cmd/bd@v1.3.1", ci)
         self.assertIn("--expected-version 0.0.10", ci)
         self.assertIn("--expected-version 0.0.10", build_main)
         self.assertIn("scripts/ci/integration_beads.sh", ci)
@@ -65,8 +65,8 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertNotRegex(integration, r"(?m)^  pull_request:")
         self.assertIn('CGO_ENABLED: "1"', integration)
         self.assertIn('GOFLAGS: "-tags=gms_pure_go"', integration)
-        self.assertIn('go install github.com/steveyegge/beads/cmd/bd@v1.1.0', integration)
-        self.assertIn('Expected Beads 1.1.0', smoke)
+        self.assertIn('go install github.com/steveyegge/beads/cmd/bd@v1.3.1', integration)
+        self.assertIn('Expected Beads 1.3.1', smoke)
 
     def test_setup_docs_explain_public_tagged_install_herdr_and_copilot(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")

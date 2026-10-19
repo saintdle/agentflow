@@ -1883,6 +1883,7 @@ def _controller_step_serial(
                 )
                 beads_backend.close_issue(
                     cwd, in_flight_task, "agentflow: Herdr result completed with recorded evidence",
+                    actor=str(document.get("actor") or lease.controller),
                 )
             task_class = _controller_session_task_class(task_issue)
             phase = _controller_session_phase(task_issue)
@@ -2431,7 +2432,8 @@ def _controller_step_parallel(
                 }},
             )
             beads_backend.close_issue(
-                cwd, task_id, "agentflow: Herdr result completed with recorded evidence"
+                cwd, task_id, "agentflow: Herdr result completed with recorded evidence",
+                actor=entry["actor"],
             )
         controller.record_session_event(
             event="completed", task_class=_controller_session_task_class(issue), task=task_id,
@@ -2691,6 +2693,74 @@ def _controller_step_parallel(
     return payload(controller.resume([], lease=lease)), False
 
 
+def _native_claim_fence_path(root: Path, workflow_root: str, task: str) -> Path:
+    credential_path = _resume_key_path(argparse.Namespace(
+        root=str(root), workflow_root=workflow_root, resume_key_file="",
+    ))
+    key = hashlib.sha256(task.encode("utf-8")).hexdigest()
+    path = credential_path.parent / f"{credential_path.stem}-task-claim-fences" / f"{key}.json"
+    try:
+        _require_external_accounting_storage(path, str(root.resolve()))
+    except controller_backend.ControllerError as exc:
+        raise ValueError(
+            "Native task claim fencing requires accessible controller storage outside "
+            "the worker workspace; move AGENTFLOW_STATE_HOME to a protected external directory"
+        ) from exc
+    return path
+
+
+def _assert_native_claim_unfenced(root: Path, workflow_root: str, task: str) -> None:
+    if _native_claim_fence_path(root, workflow_root, task).exists():
+        raise ValueError(f"native Beads claim for {task} is fenced; operator recovery is required")
+
+
+def _fence_native_claim(root: Path, workflow_root: str, task: str, reason: str) -> None:
+    # Controller state lives outside the worker's writable output boundary.
+    # Never clear this marker merely because a later heartbeat succeeds.
+    _private_atomic_json(_native_claim_fence_path(root, workflow_root, task), {
+        "schema": "agentflow.task-claim-fence@1", "workflow_root": workflow_root,
+        "task": task, "reason": reason, "fenced_at": _now(),
+    })
+
+
+def _renew_native_task_leases(
+    controller: controller_backend.RootController, root: Path, workflow_root: str,
+) -> list[str]:
+    failures: list[str] = []
+    for entry in controller.active_tasks():
+        task = str(entry.get("task") or "")
+        actor = str(entry.get("actor") or "")
+        try:
+            _assert_native_claim_unfenced(root, workflow_root, task)
+            issue = beads_backend.get_issue(root, task)
+            record = _herdr_session_record(root, task) or {}
+            channel = record.get("return_channel")
+            # A crash after accepted completion/close but before checkpoint
+            # advancement must recover through the existing disposition path.
+            if str(issue.get("status") or "") in reconciliation_backend.TERMINAL:
+                if isinstance(channel, Mapping) and channel.get("state") == "consumed":
+                    continue
+                raise ValueError("task became terminal before authenticated disposition")
+            beads_backend.verify_task_ancestry_and_ownership(
+                root, issue, task=task, root=workflow_root, actor=actor,
+            )
+            metadata = issue.get("metadata")
+            agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
+            if not isinstance(agentflow, Mapping) or any(
+                str(agentflow.get(field) or "") != expected
+                for field, expected in (
+                    ("root", workflow_root), ("task", task), ("actor", actor),
+                    ("claim_id", str(entry.get("claim_id") or "")),
+                )
+            ):
+                raise ValueError("native claim identity changed")
+            beads_backend.heartbeat_issue(root, task, actor=actor)
+        except (beads_backend.BeadsError, ValueError, OSError) as exc:
+            _fence_native_claim(root, workflow_root, task, str(exc))
+            failures.append(task)
+    return failures
+
+
 def _controller_step(
     args: argparse.Namespace,
     controller: controller_backend.RootController,
@@ -2701,6 +2771,20 @@ def _controller_step(
 ) -> tuple[dict[str, Any], bool]:
     workflow_root = getattr(args, "workflow_root", "")
     cwd = root
+    with controller.fence(lease):
+        failed = _renew_native_task_leases(controller, root, workflow_root)
+    if failed:
+        result = controller.halt(
+            "blocked", "USER_ACTION_REQUIRED: native Beads task claim renewal failed for "
+            + ", ".join(failed) + "; launch and result authority are fenced. Inspect live workers before recovery.",
+            lease=lease,
+        )
+        return ({
+            "operation": operation, "ok": True, "root": str(root),
+            "controller": lease.controller, "lease": lease.to_dict(),
+            "result": result.to_dict(), "stop_reason": "USER_ACTION_REQUIRED",
+            "workflow_root": workflow_root, "session_control": controller.session_ledger(),
+        }, True)
     root_issue = beads_backend.get_issue(cwd, workflow_root) if workflow_root else None
     policy = _controller_execution_policy(cwd, root, workflow_root, root_issue=root_issue)
     document = controller._load_checkpoint()
@@ -3973,6 +4057,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             raise ValueError("--workflow-root is required before acquiring a controller lease")
         if workflow_root != raw_workflow_root:
             raise ValueError("--workflow-root must be the exact Beads root ID without surrounding whitespace")
+        beads_backend.require_supported_version()
         if operation == "supervise" and bool(getattr(args, "takeover", False)):
             raise ValueError("controller supervise never performs lease takeover")
         if operation == "supervise" and str(getattr(args, "resume_token", "") or ""):
@@ -4241,8 +4326,8 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
             once = bool(getattr(args, "once", False))
             poll_interval = float(getattr(args, "poll_interval", 5.0))
             deadline_seconds = float(getattr(args, "deadline", 3600.0))
-            if not math.isfinite(poll_interval) or poll_interval <= 0:
-                raise ValueError("--poll-interval must be a positive finite number")
+            if not math.isfinite(poll_interval) or not 0 < poll_interval <= 60:
+                raise ValueError("--poll-interval must be positive and at most 60 seconds for native task renewal")
             if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
                 raise ValueError("--deadline must be a non-negative finite number")
             monotonic = getattr(args, "_monotonic", time.monotonic)
@@ -4589,6 +4674,7 @@ def controller_stop(args: argparse.Namespace) -> int:
 
 def worker_claim(args: argparse.Namespace) -> int:
     try:
+        beads_backend.require_supported_version()
         cwd = _task_cwd(args)
         claim = beads_backend.claim_issue_exact(
             cwd,
@@ -7044,6 +7130,7 @@ def _verify_launch_authority(
         # call so a missing actor fails closed immediately.
         if not actor:
             raise ValueError("requested actor is required to verify launch authority against a workflow root")
+        _assert_native_claim_unfenced(workspace_root, workflow_root, task_id)
         cwd = beads_cwd or workspace_root
         issue = beads_backend.get_issue(cwd, task_id)
         # Real ancestry/status/assignee proof from Beads -- never inferred
@@ -7088,6 +7175,11 @@ def _verify_launch_authority(
         # root/task/actor construction is deliberately not accepted.
         if len(stored_claim_token) < 32 or not hmac.compare_digest(claim, stored_claim_token):
             raise ValueError("provided claim must be the exact actor-bound claim token")
+        try:
+            beads_backend.heartbeat_issue(cwd, task_id, actor=actor)
+        except beads_backend.BeadsError as exc:
+            _fence_native_claim(workspace_root, workflow_root, task_id, str(exc))
+            raise ValueError("native Beads task renewal failed; claim authority is fenced") from exc
         return {
             "root": workflow_root,
             "task": task_id,
@@ -9704,7 +9796,7 @@ def beads_explain(args: argparse.Namespace) -> int:
     errors = 0
     for issue_id in args.bead:
         try:
-            issue = beads_backend.get_issue(task_cwd, issue_id)
+            issue = beads_backend.get_issue(task_cwd, issue_id, brief_dependencies=True)
         except beads_backend.BeadsError as exc:
             print(f"Cannot explain {issue_id}: {exc}", file=sys.stderr)
             errors += 1
@@ -9758,6 +9850,11 @@ def beads_explain(args: argparse.Namespace) -> int:
 
 def worker_pull(args: argparse.Namespace) -> int:
     task_cwd = _task_cwd(args)
+    try:
+        beads_backend.require_supported_version()
+    except beads_backend.BeadsError as exc:
+        print(f"Cannot claim work: {exc}", file=sys.stderr)
+        return 2
     workspace_data = beads_backend.workspace(task_cwd)
     if workspace_data is None:
         print(f"No Beads workspace is active at {task_cwd}.", file=sys.stderr)
@@ -9816,9 +9913,9 @@ def beads_init(args: argparse.Namespace) -> int:
     mode = getattr(args, "mode", "embedded")
     if not git_repository and mode == "shared-server":
         print(
-            "Gitless folders can run parallel workers, but Beads 1.1 cannot reliably "
-            "rediscover a shared-server workspace without Git metadata. Using embedded "
-            "mode with controller-only graph mutations."
+            "Gitless folders can run parallel workers, but Beads 1.3.1 shared-server "
+            "initialization with BEADS_DIR does not persist workspace metadata. "
+            "Using embedded mode with controller-only graph mutations."
         )
         mode = "embedded"
     stealth = not getattr(args, "tracked", False)

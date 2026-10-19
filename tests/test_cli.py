@@ -31,6 +31,20 @@ from agentflow import execution_limits as execution_limits_backend
 from tests import _state_home  # noqa: F401  # external controller authority
 
 
+_native_heartbeat_patch = mock.patch.object(cli.beads_backend, "heartbeat_issue")
+_supported_beads_patch = mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1")
+
+
+def setUpModule():
+    _native_heartbeat_patch.start()
+    _supported_beads_patch.start()
+
+
+def tearDownModule():
+    _supported_beads_patch.stop()
+    _native_heartbeat_patch.stop()
+
+
 def _controller_authority(root: Path, workflow_root: str, lease) -> str:
     _, credentials = cli._controller_credentials(
         argparse.Namespace(
@@ -206,6 +220,8 @@ class ValidLaunch:
     @contextlib.contextmanager
     def beads_patches(self):
         with mock.patch.object(cli.beads_backend, "get_issue", side_effect=self.get_issue), \
+             mock.patch.object(cli.beads_backend, "heartbeat_issue"), \
+             mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1"), \
              mock.patch.object(cli.beads_backend, "root_descendants", return_value=[self.task_issue]), \
              mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
              mock.patch.object(cli.beads_backend, "update_agentflow_metadata"):
@@ -406,7 +422,7 @@ class AgentflowTests(unittest.TestCase):
                 {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
                 clear=False,
             ):
-                fixture = ValidLaunch(Path(temporary).resolve())
+                fixture = ValidLaunch((Path(temporary) / "workspace").resolve())
                 session_id = "nonsterile-claude-session"
                 settings_path = fixture.root / ".claude/settings.json"
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -490,7 +506,7 @@ class AgentflowTests(unittest.TestCase):
                     {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
                     clear=False,
                 ):
-                    fixture = ValidLaunch(Path(temporary).resolve())
+                    fixture = ValidLaunch((Path(temporary) / "workspace").resolve())
                     settings_path = fixture.root / ".claude/settings.json"
                     settings = json.loads(settings_path.read_text(encoding="utf-8"))
                     settings["hooks"].pop(missing_event, None)
@@ -522,7 +538,7 @@ class AgentflowTests(unittest.TestCase):
                 {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
                 clear=False,
             ):
-                fixture = ValidLaunch(Path(temporary).resolve())
+                fixture = ValidLaunch((Path(temporary) / "workspace").resolve())
                 payloads: list[dict] = []
                 captured: dict = {}
                 with fixture.beads_patches(), \
@@ -551,7 +567,7 @@ class AgentflowTests(unittest.TestCase):
                     {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
                     clear=False,
                 ):
-                    fixture = ValidLaunch(Path(temporary).resolve())
+                    fixture = ValidLaunch((Path(temporary) / "workspace").resolve())
                     settings_path = fixture.root / ".claude/settings.json"
                     settings = json.loads(settings_path.read_text(encoding="utf-8"))
                     settings[disabling_setting] = True
@@ -654,7 +670,7 @@ class AgentflowTests(unittest.TestCase):
                 {"AGENTFLOW_STATE_HOME": str(Path(temporary) / "state")},
                 clear=False,
             ):
-                fixture = ValidLaunch(Path(temporary).resolve())
+                fixture = ValidLaunch((Path(temporary) / "workspace").resolve())
                 settings_path = fixture.root / ".claude/settings.json"
                 payloads: list[dict] = []
                 captured: dict = {}
@@ -1663,7 +1679,7 @@ class AgentflowTests(unittest.TestCase):
                 prefix=cli._slug(root.name),
                 gitless=True,
             )
-            self.assertIn("Gitless folders can run parallel workers", stdout.getvalue())
+            self.assertIn("Beads 1.3.1 shared-server", stdout.getvalue())
             self.assertIn("workspace directory (no Git)", stdout.getvalue())
             self.assertFalse((root / ".git").exists())
 
@@ -2176,30 +2192,19 @@ class AgentflowTests(unittest.TestCase):
         self.assertIn("Review lifecycle (work-1)", stdout.getvalue())
         self.assertIn("Next request:", stdout.getvalue())
 
-    def test_claim_ready_uses_atomic_shared_claim_after_empty_assigned_queue(self) -> None:
+    def test_claim_ready_selects_brief_then_claims_exact_shared_task(self) -> None:
         empty = cli.subprocess.CompletedProcess([], 0, "[]", "")
-        claimed = cli.subprocess.CompletedProcess(
-            [],
-            0,
-            json.dumps([{"id": "work-1", "title": "Ready work"}]),
-            "",
-        )
-        with mock.patch.object(
-            cli.beads_backend, "run", side_effect=[empty, claimed]
-        ) as run:
-            issue = cli.beads_backend.claim_ready(
-                Path("/tmp"),
-                parent="root",
-                labels=["af:stage:review"],
-                actor="reviewer-1",
-            )
-        self.assertEqual(issue["id"], "work-1")
-        first_arguments = run.call_args_list[0].args
-        second_arguments = run.call_args_list[1].args
-        self.assertIn("--assignee", first_arguments)
-        self.assertNotIn("--claim", first_arguments)
-        self.assertIn("--unassigned", second_arguments)
-        self.assertIn("--claim", second_arguments)
+        selected = cli.subprocess.CompletedProcess([], 0, json.dumps([{"id": "work-1"}]), "")
+        exact = mock.Mock(issue={"id": "work-1", "description": "full contract"})
+        with mock.patch.object(cli.beads_backend, "run", side_effect=[empty, selected]) as run, mock.patch.object(cli.beads_backend, "claim_issue_exact", return_value=exact) as claim:
+            issue = cli.beads_backend.claim_ready(Path("/tmp"), parent="root", labels=["af:stage:review"], actor="reviewer-1")
+        self.assertEqual(issue["description"], "full contract")
+        self.assertIn("--assignee", run.call_args_list[0].args)
+        self.assertIn("--unassigned", run.call_args_list[1].args)
+        for call in run.call_args_list:
+            self.assertIn("--brief", call.args)
+            self.assertNotIn("--claim", call.args)
+        claim.assert_called_once_with(Path("/tmp"), "work-1", root="root", actor="reviewer-1", labels=["af:stage:review"])
 
     def test_create_issue_prevents_parent_queue_label_inheritance(self) -> None:
         created = cli.subprocess.CompletedProcess(
@@ -3832,7 +3837,7 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 def task_result(_root, task_id):
                     return sibling_result if task_id == "task-sibling" and sibling_finished["value"] else None
 
-                def close_sibling(_cwd, task_id, _reason):
+                def close_sibling(_cwd, task_id, _reason, *, actor=""):
                     self.assertEqual(task_id, "task-sibling")
                     sibling["status"] = "closed"
                 args = argparse.Namespace(
@@ -5919,6 +5924,14 @@ class ControllerRunTests(unittest.TestCase):
     Beads transition -> next node -- instead of stalling forever after one
     claim."""
 
+    def setUp(self):
+        # These older traversal fixtures intentionally model only root/graph
+        # and provider state. Native claims are exercised with complete real
+        # task identities in test_beads_compatibility and real integration.
+        renewal = mock.patch.object(cli, "_renew_native_task_leases", return_value=[])
+        renewal.start()
+        self.addCleanup(renewal.stop)
+
     def _issue(self, issue_id: str, **overrides: object) -> dict:
         issue = {"id": issue_id, "status": "open", "assignee": "", "labels": [], "metadata": {}}
         issue.update(overrides)
@@ -6206,7 +6219,7 @@ class ControllerRunTests(unittest.TestCase):
             def fake_root_descendants(cwd, root_id):
                 return [fixture.task_issue]
 
-            def fake_close_issue(cwd, task_id, reason):
+            def fake_close_issue(cwd, task_id, reason, *, actor=""):
                 fixture.task_issue["status"] = "closed"
 
             common = dict(
@@ -6338,7 +6351,7 @@ class ControllerRunTests(unittest.TestCase):
             def fake_root_descendants(cwd, root_id):
                 return [fixture.task_issue]
 
-            def fake_close_issue(cwd, task_id, reason):
+            def fake_close_issue(cwd, task_id, reason, *, actor=""):
                 fixture.task_issue["status"] = "closed"
 
             # Capture payloads via _json_or_status (not stdout parsing): the
@@ -7743,7 +7756,7 @@ class ControllerRunTests(unittest.TestCase):
             def get_issue(_cwd, issue_id):
                 return fixture.root_issue if issue_id == fixture.workflow_root else fixture.task_issue
 
-            def close_issue(_cwd, task_id, _reason):
+            def close_issue(_cwd, task_id, _reason, *, actor=""):
                 fixture.task_issue["status"] = "closed"
                 closed.append(task_id)
 
@@ -7787,7 +7800,7 @@ class ControllerRunTests(unittest.TestCase):
             def fake_get_issue(cwd, issue_id):
                 return issues[issue_id]
 
-            def fake_close_issue(cwd, task_id, reason):
+            def fake_close_issue(cwd, task_id, reason, *, actor=""):
                 task1_closed["status"] = "closed"
 
             with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fake_get_issue), \
@@ -7882,7 +7895,7 @@ class GenuineLifecycleTests(unittest.TestCase):
             def fake_root_descendants(cwd, root_id):
                 return [fixture.task_issue]
 
-            def fake_close_issue(cwd, task_id, reason):
+            def fake_close_issue(cwd, task_id, reason, *, actor=""):
                 fixture.task_issue["status"] = "closed"
 
             payloads: list[dict] = []
@@ -9700,7 +9713,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     return {"outcome": "failed", "error": failure_reason[task_id]}
                 return result_state[task_id]
 
-            def close_issue(_cwd, task_id, _reason):
+            def close_issue(_cwd, task_id, _reason, *, actor=""):
                 tasks[task_id]["status"] = "closed"
                 closed.append(task_id)
 
@@ -10008,7 +10021,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
 
     def test_crash_after_reservation_halts_without_duplicate_provider_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+            fixture = ValidLaunch((Path(temp) / "workspace").resolve(), seed_lease=False)
             fixture.root_issue["metadata"]["agentflow"]["execution"] = {
                 "schema": "agentflow.execution-policy@1", "controller_only": True,
                 "max_parallel_workers": 2, "max_delegation_depth": 1,
@@ -10020,7 +10033,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             task["assignee"] = fixture.controller
             args = _controller_args(fixture.root, workflow_root=fixture.workflow_root, once=True)
             payloads: list[dict] = []
-            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")}):
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / "state-home")}):
                 state_path = cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json"
                 controller = cli.controller_backend.RootController(
                     str(fixture.root), fixture.controller, state_path=state_path,
@@ -10099,7 +10112,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     issue["assignee"] = fixture.controller
                 return issue
 
-            def close_issue(_cwd, task_id, _reason):
+            def close_issue(_cwd, task_id, _reason, *, actor=""):
                 tasks[task_id]["status"] = "closed"
                 closed.append(task_id)
                 if task_id == "task-2":
@@ -10238,7 +10251,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
     def test_timeout_after_pane_creation_is_durable_ambiguous_in_both_schedulers(self) -> None:
         for scheduler in ("serial", "parallel"):
             with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
-                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                fixture = ValidLaunch((Path(temp) / "workspace").resolve(), seed_lease=False)
                 if scheduler == "parallel":
                     self._execution_policy_for_parallel(fixture)
                 args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
@@ -10248,7 +10261,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
 
                 with mock.patch.dict(
                     os.environ,
-                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / "state-home")},
                 ), mock.patch.object(
                     cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
                 ), mock.patch.object(
@@ -10350,7 +10363,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
     def test_interrupted_launching_reservation_recovers_without_dispatch_in_both_modes(self) -> None:
         for scheduler in ("serial", "parallel"):
             with self.subTest(scheduler=scheduler), tempfile.TemporaryDirectory() as temp:
-                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                fixture = ValidLaunch((Path(temp) / "workspace").resolve(), seed_lease=False)
                 if scheduler == "parallel":
                     self._execution_policy_for_parallel(fixture)
                 args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
@@ -10363,7 +10376,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
 
                 with mock.patch.dict(
                     os.environ,
-                    {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                    {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / "state-home")},
                 ):
                     controller, _root = cli._controller_instance(args)
                     lease = controller.acquire()

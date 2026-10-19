@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Require Beads 1.3.1 or later. Pull-request integration runs against pinned
+  1.3.1 on Linux and macOS; the scheduled lane also exercises an isolated
+  shared Dolt server and restoration/upgrading of a sealed 1.1.0 fixture.
+- Renew native Beads task leases with the recorded claim actor during
+  controller supervision and before protected launches/result acceptance.
+  Failed renewal persists a claim fence and requires operator recovery.
+  Completion closes tasks with their recorded actor.
+- Use compact queue/graph discovery followed by full exact-task reads and
+  claims. Recognize explicit proxy topology and nested shared-server config;
+  reject unsupported proxy row caps without discarding them.
+- Follow the [workspace upgrade guide](docs/BEADS_UPGRADE.md) before opening
+  an existing store. Automatic reclamation and Beads HTTP transport remain
+  disabled.
+
 ## [0.0.10] - 2026-10-14
 
 ### Added
