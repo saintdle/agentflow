@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reconcile resolved provider identities and active execution budgets after an
+  authenticated controller resume rotates its fencing epoch. Preserve the
+  original signed launch, deadline and attempt ledger while rejecting foreign
+  controller continuity, future or malformed epochs, and changed claims.
+
 ## [0.0.11] - 2026-10-19
 
 ### Changed

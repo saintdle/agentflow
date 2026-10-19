@@ -352,6 +352,138 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 "expired_execution",
             )
 
+    def _mark_identity_pending(self, controller) -> bytes:
+        checkpoint = controller._load_checkpoint()
+        checkpoint["active_tasks"] = controller.active_tasks()
+        checkpoint["active_tasks"][0].update(state="identity_pending", session_id="")
+        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+        return controller.checkpoint_path.read_bytes()
+
+    def test_authenticated_resume_preserves_bound_launch_and_budget(self) -> None:
+        for pending in (False, True):
+            with self.subTest(pending=pending), self._launched_budgeted_execution() as (
+                fixture, args, controller, lease, record,
+            ):
+                if pending:
+                    self._mark_identity_pending(controller)
+                contract_path = Path(record["return_channel"]["contract_path"])
+                contract_before = contract_path.read_bytes()
+                ledger_path = cli._execution_limit_ledger_path(fixture.root, fixture.workflow_root)
+                ledger_before = ledger_path.read_bytes()
+                for increment in (1, 2):
+                    resumed = _run_controller_json(cli.controller_resume, args)
+                    self.assertTrue(resumed["ok"], resumed.get("error"))
+                    self.assertEqual(resumed["lease"]["epoch"], lease.epoch + increment)
+                    self.assertEqual(resumed["lease"]["continuity_id"], lease.continuity_id)
+                    row = controller.active_tasks()[0]
+                    self.assertEqual(row["state"], "running")
+                    self.assertEqual(row["claim_id"], record["claim_id"])
+                    self.assertEqual(row["session_id"], record["binding"]["session_id"])
+                    current = cli._herdr_session_record(fixture.root, fixture.task_id)
+                    self.assertEqual(current["launch_id"], record["launch_id"])
+                    self.assertEqual(current["binding"], record["binding"])
+                    self.assertEqual(current["attempt"], 1)
+                    self.assertEqual(current["return_channel"]["state"], "issued")
+                    self.assertEqual(contract_path.read_bytes(), contract_before)
+                    self.assertEqual(ledger_path.read_bytes(), ledger_before)
+
+    def test_bound_recovery_rejects_invalid_signed_incarnation(self) -> None:
+        mutations = [
+            ("lease_epoch", value) for value in (None, True, 0, -1, "1", 1.0, 2)
+        ] + [("controller_id", "foreign-controller"), ("continuity_id", "foreign-continuity")]
+        for pending, field, value in (
+            (pending, field, value) for pending in (False, True) for field, value in mutations
+        ):
+            with self.subTest(pending=pending, field=field, value=value), self._launched_budgeted_execution() as (
+                fixture, args, controller, lease, record,
+            ):
+                before = (
+                    self._mark_identity_pending(controller) if pending
+                    else controller.checkpoint_path.read_bytes()
+                )
+                contract_path = Path(record["return_channel"]["contract_path"])
+                contract = json.loads(contract_path.read_text())
+                contract[field] = value
+                contract["authority_hmac"] = cli._authority_mac(
+                    args._authority_secret, contract, domain="return-contract-v1",
+                )
+                cli._private_atomic_json(contract_path, contract)
+                with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                    channel = state["sessions"][fixture.task_id]["return_channel"]
+                    channel["contract_binding"] = contract
+                    channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                with self.assertRaisesRegex(ValueError, "exact pending reservation|current controller incarnation"):
+                    if pending:
+                        cli._reconcile_pending_bound_execution_identity(
+                            args, controller, fixture.root, fixture.workflow_root, lease,
+                            controller.active_tasks()[0], authority_secret=args._authority_secret,
+                        )
+                    else:
+                        cli._bound_execution_expiry_snapshot(
+                            args, controller, fixture.root, fixture.workflow_root, lease,
+                            fixture.task_id, authority_secret=args._authority_secret,
+                        )
+                self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+
+    def test_bound_resume_preserves_rejection_of_checkpoint_and_claim_tampering(self) -> None:
+        for case in ("future-checkpoint", "checkpoint-token", "claim-token", "contract-signature"):
+            with self.subTest(case=case), self._launched_budgeted_execution() as (
+                fixture, args, controller, _lease, record,
+            ):
+                resumed = _run_controller_json(cli.controller_resume, args)
+                self.assertTrue(resumed["ok"], resumed.get("error"))
+                current = controller._current_lease()
+                checkpoint = controller._load_checkpoint()
+                if case == "future-checkpoint":
+                    checkpoint["epoch"] = current.epoch + 1
+                elif case == "checkpoint-token":
+                    checkpoint["lease_token"] = "forged-token"
+                elif case == "claim-token":
+                    fixture.task_issue["metadata"]["agentflow"]["claim_token"] = "forged-token"
+                else:
+                    path = Path(record["return_channel"]["contract_path"])
+                    contract = json.loads(path.read_text())
+                    contract["authority_hmac"] = "0" * 64
+                    cli._private_atomic_json(path, contract)
+                    with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
+                        channel = state["sessions"][fixture.task_id]["return_channel"]
+                        channel["contract_binding"] = contract
+                        channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                before = controller.checkpoint_path.read_bytes()
+                with self.assertRaises(ValueError):
+                    cli._bound_execution_expiry_snapshot(
+                        args, controller, fixture.root, fixture.workflow_root, current,
+                        fixture.task_id, authority_secret=args._authority_secret,
+                    )
+                self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+
+    def test_pending_reconcile_after_resume_fences_the_displaced_owner(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            resumed = _run_controller_json(cli.controller_resume, args)
+            self.assertTrue(resumed["ok"], resumed.get("error"))
+            before = self._mark_identity_pending(controller)
+            with self.assertRaises(cli.controller_backend.FencedLease):
+                cli._reconcile_pending_bound_execution_identity(
+                    args, controller, fixture.root, fixture.workflow_root, lease,
+                    controller.active_tasks()[0], authority_secret=args._authority_secret,
+                )
+            self.assertEqual(controller.checkpoint_path.read_bytes(), before)
+
+    def test_due_bound_expiry_survives_authenticated_resume(self) -> None:
+        with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
+            self._mark_identity_pending(controller)
+            deadline = record["return_channel"]["contract_binding"]["deadline_epoch"]
+            with mock.patch.object(cli.time, "time", return_value=deadline + 1), \
+                 mock.patch.object(cli, "_require_definitively_absent_herdr_pane"):
+                resumed = _run_controller_json(cli.controller_resume, args)
+            self.assertTrue(resumed["ok"], resumed.get("error"))
+            self.assertEqual(
+                cli._herdr_session_record(fixture.root, fixture.task_id)["status"],
+                "expired_execution",
+            )
+            self.assertFalse(controller.active_tasks())
+
     def test_pending_identity_reconcile_rejects_a_wrong_claim(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, _record):
             checkpoint = controller._load_checkpoint()
