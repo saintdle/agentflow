@@ -144,7 +144,12 @@ class NativeTaskSupervisionTests(unittest.TestCase):
                 actor = "original-actor" if task == "one" else "other-actor"
                 return {"id": task, "status": "in_progress", "parent": "workflow", "assignee": actor,
                         "metadata": {"agentflow": {"root": "workflow", "task": task, "actor": actor, "claim_id": task}}}
-            with mock.patch.object(beads, "get_issue", side_effect=issue), mock.patch.object(beads, "heartbeat_issue", side_effect=[beads.BeadsError("claim lost"), None]) as heartbeat, mock.patch.object(cli, "_controller_step_parallel") as parallel, mock.patch.object(cli, "_controller_step_serial") as serial:
+            for task in ("one", "two"):
+                cli._private_atomic_json(
+                    cli._native_claim_generation_path(root, "workflow", task),
+                    cli._claim_generation_binding(issue(root, task)["metadata"]["agentflow"], "a" * 64),
+                )
+            with mock.patch.object(beads, "claim_generation", return_value="a" * 64), mock.patch.object(beads, "get_issue", side_effect=issue), mock.patch.object(beads, "heartbeat_issue", side_effect=[beads.BeadsError("claim lost"), None]) as heartbeat, mock.patch.object(cli, "_controller_step_parallel") as parallel, mock.patch.object(cli, "_controller_step_serial") as serial:
                 payload, stop = cli._controller_step(argparse.Namespace(workflow_root="workflow"), controller, root, lease, operation="resume")
                 self.assertTrue(stop)
                 self.assertEqual(payload["stop_reason"], "USER_ACTION_REQUIRED")

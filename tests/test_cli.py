@@ -31,11 +31,13 @@ from agentflow import execution_limits as execution_limits_backend
 from tests import _state_home  # noqa: F401  # external controller authority
 
 
+_native_generation_patch = mock.patch.object(cli.beads_backend, "claim_generation", return_value="a" * 64)
 _native_heartbeat_patch = mock.patch.object(cli.beads_backend, "heartbeat_issue")
 _supported_beads_patch = mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1")
 
 
 def setUpModule():
+    _native_generation_patch.start()
     _native_heartbeat_patch.start()
     _supported_beads_patch.start()
 
@@ -43,6 +45,7 @@ def setUpModule():
 def tearDownModule():
     _supported_beads_patch.stop()
     _native_heartbeat_patch.stop()
+    _native_generation_patch.stop()
 
 
 def _controller_authority(root: Path, workflow_root: str, lease) -> str:
@@ -139,6 +142,7 @@ class ValidLaunch:
         self.actor = controller
         self.gitless = gitless
         self.claim_token = claim_token
+        self._seeded_generation_paths = set()
         self.session_name = "agentflow-task-1"
         self.acceptance = {
             "version": 1, "task_id": self.task_id,
@@ -171,6 +175,7 @@ class ValidLaunch:
         # pre-seeded lease owned by a different owner_id).
         self.lease = None
         self.handoff_path = self.handoff = self.root_preflight_sha256 = None
+        self.seed_native_generation()
         if seed_lease:
             self.lease = self._seed_lease()
             self._persist_claim()
@@ -208,10 +213,18 @@ class ValidLaunch:
         return lease
 
     def _persist_claim(self) -> None:
+        self.seed_native_generation()
         cli._private_atomic_json(
             cli._claim_state_path(self.root, self.task_id),
             {"root": self.workflow_root, "task": self.task_id, "actor": self.actor,
              "claim_id": "claim-1", "claim_token": self.claim_token, "token": self.claim_token},
+        )
+
+    def seed_native_generation(self) -> None:
+        self._seeded_generation_paths.add(cli._native_claim_generation_path(self.root, self.workflow_root, self.task_id))
+        cli._private_atomic_json(
+            cli._native_claim_generation_path(self.root, self.workflow_root, self.task_id),
+            cli._claim_generation_binding(self.task_issue["metadata"]["agentflow"], "a" * 64),
         )
 
     def get_issue(self, cwd, issue_id):
@@ -219,8 +232,13 @@ class ValidLaunch:
 
     @contextlib.contextmanager
     def beads_patches(self):
+        # A relocated authority home needs the fixture's original claim seal.
+        # Never recreate a deleted seal in a home already seeded by this fixture.
+        if cli._native_claim_generation_path(self.root, self.workflow_root, self.task_id) not in self._seeded_generation_paths:
+            self.seed_native_generation()
         with mock.patch.object(cli.beads_backend, "get_issue", side_effect=self.get_issue), \
              mock.patch.object(cli.beads_backend, "heartbeat_issue"), \
+             mock.patch.object(cli.beads_backend, "claim_generation", return_value="a" * 64), \
              mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1"), \
              mock.patch.object(cli.beads_backend, "root_descendants", return_value=[self.task_issue]), \
              mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
@@ -1101,6 +1119,10 @@ class AgentflowTests(unittest.TestCase):
                     }
                 },
             }
+            cli._private_atomic_json(
+                cli._native_claim_generation_path(workspace_root, workflow_root, "task-1"),
+                cli._claim_generation_binding(issue["metadata"]["agentflow"], "a" * 64),
+            )
             with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue):
                 identity = cli._verify_launch_authority(
                     workspace_root, "task-1", "opaque-claim-token-012345678901234567890123", "lease-1",
@@ -3541,11 +3563,11 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 }
                 descendants = [fixture.task_issue, ready_issue]
                 def get_issue(_cwd, issue_id):
-                    return {
+                    return json.loads(json.dumps({
                         fixture.workflow_root: fixture.root_issue,
                         fixture.task_id: fixture.task_issue,
                         ready_issue["id"]: ready_issue,
-                    }[issue_id]
+                    }[issue_id]))
                 def beads_run(_cwd, *argv):
                     if argv and argv[0] == "update" and "--claim" in argv:
                         ready_issue["status"] = "in_progress"
@@ -5959,6 +5981,7 @@ class ControllerRunTests(unittest.TestCase):
                     resume_key_file=str(key_file),
                 )
                 with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture.seed_native_generation()
                     controller, _ = cli._controller_instance(args)
                     lease = controller.acquire()
                     cli._controller_credentials(args, lease)
@@ -6714,6 +6737,7 @@ class ControllerRunTests(unittest.TestCase):
                  mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                fixture.seed_native_generation()
                 payload = _run_controller_json(cli.controller_resume, args)
                 fixture.task_issue["status"] = "in_progress"
                 fixture.task_issue["assignee"] = fixture.controller
@@ -6821,6 +6845,7 @@ class ControllerRunTests(unittest.TestCase):
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)), \
                  mock.patch.object(cli, "herdr_launch", side_effect=tighten_before_reservation):
+                fixture.seed_native_generation()
                 payload = _run_controller_json(cli.controller_resume, args)
 
             self.assertEqual(payload["result"]["state"], "blocked", payload)
@@ -6879,6 +6904,7 @@ class ControllerRunTests(unittest.TestCase):
                      side_effect=tighten_after_reservation,
                  ), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
+                fixture.seed_native_generation()
                 payload = _run_controller_json(cli.controller_resume, args)
                 state_path = fixture.root / ".agentflow/herdr/sessions.json"
                 record = json.loads(state_path.read_text(encoding="utf-8"))["sessions"][fixture.task_id]
@@ -7179,6 +7205,7 @@ class ControllerRunTests(unittest.TestCase):
                      side_effect=fixture.herdr_run(on_spawn=lambda argv: spawned.append(argv)),
                  ), \
                  mock.patch.object(cli, "_json_or_status", side_effect=lambda payload, **_kwargs: payloads.append(payload)):
+                fixture.seed_native_generation()
                 self.assertEqual(cli.controller_supervise(first_args), 0)
                 first = payloads[-1]
                 self.assertEqual(first["result"]["state"], "running")
@@ -7796,6 +7823,8 @@ class ControllerRunTests(unittest.TestCase):
             task2["metadata"]["agentflow"]["claim_token"] = "opaque-claim-token-task2-9999999999999999999999"
             task2["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
             issues = {"wf-root": fixture.root_issue, "task-1": task1_closed, "task-2": task2}
+            cli._private_atomic_json(cli._native_claim_generation_path(fixture.root, fixture.workflow_root, "task-2"),
+                                    cli._claim_generation_binding(task2["metadata"]["agentflow"], "a" * 64))
 
             def fake_get_issue(cwd, issue_id):
                 return issues[issue_id]
@@ -9536,6 +9565,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                 resume_key_file=str(key_file),
             )
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture.seed_native_generation()
                 controller, _ = cli._controller_instance(args)
                 lease = controller.acquire()
                 cli._controller_credentials(args, lease)
@@ -10034,6 +10064,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             args = _controller_args(fixture.root, workflow_root=fixture.workflow_root, once=True)
             payloads: list[dict] = []
             with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / "state-home")}):
+                fixture.seed_native_generation()
                 state_path = cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json"
                 controller = cli.controller_backend.RootController(
                     str(fixture.root), fixture.controller, state_path=state_path,
@@ -10204,6 +10235,9 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fake_herdr_run), \
                  mock.patch.object(cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value)):
+                fixture.seed_native_generation()
+                cli._private_atomic_json(cli._native_claim_generation_path(fixture.root, fixture.workflow_root, "task-2"),
+                                        cli._claim_generation_binding(second["metadata"]["agentflow"], "a" * 64))
                 self.assertEqual(cli.controller_resume(args), 0, payloads)
                 for thread in threads:
                     thread.join(timeout=6)
@@ -10279,6 +10313,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
                 ), mock.patch.object(
                     cli, "_json_or_status", side_effect=lambda value, **_kwargs: payloads.append(value),
                 ):
+                    fixture.seed_native_generation()
                     self.assertEqual(cli.controller_resume(args), 0)
                     first = payloads[-1]
                     self.assertEqual(first["stop_reason"], "USER_ACTION_REQUIRED")
@@ -10334,7 +10369,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"AGENTFLOW_STATE_HOME": str(fixture.root / "state-home")},
+                {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / (fixture.root.name + "-state-home"))},
             ), mock.patch.object(
                 cli.beads_backend, "get_issue", side_effect=fixture.get_issue,
             ), mock.patch.object(
@@ -10349,6 +10384,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
                 cli, "_json_or_status",
                 side_effect=lambda value, **_kwargs: payloads.append(value),
             ):
+                fixture.seed_native_generation()
                 self.assertEqual(cli.controller_resume(args), 0, payloads)
 
             payload = payloads[-1]
@@ -10378,6 +10414,7 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
                     os.environ,
                     {"AGENTFLOW_STATE_HOME": str(fixture.root.parent / "state-home")},
                 ):
+                    fixture.seed_native_generation()
                     controller, _root = cli._controller_instance(args)
                     lease = controller.acquire()
                     args.resume_token = lease.resume_secret

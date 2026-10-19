@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import secrets
@@ -375,6 +376,42 @@ def get_issue(cwd: Path, issue_id: str, *, brief_dependencies: bool = False) -> 
     if brief_dependencies:
         issue["_agentflow_projection"] = "brief-deps"
     return issue
+
+
+def claim_generation(cwd: Path, task: str) -> str:
+    """Fingerprint native claim events, independently of actor/timestamp reuse.
+
+    Audit history is available without the optional event journal. Include all
+    claim IDs: native timestamps have second precision and are not a total order.
+    Heartbeats, idempotent claims and unrelated edits do not add claim events.
+    Missing/truncated history must never bootstrap a new execution generation.
+    """
+    result = run(cwd, "history", task, "--events", "--limit", "0", "--json", timeout=10)
+    if result.returncode:
+        raise BeadsError("native claim generation history is unavailable")
+    try:
+        events = json.loads(result.stdout)
+        if not isinstance(events, list):
+            raise ValueError("expected event list")
+        claims = []
+        seen = set()
+        for event in events:
+            if not isinstance(event, dict) or event.get("issue_id") != task:
+                raise ValueError("invalid task event")
+            event_id = event.get("id")
+            if not isinstance(event_id, str) or not event_id or event_id in seen:
+                raise ValueError("invalid event identity")
+            seen.add(event_id)
+            if event.get("event_type") == "claimed":
+                actor = event.get("actor")
+                if not isinstance(actor, str) or not actor:
+                    raise ValueError("invalid claim actor")
+                claims.append((event_id, actor))
+        if not claims:
+            raise ValueError("missing claim events")
+    except (ValueError, TypeError) as exc:
+        raise BeadsError("native claim generation history is invalid") from exc
+    return hashlib.sha256(json.dumps(sorted(claims), separators=(",", ":")).encode()).hexdigest()
 
 
 def heartbeat_issue(cwd: Path, task: str, *, actor: str) -> None:
