@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-10-19
+
 ### Changed
 
 - Require Beads 1.3.1 or later. Pull-request integration runs against pinned
