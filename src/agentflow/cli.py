@@ -2723,6 +2723,33 @@ def _fence_native_claim(root: Path, workflow_root: str, task: str, reason: str) 
     })
 
 
+def _native_claim_generation_path(root: Path, workflow_root: str, task: str) -> Path:
+    fence = _native_claim_fence_path(root, workflow_root, task)
+    return fence.parent.with_name(fence.parent.name + "-generations") / fence.name
+
+
+def _claim_generation_binding(identity: Mapping[str, Any], generation: str) -> dict[str, str]:
+    return {
+        "schema": "agentflow.native-claim-generation@1",
+        **{field: str(identity.get(field) or "") for field in ("root", "task", "actor", "claim_id")},
+        "claim_token_sha256": hashlib.sha256(str(identity.get("claim_token") or "").encode()).hexdigest(),
+        "native_generation": generation,
+    }
+
+
+def _verify_native_claim_generation(
+    root: Path, workflow_root: str, task: str, identity: Mapping[str, Any], *, cwd: Path | None = None,
+) -> None:
+    path = _native_claim_generation_path(root, workflow_root, task)
+    try:
+        sealed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("native claim generation binding is unavailable; operator recovery is required") from exc
+    generation = beads_backend.claim_generation(cwd or root, task)
+    if sealed != _claim_generation_binding(identity, generation):
+        raise ValueError("native claim generation changed; operator recovery is required")
+
+
 def _renew_native_task_leases(
     controller: controller_backend.RootController, root: Path, workflow_root: str,
 ) -> list[str]:
@@ -2754,7 +2781,10 @@ def _renew_native_task_leases(
                 )
             ):
                 raise ValueError("native claim identity changed")
+            identity = dict(agentflow)
+            _verify_native_claim_generation(root, workflow_root, task, identity)
             beads_backend.heartbeat_issue(root, task, actor=actor)
+            _verify_native_claim_generation(root, workflow_root, task, identity)
         except (beads_backend.BeadsError, ValueError, OSError) as exc:
             _fence_native_claim(root, workflow_root, task, str(exc))
             failures.append(task)
@@ -7051,6 +7081,23 @@ def _claim_state_path(root: Path, task_id: str) -> Path:
 def _persist_claim_identity(cwd: Path, claim: beads_backend.ExactClaim) -> None:
     path = _claim_state_path(cwd, claim.task)
     identity = dict(claim.to_dict()["identity"])
+    _assert_native_claim_unfenced(cwd, claim.root, claim.task)
+    generation_path = _native_claim_generation_path(cwd, claim.root, claim.task)
+    try:
+        if generation_path.exists():
+            _verify_native_claim_generation(cwd, claim.root, claim.task, identity)
+        else:
+            metadata = claim.issue.get("metadata") or {}
+            previous = metadata.get("agentflow") or {}
+            # Existing capabilities cannot be silently rebound on upgrade or
+            # orphan adoption. Only initial issuance may create the seal.
+            if path.exists() or previous.get("claim_token") or _herdr_session_record(cwd, claim.task):
+                raise ValueError("native claim generation binding is missing for an existing claim")
+            generation = beads_backend.claim_generation(cwd, claim.task)
+            _private_atomic_json(generation_path, _claim_generation_binding(identity, generation))
+    except (beads_backend.BeadsError, ValueError, OSError) as exc:
+        _fence_native_claim(cwd, claim.root, claim.task, str(exc))
+        raise
     identity["issued_by_agentflow"] = True
     _private_atomic_json(path, identity)
 
@@ -7186,10 +7233,12 @@ def _verify_launch_authority(
         if len(stored_claim_token) < 32 or not hmac.compare_digest(claim, stored_claim_token):
             raise ValueError("provided claim must be the exact actor-bound claim token")
         try:
+            _verify_native_claim_generation(workspace_root, workflow_root, task_id, agentflow_meta, cwd=cwd)
             beads_backend.heartbeat_issue(cwd, task_id, actor=actor)
-        except beads_backend.BeadsError as exc:
+            _verify_native_claim_generation(workspace_root, workflow_root, task_id, agentflow_meta, cwd=cwd)
+        except (beads_backend.BeadsError, ValueError, OSError) as exc:
             _fence_native_claim(workspace_root, workflow_root, task_id, str(exc))
-            raise ValueError("native Beads task renewal failed; claim authority is fenced") from exc
+            raise ValueError(f"native Beads task generation/renewal failed; claim authority is fenced: {exc}") from exc
         return {
             "root": workflow_root,
             "task": task_id,

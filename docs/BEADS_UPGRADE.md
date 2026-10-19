@@ -100,6 +100,21 @@ from its filesystem controller lease. The polling interval is limited to
 authenticated result acceptance also renew the exact claim. Full selected
 task contracts remain authoritative even though discovery rows are brief.
 
+Each newly issued claim is also sealed to its native claim-event identities in
+protected controller storage. Actor names and second-resolution timestamps do
+not identify a claim generation. Supervision and protected launch/result checks
+verify the seal before and after native renewal. A reclaim and regrant to the
+same actor therefore fences the old execution, even if native heartbeat succeeds.
+Unrelated edits, normal heartbeats and idempotent same-owner claims preserve
+the seal. Keep complete native audit history while an execution is active;
+missing, unavailable or changed claim history fails closed.
+
+Existing executions without a protected generation seal require operator
+recovery. Resume and claim adoption do not infer a seal from current ownership
+or rebind an existing capability to a later native claim. Stop and reconcile
+workers before issuing replacement work; the seal does not establish worker
+termination or make reclaim/admission atomic across independent CLI operations.
+
 A failed, timed-out or identity-mismatched renewal persists a fence in the
 protected controller state, halts admission and refuses further launches or
 results for that task. A later successful heartbeat does not clear the fence.

@@ -92,6 +92,7 @@ def exercise(cwd: Path, *, git: bool, port: int = 0) -> None:
         else:
             raise AssertionError("wrong-actor heartbeat succeeded")
         assert beads.claim_ready(cwd, parent=root, labels=[], actor="integration") is None, "review escaped dependency blocking"
+        cli._persist_claim_identity(cwd, claim)
         controller = controllers.RootController(str(cwd), "integration", state_path=cli._controller_state_dir(cwd, root) / "state.json")
         lease = controller.acquire()
         controller.reserve_active_task({"task": task["id"], "root": str(cwd), "actor": "integration", "claim_id": claim.claim_id}, lease=lease)
@@ -120,6 +121,36 @@ def exercise(cwd: Path, *, git: bool, port: int = 0) -> None:
         assert selected and selected["id"] == review["id"]
         beads.close_issue(cwd, review["id"], "Integration review accepted", actor="reviewer")
         assert all(row["status"] == "closed" for row in beads.root_descendants(cwd, root))
+        # A new native claim by the same actor must not revive an old opaque
+        # capability, even when both claims share a second-resolution timestamp.
+        generation_task = child("Same actor generation")
+        generation_claim = beads.claim_issue_exact(cwd, generation_task["id"], root=root, actor="integration", persist=True)
+        cli._persist_claim_identity(cwd, generation_claim)
+        first_generation = beads.claim_generation(cwd, generation_task["id"])
+        command(cwd, "comments", "add", generation_task["id"], "Unrelated metadata remains safe")
+        beads.claim_issue_exact(cwd, generation_task["id"], root=root, actor="integration")
+        beads.heartbeat_issue(cwd, generation_task["id"], actor="integration")
+        assert beads.claim_generation(cwd, generation_task["id"]) == first_generation
+        cli._verify_launch_authority(cwd, generation_task["id"], generation_claim.identity.token,
+                                     lease.token, workflow_root=root, actor="integration")
+        if port:
+            command(cwd, "sql", f"UPDATE leases SET lease_expires_at = '2000-01-01 00:00:00' WHERE issue_id = '{generation_task['id']}'")
+            command(cwd, "reclaim", "--id", generation_task["id"], "--older-than", "0s", "--json")
+        else:
+            command(cwd, "update", generation_task["id"], "--status", "open", "--actor", "integration")
+        beads.claim_issue_exact(cwd, generation_task["id"], root=root, actor="integration")
+        assert beads.claim_generation(cwd, generation_task["id"]) != first_generation
+        # Native actor-only heartbeat succeeds; Agentflow must still reject.
+        beads.heartbeat_issue(cwd, generation_task["id"], actor="integration")
+        try:
+            cli._verify_launch_authority(cwd, generation_task["id"], generation_claim.identity.token,
+                                         lease.token, workflow_root=root, actor="integration")
+        except ValueError as exc:
+            assert "generation" in str(exc)
+        else:
+            raise AssertionError("same-actor regrant revived old authority")
+        assert cli._native_claim_fence_path(cwd, root, generation_task["id"]).is_file()
+        beads.close_issue(cwd, generation_task["id"], "Generation regression completed", actor="integration")
         assert beads.get_issue(cwd, unrelated["id"])["status"] == "open"
         # Two independent exact claimers must not both own the same task.
         race = child("Claim race")
@@ -132,7 +163,7 @@ def exercise(cwd: Path, *, git: bool, port: int = 0) -> None:
             winners = [value for value in pool.map(contender, ("one", "two")) if value]
         assert len(winners) == 1, winners
         controller.release(lease)
-        print(f"PASS {'shared-server' if port else 'embedded'} {'Git' if git else 'gitless'}: discovery, claim race, renewal, {'reclaim' if port else 'claim-loss'}/fence, restart, review graph")
+        print(f"PASS {'shared-server' if port else 'embedded'} {'Git' if git else 'gitless'}: discovery, claim race, renewal, {'reclaim' if port else 'claim-loss'}/fence, same-actor generation, restart, review graph")
 
 
 def upgrade_fixture(base: Path, old_binary: str) -> None:

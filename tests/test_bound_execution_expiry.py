@@ -15,7 +15,7 @@ from tests.test_cli import ValidLaunch, _controller_args, _run_controller_json
 class BoundExecutionExpiryTests(unittest.TestCase):
     def setUp(self):
         # Native Beads is an external boundary in these provider/expiry tests.
-        for name, value in (("heartbeat_issue", None), ("require_supported_version", "bd version 1.3.1")):
+        for name, value in (("claim_generation", "a" * 64), ("heartbeat_issue", None), ("require_supported_version", "bd version 1.3.1")):
             patch = mock.patch.object(cli.beads_backend, name, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -44,6 +44,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                  mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run()):
+                fixture.seed_native_generation()
                 payload = _run_controller_json(cli.controller_resume, args)
                 self.assertEqual(payload["result"]["state"], "running")
                 fixture.task_issue.update(status="in_progress", assignee=fixture.controller)

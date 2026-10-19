@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Bind task authority to protected native claim-event identities. Reclaiming and
+  regranting to the same actor fences stale launches and authenticated results,
+  including a generation change during renewal. Existing unsealed executions
+  require operator recovery. Automatic reclamation and HTTP remain disabled.
+
 - Reconcile resolved provider identities and active execution budgets after an
   authenticated controller resume rotates its fencing epoch. Preserve the
   original signed launch, deadline and attempt ledger while rejecting foreign

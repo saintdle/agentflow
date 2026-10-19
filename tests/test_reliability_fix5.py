@@ -23,6 +23,9 @@ from tests import _state_home  # noqa: F401  # external controller authority
 
 class ReliabilityFix5Tests(unittest.TestCase):
     def setUp(self):
+        generation = mock.patch.object(cli.beads_backend, "claim_generation", return_value="a" * 64)
+        generation.start()
+        self.addCleanup(generation.stop)
         heartbeat = mock.patch.object(cli.beads_backend, "heartbeat_issue")
         heartbeat.start()
         self.addCleanup(heartbeat.stop)
@@ -313,6 +316,8 @@ class ReliabilityFix5Tests(unittest.TestCase):
                     }
                 },
             }
+            cli._private_atomic_json(cli._native_claim_generation_path(root, workflow, task),
+                                    cli._claim_generation_binding(issue["metadata"]["agentflow"], "a" * 64))
             results: list[int] = []
 
             def submit() -> None:
@@ -412,6 +417,8 @@ class ReliabilityFix5Tests(unittest.TestCase):
                 _capability_file=str(channel["capability_path"]),
                 _authority_secret=authority_secret,
             )
+            cli._private_atomic_json(cli._native_claim_generation_path(root, workflow, "task-reattach"),
+                                    cli._claim_generation_binding(issue["metadata"]["agentflow"], "a" * 64))
             with mock.patch.object(cli.beads_backend, "get_issue", return_value=issue), \
                  mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None):
                 self.assertEqual(cli.herdr_result(args), 0)
