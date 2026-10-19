@@ -6029,12 +6029,14 @@ def _bound_execution_expiry_snapshot(
     document = controller._load_checkpoint()
     rows = controller.active_tasks()
     admission_phase = checkpoint_backend.admission_phase(document)
+    checkpoint_epoch = document.get("epoch")
     if (
         len(rows) != 1 or rows[0].get("task") != task_id
         or rows[0].get("state") not in {"launched", "running"}
         or not rows[0].get("session_id")
-        or document.get("epoch") != lease.epoch
-        or document.get("lease_token") != lease.token
+        or not isinstance(checkpoint_epoch, int) or isinstance(checkpoint_epoch, bool)
+        or not 0 < checkpoint_epoch <= lease.epoch
+        or document.get("lease_token") != f"{lease.root}/{lease.controller}/{checkpoint_epoch}"
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != lease.controller
         or admission_phase not in {"open", "draining"}
@@ -6168,7 +6170,12 @@ def _bound_execution_expiry_snapshot(
         or contract.get("claim_id") != claim_id
         or contract.get("controller_id") != lease.controller
         or contract.get("continuity_id") != lease.continuity_id
-        or contract.get("lease_epoch") != lease.epoch
+        # Resume rotates the current fence before another checkpoint write.
+        # The canonical credential above proves the current owner; the signed
+        # launch and its unchanged ledger retain their original epoch.
+        or not isinstance(contract.get("lease_epoch"), int)
+        or isinstance(contract.get("lease_epoch"), bool)
+        or not 0 < contract["lease_epoch"] <= checkpoint_epoch
         or contract.get("provider") != record.get("provider")
         or contract.get("model") != record.get("model")
     ):
@@ -6383,7 +6390,10 @@ def _reconcile_pending_bound_execution_identity(
         or str(record.get("model") or "") != str(contract.get("model") or "")
         or contract.get("controller_id") != lease.controller
         or contract.get("continuity_id") != lease.continuity_id
-        or contract.get("lease_epoch") != lease.epoch
+        # Authenticated reattach preserves continuity while rotating its fence.
+        or not isinstance(contract.get("lease_epoch"), int)
+        or isinstance(contract.get("lease_epoch"), bool)
+        or not 0 < contract["lease_epoch"] <= lease.epoch
         or (
             str(record.get("pane_id") or "")
             and str(record.get("pane_id") or "") != str(binding.get("pane_id") or "")
