@@ -363,7 +363,7 @@ class PackagingConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(
             cli, "_version", return_value=("missing", "")
         ), mock.patch.object(cli, "_provider_command", return_value=None), mock.patch.object(
-            cli.beads_backend, "version", return_value=((1, 1, 0), "bd version 1.1.0")
+            cli.beads_backend, "version", return_value=((1, 3, 1), "bd version 1.3.1")
         ), mock.patch.object(cli.beads_backend, "workspace", return_value=None) as workspace:
             root = Path(temp)
             self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)

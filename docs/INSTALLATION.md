@@ -17,8 +17,16 @@ Agentflow supports Python 3.10 or later on macOS and Linux. Install these tools
 before Agentflow:
 
 1. Git for Git-backed projects.
-2. Beads 1.1 or later, with `bd` available on `PATH`.
+2. Beads 1.3.1 or later, with `bd` available on `PATH`.
 3. One or more coding-agent CLIs you intend to use.
+
+The next release requires Beads 1.3.1; older Beads releases are unsupported.
+Beads is an external CLI prerequisite, not a Python package dependency.
+Agentflow uses the `bd` selected by `PATH`, with conventional installation
+paths as a fallback. For an existing store, follow the
+[Beads workspace upgrade procedure](BEADS_UPGRADE.md) before normal commands
+open it. Updating the executable alone does not migrate every workspace or
+restart a running Dolt server.
 
 The [Herdr runtime](https://github.com/herdrdev/herdr) is required for
 persistent external worker sessions launched by an Agentflow controller, but

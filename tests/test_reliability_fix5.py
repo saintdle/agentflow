@@ -22,6 +22,11 @@ from tests import _state_home  # noqa: F401  # external controller authority
 
 
 class ReliabilityFix5Tests(unittest.TestCase):
+    def setUp(self):
+        heartbeat = mock.patch.object(cli.beads_backend, "heartbeat_issue")
+        heartbeat.start()
+        self.addCleanup(heartbeat.stop)
+
     def _attest_model(self, provider: str, session_id: str, model: str) -> None:
         cli.events_backend.EventSpool(cli._state_dir() / "events.jsonl").append(
             cli.events_backend.normalize_event(

@@ -13,7 +13,7 @@ from typing import Any
 from collections.abc import Iterable, Mapping
 
 
-MINIMUM_VERSION = (1, 1, 0)
+MINIMUM_VERSION = (1, 3, 1)
 
 
 class BeadsError(RuntimeError):
@@ -128,6 +128,9 @@ def _is_git_repository(cwd: Path) -> bool:
 
 
 def executable() -> str | None:
+    selected = shutil.which("bd")
+    if selected:
+        return selected
     candidates = (
         Path("/opt/homebrew/bin/bd"),
         Path.home() / ".local/bin/bd",
@@ -148,7 +151,7 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     command = executable()
     if not command:
-        raise BeadsError("Beads CLI is unavailable; install stable beads 1.1.0 or later.")
+        raise BeadsError("Beads CLI is unavailable; install stable beads 1.3.1 or later.")
     environment = os.environ.copy()
     environment.setdefault("BD_NON_INTERACTIVE", "1")
     environment.setdefault("DOLT_DISABLE_EVENT_FLUSH", "1")
@@ -157,6 +160,8 @@ def run(
         environment.setdefault("BEADS_DIR", str(local_beads))
     if environment_overrides:
         environment.update(environment_overrides)
+    if arguments and arguments[0] in {"ready", "list"}:
+        preflight_topology(cwd, environment=environment, arguments=arguments)
     try:
         return subprocess.run(
             [command, *arguments],
@@ -225,23 +230,22 @@ def workspace(cwd: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     beads_path = Path(str(value.get("path") or ""))
-    config = beads_path / "config.yaml"
-    try:
-        if re.search(
-            r"(?m)^\s*dolt\.shared-server\s*:\s*true\s*$",
-            config.read_text(encoding="utf-8"),
-        ):
-            value["_agentflow_mode"] = "shared-server"
-    except OSError:
-        pass
+    mode = _configured_mode(beads_path)
+    if mode:
+        value["_agentflow_mode"] = mode
     if not _is_git_repository(cwd):
         value["_agentflow_gitless"] = True
     return value
 
 
 def workspace_mode(data: dict[str, Any]) -> str:
-    if data.get("_agentflow_mode") == "shared-server":
-        return "shared-server"
+    mode = data.get("_agentflow_mode") or data.get("dolt_mode")
+    if mode in {"embedded", "server", "shared-server", "proxied-server"}:
+        return str(mode)
+    if data.get("path"):
+        mode = _configured_mode(Path(str(data["path"])))
+        if mode:
+            return mode
     database_path = str(data.get("database_path") or "")
     if "shared-server" in database_path:
         return "shared-server"
@@ -250,6 +254,75 @@ def workspace_mode(data: dict[str, Any]) -> str:
     if "embeddeddolt" in database_path:
         return "embedded"
     return "unknown"
+
+
+def _configured_mode(beads_dir: Path) -> str:
+    """Read topology without opening the database or starting a server."""
+    try:
+        metadata = json.loads((beads_dir / "metadata.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        metadata = {}
+    mode = metadata.get("dolt_mode", "") if isinstance(metadata, dict) else ""
+    if mode == "proxied-server":
+        return mode
+    try:
+        lines = (beads_dir / "config.yaml").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    # Beads emits both dotted top-level keys and a nested dolt mapping. Only
+    # inspect this boolean; unrelated YAML sections must not select topology.
+    in_dolt = False
+    child_indent: int | None = None
+    for line in lines:
+        content = line.split("#", 1)[0].rstrip()
+        if not content.strip():
+            continue
+        if not content[0].isspace():
+            in_dolt = bool(re.fullmatch(r"dolt\s*:\s*", content))
+            child_indent = None
+            if re.fullmatch(r"dolt\.shared-server\s*:\s*true\s*", content, re.IGNORECASE):
+                return "shared-server"
+            continue
+        indent = len(content) - len(content.lstrip())
+        if in_dolt and child_indent is None:
+            child_indent = indent
+        if in_dolt and indent == child_indent and re.fullmatch(r"\s*shared-server\s*:\s*true\s*", content, re.IGNORECASE):
+            return "shared-server"
+    return str(mode) if mode in {"embedded", "server", "shared-server"} else ""
+
+
+def preflight_topology(
+    cwd: Path, *, environment: Mapping[str, str] | None = None,
+    arguments: Iterable[str] = (),
+) -> None:
+    """Reject unsupported row caps before a proxied discovery invocation."""
+    environment = os.environ if environment is None else environment
+    selected = environment.get("BEADS_DIR")
+    beads_dir = Path(selected) if selected else _local_beads_dir(cwd)
+    if beads_dir is not None and not beads_dir.is_absolute():
+        beads_dir = cwd / beads_dir
+    if beads_dir is None:
+        return
+    # Worktrees may redirect to the repository's actual store.
+    seen: set[Path] = set()
+    while (beads_dir / "redirect").is_file():
+        if beads_dir.resolve() in seen:
+            raise BeadsError("Beads workspace redirect cycle; repair .beads/redirect before discovery")
+        seen.add(beads_dir.resolve())
+        target = Path((beads_dir / "redirect").read_text(encoding="utf-8").strip())
+        beads_dir = target if target.is_absolute() else beads_dir / target
+    if _configured_mode(beads_dir) != "proxied-server":
+        return
+    arguments = tuple(arguments)
+    capped = bool(environment.get("BEADS_MAX_ROWS")) or any(
+        value == "--max-rows" or value.startswith("--max-rows=") for value in arguments
+    )
+    if capped:
+        raise BeadsError(
+            "Proxied-server discovery does not support BEADS_MAX_ROWS/--max-rows. "
+            "Use an embedded/server workspace to enforce the cap, or explicitly "
+            "remove the cap after reviewing the query. Agentflow will not discard it."
+        )
 
 
 def initialize(
@@ -293,11 +366,30 @@ def initialize(
     return "created", created
 
 
-def get_issue(cwd: Path, issue_id: str) -> dict[str, Any]:
-    value = _json_output(run(cwd, "show", issue_id, "--json"), f"bd show {issue_id}")
+def get_issue(cwd: Path, issue_id: str, *, brief_dependencies: bool = False) -> dict[str, Any]:
+    projection = ("--brief-deps",) if brief_dependencies else ()
+    value = _json_output(run(cwd, "show", issue_id, *projection, "--json"), f"bd show {issue_id}")
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise BeadsError(f"Bead not found or ambiguous: {issue_id}")
-    return value[0]
+    issue = value[0]
+    if brief_dependencies:
+        issue["_agentflow_projection"] = "brief-deps"
+    return issue
+
+
+def heartbeat_issue(cwd: Path, task: str, *, actor: str) -> None:
+    """Renew one native claim, checking the exact identity in the CLI receipt."""
+    if not task or not actor:
+        raise BeadsError("Native task heartbeat requires an exact task and actor")
+    value = _json_output(
+        run(cwd, "heartbeat", task, "--actor", actor, "--json", timeout=10),
+        "bd heartbeat",
+    )
+    if not isinstance(value, dict) or any(
+        value.get(field) != expected
+        for field, expected in (("id", task), ("status", "heartbeat"), ("owner", actor))
+    ):
+        raise BeadsError("Native task heartbeat did not confirm the exact task and actor")
 
 
 def root_descendants(cwd: Path, root: str) -> list[dict[str, Any]]:
@@ -312,7 +404,7 @@ def root_descendants(cwd: Path, root: str) -> list[dict[str, Any]]:
     if not root:
         raise BeadsError("workflow root is required")
     value = _json_output(
-        run(cwd, "list", "--all", "--json"), "bd list --all"
+        run(cwd, "list", "--all", "--brief", "--limit", "0", "--json"), "bd list --all"
     )
     if isinstance(value, dict):
         raw = value.get("issues", [])
@@ -354,6 +446,7 @@ def root_descendants(cwd: Path, root: str) -> list[dict[str, Any]]:
             current = parent_of(ancestor)
         if reached:
             item["workflow_root"] = root
+            item["_agentflow_projection"] = "brief"
             descendants.append(item)
     return sorted(descendants, key=lambda item: str(item.get("id") or ""))
 
@@ -365,7 +458,7 @@ def claim_ready(
     labels: list[str],
     actor: str,
 ) -> dict[str, Any] | None:
-    common = ["ready", "--parent", parent, "--limit", "1", "--sort", "priority"]
+    common = ["ready", "--parent", parent, "--limit", "1", "--sort", "priority", "--brief"]
     for label in labels:
         common.extend(["--label", label])
 
@@ -380,9 +473,8 @@ def claim_ready(
             return value
         raise BeadsError(f"{operation} returned an unexpected JSON shape")
 
-    # Beads 1.1 errors when --claim is combined with an assigned filter that has
-    # no matches. Assigned work is already exclusive to this actor, so inspect it
-    # first and claim the exact ID. Keep --claim atomic for the shared queue.
+    # Brief discovery is never execution authority. Fetch the selected task in
+    # full and exact-claim it; a race must fail rather than select another task.
     assigned_value = _json_output(
         run(cwd, *common, "--assignee", actor, "--json"),
         "bd ready --assignee",
@@ -394,31 +486,23 @@ def claim_ready(
         issue_id = str(assigned[0].get("id") or "")
         if not issue_id:
             raise BeadsError("bd ready --assignee returned an issue without an ID")
-        result = run(cwd, "update", issue_id, "--claim", "--actor", actor)
-        if result.returncode:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            raise BeadsError(
-                f"bd update --claim failed: {detail[-1] if detail else result.returncode}"
-            )
-        return get_issue(cwd, issue_id)
+        return claim_issue_exact(cwd, issue_id, root=parent, actor=actor, labels=labels).issue
 
     shared_value = _json_output(
         run(
             cwd,
             *common,
             "--unassigned",
-            "--claim",
             "--json",
-            "--actor",
-            actor,
         ),
-        "bd ready --claim",
+        "bd ready --unassigned",
     )
-    shared = issues_from(shared_value, "bd ready --claim")
+    shared = issues_from(shared_value, "bd ready --unassigned")
     if shared:
         if len(shared) != 1 or not isinstance(shared[0], dict):
-            raise BeadsError("bd ready --claim returned an ambiguous result")
-        return shared[0]
+            raise BeadsError("bd ready --unassigned returned an ambiguous result")
+        issue_id = str(shared[0].get("id") or "")
+        return claim_issue_exact(cwd, issue_id, root=parent, actor=actor, labels=labels).issue
     return None
 
 
@@ -737,8 +821,11 @@ def create_issue(
     return value
 
 
-def close_issue(cwd: Path, issue_id: str, reason: str) -> None:
-    result = run(cwd, "close", issue_id, "--reason", reason)
+def close_issue(cwd: Path, issue_id: str, reason: str, *, actor: str = "") -> None:
+    arguments = ["close", issue_id, "--reason", reason]
+    if actor:
+        arguments.extend(["--actor", actor])
+    result = run(cwd, *arguments)
     if result.returncode:
         detail = (result.stderr or result.stdout).strip().splitlines()
         raise BeadsError(

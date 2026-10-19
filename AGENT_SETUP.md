@@ -12,7 +12,7 @@ indexes are unrelated projects and must not be installed.
 ## Installation contract
 
 1. Confirm the platform is supported, Python is 3.10 or later, `git` and
-   Beads 1.1 or later are available, and at least one intended provider CLI is
+   Beads 1.3.1 or later are available, and at least one intended provider CLI is
    installed. Herdr is required for persistent external worker sessions managed
    by the Agentflow controller, but not for planning-only or native-subagent
    workflows. Report other optional tools separately.

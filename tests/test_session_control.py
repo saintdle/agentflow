@@ -178,6 +178,7 @@ class SessionControlTests(unittest.TestCase):
                 cli._controller_credentials(args, lease)
                 controller.halt("blocked", "USER_ACTION_REQUIRED: stop", lease=lease)
                 with (
+                    mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1"),
                     mock.patch.object(cli.beads_backend, "get_issue", return_value={"id": "af-root"}),
                     mock.patch.object(cli.beads_backend, "claim_ready") as claim_ready,
                     mock.patch.object(cli.beads_backend, "root_descendants") as descendants,

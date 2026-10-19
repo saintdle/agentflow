@@ -187,10 +187,10 @@ class ControlledReworkFormulaTests(unittest.TestCase):
             if (
                 version.returncode
                 or match is None
-                or tuple(map(int, match.groups())) < (1, 1, 0)
+                or tuple(map(int, match.groups())) < (1, 3, 1)
             ):
                 self.skipTest(
-                    "Beads 1.1.0 or later is required for the CLI integration fixture"
+                    "Beads 1.3.1 or later is required for the CLI integration fixture"
                 )
 
             def run(*command: str) -> str:

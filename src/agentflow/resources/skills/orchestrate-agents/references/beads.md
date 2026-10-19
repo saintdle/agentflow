@@ -29,8 +29,9 @@ An existing workspace is preserved rather than silently migrated. All Git worktr
 
 Git is optional. In a Gitless folder, workers may execute concurrently on
 disjoint output paths while the controller remains the sole graph writer.
-Agentflow falls back to embedded mode if shared-server is requested because
-Beads 1.1 cannot reliably rediscover a Gitless shared-server workspace. Omit
+Agentflow falls back to embedded mode for Gitless shared-server initialization:
+Beads 1.3.1 does not persist that workspace's metadata with explicit `BEADS_DIR`.
+Existing workspaces keep their topology. Omit
 branch, commit, issue, PR, and merge claims and serialize overlapping writes.
 Agentflow creates a `.gitignore` pre-emptively so transient state remains local
 if the folder later becomes a repository. For direct Beads commands, use the

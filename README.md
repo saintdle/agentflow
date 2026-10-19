@@ -101,7 +101,7 @@ boundaries.
 ## Requirements
 
 - Python 3.10 or later.
-- [Beads](https://github.com/steveyegge/beads) 1.1 or later and its `bd` CLI.
+- [Beads](https://github.com/steveyegge/beads) 1.3.1 or later and its `bd` CLI.
 - Git for Git-backed projects.
 - At least one supported coding-agent CLI for delegated work: Codex, Claude
   Code, or GitHub Copilot CLI.

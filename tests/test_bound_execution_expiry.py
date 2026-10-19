@@ -13,6 +13,16 @@ from tests.test_cli import ValidLaunch, _controller_args, _run_controller_json
 
 
 class BoundExecutionExpiryTests(unittest.TestCase):
+    def setUp(self):
+        # Native Beads is an external boundary in these provider/expiry tests.
+        for name, value in (("heartbeat_issue", None), ("require_supported_version", "bd version 1.3.1")):
+            patch = mock.patch.object(cli.beads_backend, name, return_value=value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        renewal = mock.patch.object(cli, "_renew_native_task_leases", return_value=[])
+        renewal.start()
+        self.addCleanup(renewal.stop)
+
     @contextlib.contextmanager
     def _launched_budgeted_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
