@@ -179,7 +179,7 @@ def inspect(dist: Path, expected_version: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("dist", type=Path)
-    parser.add_argument("--expected-version", default="0.0.10")
+    parser.add_argument("--expected-version", default="0.0.11")
     args = parser.parse_args()
     try:
         inspect(args.dist, args.expected_version)
