@@ -186,7 +186,7 @@ class ControllerTests(unittest.TestCase):
                     accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
                 )
 
-    def test_v3_owner_acceptance_and_lookup_preserve_exact_checkpoint_bytes(self) -> None:
+    def test_v3_owner_acceptance_rejects_before_signing_and_preserves_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, lease = self._controller_with_unknown_causes(Path(temporary))
             legacy = json.loads(controller.checkpoint_path.read_bytes())
@@ -195,17 +195,14 @@ class ControllerTests(unittest.TestCase):
             controller.checkpoint_path.write_text(json.dumps(legacy), encoding="utf-8")
             checkpoint_before = controller.checkpoint_path.read_bytes()
 
-            receipt, duplicate = controller.accept_unresolved_drain_causes(
-                "workflow", "Historical cause provenance remains unavailable.",
-                accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
-            )
-            current = controller.unresolved_drain_cause_acceptance(
-                "workflow", authority_secret=self._authority_secret, lease=lease,
-            )
-
-            self.assertFalse(duplicate)
+            state_before = controller.state_path.read_bytes()
+            with self.assertRaisesRegex(ControllerError, "version 4 checkpoint"):
+                controller.accept_unresolved_drain_causes(
+                    "workflow", "Historical cause provenance remains unavailable.",
+                    accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+                )
             self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
-            self.assertEqual(current, receipt)
+            self.assertEqual(controller.state_path.read_bytes(), state_before)
             self.assertEqual(json.loads(checkpoint_before)["version"], 3)
 
     def test_owner_acceptance_rejects_unsigned_tampered_and_mismatched_bindings(self) -> None:

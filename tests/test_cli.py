@@ -4568,6 +4568,44 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 ])
                 self.assertEqual(controller.checkpoint_path.read_bytes(), replay_checkpoint_before)
 
+                old_proof = cli._read_controller_credentials(
+                    cli._resume_key_path(args),
+                )["resume_secret"]
+                current_lease = controller.reattach_for_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id,
+                    ready_task=ready["id"],
+                    checkpoint_epoch=fixture.lease.epoch,
+                    authority_secret=fixture.authority_secret,
+                    resume_proof=old_proof,
+                    drain_resolution_authorization=signed_authorization,
+                    readiness_verifier=lambda _current: ready["id"],
+                    persist_credentials=lambda candidate: cli._controller_credentials(args, candidate),
+                )
+                self.assertEqual(
+                    json.loads(controller.state_path.read_text())["epoch"], current_lease.epoch,
+                )
+                self.assertEqual(controller._load_checkpoint()["epoch"], fixture.lease.epoch)
+                resume_args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root,
+                    continue_after_cancelled_preidentity=fixture.task_id,
+                    continue_task=ready["id"], once=True, deadline=5.0,
+                )
+
+                def one_step(_args, _controller, root, _lease, *, operation):
+                    return ({"operation": operation, "ok": True, "root": str(root)}, True)
+
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready), \
+                     mock.patch.object(cli, "_verify_current_ready_continuation_target", side_effect=lambda _root, _workflow, selected, _controller: selected), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                    public_retry = _run_controller_json(cli.controller_resume, resume_args)
+                self.assertTrue(public_retry["ok"], public_retry)
+
+
     def test_closed_preidentity_retirement_accepts_matching_modern_generation_seal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -4824,6 +4862,21 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(controller.state_path.read_bytes(), controller_state_before)
                 self.assertEqual(baseline["state_path"].read_bytes(), herdr_state_before)
 
+                tampered_checkpoint = json.loads(checkpoint_before)
+                tampered_checkpoint["terminal_reason"] = "changed after signed retirement"
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, tampered_checkpoint)
+                tamper_probe = mock.Mock()
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", tamper_probe):
+                    tampered_replay = _run_controller_json(args.func, args)
+                self.assertFalse(tampered_replay["ok"], tampered_replay)
+                self.assertIn("full-snapshot output", tampered_replay["error"])
+                self.assertEqual(tamper_probe.call_count, 0)
+                self.assertEqual(controller.state_path.read_bytes(), controller_state_before)
+                self.assertEqual(baseline["state_path"].read_bytes(), herdr_state_before)
+                controller.checkpoint_path.write_bytes(checkpoint_before)
+
                 changed_history_probe = mock.Mock()
                 with fixture.beads_patches(), \
                      mock.patch.object(cli.beads_backend, "claim_generation", return_value="b" * 64), \
@@ -4836,6 +4889,138 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
                 self.assertEqual(controller.state_path.read_bytes(), controller_state_before)
                 self.assertEqual(baseline["state_path"].read_bytes(), herdr_state_before)
+
+                # Keep both owner receipts available across the two crash
+                # boundaries in an authenticated continuation.
+                accept_args = cli.build_parser().parse_args([
+                    "controller", "accept-unresolved-drain-causes",
+                    "--root", str(fixture.root), "--workflow-root", fixture.workflow_root,
+                    "--acknowledge-unresolved-causes",
+                    "--reason", "Accept this historical cause set as unresolved.", "--json",
+                ])
+                accepted = _run_controller_json(
+                    cli.controller_accept_unresolved_drain_causes, accept_args,
+                )
+                self.assertTrue(accepted["ok"], accepted)
+                ready = {
+                    "id": "distinct-ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                    ready["id"]: ready,
+                }
+
+                def run_ready(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": ready["id"]}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+
+                authorization_out: dict[str, Any] = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, fixture.lease,
+                            authority_secret=fixture.authority_secret,
+                            resolution_authorization_out=authorization_out,
+                        ),
+                        ready["id"],
+                    )
+                signed_authorization = authorization_out["authorization"]
+                credentials_path = cli._resume_key_path(args)
+                old_proof = cli._read_controller_credentials(credentials_path)["resume_secret"]
+                current_lease = controller.reattach_for_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id,
+                    ready_task=ready["id"],
+                    checkpoint_epoch=fixture.lease.epoch,
+                    authority_secret=fixture.authority_secret,
+                    resume_proof=old_proof,
+                    drain_resolution_authorization=signed_authorization,
+                    readiness_verifier=lambda _current: ready["id"],
+                    persist_credentials=lambda candidate: cli._controller_credentials(args, candidate),
+                )
+                current_proof = cli._read_controller_credentials(credentials_path)["resume_secret"]
+                pending = controller.pending_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id,
+                    ready_task=ready["id"],
+                    authority_secret=fixture.authority_secret,
+                    resume_proof=current_proof,
+                )
+                self.assertIsNotNone(pending)
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, current_lease,
+                            authority_secret=fixture.authority_secret,
+                            resolution_authorization=signed_authorization,
+                            pending_continuation=pending,
+                        ),
+                        ready["id"],
+                    )
+                controller.acknowledge_cancelled_preidentity_halt(
+                    fixture.workflow_root, fixture.task_id, ready["id"],
+                    authority_secret=fixture.authority_secret,
+                    resolution_authorization=signed_authorization,
+                    lease=current_lease,
+                    readiness_verifier=lambda _current: ready["id"],
+                )
+                pending = controller.pending_explicit_continuation(
+                    workflow_root=fixture.workflow_root,
+                    cancelled_task=fixture.task_id,
+                    ready_task=ready["id"],
+                    authority_secret=fixture.authority_secret,
+                    resume_proof=current_proof,
+                )
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, current_lease,
+                            authority_secret=fixture.authority_secret,
+                            allow_staged_selection=True,
+                            resolution_authorization=signed_authorization,
+                            pending_continuation=pending,
+                        ),
+                        ready["id"],
+                    )
+                resume_args = _controller_args(
+                    fixture.root, workflow_root=fixture.workflow_root,
+                    continue_after_cancelled_preidentity=fixture.task_id,
+                    continue_task=ready["id"], once=True, deadline=5.0,
+                )
+
+                def one_step(_args, _controller, root, _lease, *, operation):
+                    return ({"operation": operation, "ok": True, "root": str(root)}, True)
+
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready), \
+                     mock.patch.object(cli, "_verify_current_ready_continuation_target", side_effect=lambda _root, _workflow, selected, _controller: selected), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                    public_retry = _run_controller_json(cli.controller_resume, resume_args)
+                self.assertTrue(public_retry["ok"], public_retry)
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]):
+                    cli._verify_retired_preidentity_descendant(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                        fixture.task_issue, controller, current_lease,
+                        authority_secret=fixture.authority_secret,
+                    )
 
     def test_closed_retirement_rejection_preserves_legacy_checkpoint_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4859,7 +5044,7 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 args = cli.build_parser().parse_args([
                     "controller", "retire-closed-preidentity", "--root", str(fixture.root),
                     "--workflow-root", fixture.workflow_root, "--task", fixture.task_id,
-                    "--launch-id", str(contract["launch_id"]), "--pane-id", "wrong-pane", "--json",
+                    "--launch-id", str(contract["launch_id"]), "--pane-id", "pane-pending", "--json",
                 ])
                 args._supervisor_lock_path = str(
                     fixture.root / ".agentflow/test-controller-locks/legacy-preflight.lock"
@@ -4877,7 +5062,7 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                     result = _run_controller_json(args.func, args)
 
                 self.assertFalse(result["ok"], result)
-                self.assertIn("Herdr record does not match the exact unbound launch", result["error"])
+                self.assertIn("version 4 checkpoint", result["error"])
                 self.assertEqual(pane_probe.call_count, 0)
                 self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
                 self.assertEqual(json.loads(checkpoint_before)["version"], 3)

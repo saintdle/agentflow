@@ -25,6 +25,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Bind closed preidentity retirement receipts to complete checkpoint preimages
+  and planned postimages. Exact-snapshot owner operations now reject legacy
+  checkpoints before signing or migration, and continuation retries retain the
+  original origin and drain-cause receipts across lease rotation.
 - Bind task authority to protected native claim-event identities. Reclaiming and
   regranting to the same actor fences stale launches and authenticated results,
   including a generation change during renewal. Existing unsealed executions

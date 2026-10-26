@@ -2550,9 +2550,9 @@ class RootController:
         with self.fence(lease) as current:
             try:
                 raw_checkpoint = self.checkpoint_path.read_bytes()
-                document = checkpoint.load_checkpoint(self.checkpoint_path, migrate=False)
+                document = checkpoint.parse_current_checkpoint(raw_checkpoint)
             except (OSError, checkpoint.CheckpointError) as exc:
-                raise ControllerError("current checkpoint is missing or malformed") from exc
+                raise ControllerError("exact-snapshot owner acceptance requires a version 4 checkpoint") from exc
             causes = checkpoint._check_drain_causes(document.get("drain_causes"))
             if (
                 checkpoint.admission_phase(document) != "terminal"
@@ -3522,7 +3522,7 @@ class RootController:
         claim_id: str,
         launch_id: str,
         *,
-        commit_cancellation: Callable[[], None],
+        commit_cancellation: Callable[[str], None],
         lease: Lease | str | None = None,
         retirement_reason: str = "expired",
         _abandoned_epoch_repair_authority: Mapping[str, Any] | None = None,
@@ -3550,7 +3550,15 @@ class RootController:
         with self.fence(
             lease, _abandoned_epoch_repair_authority=_abandoned_epoch_repair_authority,
         ) as current:
-            document = self._load_checkpoint()
+            if retirement_reason == "superseded_closed_preidentity":
+                try:
+                    preimage_bytes = self.checkpoint_path.read_bytes()
+                    document = checkpoint.parse_current_checkpoint(preimage_bytes)
+                except (OSError, checkpoint.CheckpointError) as exc:
+                    raise LeaseConflict("closed retirement requires an exact version 4 checkpoint") from exc
+            else:
+                document = self._load_checkpoint()
+                preimage_bytes = self.checkpoint_path.read_bytes()
             expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
             reason = str(document.get("terminal_reason") or "")
             renewal_halt = (
@@ -3588,7 +3596,7 @@ class RootController:
                     self._verify_owner_retired_checkpoint_digest(
                         state=_read_json(self.state_path), authority=_abandoned_epoch_repair_authority,
                     )
-                commit_cancellation()
+                commit_cancellation(hashlib.sha256(preimage_bytes).hexdigest())
                 if retirement_reason == "owner_abandoned_epoch":
                     state = _read_json(self.state_path)
                     pending = state.pop("abandoned_epoch_repair", None)
@@ -3630,6 +3638,8 @@ class RootController:
                 "next_action": "explicitly continue with a distinct ready task",
                 "last_check": retired_check,
             })
+            planned_checkpoint_bytes = checkpoint.serialize_checkpoint(document)
+            planned_checkpoint_sha256 = hashlib.sha256(planned_checkpoint_bytes).hexdigest()
             retired_digest = ""
             if retirement_reason == "owner_abandoned_epoch":
                 state = _read_json(self.state_path)
@@ -3656,8 +3666,10 @@ class RootController:
             # Cross-file crash semantics are deliberate: the exact checkpoint
             # output is signed into the protected intent first, then Herdr is
             # atomically fenced, and only then is the checkpoint pointer cleared.
-            commit_cancellation()
+            commit_cancellation(planned_checkpoint_sha256)
             result = self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+            if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != planned_checkpoint_sha256:
+                raise LeaseConflict("retired checkpoint bytes differ from the authenticated planned output")
             if retirement_reason == "owner_abandoned_epoch":
                 if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != retired_digest:
                     raise LeaseConflict("retired checkpoint bytes do not match the signed owner-repair output")
@@ -3700,7 +3712,7 @@ class RootController:
         claim_id: str,
         launch_id: str,
         *,
-        commit_cancellation: Callable[[], None],
+        commit_cancellation: Callable[[str], None],
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Retire an authenticated legacy launch after its owning scope ends."""

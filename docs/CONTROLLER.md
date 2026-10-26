@@ -120,6 +120,9 @@ dispatch work. Present seals must still match exactly; the legacy
 same retirement requires the same signed decision and unchanged evidence.
 Typed drain causes still require their supported authenticated resolution
 paths. Unknown causes require the separate owner decision described below.
+Closed retirement and owner acceptance require a current version 4 checkpoint.
+They reject legacy checkpoint versions before signing or migration so a receipt
+cannot be detached from the bytes it records.
 
 Retire the closed launch first. Then inspect the resulting blocked checkpoint.
 If its complete drain-cause set is still unknown, an owner may explicitly
@@ -147,10 +150,15 @@ With the exact acceptance recorded, use the explicit continuation command in
 the expired preidentity recovery section, passing this task as `TASK` and a
 distinct ready descendant as `READY_TASK`. Continuation still checks the
 signed retirement, root ancestry, unchanged claim-history evidence, budgets,
-absence of other active work, and the exact ready target. The unresolved-origin
-receipt only authenticates negative retirement; it does not start continuation
-or authorize work by itself. Without matching owner receipts, unknown causes
-remain a blocker.
+absence of other active work, and the exact ready target. The signed retirement
+binds both the original checkpoint fingerprint and the complete retired
+checkpoint output. Its origin decision and the drain-cause decision remain
+separate signed receipts. During an interrupted continuation, Agentflow checks
+the pending intent against the original lease and retired checkpoint before it
+accepts either the old checkpoint or its exact staged successor. The unresolved
+origin receipt only authenticates negative retirement; it does not start
+continuation or authorize work by itself. Without matching owner receipts,
+unknown causes remain a blocker.
 
 If this explicit continuation is interrupted while its protected credential
 is being rotated, rerun the same command with the same task IDs. Ordinary

@@ -74,6 +74,21 @@ class AdmissionPhaseTests(unittest.TestCase):
             self.assertEqual(cause["diagnostic_sha256"], expected)
             self.assertEqual(migrated_halt["version"], checkpoint.SCHEMA_VERSION)
 
+    def test_exact_snapshot_reader_rejects_v3_without_migrating_and_serializer_matches_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint.json"
+            legacy = self._document(version=3, state="blocked", status="blocked", terminal=True)
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            before = path.read_bytes()
+            with self.assertRaisesRegex(checkpoint.CheckpointError, "version 4 checkpoint"):
+                checkpoint.load_current_checkpoint(path)
+            self.assertEqual(path.read_bytes(), before)
+
+            current = checkpoint.build_checkpoint(self._document(state="running", status="running"))
+            expected = checkpoint.serialize_checkpoint(current)
+            checkpoint.write_checkpoint(path, current)
+            self.assertEqual(path.read_bytes(), expected)
+
     def test_drain_cause_schema_is_closed_and_bounded(self) -> None:
         valid = {
             "cause_id": "cause-1", "kind": "unknown",
