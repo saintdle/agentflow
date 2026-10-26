@@ -69,6 +69,54 @@ controller incarnation, root, and absence of other active work before
 reopening the checkpoint. This flow does not close the cancelled Beads task
 or claim a provider result for it.
 
+## Expired launch for a task already closed in Beads
+
+If the exact task is already closed while its signed preidentity launch still
+has an issued, unbound return channel, an operator can retire that launch with
+the current protected controller credential:
+
+```sh
+agentflow controller retire-closed-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID
+```
+
+The command requires the exact owned task to remain a descendant of the
+workflow root, the canonical credential for the current active controller
+epoch, and a signed launch from an earlier positive epoch whose protected
+budget ledger proves expiry. The checkpoint must match the current controller
+epoch, and the task must be the sole unbound identity-pending claim. The
+command also verifies the native claim-generation seal, the unbound Herdr
+record, absence of a result, and Herdr's structured `pane_not_found`
+response. It records a signed budgeted retirement and revokes the old return
+channel before placing the controller checkpoint in a halted state. The task
+stays closed with its claim metadata and fence evidence intact; the original
+attempt and budget remain unchanged. Retries finish the same disposition after
+an interrupted checkpoint write.
+
+Some historical closed claims predate the native claim-generation seal. Only
+for a missing seal, an operator can explicitly acknowledge that limit:
+
+```sh
+agentflow controller retire-closed-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID \
+  --acknowledge-missing-native-generation
+```
+
+The command records the current Beads claim-history digest in its signed
+retirement audit and requires that digest to remain unchanged on retry and
+continuation. This is an observation made at retirement, not proof that the
+old launch was bound to that history. The command does not create a generation
+seal. A present seal must still match exactly, and a missing seal without this
+explicit acknowledgement remains an error. Continuation still requires all
+recorded drain causes to be resolved by their supported authenticated paths;
+unclassified causes remain a blocker. When those gates pass, use the explicit
+continuation command documented in the expired preidentity recovery section,
+passing this task as `TASK` and a distinct ready descendant as `READY_TASK`.
+
 If this explicit continuation is interrupted while its protected credential
 is being rotated, rerun the same command with the same task IDs. Ordinary
 controller start, resume, supervise, recovery, stop, progress, rotate, and

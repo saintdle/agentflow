@@ -233,6 +233,20 @@ class FencedLease(LeaseConflict):
     """The lease epoch/token is no longer current."""
 
 
+def native_claim_renewal_halt_reason(task_ids: Iterable[str]) -> str:
+    """Return the exact halt reason written when native claim renewal fails."""
+    selected = ", ".join(str(task_id) for task_id in task_ids)
+    return (
+        "USER_ACTION_REQUIRED: native Beads task claim renewal failed for "
+        f"{selected}; launch and result authority are fenced. Inspect live workers before recovery."
+    )
+
+
+def is_native_claim_renewal_halt(document: Mapping[str, Any], task_id: str) -> bool:
+    """Match only the exact single-task renewal halt, with no free-form suffix."""
+    return str(document.get("terminal_reason") or "") == native_claim_renewal_halt_reason((task_id,))
+
+
 class RootViolation(ControllerError):
     """A scheduler input is not an exact descendant of the approved root."""
 
@@ -3089,7 +3103,10 @@ class RootController:
         disposition without accepting a late result.
         """
 
-        if retirement_reason not in {"expired", "superseded_legacy_scope", "owner_abandoned_epoch"}:
+        if retirement_reason not in {
+            "expired", "superseded_legacy_scope", "owner_abandoned_epoch",
+            "superseded_closed_preidentity",
+        }:
             raise ControllerError("unsupported preidentity retirement reason")
         if (retirement_reason == "owner_abandoned_epoch") != (
             _abandoned_epoch_repair_authority is not None
@@ -3104,6 +3121,10 @@ class RootController:
             document = self._load_checkpoint()
             expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
             reason = str(document.get("terminal_reason") or "")
+            renewal_halt = (
+                retirement_reason == "superseded_closed_preidentity"
+                and is_native_claim_renewal_halt(document, task_id)
+            )
             rows = _active_tasks_from_checkpoint(document, self.root)
             retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
             terminal_halt = (
@@ -3146,8 +3167,10 @@ class RootController:
                         raise LeaseConflict("completed abandoned-epoch repair lost its signed intent")
                 return self._result(document, resumed=True)
             eligible = (
-                ((terminal_halt and reason.startswith(expected_reason)) or retained_draining)
-                and (retirement_reason == "expired" or retained_draining)
+                ((terminal_halt and (
+                    reason.startswith(expected_reason) or renewal_halt
+                )) or retained_draining)
+                and (retirement_reason in {"expired", "superseded_closed_preidentity"} or retained_draining)
                 and str(document.get("root") or "") == self.root
                 and str(document.get("controller") or "") == self.controller
                 and len(rows) == 1
