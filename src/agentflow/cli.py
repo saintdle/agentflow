@@ -3083,6 +3083,22 @@ def _has_matching_drain_resolution_audit(
     """
     try:
         state = _read_json_value(str(controller.state_path))
+        unresolved_acceptance = resolution_authorization.get("unresolved_cause_acceptance")
+        if isinstance(unresolved_acceptance, Mapping):
+            accepted = controller_backend._matching_unresolved_cause_acceptance(
+                state, unresolved_acceptance, authority_secret,
+            ) if isinstance(state, Mapping) else None
+            if accepted is None:
+                return False
+            archived_causes = checkpoint_backend._check_drain_causes(accepted.get("causes"))
+            return bool(
+                (causes is None or archived_causes == causes)
+                and [cause["cause_id"] for cause in archived_causes]
+                == resolution_authorization.get("cause_ids")
+                and controller_backend._drain_causes_digest(archived_causes)
+                == resolution_authorization.get("causes_sha256")
+                and accepted.get("receipt") == dict(unresolved_acceptance)
+            )
         audit = state.get("drain_audit") if isinstance(state, Mapping) else None
         if (
             not isinstance(audit, list)
@@ -3182,6 +3198,7 @@ def _new_drain_resolution_authorization(
     contract: Mapping[str, Any],
     causes: list[dict[str, str]],
     authority_secret: str,
+    unresolved_cause_acceptance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     disposition = (
         record.get("execution_disposition")
@@ -3213,6 +3230,8 @@ def _new_drain_resolution_authorization(
         "retired_checkpoint_token": retired_checkpoint.get("lease_token"),
         "retired_checkpoint_last_check": retired_checkpoint.get("last_check"),
     }
+    if unresolved_cause_acceptance is not None:
+        payload["unresolved_cause_acceptance"] = dict(unresolved_cause_acceptance)
     payload["authority_hmac"] = _authority_mac(
         authority_secret, payload, domain="drain-resolution-authorization-v1",
     )
@@ -3274,6 +3293,48 @@ def _verify_drain_resolution_authorization(
             "ready_task": ready_task,
             **retired_fields,
         }
+        unresolved_acceptance = payload.get("unresolved_cause_acceptance")
+        expected_payload_fields = {
+            "schema", "root", "controller", "workflow_root", "continuity_id",
+            "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
+            "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
+            "ready_task", "intent_id", "retired_checkpoint_sha256",
+            "retired_checkpoint_epoch", "retired_checkpoint_token",
+            "retired_checkpoint_last_check",
+        } | ({"unresolved_cause_acceptance"} if unresolved_acceptance is not None else set())
+        has_unknown = any(cause["kind"] == "unknown" for cause in causes)
+        if staged_selection and isinstance(unresolved_acceptance, Mapping):
+            accepted = controller_backend._matching_unresolved_cause_acceptance(
+                state, unresolved_acceptance, authority_secret,
+            ) if isinstance(state, Mapping) else None
+            archived_causes = (
+                checkpoint_backend._check_drain_causes(accepted.get("causes"))
+                if accepted is not None else []
+            )
+            if (
+                accepted is None
+                or [cause["cause_id"] for cause in archived_causes] != payload.get("cause_ids")
+                or controller_backend._drain_causes_digest(archived_causes)
+                != payload.get("causes_sha256")
+                or accepted.get("receipt") != dict(unresolved_acceptance)
+            ):
+                return False
+        elif has_unknown:
+            if not isinstance(unresolved_acceptance, Mapping):
+                return False
+            controller_backend._validate_unresolved_cause_acceptance(
+                unresolved_acceptance, authority_secret,
+                root=controller.root, controller=controller.controller,
+                workflow_root=workflow_root, continuity_id=lease.continuity_id,
+                lease_epoch=payload.get("lease_epoch"),
+                lease_token=str(payload.get("lease_token") or ""),
+                checkpoint_sha256=str(payload.get("retired_checkpoint_sha256") or ""),
+                checkpoint_epoch=payload.get("retired_checkpoint_epoch"),
+                checkpoint_token=str(payload.get("retired_checkpoint_token") or ""),
+                causes=causes,
+            )
+        elif unresolved_acceptance is not None:
+            return False
         rotated = bool(
             staged_selection and isinstance(pending, Mapping)
             and pending.get("drain_resolution_authorization") == dict(authorization)
@@ -3294,14 +3355,7 @@ def _verify_drain_resolution_authorization(
             and pending.get("token") == lease.token
         )
         return bool(
-            set(payload) == {
-                "schema", "root", "controller", "workflow_root", "continuity_id",
-                "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
-                "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
-                "ready_task", "intent_id", "retired_checkpoint_sha256",
-                "retired_checkpoint_epoch", "retired_checkpoint_token",
-                "retired_checkpoint_last_check",
-            }
+            set(payload) == expected_payload_fields
             and all(payload.get(key) == value for key, value in expected.items())
             and isinstance(payload.get("lease_epoch"), int)
             and not isinstance(payload.get("lease_epoch"), bool)
@@ -3314,7 +3368,6 @@ def _verify_drain_resolution_authorization(
                 or (
                     payload.get("cause_ids") == [cause["cause_id"] for cause in causes]
                     and payload.get("causes_sha256") == controller_backend._drain_causes_digest(causes)
-                    and not any(cause["kind"] == "unknown" for cause in causes)
                 )
             )
             and epoch_ok
@@ -3451,6 +3504,7 @@ def _verify_cancelled_preidentity_continuation(
     if controller.session_ledger().get("blocked"):
         raise controller_backend.ControllerError("cannot continue a blocked controller budget")
     prior_causes: list[dict[str, str]] = []
+    unresolved_acceptance: Mapping[str, Any] | None = None
     if bound_expired:
         if not _authenticated_expired_bound_execution(
             root, workflow_root, cancelled_task, authority_secret=authority_secret,
@@ -3574,9 +3628,6 @@ def _verify_cancelled_preidentity_continuation(
             raise controller_backend.ControllerError(str(exc)) from exc
     elif str(cancelled_issue.get("parent") or "") != workflow_root:
         raise controller_backend.ControllerError("blocked preidentity task is no longer under the exact workflow root")
-    if closed_scope and any(cause["kind"] == "unknown" for cause in prior_causes):
-        raise controller_backend.ControllerError("closed preidentity continuation has an unknown drain cause")
-
     root_issue = beads_backend.get_issue(root, workflow_root)
     if (
         str(root_issue.get("id") or "") != workflow_root
@@ -3587,10 +3638,56 @@ def _verify_cancelled_preidentity_continuation(
     by_id = {str(row.get("id") or ""): row for row in descendants}
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
+    if any(cause["kind"] == "unknown" for cause in prior_causes):
+        if not closed_scope:
+            raise controller_backend.ControllerError("preidentity continuation has an unknown drain cause")
+        candidate_acceptance = (
+            resolution_authorization.get("unresolved_cause_acceptance")
+            if isinstance(resolution_authorization, Mapping) else None
+        )
+        if isinstance(candidate_acceptance, Mapping):
+            unresolved_acceptance = dict(candidate_acceptance)
+        elif not staged_selection:
+            unresolved_acceptance = controller.unresolved_drain_cause_acceptance(
+                workflow_root, authority_secret=authority_secret, lease=lease,
+            )
+        if not isinstance(unresolved_acceptance, Mapping):
+            raise controller_backend.ControllerError(
+                "closed preidentity continuation has an unknown drain cause without explicit owner acceptance"
+            )
+        try:
+            retired_raw = controller.checkpoint_path.read_bytes()
+            controller_backend._validate_unresolved_cause_acceptance(
+                unresolved_acceptance, authority_secret,
+                root=controller.root, controller=controller.controller,
+                workflow_root=workflow_root, continuity_id=lease.continuity_id,
+                lease_epoch=lease.epoch, lease_token=lease.token,
+                checkpoint_sha256=hashlib.sha256(retired_raw).hexdigest(),
+                checkpoint_epoch=document.get("epoch"),
+                checkpoint_token=str(document.get("lease_token") or ""),
+                causes=prior_causes,
+            )
+        except (OSError, controller_backend.ControllerError) as exc:
+            raise controller_backend.ControllerError(
+                "owner acceptance does not match the current unresolved cause snapshot"
+            ) from exc
+        state_snapshot = _read_json_value(str(controller.state_path))
+        archived_acceptance = controller_backend._matching_unresolved_cause_acceptance(
+            state_snapshot, unresolved_acceptance, authority_secret,
+        ) if isinstance(state_snapshot, Mapping) else None
+        if (
+            archived_acceptance is None
+            or archived_acceptance.get("causes") != prior_causes
+        ):
+            raise controller_backend.ControllerError(
+                "owner acceptance has no authenticated audit of the original causes"
+            )
     resolved_failure_tasks: set[str] = set()
     if prior_causes:
         for cause in prior_causes:
             kind = cause["kind"]
+            if kind == "unknown" and closed_scope and unresolved_acceptance is not None:
+                continue
             if kind == "no_ready_work":
                 if cause["provenance"] != "scheduler_no_ready_work":
                     raise controller_backend.ControllerError("prior no-ready cause provenance is unsupported")
@@ -3778,6 +3875,7 @@ def _verify_cancelled_preidentity_continuation(
             cancelled_task=cancelled_task, ready_task=ready_task,
             record=record, contract=contract, causes=authorization_causes,
             authority_secret=authority_secret,
+            unresolved_cause_acceptance=unresolved_acceptance,
         )
     if staged_selection and resolution_authorization.get("cause_ids"):
         if not _has_matching_drain_resolution_audit(
@@ -4640,6 +4738,93 @@ def controller_status(args: argparse.Namespace) -> int:
     ) as exc:
         payload = {"operation": "status", "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS FAILED")
+        return 2
+
+
+def controller_accept_unresolved_drain_causes(args: argparse.Namespace) -> int:
+    """Record the owner's exact-snapshot decision to retain unknown causes as unresolved."""
+    try:
+        _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
+        raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
+        workflow_root = raw_workflow_root.strip()
+        if not workflow_root or workflow_root != raw_workflow_root:
+            raise ValueError("--workflow-root is required as an exact Beads root ID")
+        if str(getattr(args, "resume_token", "") or ""):
+            raise ValueError("owner acceptance requires the canonical protected controller credential")
+        controller, root = _controller_instance(args)
+        key_path = _resume_key_path(args)
+        canonical_path = _resume_key_path(argparse.Namespace(
+            root=str(root), workflow_root=workflow_root, resume_key_file="",
+        ))
+        if key_path != canonical_path:
+            raise controller_backend.LeaseConflict(
+                "owner acceptance requires the canonical protected controller credential"
+            )
+        _require_external_accounting_storage(key_path, str(root.resolve()))
+        if (
+            key_path.is_symlink() or key_path.parent.is_symlink()
+            or key_path.resolve() != key_path.absolute()
+            or not key_path.is_file()
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical protected controller credential is unavailable"
+            )
+        if os.name == "posix" and (
+            key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller credential permissions are too broad"
+            )
+        credentials = _read_controller_credentials(key_path)
+        raw_credentials = json.loads(key_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(raw_credentials, Mapping)
+            or raw_credentials.get("schema") != "agentflow.controller_credentials"
+            or raw_credentials.get("version") != 2
+            or credentials.get("workspace_root") != str(root.resolve())
+            or credentials.get("workflow_root") != workflow_root
+            or not credentials.get("continuity_id")
+            or not credentials.get("authority_secret")
+            or not credentials.get("resume_secret")
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller credential does not authenticate this workflow incarnation"
+            )
+        lease = controller.authorize(credentials["resume_secret"])
+        if (
+            lease.root != str(root)
+            or lease.controller != controller.controller
+            or lease.continuity_id != credentials["continuity_id"]
+        ):
+            raise controller_backend.LeaseConflict(
+                "current lease does not match the canonical workflow credential"
+            )
+        receipt, duplicate = controller.accept_unresolved_drain_causes(
+            workflow_root, str(getattr(args, "reason", "") or ""),
+            accept_as_unresolved=bool(getattr(args, "acknowledge_unresolved_causes", False)),
+            authority_secret=credentials["authority_secret"], lease=lease,
+        )
+        payload = {
+            "operation": "accept-unresolved-drain-causes", "ok": True,
+            "root": str(root), "workflow_root": workflow_root,
+            "accepted_as": receipt["accepted_as"], "reason": receipt["reason"],
+            "epoch": receipt["lease_epoch"],
+            "checkpoint_sha256": receipt["checkpoint_sha256"],
+            "cause_ids": list(receipt["cause_ids"]),
+            "causes_sha256": receipt["causes_sha256"],
+            "duplicate": duplicate,
+        }
+        _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="UNRESOLVED CAUSES ACCEPTED")
+        return 0
+    except (
+        controller_backend.ControllerError, OSError, ValueError,
+        TypeError, KeyError, json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": "accept-unresolved-drain-causes", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="UNRESOLVED CAUSE ACCEPTANCE FAILED",
+        )
         return 2
 
 
@@ -15040,6 +15225,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_controller_common(controller_status_parser)
     controller_status_parser.set_defaults(func=controller_status)
+    controller_unresolved_causes_parser = controller_sub.add_parser(
+        "accept-unresolved-drain-causes",
+        help="Record an owner's exact-snapshot acceptance of historical causes as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument("--root", required=True)
+    controller_unresolved_causes_parser.add_argument("--workflow-root", required=True)
+    controller_unresolved_causes_parser.add_argument("--controller", default="agentflow-controller")
+    controller_unresolved_causes_parser.add_argument(
+        "--acknowledge-unresolved-causes", action="store_true", required=True,
+        help="explicitly accept the complete current unknown cause set as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument(
+        "--reason", required=True,
+        help="bounded owner reason for retaining the causes as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument("--json", action="store_true")
+    controller_unresolved_causes_parser.set_defaults(func=controller_accept_unresolved_drain_causes)
     controller_progress_parser = controller_sub.add_parser(
         "progress",
         help="Record task-aware progress or a named approach failure in the durable session budget",

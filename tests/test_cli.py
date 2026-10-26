@@ -4216,6 +4216,58 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(resume.continue_after_cancelled_preidentity, "task")
         self.assertEqual(resume.continue_task, "child")
 
+    def test_owner_can_accept_exact_unknown_cause_snapshot_as_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "workspace"
+            root.mkdir()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                args = cli.build_parser().parse_args([
+                    "controller", "accept-unresolved-drain-causes",
+                    "--root", str(root), "--workflow-root", "workflow",
+                    "--acknowledge-unresolved-causes",
+                    "--reason", "Historical cause provenance is unavailable; retain this halt as unresolved.",
+                    "--json",
+                ])
+                controller, _ = cli._controller_instance(args)
+                lease = controller.acquire()
+                cli._controller_credentials(args, lease)
+                for _ in range(4):
+                    controller.halt("blocked", "synthetic historical halt", lease=lease)
+                original_checkpoint = controller.checkpoint_path.read_bytes()
+                original_causes = json.loads(original_checkpoint)["drain_causes"]
+
+                accepted = _run_controller_json(args.func, args)
+
+                self.assertTrue(accepted["ok"], accepted)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), original_checkpoint)
+                state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                records = state["unresolved_drain_cause_acceptances"]
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                receipt = record["receipt"]
+                self.assertEqual(record["causes"], original_causes)
+                self.assertEqual(receipt["accepted_as"], "unresolved")
+                self.assertEqual(receipt["reason"], args.reason)
+                self.assertEqual(receipt["root"], str(root))
+                self.assertEqual(receipt["workflow_root"], "workflow")
+                self.assertEqual(receipt["checkpoint_sha256"], hashlib.sha256(original_checkpoint).hexdigest())
+                self.assertEqual(receipt["cause_ids"], [cause["cause_id"] for cause in original_causes])
+                self.assertEqual(
+                    receipt["causes_sha256"],
+                    cli.controller_backend._drain_causes_digest(original_causes),
+                )
+                self.assertFalse({"task_id", "launch_id", "diagnostic_sha256", "outcome"} & set(receipt))
+
+                repeated = _run_controller_json(args.func, args)
+                self.assertTrue(repeated["ok"], repeated)
+                self.assertEqual(
+                    json.loads(controller.state_path.read_text(encoding="utf-8"))[
+                        "unresolved_drain_cause_acceptances"
+                    ],
+                    records,
+                )
+
     def test_closed_preidentity_retirement_preserves_claim_and_blocks_unknown_cause_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -4278,6 +4330,21 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 args._supervisor_lock_path = str(
                     fixture.root / ".agentflow/test-controller-locks/closed-recovery.lock"
                 )
+                early_acceptance_args = parser.parse_args([
+                    "controller", "accept-unresolved-drain-causes",
+                    "--root", str(fixture.root), "--workflow-root", fixture.workflow_root,
+                    "--acknowledge-unresolved-causes",
+                    "--reason", "Retain historical causes as unresolved.", "--json",
+                ])
+                pre_retirement_checkpoint = controller.checkpoint_path.read_bytes()
+                pre_retirement_state = controller.state_path.read_bytes()
+                early_acceptance = _run_controller_json(
+                    cli.controller_accept_unresolved_drain_causes, early_acceptance_args,
+                )
+                self.assertFalse(early_acceptance["ok"], early_acceptance)
+                self.assertIn("owner acceptance requires", early_acceptance["error"])
+                self.assertEqual(controller.checkpoint_path.read_bytes(), pre_retirement_checkpoint)
+                self.assertEqual(controller.state_path.read_bytes(), pre_retirement_state)
                 fence_path = cli._native_claim_fence_path(
                     fixture.root, fixture.workflow_root, fixture.task_id,
                 )
@@ -4431,6 +4498,66 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 self.assertEqual(controller.state_path.read_bytes(), replay_state_before)
                 self.assertEqual(ready["status"], "open")
                 self.assertEqual(fixture.task_issue["status"], "closed")
+
+                accept_args = cli.build_parser().parse_args([
+                    "controller", "accept-unresolved-drain-causes",
+                    "--root", str(fixture.root), "--workflow-root", fixture.workflow_root,
+                    "--acknowledge-unresolved-causes",
+                    "--reason", "Accept this historical cause set as unresolved.", "--json",
+                ])
+                accepted = _run_controller_json(
+                    cli.controller_accept_unresolved_drain_causes, accept_args,
+                )
+                self.assertTrue(accepted["ok"], accepted)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), replay_checkpoint_before)
+                acceptance_state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+                acceptance_audit, = acceptance_state["unresolved_drain_cause_acceptances"]
+                self.assertEqual(acceptance_audit["causes"], original_causes)
+
+                claim_generation_value = "b" * 64
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "claim_generation", return_value="b" * 64):
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError,
+                        "observed historical claim generation changed",
+                    ):
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, fixture.lease,
+                            authority_secret=fixture.authority_secret,
+                        )
+                claim_generation_value = "a" * 64
+
+                def run_ready(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": ready["id"]}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+
+                authorization_out: dict[str, Any] = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_ready), \
+                     mock.patch.object(cli.beads_backend, "claim_generation", return_value="a" * 64):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, fixture.lease,
+                            authority_secret=fixture.authority_secret,
+                            resolution_authorization_out=authorization_out,
+                        ),
+                        ready["id"],
+                    )
+                signed_authorization = authorization_out["authorization"]
+                self.assertEqual(
+                    signed_authorization["unresolved_cause_acceptance"],
+                    acceptance_audit["receipt"],
+                )
+                self.assertEqual(signed_authorization["cause_ids"], [
+                    cause["cause_id"] for cause in original_causes
+                ])
+                self.assertEqual(controller.checkpoint_path.read_bytes(), replay_checkpoint_before)
 
     def test_closed_preidentity_retirement_accepts_matching_modern_generation_seal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -9410,6 +9537,30 @@ class ControllerDocumentationTests(unittest.TestCase):
         self.assertFalse(args.takeover)
         self.assertEqual(args.resume_token, "")
         self.assertEqual(args.resume_key_file, "")
+
+    def test_documented_unresolved_acceptance_command_parses_and_requires_explicit_reason(self) -> None:
+        document = (Path(__file__).resolve().parents[1] / "docs/CONTROLLER.md").read_text(
+            encoding="utf-8"
+        )
+        block = next(
+            block for block in re.findall(r"```(?:sh|shell)\s*\n(.*?)\n```", document, re.DOTALL)
+            if "agentflow controller accept-unresolved-drain-causes" in block
+        )
+        command = " ".join(
+            line.strip().removesuffix("\\").strip()
+            for line in block.splitlines() if line.strip()
+        )
+        args = cli.build_parser().parse_args(shlex.split(command)[1:])
+
+        self.assertIs(args.func, cli.controller_accept_unresolved_drain_causes)
+        self.assertEqual(args.root, "/path/to/workspace")
+        self.assertEqual(args.workflow_root, "ROOT")
+        self.assertTrue(args.acknowledge_unresolved_causes)
+        self.assertTrue(args.reason)
+        self.assertLess(
+            document.index("Retire the closed launch first"),
+            document.index("agentflow controller accept-unresolved-drain-causes"),
+        )
 
 
 class IsolationCliTests(unittest.TestCase):
