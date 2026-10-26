@@ -95,25 +95,31 @@ stays closed with its claim metadata and fence evidence intact; the original
 attempt and budget remain unchanged. Retries finish the same disposition after
 an interrupted checkpoint write.
 
-Some historical closed claims predate the native claim-generation seal. Only
-for a missing seal, an operator can explicitly acknowledge that limit:
+Some closed claims have no native claim-generation seal. Because the signed
+launch contract does not establish whether the seal was never created or later
+deleted, the legacy acknowledgement flag alone cannot authorize retirement.
+An owner may explicitly accept that origin as unresolved for this one negative
+retirement:
 
 ```sh
 agentflow controller retire-closed-preidentity \
   --root /path/to/workspace --workflow-root ROOT \
   --controller agentflow-controller \
   --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID \
-  --acknowledge-missing-native-generation
+  --accept-unresolved-generation-origin \
+  --reason "Generation origin is unknown; revoke this closed launch only."
 ```
 
-The command records the current Beads claim-history digest in its signed
-retirement audit and requires that digest to remain unchanged on retry and
-continuation. This is an observation made at retirement, not proof that the
-old launch was bound to that history. The command does not create a generation
-seal. A present seal must still match exactly, and a missing seal without this
-explicit acknowledgement remains an error. Typed drain causes still require
-their supported authenticated resolution paths. Unknown causes require the
-separate owner decision described below.
+The signed audit binds the owner's reason to the exact root, controller lease
+and fence, checkpoint, launch contract, claim identity, current claim-history
+digest, and expired budget record. It records the origin as unresolved and only
+revokes that closed launch. It does not classify the launch as pre-seal,
+create a generation seal, renew the claim, accept a result, reset its budget, or
+dispatch work. Present seals must still match exactly; the legacy
+`--acknowledge-missing-native-generation` flag alone is rejected. Retrying the
+same retirement requires the same signed decision and unchanged evidence.
+Typed drain causes still require their supported authenticated resolution
+paths. Unknown causes require the separate owner decision described below.
 
 Retire the closed launch first. Then inspect the resulting blocked checkpoint.
 If its complete drain-cause set is still unknown, an owner may explicitly
@@ -140,9 +146,11 @@ change.
 With the exact acceptance recorded, use the explicit continuation command in
 the expired preidentity recovery section, passing this task as `TASK` and a
 distinct ready descendant as `READY_TASK`. Continuation still checks the
-signed retirement, root ancestry, claim generation, budgets, absence of other
-active work, and the exact ready target. Without a matching owner receipt,
-unknown causes remain a blocker.
+signed retirement, root ancestry, unchanged claim-history evidence, budgets,
+absence of other active work, and the exact ready target. The unresolved-origin
+receipt only authenticates negative retirement; it does not start continuation
+or authorize work by itself. Without matching owner receipts, unknown causes
+remain a blocker.
 
 If this explicit continuation is interrupted while its protected credential
 is being rotated, rerun the same command with the same task IDs. Ordinary

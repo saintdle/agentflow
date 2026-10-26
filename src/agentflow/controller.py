@@ -2499,10 +2499,10 @@ class RootController:
             }
         )
 
-    def _load_checkpoint(self) -> dict[str, Any]:
+    def _load_checkpoint(self, *, migrate: bool = True) -> dict[str, Any]:
         if not self.checkpoint_path.exists():
             return self._base_checkpoint()
-        return checkpoint.load_checkpoint(self.checkpoint_path)
+        return checkpoint.load_checkpoint(self.checkpoint_path, migrate=migrate)
 
     def _save_checkpoint(
         self, document: dict[str, Any], *, lease: Lease | str | None = None
@@ -2550,7 +2550,7 @@ class RootController:
         with self.fence(lease) as current:
             try:
                 raw_checkpoint = self.checkpoint_path.read_bytes()
-                document = checkpoint.load_checkpoint(self.checkpoint_path)
+                document = checkpoint.load_checkpoint(self.checkpoint_path, migrate=False)
             except (OSError, checkpoint.CheckpointError) as exc:
                 raise ControllerError("current checkpoint is missing or malformed") from exc
             causes = checkpoint._check_drain_causes(document.get("drain_causes"))
@@ -2665,7 +2665,7 @@ class RootController:
         with self.fence(lease) as current:
             try:
                 raw_checkpoint = self.checkpoint_path.read_bytes()
-                document = checkpoint.load_checkpoint(self.checkpoint_path)
+                document = checkpoint.load_checkpoint(self.checkpoint_path, migrate=False)
             except (OSError, checkpoint.CheckpointError):
                 return None
             causes = checkpoint._check_drain_causes(document.get("drain_causes"))
@@ -2928,9 +2928,9 @@ class RootController:
         document["drain_causes"] = []
         return audit_id
 
-    def active_tasks(self) -> list[dict[str, str]]:
+    def active_tasks(self, *, migrate: bool = True) -> list[dict[str, str]]:
         """Return current workers, preserving a legacy single-task checkpoint."""
-        return _active_tasks_from_checkpoint(self._load_checkpoint(), self.root)
+        return _active_tasks_from_checkpoint(self._load_checkpoint(migrate=migrate), self.root)
 
     def _checkpoint_active_tasks(
         self,
