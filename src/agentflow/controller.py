@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,9 @@ TERMINAL_STATES = frozenset({"completed", "failed", "blocked", "halted", "termin
 MAX_DRAIN_AUDIT_ENTRIES = 16
 DRAIN_AUDIT_SCHEMA = "agentflow.controller-drain-audit@1"
 DRAIN_RESOLUTION_AUTH_SCHEMA = "agentflow.controller-drain-resolution-authorization@1"
+DRAIN_UNRESOLVED_ACCEPTANCE_SCHEMA = "agentflow.controller-drain-unresolved-acceptance@1"
+DRAIN_UNRESOLVED_AUDIT_SCHEMA = "agentflow.controller-drain-unresolved-audit@1"
+MAX_UNRESOLVED_ACCEPTANCE_ENTRIES = 16
 
 
 def checkpoint_digest(document: Mapping[str, Any]) -> str:
@@ -80,6 +84,146 @@ def _drain_causes_digest(causes: list[Mapping[str, Any]]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _validate_unresolved_cause_acceptance(
+    acceptance: Mapping[str, Any],
+    authority_secret: str,
+    *,
+    root: str,
+    controller: str,
+    workflow_root: str,
+    continuity_id: str,
+    lease_epoch: int,
+    lease_token: str,
+    checkpoint_sha256: str,
+    checkpoint_epoch: int,
+    checkpoint_token: str,
+    causes: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Authenticate an owner's decision about one exact all-unknown cause snapshot."""
+    payload = dict(acceptance)
+    supplied = str(payload.pop("authority_hmac", ""))
+    clean_causes = checkpoint._check_drain_causes(causes)
+    cause_ids = [cause["cause_id"] for cause in clean_causes]
+    reason = payload.get("reason")
+    expected_fields = {
+        "schema", "root", "controller", "workflow_root", "continuity_id",
+        "lease_epoch", "lease_token", "checkpoint_sha256", "checkpoint_epoch",
+        "checkpoint_token", "cause_ids", "causes_sha256", "accepted_as", "reason",
+    }
+    if (
+        set(payload) != expected_fields
+        or payload.get("schema") != DRAIN_UNRESOLVED_ACCEPTANCE_SCHEMA
+        or payload.get("root") != root
+        or payload.get("controller") != controller
+        or payload.get("workflow_root") != workflow_root
+        or payload.get("continuity_id") != continuity_id
+        or not isinstance(lease_epoch, int) or isinstance(lease_epoch, bool) or lease_epoch < 1
+        or payload.get("lease_epoch") != lease_epoch
+        or payload.get("lease_token") != lease_token
+        or payload.get("checkpoint_sha256") != checkpoint_sha256
+        or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("checkpoint_sha256") or ""))
+        or not isinstance(checkpoint_epoch, int) or isinstance(checkpoint_epoch, bool)
+        or payload.get("checkpoint_epoch") != checkpoint_epoch
+        or payload.get("checkpoint_token") != checkpoint_token
+        or checkpoint_epoch != lease_epoch
+        or checkpoint_token != lease_token
+        or not isinstance(payload.get("cause_ids"), list)
+        or payload.get("cause_ids") != cause_ids
+        or payload.get("causes_sha256") != _drain_causes_digest(clean_causes)
+        or not clean_causes
+        or any(cause["kind"] != "unknown" for cause in clean_causes)
+        or payload.get("accepted_as") != "unresolved"
+        or not isinstance(reason, str)
+        or not reason or reason != reason.strip()
+        or len(reason) > checkpoint.FIELD_MAX
+        or any(ord(char) < 32 for char in reason)
+        or not authority_secret
+        or not hmac.compare_digest(
+            supplied,
+            _authority_mac(authority_secret, payload, domain="drain-unresolved-acceptance-v1"),
+        )
+    ):
+        raise LeaseConflict("owner acceptance does not authenticate the exact unresolved cause snapshot")
+    return {**payload, "authority_hmac": supplied}
+
+
+def _matching_unresolved_cause_acceptance(
+    state: Mapping[str, Any],
+    acceptance: Mapping[str, Any],
+    authority_secret: str,
+) -> dict[str, Any] | None:
+    """Return one fully authenticated audit row carrying ``acceptance``."""
+    records = state.get("unresolved_drain_cause_acceptances")
+    if not isinstance(records, list) or len(records) > MAX_UNRESOLVED_ACCEPTANCE_ENTRIES:
+        return None
+    expected_fields = {
+        "schema", "receipt", "causes", "accepted_at", "audit_id", "authority_hmac",
+    }
+    seen: set[str] = set()
+    seen_snapshots: set[str] = set()
+    match: dict[str, Any] | None = None
+    try:
+        for row in records:
+            if not isinstance(row, Mapping) or set(row) != expected_fields:
+                return None
+            copied = dict(row)
+            supplied = str(copied.pop("authority_hmac", ""))
+            clean_causes = checkpoint._check_drain_causes(copied.get("causes"))
+            receipt = copied.get("receipt")
+            if not isinstance(receipt, Mapping):
+                return None
+            validated_receipt = _validate_unresolved_cause_acceptance(
+                receipt, authority_secret,
+                root=str(receipt.get("root") or ""),
+                controller=str(receipt.get("controller") or ""),
+                workflow_root=str(receipt.get("workflow_root") or ""),
+                continuity_id=str(receipt.get("continuity_id") or ""),
+                lease_epoch=receipt.get("lease_epoch"),
+                lease_token=str(receipt.get("lease_token") or ""),
+                checkpoint_sha256=str(receipt.get("checkpoint_sha256") or ""),
+                checkpoint_epoch=receipt.get("checkpoint_epoch"),
+                checkpoint_token=str(receipt.get("checkpoint_token") or ""),
+                causes=clean_causes,
+            )
+            identity = {
+                key: copied[key] for key in ("schema", "receipt", "causes", "accepted_at")
+            }
+            snapshot_key = json.dumps(
+                {key: validated_receipt[key] for key in (
+                    "root", "controller", "workflow_root", "continuity_id", "lease_epoch",
+                    "lease_token", "checkpoint_sha256", "checkpoint_epoch", "checkpoint_token",
+                    "cause_ids", "causes_sha256",
+                )},
+                sort_keys=True, separators=(",", ":"),
+            )
+            audit_id = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            accepted_at = copied.get("accepted_at")
+            if (
+                copied.get("schema") != DRAIN_UNRESOLVED_AUDIT_SCHEMA
+                or copied.get("audit_id") != audit_id
+                or audit_id in seen
+                or snapshot_key in seen_snapshots
+                or isinstance(accepted_at, bool)
+                or not isinstance(accepted_at, (int, float))
+                or not math.isfinite(float(accepted_at))
+                or accepted_at < 0
+                or not hmac.compare_digest(
+                    supplied,
+                    _authority_mac(authority_secret, copied, domain="drain-unresolved-audit-v1"),
+                )
+            ):
+                return None
+            seen.add(audit_id)
+            seen_snapshots.add(snapshot_key)
+            if dict(validated_receipt) == dict(acceptance):
+                match = dict(row)
+        return match
+    except (checkpoint.CheckpointError, TypeError, ValueError, KeyError, OverflowError):
+        return None
+
+
 def _validate_drain_resolution_authorization(
     authorization: Mapping[str, Any],
     authority_secret: str,
@@ -108,6 +252,26 @@ def _validate_drain_resolution_authorization(
     }
     clean_causes = checkpoint._check_drain_causes(causes)
     ids = [cause["cause_id"] for cause in clean_causes]
+    unresolved_acceptance = payload.get("unresolved_cause_acceptance")
+    expected_payload_fields = expected_fields | (
+        {"unresolved_cause_acceptance"} if unresolved_acceptance is not None else set()
+    )
+    has_unknown = any(cause["kind"] == "unknown" for cause in clean_causes)
+    if has_unknown:
+        if not isinstance(unresolved_acceptance, Mapping):
+            raise LeaseConflict("continuation does not accept unresolved drain causes")
+        _validate_unresolved_cause_acceptance(
+            unresolved_acceptance, authority_secret,
+            root=root, controller=controller, workflow_root=workflow_root,
+            continuity_id=continuity_id, lease_epoch=payload.get("lease_epoch"),
+            lease_token=str(payload.get("lease_token") or ""),
+            checkpoint_sha256=str(payload.get("retired_checkpoint_sha256") or ""),
+            checkpoint_epoch=payload.get("retired_checkpoint_epoch"),
+            checkpoint_token=str(payload.get("retired_checkpoint_token") or ""),
+            causes=clean_causes,
+        )
+    elif unresolved_acceptance is not None:
+        raise LeaseConflict("continuation carries an unrelated unresolved-cause acceptance")
     epoch = payload.get("lease_epoch")
     rotated = bool(
         isinstance(pending, Mapping)
@@ -124,7 +288,7 @@ def _validate_drain_resolution_authorization(
         and pending.get("retired_checkpoint_last_check") == payload.get("retired_checkpoint_last_check")
     )
     if (
-        set(payload) != expected_fields
+        set(payload) != expected_payload_fields
         or payload.get("schema") != DRAIN_RESOLUTION_AUTH_SCHEMA
         or payload.get("root") != root
         or payload.get("controller") != controller
@@ -137,7 +301,6 @@ def _validate_drain_resolution_authorization(
         or not isinstance(payload.get("cause_ids"), list)
         or payload.get("cause_ids") != ids
         or payload.get("causes_sha256") != _drain_causes_digest(clean_causes)
-        or any(cause["kind"] == "unknown" for cause in clean_causes)
         or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("receipt_sha256") or ""))
         or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("contract_sha256") or ""))
         or not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("intent_id") or ""))
@@ -162,11 +325,30 @@ def _validate_drain_resolution_authorization(
 
 def _checkpoint_matches_retired_binding(
     document: Mapping[str, Any], raw: bytes, authorization: Mapping[str, Any],
-    *, root: str, controller: str,
+    *, root: str, controller: str, authority_secret: str = "",
 ) -> bool:
     """Check the exact signed terminal checkpoint that began a continuation."""
     try:
         causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+        unresolved_acceptance = authorization.get("unresolved_cause_acceptance")
+        has_unknown = any(cause["kind"] == "unknown" for cause in causes)
+        if has_unknown:
+            if not isinstance(unresolved_acceptance, Mapping):
+                return False
+            _validate_unresolved_cause_acceptance(
+                unresolved_acceptance, authority_secret,
+                root=root, controller=controller,
+                workflow_root=str(authorization.get("workflow_root") or ""),
+                continuity_id=str(authorization.get("continuity_id") or ""),
+                lease_epoch=authorization.get("lease_epoch"),
+                lease_token=str(authorization.get("lease_token") or ""),
+                checkpoint_sha256=str(authorization.get("retired_checkpoint_sha256") or ""),
+                checkpoint_epoch=authorization.get("retired_checkpoint_epoch"),
+                checkpoint_token=str(authorization.get("retired_checkpoint_token") or ""),
+                causes=causes,
+            )
+        elif unresolved_acceptance is not None:
+            return False
         return bool(
             hashlib.sha256(raw).hexdigest() == authorization.get("retired_checkpoint_sha256")
             and checkpoint.admission_phase(document) == "terminal"
@@ -184,7 +366,6 @@ def _checkpoint_matches_retired_binding(
             and not document.get("session_id")
             and [cause["cause_id"] for cause in causes] == authorization.get("cause_ids")
             and _drain_causes_digest(causes) == authorization.get("causes_sha256")
-            and not any(cause["kind"] == "unknown" for cause in causes)
         )
     except (checkpoint.CheckpointError, TypeError, ValueError):
         return False
@@ -231,6 +412,20 @@ class StaleLease(LeaseConflict):
 
 class FencedLease(LeaseConflict):
     """The lease epoch/token is no longer current."""
+
+
+def native_claim_renewal_halt_reason(task_ids: Iterable[str]) -> str:
+    """Return the exact halt reason written when native claim renewal fails."""
+    selected = ", ".join(str(task_id) for task_id in task_ids)
+    return (
+        "USER_ACTION_REQUIRED: native Beads task claim renewal failed for "
+        f"{selected}; launch and result authority are fenced. Inspect live workers before recovery."
+    )
+
+
+def is_native_claim_renewal_halt(document: Mapping[str, Any], task_id: str) -> bool:
+    """Match only the exact single-task renewal halt, with no free-form suffix."""
+    return str(document.get("terminal_reason") or "") == native_claim_renewal_halt_reason((task_id,))
 
 
 class RootViolation(ControllerError):
@@ -1471,6 +1666,7 @@ class RootController:
             raise LeaseConflict("staged continuation changed its retired checkpoint binding")
         if _checkpoint_matches_retired_binding(
             document, raw, authorization, root=self.root, controller=self.controller,
+            authority_secret=authority_secret,
         ):
             return False
 
@@ -1501,6 +1697,30 @@ class RootController:
         )
         if not staged:
             raise LeaseConflict("staged continuation checkpoint is neither the exact retired nor staged checkpoint")
+        unresolved_acceptance = authorization.get("unresolved_cause_acceptance")
+        if isinstance(unresolved_acceptance, Mapping):
+            accepted = _matching_unresolved_cause_acceptance(
+                state, unresolved_acceptance, authority_secret,
+            )
+            if accepted is None:
+                raise LeaseConflict("staged continuation has no authenticated unresolved-cause acceptance")
+            archived_causes = checkpoint._check_drain_causes(accepted.get("causes"))
+            if (
+                [cause["cause_id"] for cause in archived_causes] != authorization.get("cause_ids")
+                or _drain_causes_digest(archived_causes) != authorization.get("causes_sha256")
+                or accepted.get("receipt") != dict(unresolved_acceptance)
+                or unresolved_acceptance.get("root") != self.root
+                or unresolved_acceptance.get("controller") != self.controller
+                or unresolved_acceptance.get("workflow_root") != pending.get("workflow_root")
+                or unresolved_acceptance.get("continuity_id") != pending.get("continuity_id")
+                or unresolved_acceptance.get("lease_epoch") != authorization.get("lease_epoch")
+                or unresolved_acceptance.get("lease_token") != authorization.get("lease_token")
+                or unresolved_acceptance.get("checkpoint_sha256") != pending.get("retired_checkpoint_sha256")
+                or unresolved_acceptance.get("checkpoint_epoch") != pending.get("retired_checkpoint_epoch")
+                or unresolved_acceptance.get("checkpoint_token") != pending.get("retired_checkpoint_token")
+            ):
+                raise LeaseConflict("staged continuation acceptance does not bind its original cause snapshot")
+            return True
         context = {
             "workflow_root": str(pending.get("workflow_root") or ""),
             "cancelled_task": str(pending.get("cancelled_task") or ""),
@@ -1837,7 +2057,7 @@ class RootController:
                 raise LeaseConflict("retired checkpoint is missing or malformed") from exc
             if not _checkpoint_matches_retired_binding(
                 retired_document, retired_raw, drain_resolution_authorization,
-                root=self.root, controller=self.controller,
+                root=self.root, controller=self.controller, authority_secret=authority_secret,
             ):
                 raise LeaseConflict("continuation does not bind the exact retired checkpoint")
             now = float(self.clock())
@@ -2279,10 +2499,10 @@ class RootController:
             }
         )
 
-    def _load_checkpoint(self) -> dict[str, Any]:
+    def _load_checkpoint(self, *, migrate: bool = True) -> dict[str, Any]:
         if not self.checkpoint_path.exists():
             return self._base_checkpoint()
-        return checkpoint.load_checkpoint(self.checkpoint_path)
+        return checkpoint.load_checkpoint(self.checkpoint_path, migrate=migrate)
 
     def _save_checkpoint(
         self, document: dict[str, Any], *, lease: Lease | str | None = None
@@ -2304,6 +2524,198 @@ class RootController:
                 return checkpoint.write_checkpoint(self.checkpoint_path, document)
         with self.fence(lease):
             return checkpoint.write_checkpoint(self.checkpoint_path, document)
+
+    def accept_unresolved_drain_causes(
+        self,
+        workflow_root: str,
+        reason: str,
+        *,
+        accept_as_unresolved: bool,
+        authority_secret: str,
+        lease: Lease | str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Record an explicit owner decision for one exact all-unknown halt."""
+        if not workflow_root or workflow_root != workflow_root.strip():
+            raise ControllerError("an exact workflow root is required")
+        if not accept_as_unresolved:
+            raise ControllerError("explicit acceptance as unresolved is required")
+        if (
+            not isinstance(reason, str) or not reason or reason != reason.strip()
+            or len(reason) > checkpoint.FIELD_MAX
+            or any(ord(char) < 32 for char in reason)
+        ):
+            raise ControllerError("a bounded explicit reason is required")
+        if not authority_secret:
+            raise ControllerError("protected controller signing authority is required")
+        with self.fence(lease) as current:
+            try:
+                raw_checkpoint = self.checkpoint_path.read_bytes()
+                document = checkpoint.parse_current_checkpoint(raw_checkpoint)
+            except (OSError, checkpoint.CheckpointError) as exc:
+                raise ControllerError("exact-snapshot owner acceptance requires a version 4 checkpoint") from exc
+            causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+            if (
+                checkpoint.admission_phase(document) != "terminal"
+                or checkpoint.resume_state(document) != "blocked"
+                or document.get("terminal") is not True
+                or document.get("root") != self.root
+                or document.get("controller") != self.controller
+                or document.get("task") != self.root
+                or document.get("epoch") != current.epoch
+                or document.get("lease_token") != current.token
+                or document.get("active_tasks")
+                or document.get("actor")
+                or document.get("claim_id")
+                or document.get("session_id")
+                or not causes
+                or any(cause["kind"] != "unknown" for cause in causes)
+            ):
+                raise ControllerError(
+                    "owner acceptance requires the exact current blocked checkpoint with only unknown causes"
+                )
+            receipt: dict[str, Any] = {
+                "schema": DRAIN_UNRESOLVED_ACCEPTANCE_SCHEMA,
+                "root": self.root,
+                "controller": self.controller,
+                "workflow_root": workflow_root,
+                "continuity_id": current.continuity_id,
+                "lease_epoch": current.epoch,
+                "lease_token": current.token,
+                "checkpoint_sha256": hashlib.sha256(raw_checkpoint).hexdigest(),
+                "checkpoint_epoch": document["epoch"],
+                "checkpoint_token": document["lease_token"],
+                "cause_ids": [cause["cause_id"] for cause in causes],
+                "causes_sha256": _drain_causes_digest(causes),
+                "accepted_as": "unresolved",
+                "reason": reason,
+            }
+            receipt["authority_hmac"] = _authority_mac(
+                authority_secret, receipt, domain="drain-unresolved-acceptance-v1",
+            )
+            _validate_unresolved_cause_acceptance(
+                receipt, authority_secret,
+                root=self.root, controller=self.controller,
+                workflow_root=workflow_root, continuity_id=current.continuity_id,
+                lease_epoch=current.epoch, lease_token=current.token,
+                checkpoint_sha256=hashlib.sha256(raw_checkpoint).hexdigest(),
+                checkpoint_epoch=document["epoch"], checkpoint_token=document["lease_token"],
+                causes=causes,
+            )
+            state = _read_json(self.state_path)
+            records = state.get("unresolved_drain_cause_acceptances", [])
+            if not isinstance(records, list) or len(records) > MAX_UNRESOLVED_ACCEPTANCE_ENTRIES:
+                raise ControllerError("unresolved-cause acceptance audit is malformed or full")
+            duplicate = False
+            current_snapshot = {
+                key: receipt[key] for key in (
+                    "root", "controller", "workflow_root", "continuity_id", "lease_epoch",
+                    "lease_token", "checkpoint_sha256", "checkpoint_epoch", "checkpoint_token",
+                    "cause_ids", "causes_sha256",
+                )
+            }
+            for existing in records:
+                if not isinstance(existing, Mapping) or not isinstance(existing.get("receipt"), Mapping):
+                    raise ControllerError("unresolved-cause acceptance audit entry is malformed")
+                prior_receipt = existing["receipt"]
+                verified = _matching_unresolved_cause_acceptance(
+                    state, prior_receipt, authority_secret,
+                )
+                if verified is None or dict(verified) != dict(existing):
+                    raise ControllerError("unresolved-cause acceptance audit failed authentication")
+                prior_snapshot = {
+                    key: prior_receipt.get(key) for key in current_snapshot
+                }
+                if prior_snapshot == current_snapshot:
+                    if dict(prior_receipt) != receipt:
+                        raise ControllerError("this exact snapshot already has a different owner decision")
+                    duplicate = True
+            if duplicate:
+                return receipt, True
+            if len(records) >= MAX_UNRESOLVED_ACCEPTANCE_ENTRIES:
+                raise ControllerError("unresolved-cause acceptance audit is full")
+            identity = {
+                "schema": DRAIN_UNRESOLVED_AUDIT_SCHEMA,
+                "receipt": receipt,
+                "causes": causes,
+                "accepted_at": float(self.clock()),
+            }
+            if not math.isfinite(identity["accepted_at"]) or identity["accepted_at"] < 0:
+                raise ControllerError("owner acceptance audit timestamp is invalid")
+            record = dict(identity)
+            record["audit_id"] = hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            record["authority_hmac"] = _authority_mac(
+                authority_secret, record, domain="drain-unresolved-audit-v1",
+            )
+            state["unresolved_drain_cause_acceptances"] = [*records, record]
+            self._write_state(state)
+            return receipt, False
+
+    def unresolved_drain_cause_acceptance(
+        self,
+        workflow_root: str,
+        *,
+        authority_secret: str,
+        lease: Lease | str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the signed owner decision only while its exact snapshot is current."""
+        if not workflow_root or not authority_secret:
+            return None
+        with self.fence(lease) as current:
+            try:
+                raw_checkpoint = self.checkpoint_path.read_bytes()
+                document = checkpoint.load_checkpoint(self.checkpoint_path, migrate=False)
+            except (OSError, checkpoint.CheckpointError):
+                return None
+            causes = checkpoint._check_drain_causes(document.get("drain_causes"))
+            if (
+                checkpoint.admission_phase(document) != "terminal"
+                or checkpoint.resume_state(document) != "blocked"
+                or document.get("terminal") is not True
+                or document.get("root") != self.root
+                or document.get("controller") != self.controller
+                or document.get("task") != self.root
+                or document.get("epoch") != current.epoch
+                or document.get("lease_token") != current.token
+                or document.get("active_tasks")
+                or document.get("actor")
+                or document.get("claim_id")
+                or document.get("session_id")
+                or not causes
+                or any(cause["kind"] != "unknown" for cause in causes)
+            ):
+                return None
+            state = _read_json(self.state_path)
+            records = state.get("unresolved_drain_cause_acceptances", [])
+            if not isinstance(records, list) or len(records) > MAX_UNRESOLVED_ACCEPTANCE_ENTRIES:
+                raise ControllerError("unresolved-cause acceptance audit is malformed")
+            raw_digest = hashlib.sha256(raw_checkpoint).hexdigest()
+            cause_digest = _drain_causes_digest(causes)
+            for existing in records:
+                if not isinstance(existing, Mapping) or not isinstance(existing.get("receipt"), Mapping):
+                    raise ControllerError("unresolved-cause acceptance audit entry is malformed")
+                prior_receipt = existing["receipt"]
+                verified = _matching_unresolved_cause_acceptance(
+                    state, prior_receipt, authority_secret,
+                )
+                if verified is None or dict(verified) != dict(existing):
+                    raise ControllerError("unresolved-cause acceptance audit failed authentication")
+                if (
+                    prior_receipt.get("root") == self.root
+                    and prior_receipt.get("controller") == self.controller
+                    and prior_receipt.get("workflow_root") == workflow_root
+                    and prior_receipt.get("continuity_id") == current.continuity_id
+                    and prior_receipt.get("lease_epoch") == current.epoch
+                    and prior_receipt.get("lease_token") == current.token
+                    and prior_receipt.get("checkpoint_sha256") == raw_digest
+                    and prior_receipt.get("checkpoint_epoch") == document.get("epoch")
+                    and prior_receipt.get("checkpoint_token") == document.get("lease_token")
+                    and prior_receipt.get("cause_ids") == [cause["cause_id"] for cause in causes]
+                    and prior_receipt.get("causes_sha256") == cause_digest
+                ):
+                    return dict(prior_receipt)
+            return None
 
     def _archive_resolved_drain_causes(
         self,
@@ -2327,7 +2739,41 @@ class RootController:
         if not causes and resolution != "authenticated_continuation":
             return ""
         if any(cause["kind"] == "unknown" for cause in causes):
-            raise ControllerError("cannot archive unresolved or opaque drain causes")
+            if (
+                resolution != "authenticated_continuation"
+                or not isinstance(resolution_authorization, Mapping)
+                or not isinstance(resolution_authorization.get("unresolved_cause_acceptance"), Mapping)
+            ):
+                raise ControllerError("cannot archive unresolved or opaque drain causes")
+            state = _read_json(self.state_path)
+            pending = state.get("continuation_reattach")
+            clean_context = {str(key): str(value) for key, value in context.items()}
+            try:
+                retired_raw = self.checkpoint_path.read_bytes()
+            except OSError as exc:
+                raise ControllerError("accepted unresolved cause checkpoint is missing") from exc
+            _validate_drain_resolution_authorization(
+                resolution_authorization, authority_secret,
+                root=self.root, controller=self.controller,
+                workflow_root=clean_context.get("workflow_root", ""),
+                continuity_id=current.continuity_id,
+                cancelled_task=clean_context.get("cancelled_task", ""),
+                ready_task=clean_context.get("ready_task", ""),
+                causes=causes, current_epoch=current.epoch, current_token=current.token,
+                pending=pending if isinstance(pending, Mapping) else None,
+            )
+            if not _checkpoint_matches_retired_binding(
+                document, retired_raw, resolution_authorization,
+                root=self.root, controller=self.controller,
+                authority_secret=authority_secret,
+            ):
+                raise ControllerError("owner acceptance no longer binds the exact retired checkpoint")
+            receipt = resolution_authorization["unresolved_cause_acceptance"]
+            audit = _matching_unresolved_cause_acceptance(state, receipt, authority_secret)
+            if audit is None or audit.get("causes") != causes:
+                raise ControllerError("unresolved cause acceptance has no authenticated original-cause audit")
+            document["drain_causes"] = []
+            return str(receipt.get("causes_sha256") or "")
         clean_context = {str(key): str(value) for key, value in context.items()}
         identity: dict[str, Any] = {
             "schema": DRAIN_AUDIT_SCHEMA,
@@ -2482,9 +2928,9 @@ class RootController:
         document["drain_causes"] = []
         return audit_id
 
-    def active_tasks(self) -> list[dict[str, str]]:
+    def active_tasks(self, *, migrate: bool = True) -> list[dict[str, str]]:
         """Return current workers, preserving a legacy single-task checkpoint."""
-        return _active_tasks_from_checkpoint(self._load_checkpoint(), self.root)
+        return _active_tasks_from_checkpoint(self._load_checkpoint(migrate=migrate), self.root)
 
     def _checkpoint_active_tasks(
         self,
@@ -3076,7 +3522,7 @@ class RootController:
         claim_id: str,
         launch_id: str,
         *,
-        commit_cancellation: Callable[[], None],
+        commit_cancellation: Callable[[str], None],
         lease: Lease | str | None = None,
         retirement_reason: str = "expired",
         _abandoned_epoch_repair_authority: Mapping[str, Any] | None = None,
@@ -3089,7 +3535,10 @@ class RootController:
         disposition without accepting a late result.
         """
 
-        if retirement_reason not in {"expired", "superseded_legacy_scope", "owner_abandoned_epoch"}:
+        if retirement_reason not in {
+            "expired", "superseded_legacy_scope", "owner_abandoned_epoch",
+            "superseded_closed_preidentity",
+        }:
             raise ControllerError("unsupported preidentity retirement reason")
         if (retirement_reason == "owner_abandoned_epoch") != (
             _abandoned_epoch_repair_authority is not None
@@ -3101,9 +3550,21 @@ class RootController:
         with self.fence(
             lease, _abandoned_epoch_repair_authority=_abandoned_epoch_repair_authority,
         ) as current:
-            document = self._load_checkpoint()
+            if retirement_reason == "superseded_closed_preidentity":
+                try:
+                    preimage_bytes = self.checkpoint_path.read_bytes()
+                    document = checkpoint.parse_current_checkpoint(preimage_bytes)
+                except (OSError, checkpoint.CheckpointError) as exc:
+                    raise LeaseConflict("closed retirement requires an exact version 4 checkpoint") from exc
+            else:
+                document = self._load_checkpoint()
+                preimage_bytes = self.checkpoint_path.read_bytes()
             expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
             reason = str(document.get("terminal_reason") or "")
+            renewal_halt = (
+                retirement_reason == "superseded_closed_preidentity"
+                and is_native_claim_renewal_halt(document, task_id)
+            )
             rows = _active_tasks_from_checkpoint(document, self.root)
             retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
             terminal_halt = (
@@ -3135,7 +3596,7 @@ class RootController:
                     self._verify_owner_retired_checkpoint_digest(
                         state=_read_json(self.state_path), authority=_abandoned_epoch_repair_authority,
                     )
-                commit_cancellation()
+                commit_cancellation(hashlib.sha256(preimage_bytes).hexdigest())
                 if retirement_reason == "owner_abandoned_epoch":
                     state = _read_json(self.state_path)
                     pending = state.pop("abandoned_epoch_repair", None)
@@ -3146,8 +3607,10 @@ class RootController:
                         raise LeaseConflict("completed abandoned-epoch repair lost its signed intent")
                 return self._result(document, resumed=True)
             eligible = (
-                ((terminal_halt and reason.startswith(expected_reason)) or retained_draining)
-                and (retirement_reason == "expired" or retained_draining)
+                ((terminal_halt and (
+                    reason.startswith(expected_reason) or renewal_halt
+                )) or retained_draining)
+                and (retirement_reason in {"expired", "superseded_closed_preidentity"} or retained_draining)
                 and str(document.get("root") or "") == self.root
                 and str(document.get("controller") or "") == self.controller
                 and len(rows) == 1
@@ -3175,6 +3638,8 @@ class RootController:
                 "next_action": "explicitly continue with a distinct ready task",
                 "last_check": retired_check,
             })
+            planned_checkpoint_bytes = checkpoint.serialize_checkpoint(document)
+            planned_checkpoint_sha256 = hashlib.sha256(planned_checkpoint_bytes).hexdigest()
             retired_digest = ""
             if retirement_reason == "owner_abandoned_epoch":
                 state = _read_json(self.state_path)
@@ -3201,8 +3666,10 @@ class RootController:
             # Cross-file crash semantics are deliberate: the exact checkpoint
             # output is signed into the protected intent first, then Herdr is
             # atomically fenced, and only then is the checkpoint pointer cleared.
-            commit_cancellation()
+            commit_cancellation(planned_checkpoint_sha256)
             result = self._result(checkpoint.write_checkpoint(self.checkpoint_path, document), resumed=True)
+            if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != planned_checkpoint_sha256:
+                raise LeaseConflict("retired checkpoint bytes differ from the authenticated planned output")
             if retirement_reason == "owner_abandoned_epoch":
                 if hashlib.sha256(self.checkpoint_path.read_bytes()).hexdigest() != retired_digest:
                     raise LeaseConflict("retired checkpoint bytes do not match the signed owner-repair output")
@@ -3245,7 +3712,7 @@ class RootController:
         claim_id: str,
         launch_id: str,
         *,
-        commit_cancellation: Callable[[], None],
+        commit_cancellation: Callable[[str], None],
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Retire an authenticated legacy launch after its owning scope ends."""
@@ -3395,13 +3862,17 @@ class RootController:
                 raise ControllerError("retired checkpoint is missing or malformed") from exc
             if not _checkpoint_matches_retired_binding(
                 retired_document, retired_raw, resolution_authorization,
-                root=self.root, controller=self.controller,
+                root=self.root, controller=self.controller, authority_secret=authority_secret,
             ):
                 raise ControllerError("continuation does not bind the exact cause snapshot or retired checkpoint")
             causes = document.get("drain_causes")
-            if not isinstance(causes, list) or any(
+            has_unknown = isinstance(causes, list) and any(
                 not isinstance(cause, Mapping) or cause.get("kind") == "unknown"
                 for cause in causes
+            )
+            if not isinstance(causes, list) or (
+                has_unknown
+                and not isinstance(resolution_authorization.get("unresolved_cause_acceptance"), Mapping)
             ):
                 raise ControllerError("checkpoint has unresolved or opaque drain causes")
             _validate_drain_resolution_authorization(

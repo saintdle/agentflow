@@ -69,6 +69,97 @@ controller incarnation, root, and absence of other active work before
 reopening the checkpoint. This flow does not close the cancelled Beads task
 or claim a provider result for it.
 
+## Expired launch for a task already closed in Beads
+
+If the exact task is already closed while its signed preidentity launch still
+has an issued, unbound return channel, an operator can retire that launch with
+the current protected controller credential:
+
+```sh
+agentflow controller retire-closed-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID
+```
+
+The command requires the exact owned task to remain a descendant of the
+workflow root, the canonical credential for the current active controller
+epoch, and a signed launch from an earlier positive epoch whose protected
+budget ledger proves expiry. The checkpoint must match the current controller
+epoch, and the task must be the sole unbound identity-pending claim. The
+command also verifies the native claim-generation seal, the unbound Herdr
+record, absence of a result, and Herdr's structured `pane_not_found`
+response. It records a signed budgeted retirement and revokes the old return
+channel before placing the controller checkpoint in a halted state. The task
+stays closed with its claim metadata and fence evidence intact; the original
+attempt and budget remain unchanged. Retries finish the same disposition after
+an interrupted checkpoint write.
+
+Some closed claims have no native claim-generation seal. Because the signed
+launch contract does not establish whether the seal was never created or later
+deleted, the legacy acknowledgement flag alone cannot authorize retirement.
+An owner may explicitly accept that origin as unresolved for this one negative
+retirement:
+
+```sh
+agentflow controller retire-closed-preidentity \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --task TASK --launch-id LAUNCH_ID --pane-id PANE_ID \
+  --accept-unresolved-generation-origin \
+  --reason "Generation origin is unknown; revoke this closed launch only."
+```
+
+The signed audit binds the owner's reason to the exact root, controller lease
+and fence, checkpoint, launch contract, claim identity, current claim-history
+digest, and expired budget record. It records the origin as unresolved and only
+revokes that closed launch. It does not classify the launch as pre-seal,
+create a generation seal, renew the claim, accept a result, reset its budget, or
+dispatch work. Present seals must still match exactly; the legacy
+`--acknowledge-missing-native-generation` flag alone is rejected. Retrying the
+same retirement requires the same signed decision and unchanged evidence.
+Typed drain causes still require their supported authenticated resolution
+paths. Unknown causes require the separate owner decision described below.
+Closed retirement and owner acceptance require a current version 4 checkpoint.
+They reject legacy checkpoint versions before signing or migration so a receipt
+cannot be detached from the bytes it records.
+
+Retire the closed launch first. Then inspect the resulting blocked checkpoint.
+If its complete drain-cause set is still unknown, an owner may explicitly
+accept that exact set as **unresolved** with the current protected credential:
+
+```sh
+agentflow controller accept-unresolved-drain-causes \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --acknowledge-unresolved-causes \
+  --reason "Historical cause provenance is unavailable; retain this uncertainty."
+```
+
+The command requires a current lease, a blocked checkpoint at that lease's
+epoch, no active task, and a non-empty owner reason. It signs and audits the
+complete cause IDs and digest together with the checkpoint fingerprint, root,
+epoch, and current fence. The audit retains the original cause records. It
+does not mark them resolved or supply missing task, launch, diagnostic, or
+outcome bindings. It does not change the checkpoint or authorize work by
+itself. Any later checkpoint change, including another retirement, makes the
+receipt stale; inspect and explicitly accept the new snapshot after that
+change.
+
+With the exact acceptance recorded, use the explicit continuation command in
+the expired preidentity recovery section, passing this task as `TASK` and a
+distinct ready descendant as `READY_TASK`. Continuation still checks the
+signed retirement, root ancestry, unchanged claim-history evidence, budgets,
+absence of other active work, and the exact ready target. The signed retirement
+binds both the original checkpoint fingerprint and the complete retired
+checkpoint output. Its origin decision and the drain-cause decision remain
+separate signed receipts. During an interrupted continuation, Agentflow checks
+the pending intent against the original lease and retired checkpoint before it
+accepts either the old checkpoint or its exact staged successor. The unresolved
+origin receipt only authenticates negative retirement; it does not start
+continuation or authorize work by itself. Without matching owner receipts,
+unknown causes remain a blocker.
+
 If this explicit continuation is interrupted while its protected credential
 is being rotated, rerun the same command with the same task IDs. Ordinary
 controller start, resume, supervise, recovery, stop, progress, rotate, and

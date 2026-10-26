@@ -2750,6 +2750,283 @@ def _verify_native_claim_generation(
         raise ValueError("native claim generation changed; operator recovery is required")
 
 
+_HISTORICAL_NATIVE_GENERATION_ACK_SCHEMA = "agentflow.historical-native-generation-observation@1"
+_UNRESOLVED_GENERATION_ORIGIN_SCHEMA = "agentflow.unresolved-generation-origin-acceptance@1"
+_UNRESOLVED_GENERATION_ORIGIN_FIELDS = frozenset({
+    "schema", "accepted_as", "effect", "reason", "workspace_root", "workflow_root",
+    "task_id", "launch_id", "pane_id", "controller_id", "continuity_id",
+    "current_lease_epoch", "current_lease_token_sha256", "checkpoint_sha256",
+    "checkpoint_binding_sha256",
+    "checkpoint_epoch", "checkpoint_token_sha256", "contract_sha256",
+    "launch_lease_epoch", "claim_id", "actor", "claim_token_sha256",
+    "claim_identity_sha256", "claim_generation_sha256", "expired_ledger_sha256",
+    "authority_key_id", "authority_hmac",
+})
+
+
+def _verify_unresolved_generation_origin_acceptance(
+    value: Any,
+    *,
+    authority_secret: str,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify a signed owner decision limited to one negative retirement."""
+    if not isinstance(value, Mapping) or set(value) != _UNRESOLVED_GENERATION_ORIGIN_FIELDS:
+        raise ValueError("unresolved generation-origin acceptance is malformed")
+    if (
+        value.get("schema") != _UNRESOLVED_GENERATION_ORIGIN_SCHEMA
+        or value.get("accepted_as") != "unresolved"
+        or value.get("effect") != "negative_retirement_only"
+        or value.get("authority_key_id") != _credential_key_id(authority_secret)
+        or not _verify_authority_mac(
+            authority_secret, value, domain="unresolved-generation-origin-v1",
+        )
+    ):
+        raise ValueError("unresolved generation-origin acceptance is not authenticated")
+    reason = value.get("reason")
+    if (
+        not isinstance(reason, str) or not reason or reason != reason.strip()
+        or len(reason) > checkpoint_backend.FIELD_MAX
+        or any(ord(char) < 32 for char in reason)
+    ):
+        raise ValueError("unresolved generation-origin reason is invalid")
+    for field in (
+        "current_lease_token_sha256", "checkpoint_sha256", "checkpoint_binding_sha256",
+        "checkpoint_token_sha256",
+        "contract_sha256", "claim_token_sha256", "claim_identity_sha256",
+        "claim_generation_sha256", "expired_ledger_sha256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value.get(field) or "")):
+            raise ValueError(f"unresolved generation-origin {field} is malformed")
+    for field, expected_value in expected.items():
+        if value.get(field) != expected_value:
+            raise ValueError(
+                f"unresolved generation-origin acceptance does not match the exact snapshot: {field}"
+            )
+    return dict(value)
+
+
+def _new_unresolved_generation_origin_acceptance(
+    snapshot: Mapping[str, Any], reason: str, authority_secret: str,
+) -> dict[str, Any]:
+    value = {
+        "schema": _UNRESOLVED_GENERATION_ORIGIN_SCHEMA,
+        "accepted_as": "unresolved",
+        "effect": "negative_retirement_only",
+        "reason": reason,
+        **dict(snapshot),
+        "authority_key_id": _credential_key_id(authority_secret),
+    }
+    value["authority_hmac"] = _authority_mac(
+        authority_secret, value, domain="unresolved-generation-origin-v1",
+    )
+    return _verify_unresolved_generation_origin_acceptance(
+        value, authority_secret=authority_secret, expected=snapshot,
+    )
+
+
+def _verify_historical_unresolved_generation_origin_acceptance(
+    root: Path,
+    workflow_root: str,
+    task: str,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+) -> dict[str, Any]:
+    """Verify immutable owner evidence without treating it as current permission."""
+    channel = record.get("return_channel")
+    if (
+        record.get("status") != "cancelled_preidentity"
+        or record.get("result") not in (None, {})
+        or not isinstance(channel, Mapping)
+        or channel.get("state") != "revoked"
+        or channel.get("contract_binding") != dict(contract)
+    ):
+        raise ValueError("historical unresolved-origin event is not an exact revoked launch")
+    disposition = _verify_preidentity_disposition(
+        record.get("recovery_disposition"), contract,
+        pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+    )
+    receipt = disposition.get("unresolved_generation_origin_acceptance")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("historical unresolved-origin event has no signed owner decision")
+    claim_token = str(identity.get("claim_token") or "")
+    claim_token_sha256 = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+    expected = {
+        "workspace_root": str(root.resolve()),
+        "workflow_root": workflow_root,
+        "task_id": task,
+        "launch_id": str(record.get("launch_id") or ""),
+        "pane_id": str(record.get("pane_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "contract_sha256": _canonical_json_digest(dict(contract)),
+        "launch_lease_epoch": contract.get("lease_epoch"),
+        "claim_id": str(identity.get("claim_id") or ""),
+        "actor": str(identity.get("actor") or ""),
+        "claim_token_sha256": claim_token_sha256,
+        "claim_identity_sha256": _canonical_json_digest({
+            "root": workflow_root,
+            "task": task,
+            "actor": str(identity.get("actor") or ""),
+            "claim_id": str(identity.get("claim_id") or ""),
+            "claim_token_sha256": claim_token_sha256,
+        }),
+        "checkpoint_sha256": disposition.get("pre_retirement_checkpoint_sha256"),
+    }
+    return _verify_unresolved_generation_origin_acceptance(
+        receipt, authority_secret=authority_secret, expected=expected,
+    )
+
+
+def _verify_closed_native_claim_generation(
+    root: Path,
+    workflow_root: str,
+    task: str,
+    identity: Mapping[str, Any],
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    authority_secret: str,
+    acknowledge_missing: bool = False,
+) -> dict[str, str] | None:
+    """Verify a closed seal or an already-signed negative retirement receipt."""
+    path = _native_claim_generation_path(root, workflow_root, task)
+    if path.is_symlink():
+        raise ValueError("native claim generation binding is unsafe; operator recovery is required")
+    if not path.exists():
+        if record.get("status") != "cancelled_preidentity":
+            suffix = (
+                "; --acknowledge-missing-native-generation cannot substitute for that proof"
+                if acknowledge_missing else ""
+            )
+            raise ValueError(
+                "native claim generation binding is missing and the signed launch has no "
+                "authenticated historical pre-seal eligibility proof" + suffix
+            )
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract,
+            pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+        )
+        receipt = disposition.get("unresolved_generation_origin_acceptance")
+        channel = record.get("return_channel")
+        if (
+            disposition.get("reason") != "superseded_closed_preidentity"
+            or not isinstance(receipt, Mapping)
+            or not isinstance(channel, Mapping)
+            or channel.get("state") != "revoked"
+            or channel.get("revocation") != dict(disposition)
+            or record.get("result") not in (None, {})
+        ):
+            raise ValueError("missing native seal has no signed negative-retirement owner decision")
+        historical_receipt = _verify_historical_unresolved_generation_origin_acceptance(
+            root, workflow_root, task, identity, record, contract,
+            authority_secret=authority_secret,
+        )
+        state_path = _controller_state_dir(root, workflow_root) / "state.json"
+        checkpoint_path = state_path.with_name("checkpoint.json")
+        controller = controller_backend.RootController(
+            str(root), str(contract.get("controller_id") or ""),
+            state_path=state_path, checkpoint_path=checkpoint_path,
+        )
+        state = _read_json_value(str(state_path))
+        lease = controller._read_lease(state) if isinstance(state, Mapping) else None
+        if lease is None:
+            raise ValueError("unresolved generation-origin receipt has no current controller lease")
+        lease = controller.assert_lease(lease)
+        document = controller._load_checkpoint(migrate=False)
+        raw_checkpoint = controller.checkpoint_path.read_bytes()
+        if hashlib.sha256(raw_checkpoint).hexdigest() != disposition.get("retired_checkpoint_sha256"):
+            raise ValueError("retired checkpoint differs from its authenticated complete postimage")
+        retired_check = (
+            "cancelled superseded_closed_preidentity preidentity launch "
+            f"{record.get('launch_id')} for {task}"
+        )
+        if (
+            lease.root != str(root)
+            or lease.controller != str(contract.get("controller_id") or "")
+            or lease.continuity_id != str(contract.get("continuity_id") or "")
+            or int(contract.get("lease_epoch", 0)) >= lease.epoch
+            or document.get("root") != str(root)
+            or document.get("controller") != controller.controller
+            or document.get("task") != controller.root
+            or document.get("epoch") != lease.epoch
+            or document.get("lease_token") != lease.token
+            or document.get("last_check") != retired_check
+            or document.get("active_tasks")
+            or document.get("actor") or document.get("claim_id") or document.get("session_id")
+            or checkpoint_backend.admission_phase(document) != "terminal"
+            or checkpoint_backend.resume_state(document) != "blocked"
+            or document.get("terminal") is not True
+        ):
+            raise ValueError("unresolved generation-origin receipt no longer matches the retired checkpoint")
+        claim_token = str(identity.get("claim_token") or "")
+        claim_token_sha256 = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        current_generation = beads_backend.claim_generation(root, task)
+        if not isinstance(current_generation, str) or not re.fullmatch(r"[0-9a-f]{64}", current_generation):
+            raise ValueError("current native claim history is unavailable or invalid")
+        execution_entry = _verify_execution_snapshot_against_ledger(
+            root, workflow_root, task, contract, authority_secret=authority_secret,
+        )
+        if execution_entry is None or execution_entry.get("status") != "expired":
+            raise ValueError("unresolved generation-origin receipt has no exact expired budget evidence")
+        expected = {
+            "workspace_root": str(root.resolve()),
+            "workflow_root": workflow_root,
+            "task_id": task,
+            "launch_id": str(record.get("launch_id") or ""),
+            "pane_id": str(record.get("pane_id") or ""),
+            "controller_id": controller.controller,
+            "continuity_id": lease.continuity_id,
+            "current_lease_epoch": lease.epoch,
+            "current_lease_token_sha256": hashlib.sha256(lease.token.encode()).hexdigest(),
+            "checkpoint_binding_sha256": _canonical_json_digest({
+                "root": document.get("root"),
+                "controller": document.get("controller"),
+                "epoch": document.get("epoch"),
+                "lease_token": document.get("lease_token"),
+                "drain_causes": document.get("drain_causes"),
+            }),
+            "checkpoint_epoch": document.get("epoch"),
+            "checkpoint_token_sha256": hashlib.sha256(
+                str(document.get("lease_token") or "").encode()
+            ).hexdigest(),
+            "contract_sha256": _canonical_json_digest(dict(contract)),
+            "launch_lease_epoch": contract.get("lease_epoch"),
+            "claim_id": str(identity.get("claim_id") or ""),
+            "actor": str(identity.get("actor") or ""),
+            "claim_token_sha256": claim_token_sha256,
+            "claim_identity_sha256": _canonical_json_digest({
+                "root": workflow_root, "task": task,
+                "actor": str(identity.get("actor") or ""),
+                "claim_id": str(identity.get("claim_id") or ""),
+                "claim_token_sha256": claim_token_sha256,
+            }),
+            "claim_generation_sha256": current_generation,
+            "expired_ledger_sha256": _expired_ledger_evidence_sha256(
+                execution_entry, _execution_launch_identity(root, workflow_root, task, contract),
+            ),
+        }
+        if dict(historical_receipt) != dict(receipt):
+            raise ValueError("historical unresolved-origin receipt changed from its signed disposition")
+        return _verify_unresolved_generation_origin_acceptance(
+            historical_receipt, authority_secret=authority_secret, expected=expected,
+        )
+    if acknowledge_missing:
+        raise ValueError("missing-generation acknowledgement is only valid when the seal is absent")
+    _verify_native_claim_generation(root, workflow_root, task, identity, cwd=root)
+    if record.get("status") == "cancelled_preidentity":
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract,
+            pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+        )
+        if isinstance(disposition.get("unresolved_generation_origin_acceptance"), Mapping):
+            raise ValueError("native claim seal appeared after unresolved-origin negative retirement")
+    return None
+
+
 def _renew_native_task_leases(
     controller: controller_backend.RootController, root: Path, workflow_root: str,
 ) -> list[str]:
@@ -2805,8 +3082,7 @@ def _controller_step(
         failed = _renew_native_task_leases(controller, root, workflow_root)
     if failed:
         result = controller.halt(
-            "blocked", "USER_ACTION_REQUIRED: native Beads task claim renewal failed for "
-            + ", ".join(failed) + "; launch and result authority are fenced. Inspect live workers before recovery.",
+            "blocked", controller_backend.native_claim_renewal_halt_reason(failed),
             lease=lease,
         )
         return ({
@@ -3019,6 +3295,22 @@ def _has_matching_drain_resolution_audit(
     """
     try:
         state = _read_json_value(str(controller.state_path))
+        unresolved_acceptance = resolution_authorization.get("unresolved_cause_acceptance")
+        if isinstance(unresolved_acceptance, Mapping):
+            accepted = controller_backend._matching_unresolved_cause_acceptance(
+                state, unresolved_acceptance, authority_secret,
+            ) if isinstance(state, Mapping) else None
+            if accepted is None:
+                return False
+            archived_causes = checkpoint_backend._check_drain_causes(accepted.get("causes"))
+            return bool(
+                (causes is None or archived_causes == causes)
+                and [cause["cause_id"] for cause in archived_causes]
+                == resolution_authorization.get("cause_ids")
+                and controller_backend._drain_causes_digest(archived_causes)
+                == resolution_authorization.get("causes_sha256")
+                and accepted.get("receipt") == dict(unresolved_acceptance)
+            )
         audit = state.get("drain_audit") if isinstance(state, Mapping) else None
         if (
             not isinstance(audit, list)
@@ -3118,6 +3410,7 @@ def _new_drain_resolution_authorization(
     contract: Mapping[str, Any],
     causes: list[dict[str, str]],
     authority_secret: str,
+    unresolved_cause_acceptance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     disposition = (
         record.get("execution_disposition")
@@ -3149,6 +3442,8 @@ def _new_drain_resolution_authorization(
         "retired_checkpoint_token": retired_checkpoint.get("lease_token"),
         "retired_checkpoint_last_check": retired_checkpoint.get("last_check"),
     }
+    if unresolved_cause_acceptance is not None:
+        payload["unresolved_cause_acceptance"] = dict(unresolved_cause_acceptance)
     payload["authority_hmac"] = _authority_mac(
         authority_secret, payload, domain="drain-resolution-authorization-v1",
     )
@@ -3210,6 +3505,48 @@ def _verify_drain_resolution_authorization(
             "ready_task": ready_task,
             **retired_fields,
         }
+        unresolved_acceptance = payload.get("unresolved_cause_acceptance")
+        expected_payload_fields = {
+            "schema", "root", "controller", "workflow_root", "continuity_id",
+            "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
+            "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
+            "ready_task", "intent_id", "retired_checkpoint_sha256",
+            "retired_checkpoint_epoch", "retired_checkpoint_token",
+            "retired_checkpoint_last_check",
+        } | ({"unresolved_cause_acceptance"} if unresolved_acceptance is not None else set())
+        has_unknown = any(cause["kind"] == "unknown" for cause in causes)
+        if staged_selection and isinstance(unresolved_acceptance, Mapping):
+            accepted = controller_backend._matching_unresolved_cause_acceptance(
+                state, unresolved_acceptance, authority_secret,
+            ) if isinstance(state, Mapping) else None
+            archived_causes = (
+                checkpoint_backend._check_drain_causes(accepted.get("causes"))
+                if accepted is not None else []
+            )
+            if (
+                accepted is None
+                or [cause["cause_id"] for cause in archived_causes] != payload.get("cause_ids")
+                or controller_backend._drain_causes_digest(archived_causes)
+                != payload.get("causes_sha256")
+                or accepted.get("receipt") != dict(unresolved_acceptance)
+            ):
+                return False
+        elif has_unknown:
+            if not isinstance(unresolved_acceptance, Mapping):
+                return False
+            controller_backend._validate_unresolved_cause_acceptance(
+                unresolved_acceptance, authority_secret,
+                root=controller.root, controller=controller.controller,
+                workflow_root=workflow_root, continuity_id=lease.continuity_id,
+                lease_epoch=payload.get("lease_epoch"),
+                lease_token=str(payload.get("lease_token") or ""),
+                checkpoint_sha256=str(payload.get("retired_checkpoint_sha256") or ""),
+                checkpoint_epoch=payload.get("retired_checkpoint_epoch"),
+                checkpoint_token=str(payload.get("retired_checkpoint_token") or ""),
+                causes=causes,
+            )
+        elif unresolved_acceptance is not None:
+            return False
         rotated = bool(
             staged_selection and isinstance(pending, Mapping)
             and pending.get("drain_resolution_authorization") == dict(authorization)
@@ -3230,14 +3567,7 @@ def _verify_drain_resolution_authorization(
             and pending.get("token") == lease.token
         )
         return bool(
-            set(payload) == {
-                "schema", "root", "controller", "workflow_root", "continuity_id",
-                "lease_epoch", "lease_token", "cause_ids", "causes_sha256",
-                "cancelled_task", "launch_id", "receipt_sha256", "contract_sha256",
-                "ready_task", "intent_id", "retired_checkpoint_sha256",
-                "retired_checkpoint_epoch", "retired_checkpoint_token",
-                "retired_checkpoint_last_check",
-            }
+            set(payload) == expected_payload_fields
             and all(payload.get(key) == value for key, value in expected.items())
             and isinstance(payload.get("lease_epoch"), int)
             and not isinstance(payload.get("lease_epoch"), bool)
@@ -3250,7 +3580,6 @@ def _verify_drain_resolution_authorization(
                 or (
                     payload.get("cause_ids") == [cause["cause_id"] for cause in causes]
                     and payload.get("causes_sha256") == controller_backend._drain_causes_digest(causes)
-                    and not any(cause["kind"] == "unknown" for cause in causes)
                 )
             )
             and epoch_ok
@@ -3261,6 +3590,114 @@ def _verify_drain_resolution_authorization(
         )
     except (OSError, ValueError, TypeError, KeyError, OverflowError):
         return False
+
+
+def _verify_closed_retirement_transition(
+    controller: controller_backend.RootController,
+    workflow_root: str,
+    cancelled_task: str,
+    ready_task: str,
+    record: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    *,
+    authority_secret: str,
+    pending: Mapping[str, Any] | None,
+    staged_selection: bool,
+) -> bool:
+    """Bind current, old-checkpoint, and staged-checkpoint phases to one retirement."""
+    disposition = _verify_preidentity_disposition(
+        record.get("recovery_disposition"), contract,
+        pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+    )
+    retired_digest = str(disposition.get("retired_checkpoint_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", retired_digest):
+        raise controller_backend.ControllerError(
+            "closed retirement has no authenticated full checkpoint postimage"
+        )
+    raw_checkpoint = controller.checkpoint_path.read_bytes()
+    if pending is None:
+        if hashlib.sha256(raw_checkpoint).hexdigest() != retired_digest:
+            raise controller_backend.ControllerError(
+                "retired checkpoint differs from its authenticated full postimage"
+            )
+        return False
+
+    intent = dict(pending)
+    supplied = str(intent.pop("authority_hmac", ""))
+    authorization = pending.get("drain_resolution_authorization")
+    receipt = disposition.get("unresolved_generation_origin_acceptance")
+    expected = {
+        "schema": "agentflow.continuation-reattach@1",
+        "root": controller.root,
+        "controller": controller.controller,
+        "workflow_root": workflow_root,
+        "cancelled_task": cancelled_task,
+        "ready_task": ready_task,
+    }
+    if (
+        not isinstance(authorization, Mapping)
+        or any(intent.get(key) != value for key, value in expected.items())
+        or not hmac.compare_digest(
+            supplied, _authority_mac(authority_secret, intent, domain="continuation-reattach-v1"),
+        )
+        or intent.get("retired_checkpoint_sha256") != retired_digest
+        or authorization.get("retired_checkpoint_sha256") != retired_digest
+        or intent.get("retired_checkpoint_epoch") != authorization.get("retired_checkpoint_epoch")
+        or intent.get("retired_checkpoint_token") != intent.get("previous_token")
+        or intent.get("retired_checkpoint_token") != authorization.get("retired_checkpoint_token")
+        or intent.get("retired_checkpoint_last_check") != authorization.get("retired_checkpoint_last_check")
+        or authorization.get("receipt_sha256") != _canonical_json_digest(dict(disposition))
+        or authorization.get("contract_sha256") != _canonical_json_digest(dict(contract))
+        or isinstance(intent.get("previous_epoch"), bool)
+        or not isinstance(intent.get("previous_epoch"), int)
+        or isinstance(intent.get("epoch"), bool)
+        or not isinstance(intent.get("epoch"), int)
+        or intent.get("previous_epoch") != intent.get("retired_checkpoint_epoch")
+        or intent.get("epoch") != intent.get("previous_epoch") + 1
+    ):
+        raise controller_backend.ControllerError(
+            "pending continuation does not authenticate the exact retired transition"
+        )
+    if isinstance(receipt, Mapping):
+        if (
+            receipt.get("current_lease_epoch") != intent.get("previous_epoch")
+            or receipt.get("checkpoint_epoch") != intent.get("retired_checkpoint_epoch")
+            or receipt.get("checkpoint_token_sha256") != hashlib.sha256(
+                str(intent.get("previous_token") or "").encode("utf-8")
+            ).hexdigest()
+            or receipt.get("current_lease_token_sha256") != hashlib.sha256(
+                str(intent.get("previous_token") or "").encode("utf-8")
+            ).hexdigest()
+            or receipt.get("checkpoint_sha256") != disposition.get("pre_retirement_checkpoint_sha256")
+        ):
+            raise controller_backend.ControllerError(
+                "pending continuation does not preserve its original owner receipt context"
+            )
+        _verify_historical_unresolved_generation_origin_acceptance(
+            Path(controller.root), workflow_root, cancelled_task,
+            identity, record, contract, authority_secret=authority_secret,
+        )
+
+    current_lease = controller._current_lease()
+    rotated = bool(
+        current_lease is not None
+        and intent.get("epoch") == current_lease.epoch
+        and intent.get("token") == current_lease.token
+    )
+    if staged_selection:
+        if not rotated or not controller._verify_pending_continuation_checkpoint(
+            _read_json_value(str(controller.state_path)), pending,
+            authority_secret=authority_secret,
+        ):
+            raise controller_backend.ControllerError(
+                "staged continuation is not the exact authenticated checkpoint target"
+            )
+    elif hashlib.sha256(raw_checkpoint).hexdigest() != retired_digest:
+        raise controller_backend.ControllerError(
+            "pending continuation old checkpoint differs from its authenticated retirement"
+        )
+    return bool(rotated)
 
 
 def _verify_cancelled_preidentity_continuation(
@@ -3286,7 +3723,7 @@ def _verify_cancelled_preidentity_continuation(
     current_lease = controller._current_lease()
     if not controller._lease_matches(current_lease, lease):
         raise controller_backend.ControllerError("continuation lease is no longer current")
-    document = controller._load_checkpoint()
+    document = checkpoint_backend.load_current_checkpoint(controller.checkpoint_path)
     record = _herdr_session_record(root, cancelled_task)
     bound_expired = bool(
         isinstance(record, Mapping) and record.get("status") == "expired_execution"
@@ -3309,9 +3746,11 @@ def _verify_cancelled_preidentity_continuation(
         "expired launch deadline; Herdr definitively reports pane absent before provider identity",
         "superseded_legacy_scope",
         "owner_abandoned_epoch",
+        "superseded_closed_preidentity",
         _BOUND_EXECUTION_EXPIRY_REASON,
     }:
         raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
+    closed_scope = not bound_expired and retirement_reason == "superseded_closed_preidentity"
     marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
     retired_check = (
         f"expired bound execution launch {record.get('launch_id')} for {cancelled_task}"
@@ -3385,6 +3824,7 @@ def _verify_cancelled_preidentity_continuation(
     if controller.session_ledger().get("blocked"):
         raise controller_backend.ControllerError("cannot continue a blocked controller budget")
     prior_causes: list[dict[str, str]] = []
+    unresolved_acceptance: Mapping[str, Any] | None = None
     if bound_expired:
         if not _authenticated_expired_bound_execution(
             root, workflow_root, cancelled_task, authority_secret=authority_secret,
@@ -3452,7 +3892,7 @@ def _verify_cancelled_preidentity_continuation(
             prior_causes = checkpoint_backend._check_drain_causes(document.get("drain_causes"))
         except checkpoint_backend.CheckpointError as exc:
             raise controller_backend.ControllerError("current checkpoint has malformed drain causes") from exc
-        if any(cause["kind"] == "unknown" for cause in prior_causes):
+        if not closed_scope and any(cause["kind"] == "unknown" for cause in prior_causes):
             raise controller_backend.ControllerError("preidentity continuation has an unknown drain cause")
     assert isinstance(record, Mapping)
     legacy_scope = not bound_expired and retirement_reason in {"superseded_legacy_scope", "owner_abandoned_epoch"}
@@ -3463,6 +3903,12 @@ def _verify_cancelled_preidentity_continuation(
         or contract.get("continuity_id") != lease.continuity_id
         or contract.get("controller_id") != lease.controller
         or int(contract.get("lease_epoch", 0)) > lease.epoch
+        or closed_scope and (
+            not isinstance(contract.get("lease_epoch"), int)
+            or isinstance(contract.get("lease_epoch"), bool)
+            or contract.get("lease_epoch") < 1
+            or contract.get("lease_epoch") >= lease.epoch
+        )
     ):
         raise controller_backend.ControllerError("cancelled launch belongs to another controller incarnation")
     cancelled_issue = beads_backend.get_issue(root, cancelled_task)
@@ -3470,8 +3916,11 @@ def _verify_cancelled_preidentity_continuation(
     agentflow = metadata.get("agentflow") if isinstance(metadata, Mapping) else None
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
     claim_token = str(agentflow.get("claim_token") or "")
+    expected_cancelled_status = (
+        "in_progress" if bound_expired else "closed" if closed_scope else "blocked"
+    )
     if (
-        str(cancelled_issue.get("status") or "").lower() != ("in_progress" if bound_expired else "blocked")
+        str(cancelled_issue.get("status") or "").lower() != expected_cancelled_status
         or str(cancelled_issue.get("assignee") or "") != lease.controller
         or str(agentflow.get("root") or "") != workflow_root
         or str(agentflow.get("task") or "") != cancelled_task
@@ -3487,9 +3936,39 @@ def _verify_cancelled_preidentity_continuation(
         beads_backend.verify_task_ancestry_and_ownership(
             root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
         )
+    elif closed_scope:
+        if workflow_root not in _history_task_ancestry(root, cancelled_task):
+            raise controller_backend.ControllerError("closed preidentity task is no longer under the exact workflow root")
+        try:
+            rotated_pending = _verify_closed_retirement_transition(
+                controller, workflow_root, cancelled_task, ready_task,
+                record, contract, agentflow,
+                authority_secret=authority_secret,
+                pending=pending_continuation,
+                staged_selection=staged_selection,
+            )
+            generation_path = _native_claim_generation_path(root, workflow_root, cancelled_task)
+            if rotated_pending:
+                if generation_path.is_symlink():
+                    raise ValueError("native claim generation binding is unsafe; operator recovery is required")
+                if generation_path.exists():
+                    _verify_native_claim_generation(root, workflow_root, cancelled_task, agentflow, cwd=root)
+                    if isinstance(disposition.get("unresolved_generation_origin_acceptance"), Mapping):
+                        raise ValueError("native claim seal appeared after unresolved-origin negative retirement")
+                else:
+                    _verify_historical_unresolved_generation_origin_acceptance(
+                        root, workflow_root, cancelled_task, agentflow, record, contract,
+                        authority_secret=authority_secret,
+                    )
+            else:
+                _verify_closed_native_claim_generation(
+                    root, workflow_root, cancelled_task, agentflow, record, contract,
+                    authority_secret=authority_secret,
+                )
+        except (OSError, ValueError) as exc:
+            raise controller_backend.ControllerError(str(exc)) from exc
     elif str(cancelled_issue.get("parent") or "") != workflow_root:
         raise controller_backend.ControllerError("blocked preidentity task is no longer under the exact workflow root")
-
     root_issue = beads_backend.get_issue(root, workflow_root)
     if (
         str(root_issue.get("id") or "") != workflow_root
@@ -3500,10 +3979,57 @@ def _verify_cancelled_preidentity_continuation(
     by_id = {str(row.get("id") or ""): row for row in descendants}
     if cancelled_task not in by_id or ready_task not in by_id:
         raise controller_backend.ControllerError("cancelled and ready tasks must be descendants of this root")
+    if any(cause["kind"] == "unknown" for cause in prior_causes):
+        if not closed_scope:
+            raise controller_backend.ControllerError("preidentity continuation has an unknown drain cause")
+        candidate_acceptance = (
+            resolution_authorization.get("unresolved_cause_acceptance")
+            if isinstance(resolution_authorization, Mapping) else None
+        )
+        if isinstance(candidate_acceptance, Mapping):
+            unresolved_acceptance = dict(candidate_acceptance)
+        elif not staged_selection:
+            unresolved_acceptance = controller.unresolved_drain_cause_acceptance(
+                workflow_root, authority_secret=authority_secret, lease=lease,
+            )
+        if not isinstance(unresolved_acceptance, Mapping):
+            raise controller_backend.ControllerError(
+                "closed preidentity continuation has an unknown drain cause without explicit owner acceptance"
+            )
+        state_snapshot = _read_json_value(str(controller.state_path))
+        archived_acceptance = controller_backend._matching_unresolved_cause_acceptance(
+            state_snapshot, unresolved_acceptance, authority_secret,
+        ) if isinstance(state_snapshot, Mapping) else None
+        if (
+            archived_acceptance is None
+            or archived_acceptance.get("causes") != prior_causes
+        ):
+            raise controller_backend.ControllerError(
+                "owner acceptance has no authenticated audit of the original causes"
+            )
+        if not pending_old_checkpoint:
+            try:
+                retired_raw = controller.checkpoint_path.read_bytes()
+                controller_backend._validate_unresolved_cause_acceptance(
+                    unresolved_acceptance, authority_secret,
+                    root=controller.root, controller=controller.controller,
+                    workflow_root=workflow_root, continuity_id=lease.continuity_id,
+                    lease_epoch=lease.epoch, lease_token=lease.token,
+                    checkpoint_sha256=hashlib.sha256(retired_raw).hexdigest(),
+                    checkpoint_epoch=document.get("epoch"),
+                    checkpoint_token=str(document.get("lease_token") or ""),
+                    causes=prior_causes,
+                )
+            except (OSError, controller_backend.ControllerError) as exc:
+                raise controller_backend.ControllerError(
+                    "owner acceptance does not match the current unresolved cause snapshot"
+                ) from exc
     resolved_failure_tasks: set[str] = set()
     if prior_causes:
         for cause in prior_causes:
             kind = cause["kind"]
+            if kind == "unknown" and closed_scope and unresolved_acceptance is not None:
+                continue
             if kind == "no_ready_work":
                 if cause["provenance"] != "scheduler_no_ready_work":
                     raise controller_backend.ControllerError("prior no-ready cause provenance is unsupported")
@@ -3611,7 +4137,6 @@ def _verify_cancelled_preidentity_continuation(
                     f"causal failure task lacks its exact authenticated outcome: {causal_task}"
                 )
             resolved_failure_tasks.add(causal_task)
-    expected_cancelled_status = "in_progress" if bound_expired else "blocked"
     if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
     if not bound_expired and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
@@ -3692,6 +4217,7 @@ def _verify_cancelled_preidentity_continuation(
             cancelled_task=cancelled_task, ready_task=ready_task,
             record=record, contract=contract, causes=authorization_causes,
             authority_secret=authority_secret,
+            unresolved_cause_acceptance=unresolved_acceptance,
         )
     if staged_selection and resolution_authorization.get("cause_ids"):
         if not _has_matching_drain_resolution_audit(
@@ -3724,7 +4250,7 @@ def _verify_retired_preidentity_descendant(
     *,
     authority_secret: str,
 ) -> None:
-    """Accept only another independently authenticated, blocked legacy retirement."""
+    """Accept another independently authenticated retired preidentity descendant."""
     record = _herdr_session_record(root, task_id)
     if not isinstance(record, Mapping) or not _authenticated_cancelled_preidentity(
         root, workflow_root, task_id, authority_secret=authority_secret,
@@ -3734,7 +4260,8 @@ def _verify_retired_preidentity_descendant(
         )
     disposition = record.get("recovery_disposition")
     reason = str(disposition.get("reason") or "") if isinstance(disposition, Mapping) else ""
-    if reason not in {"superseded_legacy_scope", "owner_abandoned_epoch"}:
+    closed_scope = reason == "superseded_closed_preidentity"
+    if reason not in {"superseded_legacy_scope", "owner_abandoned_epoch", "superseded_closed_preidentity"}:
         raise controller_backend.ControllerError(
             "another descendant has an unsupported preidentity retirement"
         )
@@ -3766,10 +4293,9 @@ def _verify_retired_preidentity_descendant(
     claim_token = str(agentflow.get("claim_token") or "")
     if (
         str(issue.get("id") or "") != task_id
-        or str(issue.get("parent") or "") != workflow_root
-        or str(issue.get("status") or "").lower() != "blocked"
+        or str(issue.get("status") or "").lower() != ("closed" if closed_scope else "blocked")
         or str(issue.get("assignee") or "") != lease.controller
-        or str(descendant.get("status") or "").lower() != "blocked"
+        or str(descendant.get("status") or "").lower() != ("closed" if closed_scope else "blocked")
         or str(descendant.get("assignee") or "") != lease.controller
         or str(agentflow.get("root") or "") != workflow_root
         or str(agentflow.get("task") or "") != task_id
@@ -3785,6 +4311,37 @@ def _verify_retired_preidentity_descendant(
         raise controller_backend.ControllerError(
             "another retired task no longer has its exact blocked Beads claim"
         )
+    if closed_scope:
+        if workflow_root not in _history_task_ancestry(root, task_id):
+            raise controller_backend.ControllerError(
+                "another closed retired task is no longer under the exact workflow root"
+            )
+        if not isinstance(contract, Mapping):
+            raise controller_backend.ControllerError("closed retired descendant has no signed claim contract")
+        generation_path = _native_claim_generation_path(root, workflow_root, task_id)
+        if generation_path.is_symlink():
+            raise controller_backend.ControllerError(
+                "historical native claim generation binding is unsafe"
+            )
+        disposition = _verify_preidentity_disposition(
+            record.get("recovery_disposition"), contract,
+            pane_id=str(record.get("pane_id") or ""), authority_secret=authority_secret,
+        )
+        if generation_path.exists():
+            _verify_native_claim_generation(root, workflow_root, task_id, agentflow, cwd=root)
+            if isinstance(disposition.get("unresolved_generation_origin_acceptance"), Mapping):
+                raise controller_backend.ControllerError(
+                    "native claim seal appeared after unresolved-origin negative retirement"
+                )
+        else:
+            _verify_historical_unresolved_generation_origin_acceptance(
+                root, workflow_root, task_id, agentflow, record, contract,
+                authority_secret=authority_secret,
+            )
+    elif str(issue.get("parent") or "") != workflow_root:
+        raise controller_backend.ControllerError(
+            "another retired task no longer has its exact blocked workflow parent"
+        )
 
 
 def controller_recover_preidentity(args: argparse.Namespace) -> int:
@@ -3796,6 +4353,11 @@ def controller_retire_superseded_legacy_preidentity(args: argparse.Namespace) ->
     return _controller_preidentity_retirement(args, superseded_legacy_scope=True)
 
 
+def controller_retire_closed_preidentity(args: argparse.Namespace) -> int:
+    """Retire one expired launch whose exact owned Beads task is already closed."""
+    return _controller_preidentity_retirement(args, closed_superseded=True)
+
+
 def controller_repair_abandoned_epoch(args: argparse.Namespace) -> int:
     """Repair one explicitly acknowledged abandoned controller epoch gap."""
     return _controller_preidentity_retirement(args, owner_abandoned_epoch=True)
@@ -3803,11 +4365,12 @@ def controller_repair_abandoned_epoch(args: argparse.Namespace) -> int:
 
 def _controller_preidentity_retirement(
     args: argparse.Namespace, *, superseded_legacy_scope: bool = False,
-    owner_abandoned_epoch: bool = False,
+    owner_abandoned_epoch: bool = False, closed_superseded: bool = False,
 ) -> int:
     """Retire one exact absent-pane identity-pending launch under its root lease."""
     operation_name = (
         "repair-abandoned-epoch" if owner_abandoned_epoch
+        else "retire-closed-preidentity" if closed_superseded
         else "retire-superseded-legacy-preidentity" if superseded_legacy_scope
         else "recover-preidentity"
     )
@@ -3819,6 +4382,20 @@ def _controller_preidentity_retirement(
         task_id = str(getattr(args, "task", "") or "")
         launch_id = str(getattr(args, "launch_id", "") or "")
         pane_id = str(getattr(args, "pane_id", "") or "")
+        accept_unresolved_generation_origin = bool(
+            getattr(args, "accept_unresolved_generation_origin", False)
+        )
+        generation_origin_reason = str(getattr(args, "reason", "") or "")
+        if accept_unresolved_generation_origin and not closed_superseded:
+            raise ValueError("unresolved generation origin can authorize only closed-launch negative retirement")
+        if accept_unresolved_generation_origin and (
+            not generation_origin_reason or generation_origin_reason != generation_origin_reason.strip()
+            or len(generation_origin_reason) > checkpoint_backend.FIELD_MAX
+            or any(ord(char) < 32 for char in generation_origin_reason)
+        ):
+            raise ValueError("--reason must be a bounded explicit owner reason for unresolved generation origin")
+        if not accept_unresolved_generation_origin and generation_origin_reason:
+            raise ValueError("--reason requires --accept-unresolved-generation-origin")
         if not workflow_root or workflow_root != raw_workflow_root:
             raise ValueError("--workflow-root is required as an exact Beads root ID")
         if not task_id or not launch_id or not pane_id:
@@ -3911,6 +4488,10 @@ def _controller_preidentity_retirement(
                     )
                 if preauthenticated_epoch is None:
                     preauthenticated_epoch = abandoned_epoch
+            if closed_superseded and (active is None or preauthenticated_epoch is None):
+                raise controller_backend.LeaseConflict(
+                    "closed preidentity retirement requires the current authenticated controller lease"
+                )
 
             # Validate all immutable protected evidence before changing a
             # released/legacy lease epoch or writing a cancellation record.
@@ -3920,7 +4501,15 @@ def _controller_preidentity_retirement(
                 expected_current_epoch=preauthenticated_epoch,
                 superseded_legacy_scope=superseded_legacy_scope,
                 owner_abandoned_epoch=owner_abandoned_epoch,
+                closed_superseded=closed_superseded,
+                acknowledge_missing_native_generation=bool(
+                    getattr(args, "acknowledge_missing_native_generation", False)
+                ),
+                accept_unresolved_generation_origin=accept_unresolved_generation_origin,
+                generation_origin_reason=generation_origin_reason,
             )
+            initial_native_generation_observation = snapshot.get("native_generation_observation")
+            initial_generation_origin_acceptance = snapshot.get("generation_origin_acceptance")
             contract = snapshot["contract"]
             if credentials["continuity_id"] != contract.get("continuity_id"):
                 raise controller_backend.LeaseConflict(
@@ -4019,22 +4608,51 @@ def _controller_preidentity_retirement(
                 expected_current_epoch=lease.epoch,
                 superseded_legacy_scope=superseded_legacy_scope,
                 owner_abandoned_epoch=owner_abandoned_epoch,
+                closed_superseded=closed_superseded,
+                acknowledge_missing_native_generation=bool(
+                    getattr(args, "acknowledge_missing_native_generation", False)
+                ),
+                accept_unresolved_generation_origin=accept_unresolved_generation_origin,
+                generation_origin_reason=generation_origin_reason,
             )
-            def commit_cancellation() -> None:
+            if snapshot.get("native_generation_observation") != initial_native_generation_observation:
+                raise ValueError("native claim history changed during recovery preflight")
+            if snapshot.get("generation_origin_acceptance") != initial_generation_origin_acceptance:
+                raise ValueError("unresolved generation-origin owner decision changed during recovery preflight")
+            def commit_cancellation(planned_checkpoint_sha256: str) -> None:
                 current = _preidentity_recovery_snapshot(
                     controller, root, workflow_root, task_id, launch_id, pane_id,
                     authority_secret=credentials["authority_secret"],
                     expected_current_epoch=lease.epoch,
                     superseded_legacy_scope=superseded_legacy_scope,
                     owner_abandoned_epoch=owner_abandoned_epoch,
+                    closed_superseded=closed_superseded,
+                    acknowledge_missing_native_generation=bool(
+                        getattr(args, "acknowledge_missing_native_generation", False)
+                    ),
+                    accept_unresolved_generation_origin=accept_unresolved_generation_origin,
+                    generation_origin_reason=generation_origin_reason,
                 )
                 if current["contract"] != snapshot["contract"]:
                     raise ValueError("signed launch changed during recovery")
+                if current.get("native_generation_observation") != initial_native_generation_observation:
+                    raise ValueError("native claim history changed before retirement commit")
+                if current.get("generation_origin_acceptance") != initial_generation_origin_acceptance:
+                    raise ValueError("unresolved generation-origin owner decision changed before retirement commit")
+                if closed_superseded and current.get("checkpoint_sha256") != snapshot.get("checkpoint_sha256"):
+                    raise ValueError("checkpoint changed from the exact retirement preflight snapshot")
                 _commit_preidentity_cancellation(
                     root, workflow_root, task_id, launch_id, pane_id,
                     current["contract"], authority_secret=credentials["authority_secret"],
                     superseded_legacy_scope=superseded_legacy_scope,
                     owner_abandoned_epoch=owner_abandoned_epoch,
+                    closed_superseded=closed_superseded,
+                    native_generation_observation=current.get("native_generation_observation"),
+                    generation_origin_acceptance=current.get("generation_origin_acceptance"),
+                    pre_retirement_checkpoint_sha256=current.get(
+                        "pre_retirement_checkpoint_sha256", "",
+                    ),
+                    retired_checkpoint_sha256=planned_checkpoint_sha256,
                 )
             if superseded_legacy_scope:
                 result = controller.cancel_superseded_legacy_preidentity_task(
@@ -4045,7 +4663,11 @@ def _controller_preidentity_retirement(
                 result = controller.cancel_expired_preidentity_task(
                     task_id, str(snapshot["contract"].get("claim_id") or ""), launch_id,
                     commit_cancellation=commit_cancellation, lease=lease,
-                    retirement_reason=("owner_abandoned_epoch" if owner_abandoned_epoch else "expired"),
+                    retirement_reason=(
+                        "owner_abandoned_epoch" if owner_abandoned_epoch
+                        else "superseded_closed_preidentity" if closed_superseded
+                        else "expired"
+                    ),
                     _abandoned_epoch_repair_authority=(
                         {
                             "workflow_root": workflow_root,
@@ -4067,7 +4689,7 @@ def _controller_preidentity_retirement(
             return 0
     except (
         controller_backend.ControllerError, controller_backend.FencedLease,
-        beads_backend.BeadsError, herdr_backend.HerdrError,
+        beads_backend.BeadsError, herdr_backend.HerdrError, checkpoint_backend.CheckpointError,
         OSError, ValueError, KeyError, TypeError, json.JSONDecodeError,
     ) as exc:
         _json_or_status(
@@ -4196,7 +4818,9 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
                     if previous is None and continue_cancelled_task and isinstance(state, Mapping):
                         dormant_raw = state.get("dormant_lease")
                         previous = controller._read_lease({"lease": dormant_raw}) if isinstance(dormant_raw, Mapping) else None
-                    checkpoint_epoch = controller._load_checkpoint().get("epoch")
+                    checkpoint_epoch = checkpoint_backend.load_current_checkpoint(
+                        controller.checkpoint_path,
+                    ).get("epoch")
                     if (
                         previous is None or previous.root != str(root)
                         or previous.controller != controller.controller
@@ -4420,7 +5044,7 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
     except (
         controller_backend.ControllerError, beads_backend.BeadsError,
         herdr_backend.HerdrError, session_control_backend.SessionControlError,
-        OSError, ValueError, json.JSONDecodeError,
+        checkpoint_backend.CheckpointError, OSError, ValueError, json.JSONDecodeError,
     ) as exc:
         payload = {"operation": operation, "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title=f"CONTROLLER {operation.upper()} FAILED")
@@ -4506,6 +5130,93 @@ def controller_status(args: argparse.Namespace) -> int:
     ) as exc:
         payload = {"operation": "status", "ok": False, "error": str(exc)}
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS FAILED")
+        return 2
+
+
+def controller_accept_unresolved_drain_causes(args: argparse.Namespace) -> int:
+    """Record the owner's exact-snapshot decision to retain unknown causes as unresolved."""
+    try:
+        _reject_custom_controller_state_path(args)
+        _reject_custom_controller_checkpoint(args)
+        raw_workflow_root = str(getattr(args, "workflow_root", "") or "")
+        workflow_root = raw_workflow_root.strip()
+        if not workflow_root or workflow_root != raw_workflow_root:
+            raise ValueError("--workflow-root is required as an exact Beads root ID")
+        if str(getattr(args, "resume_token", "") or ""):
+            raise ValueError("owner acceptance requires the canonical protected controller credential")
+        controller, root = _controller_instance(args)
+        key_path = _resume_key_path(args)
+        canonical_path = _resume_key_path(argparse.Namespace(
+            root=str(root), workflow_root=workflow_root, resume_key_file="",
+        ))
+        if key_path != canonical_path:
+            raise controller_backend.LeaseConflict(
+                "owner acceptance requires the canonical protected controller credential"
+            )
+        _require_external_accounting_storage(key_path, str(root.resolve()))
+        if (
+            key_path.is_symlink() or key_path.parent.is_symlink()
+            or key_path.resolve() != key_path.absolute()
+            or not key_path.is_file()
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical protected controller credential is unavailable"
+            )
+        if os.name == "posix" and (
+            key_path.stat().st_mode & 0o077 or key_path.parent.stat().st_mode & 0o077
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller credential permissions are too broad"
+            )
+        credentials = _read_controller_credentials(key_path)
+        raw_credentials = json.loads(key_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(raw_credentials, Mapping)
+            or raw_credentials.get("schema") != "agentflow.controller_credentials"
+            or raw_credentials.get("version") != 2
+            or credentials.get("workspace_root") != str(root.resolve())
+            or credentials.get("workflow_root") != workflow_root
+            or not credentials.get("continuity_id")
+            or not credentials.get("authority_secret")
+            or not credentials.get("resume_secret")
+        ):
+            raise controller_backend.LeaseConflict(
+                "canonical controller credential does not authenticate this workflow incarnation"
+            )
+        lease = controller.authorize(credentials["resume_secret"])
+        if (
+            lease.root != str(root)
+            or lease.controller != controller.controller
+            or lease.continuity_id != credentials["continuity_id"]
+        ):
+            raise controller_backend.LeaseConflict(
+                "current lease does not match the canonical workflow credential"
+            )
+        receipt, duplicate = controller.accept_unresolved_drain_causes(
+            workflow_root, str(getattr(args, "reason", "") or ""),
+            accept_as_unresolved=bool(getattr(args, "acknowledge_unresolved_causes", False)),
+            authority_secret=credentials["authority_secret"], lease=lease,
+        )
+        payload = {
+            "operation": "accept-unresolved-drain-causes", "ok": True,
+            "root": str(root), "workflow_root": workflow_root,
+            "accepted_as": receipt["accepted_as"], "reason": receipt["reason"],
+            "epoch": receipt["lease_epoch"],
+            "checkpoint_sha256": receipt["checkpoint_sha256"],
+            "cause_ids": list(receipt["cause_ids"]),
+            "causes_sha256": receipt["causes_sha256"],
+            "duplicate": duplicate,
+        }
+        _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="UNRESOLVED CAUSES ACCEPTED")
+        return 0
+    except (
+        controller_backend.ControllerError, OSError, ValueError,
+        TypeError, KeyError, json.JSONDecodeError,
+    ) as exc:
+        _json_or_status(
+            {"operation": "accept-unresolved-drain-causes", "ok": False, "error": str(exc)},
+            as_json=bool(getattr(args, "json", False)), title="UNRESOLVED CAUSE ACCEPTANCE FAILED",
+        )
         return 2
 
 
@@ -5236,6 +5947,36 @@ def _verify_execution_snapshot_against_ledger(
     return entry
 
 
+def _execution_launch_identity(
+    root: Path, workflow_root: str, task_id: str, contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the immutable launch identity authenticated by its signed contract."""
+    return {
+        "workspace_root": str(root.resolve()),
+        "workflow_root": workflow_root,
+        "task_id": task_id,
+        "claim_id": str(contract.get("claim_id") or ""),
+        "lease_id": str(contract.get("lease_id") or ""),
+        "launch_id": str(contract.get("launch_id") or ""),
+        "controller_id": str(contract.get("controller_id") or ""),
+        "continuity_id": str(contract.get("continuity_id") or ""),
+        "lease_epoch": contract.get("lease_epoch"),
+    }
+
+
+def _expired_ledger_evidence_sha256(
+    entry: Mapping[str, Any], launch_identity: Mapping[str, Any],
+) -> str:
+    """Digest stable budget evidence, normalizing an absent identity from the signed contract."""
+    return _canonical_json_digest({
+        "attempt": entry.get("attempt"),
+        "max_attempts": entry.get("max_attempts"),
+        "execution_limits": entry.get("execution_limits"),
+        "deadline_epoch": entry.get("deadline_epoch"),
+        "launch_identity": dict(launch_identity),
+    })
+
+
 def _expired_preidentity_ledger_disposition(
     root: Path,
     workflow_root: str,
@@ -5320,16 +6061,29 @@ def _preidentity_recovery_snapshot(
     expected_current_epoch: int | None = None,
     superseded_legacy_scope: bool = False,
     owner_abandoned_epoch: bool = False,
+    closed_superseded: bool = False,
+    acknowledge_missing_native_generation: bool = False,
+    accept_unresolved_generation_origin: bool = False,
+    generation_origin_reason: str = "",
 ) -> dict[str, Any]:
     """Prove the exact halted launch before any lease or state transition."""
-    document = controller._load_checkpoint()
+    checkpoint_bytes = (
+        controller.checkpoint_path.read_bytes() if controller.checkpoint_path.is_file() else b""
+    )
+    if closed_superseded:
+        document = checkpoint_backend.parse_current_checkpoint(checkpoint_bytes)
+    else:
+        document = controller._load_checkpoint(migrate=False)
+    checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+    pre_retirement_checkpoint_sha256 = checkpoint_sha256
     expected_reason = f"USER_ACTION_REQUIRED: task {task_id} provider identity never resolved within "
     retirement_reason = (
         "owner_abandoned_epoch" if owner_abandoned_epoch
+        else "superseded_closed_preidentity" if closed_superseded
         else "superseded_legacy_scope" if superseded_legacy_scope else "expired"
     )
     retired_check = f"cancelled {retirement_reason} preidentity launch {launch_id} for {task_id}"
-    rows = controller.active_tasks()
+    rows = controller.active_tasks(migrate=False)
     already_retired = (
         not rows and document.get("task") == controller.root
         and not document.get("active_tasks")
@@ -5350,7 +6104,11 @@ def _preidentity_recovery_snapshot(
         checkpoint_backend.admission_phase(document) == "terminal"
         and checkpoint_backend.resume_state(document) == "blocked"
         and document.get("terminal") is True
-        and str(document.get("terminal_reason") or "").startswith(expected_reason)
+        and (
+            str(document.get("terminal_reason") or "").startswith(expected_reason)
+            or closed_superseded
+            and controller_backend.is_native_claim_renewal_halt(document, task_id)
+        )
     )
     if (
         not ((terminal_halt and not superseded_legacy_scope and not owner_abandoned_epoch)
@@ -5370,8 +6128,17 @@ def _preidentity_recovery_snapshot(
     if raw_lease is not None and not isinstance(raw_lease, Mapping):
         raise ValueError("controller lease state is malformed")
     stored_epoch = int(raw_state.get("epoch", -1))
+    current_lease = controller._read_lease(raw_state) if isinstance(raw_state, Mapping) else None
     if stored_epoch != int(document.get("epoch", -2)) and stored_epoch != expected_current_epoch:
         raise ValueError("checkpoint epoch does not match protected controller state")
+    if closed_superseded and (
+        expected_current_epoch is None
+        or stored_epoch != expected_current_epoch
+        or document.get("epoch") != expected_current_epoch
+        or current_lease is None
+        or current_lease.epoch != expected_current_epoch
+    ):
+        raise ValueError("closed preidentity checkpoint is not at the authenticated current controller epoch")
 
     descendants = beads_backend.root_descendants(root, workflow_root)
     descendant_ids = {str(item.get("id") or "") for item in descendants}
@@ -5385,7 +6152,9 @@ def _preidentity_recovery_snapshot(
         raise ValueError("another workflow descendant is still claimed in progress")
     task_issue = beads_backend.get_issue(root, task_id)
     legacy_scope = superseded_legacy_scope or owner_abandoned_epoch
-    expected_task_status = "blocked" if legacy_scope else "in_progress"
+    expected_task_status = (
+        "closed" if closed_superseded else "blocked" if legacy_scope else "in_progress"
+    )
     if str(task_issue.get("status") or "").lower() != expected_task_status:
         raise ValueError("exact task no longer has the expected retained claim status")
     metadata = task_issue.get("metadata")
@@ -5395,15 +6164,19 @@ def _preidentity_recovery_snapshot(
     actor = str(agentflow.get("actor") or "")
     if not claim_token or not actor:
         raise ValueError("exact live Beads claim is unavailable")
-    if legacy_scope:
+    if legacy_scope or closed_superseded:
         if (
             str(task_issue.get("assignee") or "") != controller.controller
             or actor != controller.controller
             or str(agentflow.get("root") or "") != workflow_root
             or str(agentflow.get("task") or "") != task_id
-            or str(task_issue.get("parent") or "") != workflow_root
         ):
-            raise ValueError("blocked legacy claim no longer matches its exact owner and workflow root")
+            raise ValueError("retained claim no longer matches its exact owner and workflow root")
+        if legacy_scope:
+            if str(task_issue.get("parent") or "") != workflow_root:
+                raise ValueError("blocked legacy claim no longer has its exact workflow parent")
+        elif workflow_root not in _history_task_ancestry(root, task_id):
+            raise ValueError("closed task is not an exact descendant of the workflow root")
     else:
         beads_backend.verify_task_ancestry_and_ownership(
             root, task_issue, task=task_id, root=workflow_root, actor=actor,
@@ -5416,6 +6189,7 @@ def _preidentity_recovery_snapshot(
     if not isinstance(record, Mapping):
         raise ValueError("exact Herdr launch record is unavailable")
     was_cancelled = record.get("status") == "cancelled_preidentity"
+    existing_generation_origin_acceptance = None
     if (
         record.get("status") not in {"identity_pending", "cancelled_preidentity"}
         or record.get("root") != str(root)
@@ -5450,6 +6224,19 @@ def _preidentity_recovery_snapshot(
             record.get("recovery_disposition"), contract, pane_id=pane_id,
             authority_secret=authority_secret,
         )
+        existing_generation_origin_acceptance = disposition.get(
+            "unresolved_generation_origin_acceptance"
+        )
+        if closed_superseded:
+            pre_retirement_checkpoint_sha256 = str(
+                disposition.get("pre_retirement_checkpoint_sha256") or ""
+            )
+            retired_checkpoint_sha256 = str(disposition.get("retired_checkpoint_sha256") or "")
+            if already_retired:
+                if checkpoint_sha256 != retired_checkpoint_sha256:
+                    raise ValueError("retired checkpoint changed from its signed full-snapshot output")
+            elif checkpoint_sha256 != pre_retirement_checkpoint_sha256:
+                raise ValueError("retirement preimage changed after its authenticated intent was committed")
         expected_disposition_reason = (
             "expired launch deadline; Herdr definitively reports pane absent before provider identity"
             if retirement_reason == "expired" else retirement_reason
@@ -5458,6 +6245,37 @@ def _preidentity_recovery_snapshot(
             raise ValueError("cancelled preidentity launch requires its matching retirement command")
         if channel.get("revocation") != dict(disposition):
             raise ValueError("return channel revocation does not match the signed cancellation")
+    native_generation_observation = None
+    missing_native_generation = False
+    if closed_superseded:
+        generation_path = _native_claim_generation_path(root, workflow_root, task_id)
+        if generation_path.is_symlink():
+            raise ValueError("native claim generation binding is unsafe; operator recovery is required")
+        missing_native_generation = not generation_path.exists()
+        if missing_native_generation:
+            if was_cancelled and not isinstance(existing_generation_origin_acceptance, Mapping):
+                raise ValueError(
+                    "retired launch has no signed unresolved-origin owner decision; "
+                    "the legacy acknowledgement cannot establish historical eligibility"
+                )
+            if not was_cancelled and not accept_unresolved_generation_origin:
+                _verify_closed_native_claim_generation(
+                    root, workflow_root, task_id, agentflow, record, contract,
+                    authority_secret=authority_secret,
+                    acknowledge_missing=acknowledge_missing_native_generation,
+                )
+        else:
+            if accept_unresolved_generation_origin or isinstance(
+                existing_generation_origin_acceptance, Mapping
+            ):
+                raise ValueError(
+                    "unresolved-origin acceptance applies only while the native generation seal is absent"
+                )
+            native_generation_observation = _verify_closed_native_claim_generation(
+                root, workflow_root, task_id, agentflow, record, contract,
+                authority_secret=authority_secret,
+                acknowledge_missing=acknowledge_missing_native_generation,
+            )
     expected = {
         "workspace_root": str(root.resolve()), "workflow_root": workflow_root,
         "task_id": task_id, "claim_id": str(agentflow.get("claim_id") or ""),
@@ -5476,12 +6294,23 @@ def _preidentity_recovery_snapshot(
         "continuity_id": str(contract.get("continuity_id") or ""),
         "lease_epoch": contract.get("lease_epoch"),
     }
-    if actual != expected or (
-        not already_retired and document.get("epoch") != contract.get("lease_epoch")
-    ) or (
-        already_retired and int(document.get("epoch", 0)) < int(contract.get("lease_epoch", 0))
-    ):
+    checkpoint_epoch_matches = (
+        document.get("epoch") == expected_current_epoch
+        if closed_superseded
+        else document.get("epoch") == contract.get("lease_epoch")
+        if not already_retired
+        else int(document.get("epoch", 0)) >= int(contract.get("lease_epoch", 0))
+    )
+    if actual != expected or not checkpoint_epoch_matches:
         raise ValueError("checkpoint and signed launch identities do not match exactly")
+    if closed_superseded and (
+        not isinstance(contract.get("lease_epoch"), int)
+        or isinstance(contract.get("lease_epoch"), bool)
+        or contract.get("lease_epoch") < 1
+        or expected_current_epoch is None
+        or contract.get("lease_epoch") >= expected_current_epoch
+    ):
+        raise ValueError("closed preidentity launch must be signed in a positive earlier controller epoch")
     if not already_retired and (
         rows[0].get("claim_id") != expected["claim_id"] or rows[0].get("actor") != actor
     ):
@@ -5548,10 +6377,85 @@ def _preidentity_recovery_snapshot(
         or str(root_issue.get("status") or "").lower() in reconciliation_backend.TERMINAL
     ):
         raise ValueError("workflow root is missing, mismatched, or terminal")
+    generation_origin_acceptance = None
+    if closed_superseded and missing_native_generation:
+        generation = beads_backend.claim_generation(root, task_id)
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9a-f]{64}", generation):
+            raise ValueError("current native claim history is unavailable or invalid")
+        claim_token_sha256 = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        claim_identity_sha256 = _canonical_json_digest({
+            "root": workflow_root,
+            "task": task_id,
+            "actor": actor,
+            "claim_id": str(agentflow.get("claim_id") or ""),
+            "claim_token_sha256": claim_token_sha256,
+        })
+        checkpoint_binding_sha256 = _canonical_json_digest({
+            "root": document.get("root"),
+            "controller": document.get("controller"),
+            "epoch": document.get("epoch"),
+            "lease_token": document.get("lease_token"),
+            "drain_causes": document.get("drain_causes"),
+        })
+        origin_snapshot = {
+            "workspace_root": str(root.resolve()),
+            "workflow_root": workflow_root,
+            "task_id": task_id,
+            "launch_id": launch_id,
+            "pane_id": pane_id,
+            "controller_id": controller.controller,
+            "continuity_id": str(contract.get("continuity_id") or ""),
+            "current_lease_epoch": current_lease.epoch if current_lease is not None else -1,
+            "current_lease_token_sha256": hashlib.sha256(
+                str(current_lease.token if current_lease is not None else "").encode()
+            ).hexdigest(),
+            "checkpoint_binding_sha256": checkpoint_binding_sha256,
+            "checkpoint_epoch": document.get("epoch"),
+            "checkpoint_token_sha256": hashlib.sha256(
+                str(document.get("lease_token") or "").encode()
+            ).hexdigest(),
+            "contract_sha256": _canonical_json_digest(dict(contract)),
+            "launch_lease_epoch": contract.get("lease_epoch"),
+            "claim_id": str(agentflow.get("claim_id") or ""),
+            "actor": actor,
+            "claim_token_sha256": claim_token_sha256,
+            "claim_identity_sha256": claim_identity_sha256,
+            "claim_generation_sha256": generation,
+            "expired_ledger_sha256": _expired_ledger_evidence_sha256(
+                execution_entry, _execution_launch_identity(root, workflow_root, task_id, contract),
+            ),
+        }
+        if not already_retired:
+            origin_snapshot["checkpoint_sha256"] = checkpoint_sha256
+        if isinstance(existing_generation_origin_acceptance, Mapping):
+            if (
+                accept_unresolved_generation_origin
+                and existing_generation_origin_acceptance.get("reason") != generation_origin_reason
+            ):
+                raise ValueError("unresolved generation-origin owner reason changed on retry")
+            generation_origin_acceptance = _verify_unresolved_generation_origin_acceptance(
+                existing_generation_origin_acceptance,
+                authority_secret=authority_secret,
+                expected=origin_snapshot,
+            )
+        else:
+            if already_retired:
+                raise ValueError(
+                    "unresolved generation origin cannot be accepted after retirement without its original signed decision"
+                )
+            if not accept_unresolved_generation_origin:
+                raise ValueError("explicit unresolved generation-origin owner acceptance is required")
+            generation_origin_acceptance = _new_unresolved_generation_origin_acceptance(
+                origin_snapshot, generation_origin_reason, authority_secret,
+            )
     return {
         "contract": dict(contract), "binding": dict(binding),
         "contract_path": expected_contract_path, "record": dict(record),
         "claim_token": claim_token, "actor": actor,
+        "native_generation_observation": native_generation_observation,
+        "generation_origin_acceptance": generation_origin_acceptance,
+        "checkpoint_sha256": checkpoint_sha256,
+        "pre_retirement_checkpoint_sha256": pre_retirement_checkpoint_sha256,
     }
 
 
@@ -5575,6 +6479,11 @@ def _require_definitively_absent_herdr_pane(pane_id: str) -> None:
 def _preidentity_disposition(
     contract: Mapping[str, Any], *, pane_id: str, authority_secret: str,
     superseded_legacy_scope: bool = False, owner_abandoned_epoch: bool = False,
+    closed_superseded: bool = False,
+    native_generation_observation: Mapping[str, Any] | None = None,
+    generation_origin_acceptance: Mapping[str, Any] | None = None,
+    pre_retirement_checkpoint_sha256: str = "",
+    retired_checkpoint_sha256: str = "",
 ) -> dict[str, Any]:
     value = {
         "schema": "agentflow.preidentity-cancellation@1",
@@ -5592,6 +6501,7 @@ def _preidentity_disposition(
         "recorded_at": _now(),
         "reason": (
             "owner_abandoned_epoch" if owner_abandoned_epoch
+            else "superseded_closed_preidentity" if closed_superseded
             else "superseded_legacy_scope" if superseded_legacy_scope
             else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
         ),
@@ -5601,6 +6511,21 @@ def _preidentity_disposition(
     else:
         value["attempt"] = contract.get("attempt")
         value["deadline_epoch"] = contract.get("deadline_epoch")
+    if closed_superseded and native_generation_observation is not None:
+        value["native_generation_observation"] = dict(native_generation_observation)
+    if closed_superseded and generation_origin_acceptance is not None:
+        if native_generation_observation is not None:
+            raise ValueError("sealed claim cannot carry an unresolved-generation-origin acceptance")
+        value["unresolved_generation_origin_acceptance"] = dict(generation_origin_acceptance)
+    elif generation_origin_acceptance is not None:
+        raise ValueError("unresolved generation-origin acceptance is valid only for closed retirement")
+    if closed_superseded:
+        if not re.fullmatch(r"[0-9a-f]{64}", pre_retirement_checkpoint_sha256) or not re.fullmatch(
+            r"[0-9a-f]{64}", retired_checkpoint_sha256,
+        ):
+            raise ValueError("closed retirement requires exact preimage and postimage checkpoint anchors")
+        value["pre_retirement_checkpoint_sha256"] = pre_retirement_checkpoint_sha256
+        value["retired_checkpoint_sha256"] = retired_checkpoint_sha256
     value["authority_key_id"] = _credential_key_id(authority_secret)
     value["authority_hmac"] = _authority_mac(
         authority_secret, value, domain="preidentity-cancellation-v1",
@@ -5645,10 +6570,70 @@ def _verify_preidentity_disposition(
         ):
             raise ValueError("legacy-scope disposition contains structured budget metadata")
     else:
-        if value.get("reason") != "expired launch deadline; Herdr definitively reports pane absent before provider identity":
+        if value.get("reason") not in {
+            "expired launch deadline; Herdr definitively reports pane absent before provider identity",
+            "superseded_closed_preidentity",
+        }:
             raise ValueError("preidentity cancellation reason is not recognized")
         if any(value.get(field) != contract.get(field) for field in ("attempt", "deadline_epoch")):
             raise ValueError("preidentity cancellation does not preserve its signed deadline")
+    generation_observation = value.get("native_generation_observation")
+    generation_origin_acceptance = value.get("unresolved_generation_origin_acceptance")
+    if value.get("reason") == "superseded_closed_preidentity":
+        preimage_digest = str(value.get("pre_retirement_checkpoint_sha256") or "")
+        retired_digest = str(value.get("retired_checkpoint_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", preimage_digest) or not re.fullmatch(
+            r"[0-9a-f]{64}", retired_digest,
+        ):
+            raise ValueError("closed preidentity disposition lacks exact checkpoint anchors")
+        if generation_observation is not None and (
+            not isinstance(generation_observation, Mapping)
+            or set(generation_observation) != {
+                "schema", "status", "observed_claim_generation_sha256",
+            }
+            or generation_observation.get("schema") != _HISTORICAL_NATIVE_GENERATION_ACK_SCHEMA
+            or generation_observation.get("status") != "operator_acknowledged_missing_seal"
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(generation_observation.get("observed_claim_generation_sha256") or ""),
+            )
+        ):
+            raise ValueError("historical native-generation observation is malformed")
+        if generation_origin_acceptance is not None:
+            if generation_observation is not None:
+                raise ValueError("sealed claim has conflicting native-generation dispositions")
+            claim_identity_sha256 = _canonical_json_digest({
+                "root": str(contract.get("workflow_root") or ""),
+                "task": str(contract.get("task_id") or ""),
+                "actor": str(contract.get("actor") or ""),
+                "claim_id": str(contract.get("claim_id") or ""),
+                "claim_token_sha256": str(contract.get("claim_token_sha256") or ""),
+            })
+            _verify_unresolved_generation_origin_acceptance(
+                generation_origin_acceptance,
+                authority_secret=authority_secret,
+                expected={
+                    "workspace_root": str(contract.get("workspace_root") or ""),
+                    "workflow_root": str(contract.get("workflow_root") or ""),
+                    "task_id": str(contract.get("task_id") or ""),
+                    "launch_id": str(contract.get("launch_id") or ""),
+                    "pane_id": pane_id,
+                    "controller_id": str(contract.get("controller_id") or ""),
+                    "continuity_id": str(contract.get("continuity_id") or ""),
+                    "launch_lease_epoch": contract.get("lease_epoch"),
+                    "contract_sha256": _canonical_json_digest(dict(contract)),
+                    "claim_id": str(contract.get("claim_id") or ""),
+                    "actor": str(contract.get("actor") or ""),
+                    "claim_token_sha256": str(contract.get("claim_token_sha256") or ""),
+                    "claim_identity_sha256": claim_identity_sha256,
+                },
+            )
+            if generation_origin_acceptance.get("checkpoint_sha256") != preimage_digest:
+                raise ValueError("unresolved-origin decision does not bind the exact retirement preimage")
+    elif generation_observation is not None:
+        raise ValueError("non-closed preidentity disposition contains a historical generation acknowledgement")
+    elif generation_origin_acceptance is not None:
+        raise ValueError("non-closed preidentity disposition contains an unresolved-origin owner decision")
     return value
 
 
@@ -5663,6 +6648,11 @@ def _commit_preidentity_cancellation(
     authority_secret: str,
     superseded_legacy_scope: bool = False,
     owner_abandoned_epoch: bool = False,
+    closed_superseded: bool = False,
+    native_generation_observation: Mapping[str, Any] | None = None,
+    generation_origin_acceptance: Mapping[str, Any] | None = None,
+    pre_retirement_checkpoint_sha256: str = "",
+    retired_checkpoint_sha256: str = "",
 ) -> None:
     """Atomically revoke the late-result channel and retain an audit record."""
     state_path = root / ".agentflow/herdr/sessions.json"
@@ -5683,11 +6673,23 @@ def _commit_preidentity_cancellation(
             )
             expected_reason = (
                 "owner_abandoned_epoch" if owner_abandoned_epoch
+                else "superseded_closed_preidentity" if closed_superseded
                 else "superseded_legacy_scope" if superseded_legacy_scope
                 else "expired launch deadline; Herdr definitively reports pane absent before provider identity"
             )
             if disposition.get("reason") != expected_reason:
                 raise ValueError("preidentity retirement mode does not match the durable disposition")
+            if closed_superseded and disposition.get("native_generation_observation") != (
+                dict(native_generation_observation) if native_generation_observation is not None else None
+            ):
+                raise ValueError("historical claim-generation observation changed during retirement retry")
+            if closed_superseded and disposition.get("unresolved_generation_origin_acceptance") != (
+                dict(generation_origin_acceptance)
+                if generation_origin_acceptance is not None else None
+            ):
+                raise ValueError("unresolved generation-origin owner decision changed during retirement retry")
+            if closed_superseded and disposition.get("retired_checkpoint_sha256") != retired_checkpoint_sha256:
+                raise ValueError("retired checkpoint changed from its signed full-snapshot output")
             if channel.get("state") != "revoked" or channel.get("revocation") != dict(disposition):
                 raise ValueError("cancelled Herdr channel is not durably fenced")
             if superseded_legacy_scope or owner_abandoned_epoch:
@@ -5728,6 +6730,11 @@ def _commit_preidentity_cancellation(
             contract, pane_id=pane_id, authority_secret=authority_secret,
             superseded_legacy_scope=superseded_legacy_scope,
             owner_abandoned_epoch=owner_abandoned_epoch,
+            closed_superseded=closed_superseded,
+            native_generation_observation=native_generation_observation,
+            generation_origin_acceptance=generation_origin_acceptance,
+            pre_retirement_checkpoint_sha256=pre_retirement_checkpoint_sha256,
+            retired_checkpoint_sha256=retired_checkpoint_sha256,
         )
         # Preserve the attempt list and count. This is a separate lifecycle
         # disposition; it never fabricates provider output or task failure.
@@ -5814,9 +6821,14 @@ def _authenticated_causal_preidentity_retirement(
     *,
     authority_secret: str,
 ) -> bool:
-    """Accept a signed negative preidentity retirement only for its blocked, unbound claim."""
+    """Accept a signed negative preidentity retirement only for its exact unbound claim."""
     try:
         record = _herdr_session_record(root, task_id)
+        raw_disposition = record.get("recovery_disposition") if isinstance(record, Mapping) else None
+        closed_scope = (
+            isinstance(raw_disposition, Mapping)
+            and raw_disposition.get("reason") == "superseded_closed_preidentity"
+        )
         if not isinstance(record, Mapping) or (
             record.get("status") != "cancelled_preidentity"
             or record.get("root") != str(root.resolve())
@@ -5826,10 +6838,14 @@ def _authenticated_causal_preidentity_retirement(
             or record.get("binding") not in (None, {})
             or record.get("result") not in (None, {})
             or str(issue.get("id") or "") != task_id
-            or str(issue.get("parent") or "") != workflow_root
-            or str(issue.get("status") or "").lower() != "blocked"
+            or str(issue.get("status") or "").lower() != ("closed" if closed_scope else "blocked")
             or str(issue.get("assignee") or "") != lease.controller
         ):
+            return False
+        if closed_scope:
+            if workflow_root not in _history_task_ancestry(root, task_id):
+                return False
+        elif str(issue.get("parent") or "") != workflow_root:
             return False
         channel = record.get("return_channel")
         contract = channel.get("contract_binding") if isinstance(channel, Mapping) else None
@@ -5840,6 +6856,7 @@ def _authenticated_causal_preidentity_retirement(
             or disposition.get("reason") not in {
                 "expired launch deadline; Herdr definitively reports pane absent before provider identity",
                 "superseded_legacy_scope", "owner_abandoned_epoch",
+                "superseded_closed_preidentity",
             }
             or str(contract.get("controller_id") or "") != lease.controller
             or str(contract.get("continuity_id") or "") != lease.continuity_id
@@ -5847,6 +6864,8 @@ def _authenticated_causal_preidentity_retirement(
             or isinstance(contract.get("lease_epoch"), bool)
             or int(contract.get("lease_epoch")) < 0
             or int(contract.get("lease_epoch")) > lease.epoch
+            or closed_scope and int(contract.get("lease_epoch")) < 1
+            or closed_scope and int(contract.get("lease_epoch")) >= lease.epoch
         ):
             return False
         metadata = issue.get("metadata")
@@ -5866,6 +6885,11 @@ def _authenticated_causal_preidentity_retirement(
             )
         ):
             return False
+        if closed_scope:
+            _verify_closed_native_claim_generation(
+                root, workflow_root, task_id, agentflow, record, contract,
+                authority_secret=authority_secret,
+            )
         return _authenticated_cancelled_preidentity(
             root, workflow_root, task_id, authority_secret=authority_secret,
         )
@@ -14758,6 +15782,38 @@ def build_parser() -> argparse.ArgumentParser:
     controller_legacy_retire_parser.add_argument("--stale-after", type=float, default=300.0)
     controller_legacy_retire_parser.add_argument("--json", action="store_true")
     controller_legacy_retire_parser.set_defaults(func=controller_retire_superseded_legacy_preidentity)
+    controller_closed_retire_parser = controller_sub.add_parser(
+        "retire-closed-preidentity",
+        help="Retire one expired signed launch for an exact task already closed in Beads",
+    )
+    controller_closed_retire_parser.add_argument("--root", required=True)
+    controller_closed_retire_parser.add_argument("--workflow-root", required=True)
+    controller_closed_retire_parser.add_argument("--controller", default="agentflow-controller")
+    controller_closed_retire_parser.add_argument("--task", required=True)
+    controller_closed_retire_parser.add_argument("--launch-id", required=True)
+    controller_closed_retire_parser.add_argument("--pane-id", required=True)
+    controller_closed_retire_parser.add_argument(
+        "--acknowledge-missing-native-generation", action="store_true",
+        help=(
+            "legacy acknowledgement; it cannot authorize a missing native-generation seal by itself"
+        ),
+    )
+    controller_closed_retire_parser.add_argument(
+        "--accept-unresolved-generation-origin", action="store_true",
+        help=(
+            "sign acceptance of unknown generation origin solely to revoke this exact closed, "
+            "expired, unbound launch"
+        ),
+    )
+    controller_closed_retire_parser.add_argument(
+        "--reason", default="",
+        help="bounded owner reason required with --accept-unresolved-generation-origin",
+    )
+    controller_closed_retire_parser.add_argument("--state-path", default="")
+    controller_closed_retire_parser.add_argument("--checkpoint-path", default="")
+    controller_closed_retire_parser.add_argument("--stale-after", type=float, default=300.0)
+    controller_closed_retire_parser.add_argument("--json", action="store_true")
+    controller_closed_retire_parser.set_defaults(func=controller_retire_closed_preidentity)
     controller_epoch_repair_parser = controller_sub.add_parser(
         "repair-abandoned-epoch",
         help=(
@@ -14795,6 +15851,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_controller_common(controller_status_parser)
     controller_status_parser.set_defaults(func=controller_status)
+    controller_unresolved_causes_parser = controller_sub.add_parser(
+        "accept-unresolved-drain-causes",
+        help="Record an owner's exact-snapshot acceptance of historical causes as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument("--root", required=True)
+    controller_unresolved_causes_parser.add_argument("--workflow-root", required=True)
+    controller_unresolved_causes_parser.add_argument("--controller", default="agentflow-controller")
+    controller_unresolved_causes_parser.add_argument(
+        "--acknowledge-unresolved-causes", action="store_true", required=True,
+        help="explicitly accept the complete current unknown cause set as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument(
+        "--reason", required=True,
+        help="bounded owner reason for retaining the causes as unresolved",
+    )
+    controller_unresolved_causes_parser.add_argument("--json", action="store_true")
+    controller_unresolved_causes_parser.set_defaults(func=controller_accept_unresolved_drain_causes)
     controller_progress_parser = controller_sub.add_parser(
         "progress",
         help="Record task-aware progress or a named approach failure in the durable session budget",

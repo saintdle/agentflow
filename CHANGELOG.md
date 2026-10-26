@@ -6,8 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add `agentflow controller accept-unresolved-drain-causes` for a signed owner
+  decision that retains the exact unknown drain-cause set as unresolved.
+- Add closed preidentity launch retirement for an already-closed task. When a
+  native claim-generation seal is missing, an owner can sign a separate
+  unresolved-origin decision bound to the exact negative retirement; the
+  decision does not recreate the seal, renew the claim, accept results, reset
+  budgets, or dispatch work.
+
+### Changed
+
+- Require an unchanged signed claim-generation seal by default. The legacy
+  `--acknowledge-missing-native-generation` flag alone cannot authorize
+  retirement; unresolved origin requires its own signed owner decision and
+  remains subject to the separate continuation and drain-cause gates.
+
 ### Fixed
 
+- Bind closed preidentity retirement receipts to complete checkpoint preimages
+  and planned postimages. Exact-snapshot owner operations now reject legacy
+  checkpoints before signing or migration, and continuation retries retain the
+  original origin and drain-cause receipts across lease rotation.
 - Bind task authority to protected native claim-event identities. Reclaiming and
   regranting to the same actor fences stale launches and authenticated results,
   including a generation change during renewal. Existing unsealed executions

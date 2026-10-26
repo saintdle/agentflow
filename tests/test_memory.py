@@ -110,11 +110,19 @@ class MemoryRecallTests(unittest.TestCase):
                         approved_at=timestamp,
                     )
 
-                with mock.patch(
-                    "sys.stdin", io.StringIO(json.dumps(payload)),
-                ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch.object(
-                    cli.beads_backend, "prime", return_value="",
-                ):
+                fixed_now = self.NOW
+
+                class FrozenDateTime(dt.datetime):
+                    @classmethod
+                    def now(cls, tz=None):
+                        return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+                with mock.patch("agentflow.memory_runtime.dt.datetime", FrozenDateTime), \
+                     mock.patch(
+                         "sys.stdin", io.StringIO(json.dumps(payload)),
+                     ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch.object(
+                         cli.beads_backend, "prime", return_value="",
+                     ):
                     self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
 
             response = json.loads(stdout.getvalue())

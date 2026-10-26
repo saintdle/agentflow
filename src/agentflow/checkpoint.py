@@ -346,9 +346,39 @@ def build_checkpoint(data: Any) -> dict[str, Any]:
     return document
 
 
+def serialize_checkpoint(data: Any) -> bytes:
+    """Return the exact deterministic bytes written for one checkpoint."""
+    document = build_checkpoint(data)
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def parse_current_checkpoint(raw_bytes: bytes) -> dict[str, Any]:
+    """Parse exact-snapshot bytes without legacy normalization or writes."""
+    try:
+        raw = json.loads(raw_bytes)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CheckpointError(f"cannot parse checkpoint: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise CheckpointError("checkpoint payload must be an object")
+    if raw.get("version") != SCHEMA_VERSION or "drain_causes" not in raw:
+        raise CheckpointError(
+            "exact-snapshot controller operations require a version 4 checkpoint"
+        )
+    return build_checkpoint(raw)
+
+
+def load_current_checkpoint(path: Path) -> dict[str, Any]:
+    """Read an exact-snapshot checkpoint without legacy normalization or writes."""
+    try:
+        raw_bytes = Path(path).read_bytes()
+    except OSError as exc:
+        raise CheckpointError(f"cannot read checkpoint: {exc}") from exc
+    return parse_current_checkpoint(raw_bytes)
+
+
 def write_checkpoint(path: Path, data: Any) -> dict[str, Any]:
     document = build_checkpoint(data)
-    _atomic_write(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    _atomic_write(path, serialize_checkpoint(document).decode("utf-8"))
     return document
 
 
