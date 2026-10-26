@@ -2779,15 +2779,17 @@ def _run_controller_json(func, args) -> dict:
 
 
 def _expired_preidentity_fixture(
-    base: Path, *, begin_drain: bool = True,
+    base: Path, *, begin_drain: bool = True, deadline_seconds: int = 600,
+    max_retries: int = 1, initial_epoch: int = 1,
 ) -> tuple[ValidLaunch, object, dict, Path, dict]:
     """Create a signed identity-pending launch, optionally already draining."""
     fixture = ValidLaunch(base / "workspace", seed_lease=False)
     fixture.task_issue["status"] = "in_progress"
     fixture.task_issue["metadata"]["agentflow"]["launch"]["execution_limits"] = {
-        "deadline_seconds": 600, "max_retries": 1,
+        "deadline_seconds": deadline_seconds, "max_retries": max_retries,
     }
     fixture.lease = fixture._seed_lease()
+    _reattach_fixture_lease_to_epoch(fixture, initial_epoch)
     fixture._persist_claim()
     fixture.handoff_path, fixture.handoff, fixture.root_preflight_sha256 = fixture._materialize()
     with fixture.beads_patches(), \
@@ -2852,6 +2854,30 @@ def _expired_preidentity_fixture(
             lease=fixture.lease,
         )
     return fixture, controller, contract, ledger_path, {"attempts": attempts, "state_path": state_path}
+
+
+def _reattach_fixture_lease_to_epoch(fixture: ValidLaunch, target_epoch: int) -> None:
+    """Rotate only synthetic fixture credentials while retaining one incarnation."""
+    if fixture.lease is None or target_epoch < fixture.lease.epoch:
+        raise ValueError("fixture target epoch must not precede its current lease")
+    args = argparse.Namespace(
+        root=str(fixture.root), workflow_root=fixture.workflow_root, resume_key_file="",
+    )
+    state_path = cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json"
+    checkpoint_path = state_path.with_name("checkpoint.json")
+    while fixture.lease.epoch < target_epoch:
+        previous = fixture.lease
+        controller = cli.controller_backend.RootController(
+            str(fixture.root), fixture.controller,
+            state_path=state_path, checkpoint_path=checkpoint_path,
+        )
+        candidate = controller.acquire(resume_proof=previous.resume_secret)
+        cli._controller_credentials(
+            args, candidate,
+            expected_resume_secret=previous.resume_secret,
+            expected_authority_secret=fixture.authority_secret,
+        )
+        fixture.lease = candidate
 
 
 class PreidentityRecoveryCommandTests(unittest.TestCase):
@@ -4166,6 +4192,13 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
             "--workflow-root", "wf", "--task", "task", "--launch-id", "launch", "--pane-id", "pane",
         ])
         self.assertIs(legacy.func, cli.controller_retire_superseded_legacy_preidentity)
+        closed = parser.parse_args([
+            "controller", "retire-closed-preidentity", "--root", "/tmp/workspace",
+            "--workflow-root", "wf", "--task", "task", "--launch-id", "launch",
+            "--pane-id", "pane", "--acknowledge-missing-native-generation",
+        ])
+        self.assertIs(closed.func, cli.controller_retire_closed_preidentity)
+        self.assertTrue(closed.acknowledge_missing_native_generation)
         owner_repair = parser.parse_args([
             "controller", "repair-abandoned-epoch", "--root", "/tmp/workspace",
             "--workflow-root", "wf", "--task", "task", "--launch-id", "launch",
@@ -4182,6 +4215,483 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
         ])
         self.assertEqual(resume.continue_after_cancelled_preidentity, "task")
         self.assertEqual(resume.continue_task, "child")
+
+    def test_closed_preidentity_retirement_preserves_claim_and_blocks_unknown_cause_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(
+                    base, deadline_seconds=1800, max_retries=0, initial_epoch=3,
+                )
+                _reattach_fixture_lease_to_epoch(fixture, 7)
+                checkpoint = controller._load_checkpoint()
+                checkpoint["drain_causes"] = [
+                    {
+                        "cause_id": uuid.uuid4().hex,
+                        "kind": "unknown",
+                        "provenance": "controller_unclassified",
+                        "task_id": task_id,
+                        "launch_id": "",
+                        "diagnostic_sha256": "",
+                    }
+                    for task_id in ("", "", "coordinator")
+                ]
+                cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                generation_path = cli._native_claim_generation_path(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                )
+                generation_path.unlink()
+                fixture.task_issue["status"] = "closed"
+                fixture.task_issue["parent"] = "nested-scope"
+                nested_scope = {
+                    "id": "nested-scope", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root,
+                }
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    "nested-scope": nested_scope,
+                    fixture.task_id: fixture.task_issue,
+                }
+                controller.halt(
+                    "blocked",
+                    cli.controller_backend.native_claim_renewal_halt_reason((fixture.task_id,)),
+                    lease=fixture.lease,
+                )
+                original_causes = json.loads(json.dumps(
+                    controller._load_checkpoint()["drain_causes"]
+                ))
+                self.assertEqual(controller._load_checkpoint()["epoch"], 7)
+                self.assertEqual(contract["lease_epoch"], 3)
+                self.assertTrue(controller._load_checkpoint()["terminal"])
+                self.assertEqual(len(original_causes), 4)
+                self.assertEqual(
+                    [cause["task_id"] for cause in original_causes], ["", "", "coordinator", ""],
+                )
+                self.assertFalse(generation_path.exists())
+                parser = cli.build_parser()
+                args = parser.parse_args([
+                    "controller", "retire-closed-preidentity",
+                    "--root", str(fixture.root), "--workflow-root", fixture.workflow_root,
+                    "--task", fixture.task_id, "--launch-id", str(contract["launch_id"]),
+                    "--pane-id", "pane-pending", "--acknowledge-missing-native-generation", "--json",
+                ])
+                args._supervisor_lock_path = str(
+                    fixture.root / ".agentflow/test-controller-locks/closed-recovery.lock"
+                )
+                fence_path = cli._native_claim_fence_path(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                )
+                cli._fence_native_claim(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    "task became terminal before authenticated disposition",
+                )
+                original_fence = fence_path.read_bytes()
+                original_metadata = json.loads(json.dumps(fixture.task_issue["metadata"]))
+                original_attempts = json.loads(json.dumps(
+                    json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]["attempts"]
+                ))
+                original_limits = json.loads(json.dumps(contract["execution_limits"]))
+                calls: list[mock.Mock] = []
+                claim_generation_value = "a" * 64
+
+                def invoke() -> dict:
+                    pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
+                        ["herdr", "pane", "get", "pane-pending"], 1, stdout="",
+                        stderr=json.dumps({
+                            "error": {
+                                "code": "pane_not_found",
+                                "message": "pane pane-pending not found",
+                            },
+                            "id": "cli:pane:get",
+                        }),
+                    ))
+                    calls.append(pane_probe)
+                    with fixture.beads_patches(), \
+                         mock.patch.object(
+                             cli.beads_backend, "claim_generation",
+                             return_value=claim_generation_value,
+                         ), \
+                         mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                         mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue]), \
+                         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                         mock.patch.object(cli.subprocess, "run", pane_probe):
+                        return _run_controller_json(args.func, args)
+
+                checkpoint_before = controller.checkpoint_path.read_bytes()
+                original_write = cli.checkpoint_backend.write_checkpoint
+                write_calls = 0
+                def fail_checkpoint_once(path, document):
+                    nonlocal write_calls
+                    if Path(path) == controller.checkpoint_path and write_calls == 0:
+                        write_calls += 1
+                        raise OSError("injected checkpoint interruption")
+                    return original_write(path, document)
+                with mock.patch.object(
+                    cli.checkpoint_backend, "write_checkpoint", side_effect=fail_checkpoint_once,
+                ):
+                    interrupted = invoke()
+                self.assertFalse(interrupted["ok"], interrupted)
+                self.assertEqual(interrupted["error"], "injected checkpoint interruption")
+                self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+                self.assertEqual(calls[0].call_count, 2)
+                durable = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                self.assertEqual(durable["status"], "cancelled_preidentity")
+                self.assertEqual(durable["return_channel"]["state"], "revoked")
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+
+                retired = invoke()
+                self.assertTrue(retired["ok"], retired)
+                self.assertEqual(retired["operation"], "retire-closed-preidentity")
+                self.assertEqual(calls[1].call_count, 0)
+                self.assertEqual(fixture.task_issue["status"], "closed")
+                self.assertEqual(fixture.task_issue["metadata"], original_metadata)
+                record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "cancelled_preidentity")
+                self.assertEqual(record["return_channel"]["state"], "revoked")
+                disposition = record["recovery_disposition"]
+                self.assertEqual(disposition["reason"], "superseded_closed_preidentity")
+                self.assertEqual(disposition["attempt"], contract["attempt"])
+                self.assertEqual(disposition["deadline_epoch"], contract["deadline_epoch"])
+                self.assertNotIn("budget_availability", disposition)
+                self.assertEqual(record["attempts"], original_attempts)
+                self.assertEqual(record["execution_limits"], original_limits)
+                ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+                entry = ledger["entries"][cli._execution_ledger_key(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                )]
+                self.assertEqual(entry["status"], "expired")
+                self.assertEqual(entry["execution_limits"], original_limits)
+                self.assertEqual(entry["attempt"], contract["attempt"])
+                self.assertEqual(fence_path.read_bytes(), original_fence)
+                self.assertFalse(generation_path.exists())
+                self.assertEqual(controller._load_checkpoint()["drain_causes"], original_causes)
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    authority_secret=fixture.authority_secret,
+                ))
+
+                # A partial commit is replayable only while the signed
+                # historical observation still matches the exact Beads history.
+                claim_generation_value = "b" * 64
+                replay_state_before = controller.state_path.read_bytes()
+                replay_checkpoint_before = controller.checkpoint_path.read_bytes()
+                replay_herdr_before = baseline["state_path"].read_bytes()
+                changed_history_retry = invoke()
+                self.assertFalse(changed_history_retry["ok"], changed_history_retry)
+                self.assertIn("observed historical claim generation changed", changed_history_retry["error"])
+                self.assertEqual(calls[-1].call_count, 0)
+                self.assertEqual(controller.state_path.read_bytes(), replay_state_before)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), replay_checkpoint_before)
+                self.assertEqual(baseline["state_path"].read_bytes(), replay_herdr_before)
+                self.assertFalse(generation_path.exists())
+                claim_generation_value = "a" * 64
+
+                retried = invoke()
+                self.assertTrue(retried["ok"], retried)
+                self.assertEqual(calls[3].call_count, 0)
+                self.assertEqual(fixture.task_issue["status"], "closed")
+                self.assertEqual(fence_path.read_bytes(), original_fence)
+                self.assertFalse(generation_path.exists())
+                self.assertEqual(controller._load_checkpoint()["drain_causes"], original_causes)
+
+                ready = {
+                    "id": "distinct-ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                issues[ready["id"]] = ready
+
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue, ready]), \
+                     mock.patch.object(cli.beads_backend, "claim_generation", return_value="b" * 64):
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError,
+                        "observed historical claim generation changed",
+                    ):
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, fixture.lease,
+                            authority_secret=fixture.authority_secret,
+                        )
+
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue, ready]):
+                    with self.assertRaisesRegex(cli.controller_backend.ControllerError, "unknown drain cause"):
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            ready["id"], controller, fixture.lease,
+                            authority_secret=fixture.authority_secret,
+                        )
+                self.assertEqual(controller._load_checkpoint()["drain_causes"], original_causes)
+                self.assertEqual(controller.checkpoint_path.read_bytes(), replay_checkpoint_before)
+                self.assertEqual(controller.state_path.read_bytes(), replay_state_before)
+                self.assertEqual(ready["status"], "open")
+                self.assertEqual(fixture.task_issue["status"], "closed")
+
+    def test_closed_preidentity_retirement_accepts_matching_modern_generation_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, contract, _ledger_path, baseline = _expired_preidentity_fixture(
+                    base, deadline_seconds=1800, max_retries=0, initial_epoch=3,
+                )
+                _reattach_fixture_lease_to_epoch(fixture, 7)
+                fixture.task_issue["status"] = "closed"
+                fixture.task_issue["parent"] = "nested-scope"
+                nested_scope = {
+                    "id": "nested-scope", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root,
+                }
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    "nested-scope": nested_scope,
+                    fixture.task_id: fixture.task_issue,
+                }
+                controller.halt(
+                    "blocked",
+                    cli.controller_backend.native_claim_renewal_halt_reason((fixture.task_id,)),
+                    lease=fixture.lease,
+                )
+                generation_path = cli._native_claim_generation_path(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                )
+                original_generation = generation_path.read_bytes()
+                cli._fence_native_claim(
+                    fixture.root, fixture.workflow_root, fixture.task_id,
+                    "synthetic closed claim retains its native fence",
+                )
+                args = cli.build_parser().parse_args([
+                    "controller", "retire-closed-preidentity", "--root", str(fixture.root),
+                    "--workflow-root", fixture.workflow_root, "--task", fixture.task_id,
+                    "--launch-id", str(contract["launch_id"]), "--pane-id", "pane-pending", "--json",
+                ])
+                args._supervisor_lock_path = str(
+                    fixture.root / ".agentflow/test-controller-locks/closed-modern.lock"
+                )
+                pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
+                    ["herdr", "pane", "get", "pane-pending"], 1, stdout="",
+                    stderr=json.dumps({
+                        "error": {"code": "pane_not_found", "message": "pane pane-pending not found"},
+                        "id": "cli:pane:get",
+                    }),
+                ))
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[nested_scope, fixture.task_issue]), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", pane_probe):
+                    result = _run_controller_json(args.func, args)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(pane_probe.call_count, 2)
+                record = json.loads(baseline["state_path"].read_text())["sessions"][fixture.task_id]
+                self.assertNotIn("native_generation_observation", record["recovery_disposition"])
+                self.assertEqual(generation_path.read_bytes(), original_generation)
+
+    def test_closed_preidentity_retirement_rejects_untrusted_or_active_evidence_before_writes(self) -> None:
+        cases = (
+            "bad-hmac", "contract-hash", "wrong-claim", "wrong-claim-token",
+            "wrong-continuity", "zero-epoch", "future-epoch", "tampered-ledger",
+            "unexpired", "present-pane", "ambiguous-pane", "bound-worker",
+            "wrong-root", "wrong-task", "changed-native-generation",
+            "missing-native-generation", "changing-historical-generation",
+            "ack-with-modern-generation", "wrong-checkpoint-epoch",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                    fixture, controller, contract, ledger_path, baseline = _expired_preidentity_fixture(
+                        base, deadline_seconds=1800, max_retries=0, initial_epoch=3,
+                    )
+                    _reattach_fixture_lease_to_epoch(fixture, 7)
+                    controller.halt(
+                        "blocked",
+                        cli.controller_backend.native_claim_renewal_halt_reason((fixture.task_id,)),
+                        lease=fixture.lease,
+                    )
+                    fixture.task_issue["status"] = "closed"
+                    fixture.task_issue["parent"] = "nested-scope"
+                    nested_scope = {
+                        "id": "nested-scope", "status": "open", "assignee": "",
+                        "parent": fixture.workflow_root,
+                    }
+                    issues = {
+                        fixture.workflow_root: fixture.root_issue,
+                        "nested-scope": nested_scope,
+                        fixture.task_id: fixture.task_issue,
+                    }
+                    contract_path = Path(contract["contract_path"])
+                    record_path = baseline["state_path"]
+                    if case == "bad-hmac":
+                        contract["authority_hmac"] = "0" * 64
+                        cli._private_atomic_json(contract_path, contract)
+                        with cli._herdr_transaction(record_path) as state:
+                            channel = state["sessions"][fixture.task_id]["return_channel"]
+                            channel["contract_binding"] = contract
+                            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                    elif case == "contract-hash":
+                        altered = dict(contract)
+                        altered["model"] = "synthetic-altered-model"
+                        cli._private_atomic_json(contract_path, altered)
+                    elif case == "wrong-claim":
+                        fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "changed-claim"
+                    elif case == "wrong-claim-token":
+                        fixture.task_issue["metadata"]["agentflow"]["claim_token"] = "changed-claim-token"
+                    elif case == "wrong-continuity":
+                        args_for_key = _controller_args(
+                            fixture.root, workflow_root=fixture.workflow_root,
+                        )
+                        key_path = cli._resume_key_path(args_for_key)
+                        credentials = json.loads(key_path.read_text(encoding="utf-8"))
+                        credentials["continuity_id"] = "foreign-continuity"
+                        cli._private_atomic_json(key_path, credentials)
+                    elif case in {"zero-epoch", "future-epoch"}:
+                        epoch = 0 if case == "zero-epoch" else 8
+                        contract["lease_epoch"] = epoch
+                        contract["authority_hmac"] = cli._authority_mac(
+                            fixture.authority_secret, contract, domain="return-contract-v1",
+                        )
+                        cli._private_atomic_json(contract_path, contract)
+                        with cli._herdr_transaction(record_path) as state:
+                            channel = state["sessions"][fixture.task_id]["return_channel"]
+                            channel["contract_binding"] = contract
+                            channel["contract_sha256"] = cli._canonical_json_digest(contract)
+                        key = cli._execution_ledger_key(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                        )
+                        with cli._execution_limit_ledger_transaction(ledger_path) as ledger:
+                            entry = ledger["entries"][key]
+                            entry["launch_identity"]["lease_epoch"] = epoch
+                            entry["authority_hmac"] = cli._authority_mac(
+                                fixture.authority_secret, entry,
+                                domain="execution-limit-ledger-v1",
+                            )
+                        checkpoint = controller._load_checkpoint()
+                        checkpoint["epoch"] = epoch
+                        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                    elif case == "tampered-ledger":
+                        key = cli._execution_ledger_key(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                        )
+                        with cli._execution_limit_ledger_transaction(ledger_path) as ledger:
+                            ledger["entries"][key]["authority_hmac"] = "0" * 64
+                    elif case == "wrong-checkpoint-epoch":
+                        checkpoint = controller._load_checkpoint()
+                        checkpoint["epoch"] = 6
+                        cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                    elif case == "unexpired":
+                        self._rewrite_deadline(
+                            fixture, contract, ledger_path, time.time() + 3600,
+                        )
+                    elif case == "bound-worker":
+                        with cli._herdr_transaction(record_path) as state:
+                            record = state["sessions"][fixture.task_id]
+                            record["status"] = "running"
+                            record["binding"] = {"session_id": "synthetic-bound-session"}
+
+                    fixture.seed_native_generation()
+                    generation_path = cli._native_claim_generation_path(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                    )
+                    if case in {"missing-native-generation", "changing-historical-generation"}:
+                        generation_path.unlink()
+                    cli._fence_native_claim(
+                        fixture.root, fixture.workflow_root, fixture.task_id,
+                        "synthetic closed task retains its native claim fence",
+                    )
+
+                    requested_root = "wrong-workflow-root" if case == "wrong-root" else fixture.workflow_root
+                    requested_task = "wrong-task" if case == "wrong-task" else fixture.task_id
+                    command = [
+                        "controller", "retire-closed-preidentity", "--root", str(fixture.root),
+                        "--workflow-root", requested_root, "--task", requested_task,
+                        "--launch-id", str(contract["launch_id"]),
+                        "--pane-id", "pane-pending", "--json",
+                    ]
+                    if case in {"changing-historical-generation", "ack-with-modern-generation"}:
+                        command.append("--acknowledge-missing-native-generation")
+                    args = cli.build_parser().parse_args(command)
+                    args._supervisor_lock_path = str(
+                        fixture.root / ".agentflow/test-controller-locks/closed-negative.lock"
+                    )
+                    response = ""
+                    returncode = 1
+                    if case == "present-pane":
+                        response = json.dumps({
+                            "id": "cli:pane:get", "result": {"pane_id": "pane-pending"},
+                        })
+                        returncode = 0
+                    elif case == "ambiguous-pane":
+                        response = json.dumps({
+                            "id": "cli:pane:get",
+                            "error": {"code": "daemon_offline", "message": "unknown"},
+                        })
+                    pane_probe = mock.Mock(return_value=subprocess.CompletedProcess(
+                        ["herdr", "pane", "get", "pane-pending"], returncode,
+                        stdout=response,
+                        stderr="" if response else json.dumps({
+                            "error": {
+                                "code": "pane_not_found",
+                                "message": "pane pane-pending not found",
+                            },
+                            "id": "cli:pane:get",
+                        }),
+                    ))
+                    protected_paths = [
+                        controller.state_path, controller.checkpoint_path, record_path,
+                        ledger_path, contract_path,
+                        cli._native_claim_fence_path(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                        ),
+                        cli._native_claim_generation_path(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                        ),
+                    ]
+                    args_for_key = _controller_args(
+                        fixture.root, workflow_root=fixture.workflow_root,
+                    )
+                    protected_paths.append(cli._resume_key_path(args_for_key))
+                    before = {
+                        path: path.read_bytes() if path.exists() else None
+                        for path in protected_paths
+                    }
+                    issue_before = json.loads(json.dumps(fixture.task_issue))
+                    generation_patch = (
+                        mock.patch.object(cli.beads_backend, "claim_generation", return_value="b" * 64)
+                        if case == "changed-native-generation"
+                        else mock.patch.object(
+                            cli.beads_backend, "claim_generation",
+                            side_effect=["a" * 64, "a" * 64, "b" * 64],
+                        ) if case == "changing-historical-generation"
+                        else contextlib.nullcontext()
+                    )
+                    with fixture.beads_patches(), generation_patch, \
+                         mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
+                         mock.patch.object(
+                             cli.beads_backend, "root_descendants",
+                             return_value=[nested_scope, fixture.task_issue],
+                         ), \
+                         mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                         mock.patch.object(cli.subprocess, "run", pane_probe), \
+                         mock.patch.object(cli.beads_backend, "claim_issue_exact", side_effect=AssertionError("must not claim")), \
+                         mock.patch.object(cli.beads_backend, "claim_ready", side_effect=AssertionError("must not select")):
+                        result = _run_controller_json(args.func, args)
+                    self.assertFalse(result["ok"], (case, result))
+                    self.assertEqual(fixture.task_issue, issue_before)
+                    self.assertEqual(
+                        pane_probe.call_count,
+                        1 if case in {
+                            "present-pane", "ambiguous-pane", "changing-historical-generation",
+                        } else 0,
+                        (case, result),
+                    )
+                    for path in protected_paths:
+                        observed = path.read_bytes() if path.exists() else None
+                        self.assertEqual(observed, before[path], f"{case} changed {path.name}")
 
     def test_retirement_rejects_checkpoint_override_before_any_mutation(self) -> None:
         for legacy_scope in (False, True):
@@ -5303,6 +5813,7 @@ class ControllerPendingContinuationTests(unittest.TestCase):
         handlers = (
             cli.controller_start, cli.controller_resume, cli.controller_supervise,
             cli.controller_recover_preidentity, cli.controller_retire_superseded_legacy_preidentity,
+            cli.controller_retire_closed_preidentity,
             cli.controller_progress, cli.controller_rotate, cli.controller_stop,
             cli.controller_approve_waiver,
         )
