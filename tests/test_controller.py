@@ -23,6 +23,7 @@ from agentflow.controller import (
     DuplicateSupervisor,
     FencedLease,
     Lease,
+    LeaseConflict,
     RootController,
     RootViolation,
     StaleLease,
@@ -43,6 +44,7 @@ class ControllerTests(unittest.TestCase):
     def _resolution_authorization(
         self, controller: RootController, lease: Lease,
         workflow_root: str, cancelled_task: str, ready_task: str,
+        unresolved_cause_acceptance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         causes = checkpoint._check_drain_causes(controller._load_checkpoint().get("drain_causes"))
         payload: dict[str, Any] = {
@@ -66,6 +68,8 @@ class ControllerTests(unittest.TestCase):
             "retired_checkpoint_token": controller._load_checkpoint().get("lease_token"),
             "retired_checkpoint_last_check": controller._load_checkpoint().get("last_check"),
         }
+        if unresolved_cause_acceptance is not None:
+            payload["unresolved_cause_acceptance"] = dict(unresolved_cause_acceptance)
         payload["authority_hmac"] = controller_module._authority_mac(
             self._authority_secret, payload, domain="drain-resolution-authorization-v1",
         )
@@ -125,6 +129,223 @@ class ControllerTests(unittest.TestCase):
         authorization = self._resolution_authorization(controller, lease, "workflow", "old", "ready-task")
         lease = self._finish_test_continuation(controller, lease, authorization)
         return controller, lease
+
+    def _controller_with_unknown_causes(self, base: Path, count: int = 3) -> tuple[RootController, Lease]:
+        controller = RootController(
+            "root", "one", state_path=base / "controller.json",
+            checkpoint_path=base / "checkpoint.json",
+        )
+        lease = controller.acquire()
+        for index in range(count):
+            controller.halt("blocked", f"unclassified synthetic cause {index}", lease=lease)
+        return controller, lease
+
+    def test_owner_acceptance_is_signed_idempotent_and_preserves_exact_causes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary))
+            checkpoint_before = controller.checkpoint_path.read_bytes()
+            original_causes = controller._load_checkpoint()["drain_causes"]
+
+            receipt, duplicate = controller.accept_unresolved_drain_causes(
+                "workflow", "Historical cause provenance is unavailable.",
+                accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+            )
+
+            self.assertFalse(duplicate)
+            self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before)
+            state = controller_module._read_json(controller.state_path)
+            records = state["unresolved_drain_cause_acceptances"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["causes"], original_causes)
+            self.assertEqual(records[0]["receipt"], receipt)
+            self.assertNotIn("task_id", receipt)
+            self.assertNotIn("launch_id", receipt)
+            self.assertNotIn("outcome", receipt)
+            self.assertEqual(
+                controller.unresolved_drain_cause_acceptance(
+                    "workflow", authority_secret=self._authority_secret, lease=lease,
+                ),
+                receipt,
+            )
+
+            repeated, duplicate = controller.accept_unresolved_drain_causes(
+                "workflow", "Historical cause provenance is unavailable.",
+                accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+            )
+            self.assertTrue(duplicate)
+            self.assertEqual(repeated, receipt)
+            self.assertEqual(
+                len(controller_module._read_json(controller.state_path)[
+                    "unresolved_drain_cause_acceptances"
+                ]),
+                1,
+            )
+            with self.assertRaisesRegex(ControllerError, "different owner decision"):
+                controller.accept_unresolved_drain_causes(
+                    "workflow", "A different reason for the same snapshot.",
+                    accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+                )
+
+    def test_owner_acceptance_rejects_unsigned_tampered_and_mismatched_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary))
+            receipt, _ = controller.accept_unresolved_drain_causes(
+                "workflow", "Retain uncertainty.", accept_as_unresolved=True,
+                authority_secret=self._authority_secret, lease=lease,
+            )
+            checkpoint_raw = controller.checkpoint_path.read_bytes()
+            causes = controller._load_checkpoint()["drain_causes"]
+            expected = {
+                "root": controller.root, "controller": controller.controller,
+                "workflow_root": "workflow", "continuity_id": lease.continuity_id,
+                "lease_epoch": lease.epoch, "lease_token": lease.token,
+                "checkpoint_sha256": hashlib.sha256(checkpoint_raw).hexdigest(),
+                "checkpoint_epoch": controller._load_checkpoint()["epoch"],
+                "checkpoint_token": controller._load_checkpoint()["lease_token"],
+                "causes": causes,
+            }
+            cases = (
+                ("unsigned", lambda item: item.pop("authority_hmac")),
+                ("tampered-reason", lambda item: item.update(reason="different")),
+                ("wrong-root", lambda item: item.update(root="foreign-root")),
+                ("wrong-epoch", lambda item: item.update(lease_epoch=lease.epoch + 1)),
+                ("wrong-fence", lambda item: item.update(lease_token="foreign-fence")),
+                ("wrong-checkpoint", lambda item: item.update(checkpoint_sha256="0" * 64)),
+                ("wrong-cause", lambda item: item.update(cause_ids=["foreign-cause"])),
+                ("wrong-digest", lambda item: item.update(causes_sha256="0" * 64)),
+            )
+            for name, mutate in cases:
+                with self.subTest(case=name):
+                    candidate = dict(receipt)
+                    mutate(candidate)
+                    if name not in {"unsigned", "tampered-reason"}:
+                        candidate.pop("authority_hmac", None)
+                        candidate["authority_hmac"] = controller_module._authority_mac(
+                            self._authority_secret, candidate,
+                            domain="drain-unresolved-acceptance-v1",
+                        )
+                    with self.assertRaises(LeaseConflict):
+                        controller_module._validate_unresolved_cause_acceptance(
+                            candidate, self._authority_secret, **expected,
+                        )
+            for field, replacement in (
+                ("root", "foreign-root"),
+                ("controller", "foreign-controller"),
+                ("workflow_root", "foreign-workflow"),
+                ("continuity_id", "foreign-continuity"),
+                ("lease_epoch", lease.epoch + 1),
+                ("lease_token", "foreign-fence"),
+                ("checkpoint_sha256", "0" * 64),
+                ("checkpoint_epoch", lease.epoch + 1),
+                ("checkpoint_token", "foreign-checkpoint-fence"),
+            ):
+                with self.subTest(current_binding=field), self.assertRaises(LeaseConflict):
+                    controller_module._validate_unresolved_cause_acceptance(
+                        receipt, self._authority_secret,
+                        **{**expected, field: replacement},
+                    )
+            changed_causes = [dict(cause) for cause in causes]
+            changed_causes[-1]["cause_id"] = "f" * 32
+            with self.assertRaises(LeaseConflict):
+                controller_module._validate_unresolved_cause_acceptance(
+                    receipt, self._authority_secret, **{**expected, "causes": changed_causes},
+                )
+
+    def test_acceptance_stales_after_checkpoint_change_and_reconciles_partial_state_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary))
+            original_write = controller._write_state
+            write_count = 0
+
+            def commit_then_interrupt(state: dict[str, Any]) -> None:
+                nonlocal write_count
+                write_count += 1
+                original_write(state)
+                if write_count == 1:
+                    raise OSError("simulated lost response after durable acceptance")
+
+            with mock.patch.object(controller, "_write_state", side_effect=commit_then_interrupt):
+                with self.assertRaisesRegex(OSError, "lost response"):
+                    controller.accept_unresolved_drain_causes(
+                        "workflow", "Retain uncertainty.", accept_as_unresolved=True,
+                        authority_secret=self._authority_secret, lease=lease,
+                    )
+                receipt, duplicate = controller.accept_unresolved_drain_causes(
+                    "workflow", "Retain uncertainty.", accept_as_unresolved=True,
+                    authority_secret=self._authority_secret, lease=lease,
+                )
+            self.assertTrue(duplicate)
+            self.assertEqual(len(controller_module._read_json(controller.state_path)[
+                "unresolved_drain_cause_acceptances"
+            ]), 1)
+
+            controller.halt("blocked", "a later checkpoint mutation", lease=lease)
+            self.assertIsNone(controller.unresolved_drain_cause_acceptance(
+                "workflow", authority_secret=self._authority_secret, lease=lease,
+            ))
+            self.assertEqual(
+                controller_module._matching_unresolved_cause_acceptance(
+                    controller_module._read_json(controller.state_path), receipt,
+                    self._authority_secret,
+                )["receipt"],
+                receipt,
+            )
+
+    def test_owner_acceptance_serializes_against_concurrent_checkpoint_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary))
+            state_write_entered = threading.Event()
+            release_state_write = threading.Event()
+            mutation_finished = threading.Event()
+            results: list[Any] = []
+            errors: list[BaseException] = []
+            original_write = controller._write_state
+            write_count = 0
+
+            def pause_first_state_write(state: dict[str, Any]) -> None:
+                nonlocal write_count
+                write_count += 1
+                if write_count == 1:
+                    state_write_entered.set()
+                    if not release_state_write.wait(3):
+                        raise TimeoutError("test did not release acceptance write")
+                original_write(state)
+
+            def accept() -> None:
+                try:
+                    results.append(controller.accept_unresolved_drain_causes(
+                        "workflow", "Retain uncertainty.", accept_as_unresolved=True,
+                        authority_secret=self._authority_secret, lease=lease,
+                    ))
+                except BaseException as exc:  # noqa: BLE001 - capture thread failures for the assertion
+                    errors.append(exc)
+
+            def mutate_checkpoint() -> None:
+                try:
+                    controller.halt("blocked", "later concurrent checkpoint mutation", lease=lease)
+                except BaseException as exc:  # noqa: BLE001 - capture thread failures for the assertion
+                    errors.append(exc)
+                finally:
+                    mutation_finished.set()
+
+            with mock.patch.object(controller, "_write_state", side_effect=pause_first_state_write):
+                acceptance_thread = threading.Thread(target=accept)
+                acceptance_thread.start()
+                self.assertTrue(state_write_entered.wait(2))
+                mutation_thread = threading.Thread(target=mutate_checkpoint)
+                mutation_thread.start()
+                self.assertFalse(mutation_finished.wait(0.05))
+                release_state_write.set()
+                acceptance_thread.join(3)
+                mutation_thread.join(3)
+
+            self.assertFalse(acceptance_thread.is_alive())
+            self.assertFalse(mutation_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            self.assertIsNone(controller.unresolved_drain_cause_acceptance(
+                "workflow", authority_secret=self._authority_secret, lease=lease,
+            ))
 
     def test_supervisor_lock_is_exclusive_per_root_and_released_on_exit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -650,6 +871,76 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(len(state["drain_audit"]), 1)
             self.assertEqual(
                 state["drain_audit"][0]["resolution"], "authenticated_continuation",
+            )
+
+    def test_owner_accepted_unknown_causes_remain_auditable_and_do_not_become_resolved_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary), count=2)
+            document = controller._load_checkpoint()
+            document["last_check"] = "cancelled preidentity launch old-launch for old"
+            checkpoint.write_checkpoint(controller.checkpoint_path, document)
+            original_causes = json.loads(json.dumps(document["drain_causes"]))
+            acceptance, duplicate = controller.accept_unresolved_drain_causes(
+                "workflow", "Historical provenance remains unresolved.",
+                accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+            )
+            self.assertFalse(duplicate)
+            authorization = self._resolution_authorization(
+                controller, lease, "workflow", "old", "ready-task", acceptance,
+            )
+
+            self._finish_test_continuation(controller, lease, authorization)
+
+            state = controller_module._read_json(controller.state_path)
+            self.assertEqual(controller._load_checkpoint()["drain_causes"], [])
+            self.assertEqual(state["unresolved_drain_cause_acceptances"][0]["causes"], original_causes)
+            self.assertEqual(state.get("drain_audit", []), [])
+
+    def test_owner_acceptance_survives_interrupted_checkpoint_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, lease = self._controller_with_unknown_causes(Path(temporary), count=2)
+            document = controller._load_checkpoint()
+            document["last_check"] = "cancelled preidentity launch old-launch for old"
+            checkpoint.write_checkpoint(controller.checkpoint_path, document)
+            original_causes = json.loads(json.dumps(document["drain_causes"]))
+            acceptance, _ = controller.accept_unresolved_drain_causes(
+                "workflow", "Historical cause provenance remains unresolved.",
+                accept_as_unresolved=True, authority_secret=self._authority_secret, lease=lease,
+            )
+            authorization = self._resolution_authorization(
+                controller, lease, "workflow", "old", "ready-task", acceptance,
+            )
+            candidate = self._reattach_for_test(controller, lease, authorization)
+            original_write = checkpoint.write_checkpoint
+            writes = 0
+
+            def interrupt_checkpoint_once(path, staged):
+                nonlocal writes
+                if Path(path) == controller.checkpoint_path and writes == 0:
+                    writes += 1
+                    raise OSError("simulated interruption before continuation checkpoint commit")
+                return original_write(path, staged)
+
+            with mock.patch.object(checkpoint, "write_checkpoint", side_effect=interrupt_checkpoint_once):
+                with self.assertRaisesRegex(OSError, "interruption"):
+                    controller.acknowledge_cancelled_preidentity_halt(
+                        "workflow", "old", "ready-task", authority_secret=self._authority_secret,
+                        resolution_authorization=authorization, lease=candidate,
+                        readiness_verifier=lambda _current: "ready-task",
+                    )
+                retry = controller.acknowledge_cancelled_preidentity_halt(
+                    "workflow", "old", "ready-task", authority_secret=self._authority_secret,
+                    resolution_authorization=authorization, lease=candidate,
+                    readiness_verifier=lambda _current: "ready-task",
+                )
+            self.assertEqual(retry.checkpoint["drain_causes"], [])
+            self.assertEqual(controller_module._read_json(controller.state_path)[
+                "unresolved_drain_cause_acceptances"
+            ][0]["causes"], original_causes)
+            controller.clear_explicit_continuation(
+                workflow_root="workflow", cancelled_task="old", ready_task="ready-task",
+                authority_secret=self._authority_secret, lease=candidate,
+                readiness_verifier=lambda _current: "ready-task",
             )
 
     def test_final_ack_rejects_a_cause_added_after_authorization_byte_preservingly(self) -> None:

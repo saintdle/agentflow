@@ -111,11 +111,38 @@ retirement audit and requires that digest to remain unchanged on retry and
 continuation. This is an observation made at retirement, not proof that the
 old launch was bound to that history. The command does not create a generation
 seal. A present seal must still match exactly, and a missing seal without this
-explicit acknowledgement remains an error. Continuation still requires all
-recorded drain causes to be resolved by their supported authenticated paths;
-unclassified causes remain a blocker. When those gates pass, use the explicit
-continuation command documented in the expired preidentity recovery section,
-passing this task as `TASK` and a distinct ready descendant as `READY_TASK`.
+explicit acknowledgement remains an error. Typed drain causes still require
+their supported authenticated resolution paths. Unknown causes require the
+separate owner decision described below.
+
+Retire the closed launch first. Then inspect the resulting blocked checkpoint.
+If its complete drain-cause set is still unknown, an owner may explicitly
+accept that exact set as **unresolved** with the current protected credential:
+
+```sh
+agentflow controller accept-unresolved-drain-causes \
+  --root /path/to/workspace --workflow-root ROOT \
+  --controller agentflow-controller \
+  --acknowledge-unresolved-causes \
+  --reason "Historical cause provenance is unavailable; retain this uncertainty."
+```
+
+The command requires a current lease, a blocked checkpoint at that lease's
+epoch, no active task, and a non-empty owner reason. It signs and audits the
+complete cause IDs and digest together with the checkpoint fingerprint, root,
+epoch, and current fence. The audit retains the original cause records. It
+does not mark them resolved or supply missing task, launch, diagnostic, or
+outcome bindings. It does not change the checkpoint or authorize work by
+itself. Any later checkpoint change, including another retirement, makes the
+receipt stale; inspect and explicitly accept the new snapshot after that
+change.
+
+With the exact acceptance recorded, use the explicit continuation command in
+the expired preidentity recovery section, passing this task as `TASK` and a
+distinct ready descendant as `READY_TASK`. Continuation still checks the
+signed retirement, root ancestry, claim generation, budgets, absence of other
+active work, and the exact ready target. Without a matching owner receipt,
+unknown causes remain a blocker.
 
 If this explicit continuation is interrupted while its protected credential
 is being rotated, rerun the same command with the same task IDs. Ordinary
