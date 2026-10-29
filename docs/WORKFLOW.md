@@ -216,6 +216,46 @@ rewrite another worker's scope.
 Workers do not merge their own pull requests. Integrate one completed branch at
 a time, verify its recorded base, and rerun affected checks after integration.
 
+## CI gates
+
+Run `agentflow ci watch --bead <ci-gate> --pr <number-or-url> --repo <owner/repo>`.
+The watcher queries checks on the PR's immutable head commit and rejects head
+drift during observation. Its receipt binds the exact gate, parent, repository,
+PR, head and check set. `--required` selects GitHub's required checks;
+`--once` performs one observation without polling.
+
+The `CI_STATE` JSON output and `metadata.agentflow.ci` separate the observed
+result (`passed`, `failed`, `pending`, `unavailable`), gate disposition and
+remaining obligation. `ci.status` remains the observed-result projection.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Matching passed evidence and a closed gate; obligation accepted. |
+| `1` | Failed checks routed to an identity-bound triage task. |
+| `2` | Pending checks, unavailable evidence, identity mismatch or unresolved administration. |
+
+Closure is attempted once. If its acknowledgement fails, the watcher performs
+one exact read-back, bounded to ten seconds. A matching closed gate confirms
+success. An open gate retains `passed/open/required`; an unreadable gate reports
+`passed/closure_unresolved/blocked`. A mismatched receipt reports
+`unavailable/closure_unresolved/blocked` and preserves the last valid observation.
+The watcher never retries closure automatically or reruns GitHub workflows.
+If the final disposition metadata refresh fails after closure is verified,
+the watcher warns about the stale projection but retains exit `0`.
+
+Repeating the command against an already-closed gate succeeds only when its
+persisted passed receipt matches the current identity and check evidence.
+Legacy unbound closed gates remain unavailable and are not backfilled.
+Missing checks remain pending; malformed, failed or truncated queries cannot
+establish success. Observations exceeding the bounded 100-check query require
+operator attention rather than accepting a partial check set.
+
+Failure routing reserves an exact triage identity before creation. Repeated
+observations reuse it even after the triage task closes; a different failed
+head/check set creates a new obligation. An ambiguous creation is read back,
+not retried with a new task ID. If that reserved task cannot be verified, the
+watcher stops for controller attention without creating duplicate work.
+
 ## Hooks
 
 Agentflow hooks are small and advisory. They may record lifecycle events or
