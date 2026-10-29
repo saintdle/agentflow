@@ -239,6 +239,7 @@ one exact read-back, bounded to ten seconds. A matching closed gate confirms
 success. An open gate retains `passed/open/required`; an unreadable gate reports
 `passed/closure_unresolved/blocked`. A mismatched receipt reports
 `unavailable/closure_unresolved/blocked` and preserves the last valid observation.
+
 The watcher never retries closure automatically or reruns GitHub workflows.
 If the final disposition metadata refresh fails after closure is verified,
 the watcher warns about the stale projection but retains exit `0`.

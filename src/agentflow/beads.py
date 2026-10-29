@@ -838,8 +838,7 @@ def create_issue(
         description,
         "--acceptance",
         acceptance,
-        "--parent",
-        parent,
+        *(["--parent", parent] if not issue_id else []),
         "--no-inherit-labels",
         "--labels",
         ",".join(labels),
@@ -849,6 +848,8 @@ def create_issue(
         arguments.extend(["--assignee", assignee])
     if issue_id:
         arguments.extend(["--id", issue_id])
+        if parent:
+            dependencies = [f"parent-child:{parent}", *(dependencies or [])]
     if dependencies:
         arguments.extend(["--deps", ",".join(dependencies)])
     if metadata:

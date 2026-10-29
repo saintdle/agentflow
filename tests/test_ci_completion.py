@@ -9,6 +9,7 @@ import sys
 import time
 import unittest
 import uuid
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,10 +123,15 @@ if args[0] == "close":
            error="close timed out after commit")
 if args[0] == "create":
     state["creates"] = state.get("creates", 0) + 1
+    if "--id" in args and "--parent" in args:
+        finish(code=1, error="cannot specify both --id and --parent flags")
     key = option("--id") if "--id" in args else "triage-" + str(state["creates"])
     if key in state["issues"]:
         finish(code=1, error="issue already exists")
-    issue = {"id": key, "parent": option("--parent"), "title": args[1], "status": "open",
+    dependencies = option("--deps").split(",") if "--deps" in args else []
+    parent = option("--parent") if "--parent" in args else next(
+        (dep.removeprefix("parent-child:") for dep in dependencies if dep.startswith("parent-child:")), "")
+    issue = {"id": key, "parent": parent, "title": args[1], "status": "open",
              "metadata": json.loads(option("--metadata"))}
     if state.get("create_mode") != "open-error":
         state["issues"][key] = issue
@@ -412,6 +418,62 @@ class CICompletionTests(unittest.TestCase):
         self.state["nodes"] = [check(conclusion="FAILURE", check_id="new-run")]
         self.assertEqual(self.invoke().returncode, 1)
         self.assertEqual(self.state["creates"], 3)
+
+    def test_explicit_creation_contract_routes_failure_once(self):
+        self.state["nodes"] = [check(conclusion="FAILURE")]
+        first = self.assert_axes(self.invoke(), 1, "failed", "open", "required")
+        create = next(call for call in self.state["calls"] if call[:2] == ["bd", "create"])
+        self.assertNotIn("--parent", create)
+        self.assertEqual(create[create.index("--id") + 1], first["triage_bead"])
+        self.assertEqual(
+            create[create.index("--deps") + 1].split(","),
+            ["parent-child:gate-root", "blocks:gate-ci"],
+        )
+        triage = self.state["issues"][first["triage_bead"]]
+        self.assertEqual(triage["parent"], "gate-root")
+        triage["status"] = "closed"
+        second = self.assert_axes(self.invoke(), 1, "failed", "open", "required")
+        self.assertEqual(second["triage_bead"], first["triage_bead"])
+        self.assertEqual(self.state["creates"], 1)
+        self.assert_no_reruns()
+
+    def test_explicit_creation_contract_preserves_dependencies(self):
+        from agentflow import beads
+
+        dependencies = ["blocks:gate-ci", "depends-on:gate-other"]
+        response = subprocess.CompletedProcess([], 0, '{"id":"gate-triage"}', "")
+        with mock.patch.object(beads, "run", return_value=response) as run:
+            beads.create_issue(
+                self.directory, title="Triage", description="Diagnose checks", acceptance="Failure explained",
+                parent="gate-root", labels=["af:stage:ci-triage"], assignee="triager",
+                dependencies=dependencies, issue_id="gate-triage",
+            )
+        run.assert_called_once()
+        arguments = run.call_args.args[1:]
+        self.assertNotIn("--parent", arguments)
+        self.assertEqual(arguments[arguments.index("--id") + 1], "gate-triage")
+        self.assertEqual(
+            arguments[arguments.index("--deps") + 1].split(","),
+            ["parent-child:gate-root", "blocks:gate-ci", "depends-on:gate-other"],
+        )
+        self.assertEqual(dependencies, ["blocks:gate-ci", "depends-on:gate-other"])
+
+    def test_normal_creation_contract_retains_parent_flag(self):
+        from agentflow import beads
+
+        response = subprocess.CompletedProcess([], 0, '{"id":"gate-triage"}', "")
+        with mock.patch.object(beads, "run", return_value=response) as run:
+            beads.create_issue(
+                self.directory, title="Triage", description="Diagnose checks", acceptance="Failure explained",
+                parent="gate-root", labels=["af:stage:ci-triage"], assignee="triager",
+                dependencies=["blocks:gate-ci"],
+            )
+        run.assert_called_once_with(
+            self.directory, "create", "Triage", "--description", "Diagnose checks",
+            "--acceptance", "Failure explained", "--parent", "gate-root",
+            "--no-inherit-labels", "--labels", "af:stage:ci-triage", "--json",
+            "--assignee", "triager", "--deps", "blocks:gate-ci",
+        )
 
     def test_two_failed_invocations_do_not_create_again(self):
         self.state["nodes"] = [check(conclusion="FAILURE")]
