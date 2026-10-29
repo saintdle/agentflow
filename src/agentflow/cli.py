@@ -13494,7 +13494,7 @@ def _ci_failure_bead(
     failure_summary = ", ".join(failed_names[:8]) or "unknown failing check"
     title = f"Triage failing CI for PR #{pr}"
     try:
-        created = beads_backend.create_issue(
+        beads_backend.create_issue(
             task_cwd, issue_id=triage_id, title=title,
             description=(
                 f"Diagnose the failing checks for PR #{pr} in {repo} at "
@@ -13520,8 +13520,9 @@ def _ci_failure_bead(
             }},
         )
     except beads_backend.BeadsError:
-        return verify(beads_backend.get_issue(task_cwd, triage_id, timeout=10))
-    return verify(created)
+        pass
+    # Creation echoes may omit ancestry; only the persisted record is authoritative.
+    return verify(beads_backend.get_issue(task_cwd, triage_id, timeout=10))
 
 
 def ci_watch(args: argparse.Namespace) -> int:

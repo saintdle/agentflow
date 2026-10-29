@@ -2474,14 +2474,21 @@ class AgentflowTests(unittest.TestCase):
             "checks": [{"id": "unit", "name": "unit", "bucket": "fail"}],
         }
         record["identity"]["check_set_sha256"] = cli._ci_digest(record["checks"])
+        persisted = {}
 
         def created(*args, **kwargs):
-            return {"id": kwargs["issue_id"], "title": kwargs["title"], "status": "open",
-                    "parent": kwargs["parent"], "metadata": kwargs["metadata"]}
+            persisted.update(
+                id=kwargs["issue_id"], title=kwargs["title"], status="open",
+                parent=kwargs["parent"], metadata=kwargs["metadata"],
+            )
+            return {field: value for field, value in persisted.items() if field != "parent"}
+
+        def read_issue(cwd, issue_id, **kwargs):
+            return writer if issue_id == "writer-1" else dict(persisted)
 
         with mock.patch.object(
-            cli.beads_backend, "get_issue", return_value=writer
-        ), mock.patch.object(
+            cli.beads_backend, "get_issue", side_effect=read_issue
+        ) as read, mock.patch.object(
             cli.beads_backend, "create_issue", side_effect=created
         ) as create, mock.patch.object(cli.beads_backend, "update_agentflow_metadata"):
             result = cli._ci_failure_bead(
@@ -2495,6 +2502,10 @@ class AgentflowTests(unittest.TestCase):
                 ci_record=record,
             )
         self.assertEqual(result["id"], create.call_args.kwargs["issue_id"])
+        self.assertEqual(read.call_args_list, [
+            mock.call(Path.cwd(), "writer-1"),
+            mock.call(Path.cwd(), result["id"], timeout=10),
+        ])
         kwargs = create.call_args.kwargs
         self.assertEqual(kwargs["assignee"], "")
         self.assertIn("af:stage:ci-triage", kwargs["labels"])

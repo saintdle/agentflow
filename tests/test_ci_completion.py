@@ -135,7 +135,8 @@ if args[0] == "create":
              "metadata": json.loads(option("--metadata"))}
     if state.get("create_mode") != "open-error":
         state["issues"][key] = issue
-    finish(issue, 0 if state.get("create_mode", "success") == "success" else 1,
+    state["create_echo"] = {field: value for field, value in issue.items() if field != "parent"}
+    finish(state["create_echo"], 0 if state.get("create_mode", "success") == "success" else 1,
            error="create acknowledgement unavailable")
 finish(code=90, error="unexpected bd command")
 '''
@@ -436,6 +437,37 @@ class CICompletionTests(unittest.TestCase):
         self.assertEqual(second["triage_bead"], first["triage_bead"])
         self.assertEqual(self.state["creates"], 1)
         self.assert_no_reruns()
+
+    def test_create_echo_requires_persisted_verification(self):
+        self.state["nodes"] = [check(conclusion="FAILURE")]
+        record = self.assert_axes(self.invoke(), 1, "failed", "open", "required")
+        triage_id = record["triage_bead"]
+        self.assertNotIn("parent", self.state["create_echo"])
+        self.assertEqual(self.state["issues"][triage_id]["parent"], "gate-root")
+        self.assertEqual(
+            [call for call in self.state["calls"] if call[:3] == ["bd", "show", triage_id]],
+            [["bd", "show", triage_id, "--json"]],
+        )
+        self.state["issues"][triage_id]["status"] = "closed"
+        replay = self.assert_axes(self.invoke(), 1, "failed", "open", "required")
+        self.assertEqual(replay["triage_bead"], triage_id)
+        self.assertEqual(self.state["creates"], 1)
+        self.assert_no_reruns()
+
+    def test_create_echo_cannot_replace_unverifiable_persisted_record(self):
+        initial = json.loads(json.dumps(self.state))
+        for failure in ({"triage_override": {"parent": ""}}, {"triage_read_unavailable": True}):
+            with self.subTest(failure=failure):
+                self.state = json.loads(json.dumps(initial))
+                self.state.update(nodes=[check(conclusion="FAILURE")], **failure)
+                record = self.assert_axes(self.invoke(), 2, "failed", "open", "blocked")
+                triage_id = record["triage_bead"]
+                self.assertEqual(
+                    [call for call in self.state["calls"] if call[:3] == ["bd", "show", triage_id]],
+                    [["bd", "show", triage_id, "--json"]],
+                )
+                self.assertEqual(self.state["creates"], 1)
+                self.assert_no_reruns()
 
     def test_explicit_creation_contract_preserves_dependencies(self):
         from agentflow import beads
