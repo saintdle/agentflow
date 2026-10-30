@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Run macOS CI on the pinned `macos-15` ARM64 runner image because GitHub
+  retires `macos-14` on November 2, 2026. Coverage stays at Python 3.10 and
+  3.14 plus the pull-request Beads smoke test. The required check names become
+  `Unit (macos-15, Python 3.10)` and `Unit (macos-15, Python 3.14)`. See
+  [#55](https://github.com/saintdle/agentflow/issues/55).
+
 ### Fixed
 
 - Reconcile CI gate closure after a lost acknowledgement using one bounded
