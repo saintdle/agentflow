@@ -222,6 +222,12 @@ identity. It never contains the prior transcript, resume secret, signing key, or
 provider credentials. Paste the returned prompt into a fresh agent chat opened
 in the same workspace.
 
+The packet also includes the root's completion audit. When the root is closed
+and the audit is complete, the packet is terminal and has no next action or
+ready tasks. It keeps the last checkpoint only as historical context, and the
+prompt says there is nothing to continue. Otherwise the packet stays active and
+lists the open obligations, or states that the audit is unavailable.
+
 For a read-only cost and context review, ask the chat to run:
 
 ```text

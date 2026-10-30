@@ -493,6 +493,105 @@ def root_descendants(cwd: Path, root: str) -> list[dict[str, Any]]:
     return sorted(descendants, key=lambda item: str(item.get("id") or ""))
 
 
+def _audit_parent(item: Mapping[str, Any]) -> str:
+    # Same parent-link fields, in the same order, as root_descendants.
+    for field in ("parent", "parent_id", "root_id", "workflow_root"):
+        if field in item and item[field] not in (None, ""):
+            return str(item[field])
+    return ""
+
+
+def _audit_malformed_field(item: Mapping[str, Any]) -> str:
+    """Name the first nested field the completion audit cannot safely read."""
+
+    if not isinstance(item.get("status"), str) or not item["status"]:
+        return "status"
+    for field in ("parent", "parent_id", "root_id", "workflow_root"):
+        if item.get(field) is not None and not isinstance(item[field], str):
+            return field
+    if item.get("metadata") is not None and not isinstance(item["metadata"], dict):
+        return "metadata"
+    dependencies = item.get("dependencies")
+    if dependencies is not None and (
+        not isinstance(dependencies, list)
+        or any(not isinstance(entry, (str, dict)) for entry in dependencies)
+    ):
+        return "dependencies"
+    return ""
+
+
+def audit_root_descendants(cwd: Path, root: str) -> dict[str, Any]:
+    """Enumerate every descendant of *root* for the completion audit only.
+
+    Scheduling keeps using root_descendants. This snapshot includes gates and
+    is all-or-nothing: any ambiguity yields ``available=False`` and never an
+    empty, apparently finished descendant list.
+    """
+
+    def unavailable(error: str) -> dict[str, Any]:
+        return {"root_id": root, "available": False, "root": None, "descendants": [], "error": error}
+
+    if not root:
+        return unavailable("workflow root is required")
+    operation = "bd list --all --include-gates"
+    try:
+        result = run(cwd, "list", "--all", "--include-gates", "--brief", "--limit", "0", "--json")
+    except (BeadsError, OSError) as exc:
+        return unavailable(str(exc))
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        return unavailable(f"{operation} failed: {detail[-1] if detail else result.returncode}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return unavailable(f"{operation} returned invalid JSON")
+    if isinstance(value, dict):
+        if any(value.get(marker) for marker in ("has_more", "truncated", "next_cursor")):
+            return unavailable(f"{operation} returned a truncated listing")
+        value = value.get("issues")
+    if not isinstance(value, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+        for item in value
+    ):
+        return unavailable(f"{operation} returned an unexpected JSON shape")
+    for item in value:
+        field = _audit_malformed_field(item)
+        if field:
+            return unavailable(f"{operation} returned a malformed {field} on {item['id']}")
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in value:
+        if item["id"] in by_id:
+            return unavailable(f"{operation} returned duplicate issue {item['id']}")
+        by_id[item["id"]] = dict(item)
+    if root not in by_id:
+        return unavailable(f"workflow root {root} is absent from the Beads snapshot")
+    descendants: list[dict[str, Any]] = []
+    for item_id, item in by_id.items():
+        current = _audit_parent(item)
+        seen = {item_id}
+        reached = False
+        while current:
+            if current in seen:
+                return unavailable(f"parent cycle at {current} in the Beads snapshot")
+            if current == root:
+                reached = True
+                break
+            seen.add(current)
+            ancestor = by_id.get(current)
+            if ancestor is None:
+                return unavailable(f"parent {current} of {item_id} is absent from the Beads snapshot")
+            current = _audit_parent(ancestor)
+        if reached:
+            descendants.append(item)
+    return {
+        "root_id": root,
+        "available": True,
+        "root": by_id[root],
+        "descendants": sorted(descendants, key=lambda item: item["id"]),
+        "error": "",
+    }
+
+
 def claim_ready(
     cwd: Path,
     *,
