@@ -367,9 +367,14 @@ def initialize(
     return "created", created
 
 
-def get_issue(cwd: Path, issue_id: str, *, brief_dependencies: bool = False) -> dict[str, Any]:
+def get_issue(
+    cwd: Path, issue_id: str, *, brief_dependencies: bool = False, timeout: float = 30,
+) -> dict[str, Any]:
     projection = ("--brief-deps",) if brief_dependencies else ()
-    value = _json_output(run(cwd, "show", issue_id, *projection, "--json"), f"bd show {issue_id}")
+    value = _json_output(
+        run(cwd, "show", issue_id, *projection, "--json", timeout=timeout),
+        f"bd show {issue_id}",
+    )
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise BeadsError(f"Bead not found or ambiguous: {issue_id}")
     issue = value[0]
@@ -824,6 +829,7 @@ def create_issue(
     assignee: str = "",
     dependencies: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    issue_id: str = "",
 ) -> dict[str, Any]:
     arguments = [
         "create",
@@ -832,8 +838,7 @@ def create_issue(
         description,
         "--acceptance",
         acceptance,
-        "--parent",
-        parent,
+        *(["--parent", parent] if not issue_id else []),
         "--no-inherit-labels",
         "--labels",
         ",".join(labels),
@@ -841,6 +846,10 @@ def create_issue(
     ]
     if assignee:
         arguments.extend(["--assignee", assignee])
+    if issue_id:
+        arguments.extend(["--id", issue_id])
+        if parent:
+            dependencies = [f"parent-child:{parent}", *(dependencies or [])]
     if dependencies:
         arguments.extend(["--deps", ",".join(dependencies)])
     if metadata:
@@ -870,14 +879,18 @@ def close_issue(cwd: Path, issue_id: str, reason: str, *, actor: str = "") -> No
         )
 
 
-def update_agentflow_metadata(cwd: Path, issue_id: str, update: dict[str, Any]) -> None:
-    issue = get_issue(cwd, issue_id)
+def update_agentflow_metadata(
+    cwd: Path, issue_id: str, update: dict[str, Any], *,
+    snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Merge metadata using an optional, already validated exact-issue snapshot."""
+    issue = snapshot if snapshot is not None else get_issue(cwd, issue_id)
+    if snapshot is not None and issue.get("id") != issue_id:
+        raise BeadsError("Metadata snapshot does not match the requested issue")
     metadata = issue.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
     agentflow = metadata.get("agentflow")
-    if not isinstance(agentflow, dict):
-        agentflow = {}
+    agentflow = dict(agentflow) if isinstance(agentflow, dict) else {}
     agentflow.update(update)
     metadata["agentflow"] = agentflow
     result = run(

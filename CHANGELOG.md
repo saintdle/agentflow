@@ -8,6 +8,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Reconcile CI gate closure after a lost acknowledgement using one bounded
+  read-back of the exact gate and immutable check receipt. Repeated observations
+  reuse closed failure-triage tasks and never rerun workflows. Pending,
+  malformed, mismatched or unavailable evidence returns exit `2`; exact
+  passed-and-closed replay returns `0`. See [#52](https://github.com/saintdle/agentflow/issues/52).
+
 - Bind task authority to protected native claim-event identities. Reclaiming and
   regranting to the same actor fences stale launches and authenticated results,
   including a generation change during renewal. Existing unsealed executions

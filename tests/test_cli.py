@@ -2305,10 +2305,17 @@ class AgentflowTests(unittest.TestCase):
             "parent": "root",
             "labels": ["af:stage:ci"],
         }
+
+        def observe(**kwargs):
+            kwargs["evidence"].append({"id": "unit", "name": "unit", "bucket": "pass"})
+            return "passed", {"pass": 1}, [], ""
+
         with mock.patch.object(
             cli.beads_backend, "get_issue", return_value=issue
         ), mock.patch.object(
-            cli, "_github_pr_checks", return_value=("passed", {"pass": 3}, [], "")
+            cli, "_github_pr_identity", return_value={"repo": "owner/repo", "pr": 42, "head": "a" * 40}
+        ), mock.patch.object(
+            cli, "_github_pr_checks", side_effect=observe
         ), mock.patch.object(
             cli.beads_backend, "update_agentflow_metadata"
         ), mock.patch.object(
@@ -2329,7 +2336,7 @@ class AgentflowTests(unittest.TestCase):
                     once=True,
                     interval_seconds=30,
                     timeout_seconds=60,
-                    cwd="/tmp",
+                    cwd=".",
                 )
             )
         self.assertEqual(result, 0)
@@ -2362,14 +2369,31 @@ class AgentflowTests(unittest.TestCase):
             ),
         ]
         for checks, expected_status, expected_failures in cases:
+            nodes = [
+                {
+                    "__typename": "CheckRun", "id": str(index), "name": check["name"],
+                    "status": "IN_PROGRESS" if check["bucket"] == "pending" else "COMPLETED",
+                    "conclusion": {
+                        "pass": "SUCCESS", "fail": "FAILURE", "cancel": "CANCELLED",
+                    }.get(check["bucket"]),
+                    "isRequired": True, "detailsUrl": "",
+                }
+                for index, check in enumerate(checks)
+            ]
+            payload = {"data": {"repository": {"nameWithOwner": "owner/repo", "object": {
+                "oid": "a" * 40, "statusCheckRollup": {"contexts": {
+                    "nodes": nodes, "totalCount": len(nodes),
+                    "pageInfo": {"hasNextPage": False},
+                }},
+            }}}}
             completed = cli.subprocess.CompletedProcess(
-                [], 1 if expected_status == "failed" else 0, json.dumps(checks), ""
+                [], 0, json.dumps(payload), ""
             )
             with self.subTest(expected_status=expected_status), mock.patch.object(
                 cli.shutil, "which", return_value="/opt/homebrew/bin/gh"
             ), mock.patch.object(cli.subprocess, "run", return_value=completed):
                 status, _, failures, error = cli._github_pr_checks(
-                    pr="42", repo="owner/repo", required=False
+                    pr="42", repo="owner/repo", required=False, head="a" * 40
                 )
             self.assertEqual(status, expected_status)
             self.assertEqual(failures, expected_failures)
@@ -2384,12 +2408,19 @@ class AgentflowTests(unittest.TestCase):
             "labels": ["af:stage:ci"],
         }
         triage = {"id": "triage-ci", "title": "Triage failing CI for PR #42"}
+
+        def observe(**kwargs):
+            kwargs["evidence"].append({"id": "unit", "name": "unit", "bucket": "fail"})
+            return "failed", {"fail": 1}, ["unit"], ""
+
         with mock.patch.object(
             cli.beads_backend, "get_issue", return_value=issue
         ), mock.patch.object(
+            cli, "_github_pr_identity", return_value={"repo": "owner/repo", "pr": 42, "head": "a" * 40}
+        ), mock.patch.object(
             cli,
             "_github_pr_checks",
-            return_value=("failed", {"fail": 1}, ["unit"], ""),
+            side_effect=observe,
         ), mock.patch.object(
             cli, "_ci_failure_bead", return_value=triage
         ) as route, mock.patch.object(
@@ -2412,7 +2443,7 @@ class AgentflowTests(unittest.TestCase):
                     once=True,
                     interval_seconds=30,
                     timeout_seconds=60,
-                    cwd="/tmp",
+                    cwd=".",
                 )
             )
         self.assertEqual(result, 1)
@@ -2437,22 +2468,44 @@ class AgentflowTests(unittest.TestCase):
             "parent": "root",
             "assignee": "expensive-writer",
         }
-        created = {"id": "triage-1", "title": "Triage failing CI for PR #42"}
+        record = {
+            "identity": {"gate": "ci-1", "parent": "root", "repo": "owner/repo",
+                         "pr": 42, "head": "a" * 40, "required_only": False},
+            "checks": [{"id": "unit", "name": "unit", "bucket": "fail"}],
+        }
+        record["identity"]["check_set_sha256"] = cli._ci_digest(record["checks"])
+        persisted = {}
+
+        def created(*args, **kwargs):
+            persisted.update(
+                id=kwargs["issue_id"], title=kwargs["title"], status="open",
+                parent=kwargs["parent"], metadata=kwargs["metadata"],
+            )
+            return {field: value for field, value in persisted.items() if field != "parent"}
+
+        def read_issue(cwd, issue_id, **kwargs):
+            return writer if issue_id == "writer-1" else dict(persisted)
+
         with mock.patch.object(
-            cli.beads_backend, "get_issue", return_value=writer
-        ), mock.patch.object(
-            cli.beads_backend, "create_issue", return_value=created
-        ) as create:
+            cli.beads_backend, "get_issue", side_effect=read_issue
+        ) as read, mock.patch.object(
+            cli.beads_backend, "create_issue", side_effect=created
+        ) as create, mock.patch.object(cli.beads_backend, "update_agentflow_metadata"):
             result = cli._ci_failure_bead(
-                task_cwd=Path("/tmp"),
+                task_cwd=Path.cwd(),
                 ci_issue=ci_issue,
                 pr="42",
                 repo="owner/repo",
                 writer_id="writer-1",
                 assignee_override="",
                 failed_names=["unit"],
+                ci_record=record,
             )
-        self.assertEqual(result["id"], "triage-1")
+        self.assertEqual(result["id"], create.call_args.kwargs["issue_id"])
+        self.assertEqual(read.call_args_list, [
+            mock.call(Path.cwd(), "writer-1"),
+            mock.call(Path.cwd(), result["id"], timeout=10),
+        ])
         kwargs = create.call_args.kwargs
         self.assertEqual(kwargs["assignee"], "")
         self.assertIn("af:stage:ci-triage", kwargs["labels"])

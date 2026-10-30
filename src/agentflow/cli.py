@@ -13201,30 +13201,31 @@ def review_route_fix(args: argparse.Namespace) -> int:
     return 0
 
 
-def _github_pr_checks(
-    *,
-    pr: str,
-    repo: str,
-    required: bool,
-) -> tuple[str, dict[str, int], list[str], str]:
+def _ci_repository(value: str) -> str:
+    value = value.strip().lower().removeprefix("https://").rstrip("/")
+    value = value.removesuffix(".git").removeprefix("github.com/")
+    if not re.fullmatch(r"(?:[a-z0-9.-]+/)?[a-z0-9_.-]+/[a-z0-9_.-]+", value):
+        raise ValueError("CI repository must be [HOST/]OWNER/REPO")
+    if any(part in {".", ".."} for part in value.split("/")):
+        raise ValueError("Invalid CI repository")
+    return value
+
+
+def _ci_pr_url(value: str) -> tuple[str, int]:
+    match = re.fullmatch(r"https://([^/]+/[^/]+/[^/]+)/pull/([1-9][0-9]*)/?", value)
+    if not match:
+        raise ValueError("GitHub returned an invalid pull request URL")
+    return _ci_repository(match[1]), int(match[2])
+
+
+def _ci_github_json(arguments: list[str], *, cwd: Path | None = None) -> Any:
     gh = shutil.which("gh")
     if not gh:
-        return "error", {}, [], "GitHub CLI is unavailable"
-    command = [
-        gh,
-        "pr",
-        "checks",
-        pr,
-        "--json",
-        "name,bucket,state,link,workflow",
-    ]
-    if repo:
-        command.extend(["--repo", repo])
-    if required:
-        command.append("--required")
+        raise ValueError("GitHub CLI is unavailable")
     try:
         result = subprocess.run(
-            command,
+            [gh, *arguments],
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=30,
@@ -13232,43 +13233,220 @@ def _github_pr_checks(
             env={**os.environ, "GH_PAGER": "cat"},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return "error", {}, [], f"GitHub check query failed: {exc}"
-
-    try:
-        checks = json.loads(result.stdout) if result.stdout.strip() else []
-    except json.JSONDecodeError:
-        checks = []
-    if not isinstance(checks, list):
-        return "error", {}, [], "GitHub check query returned unexpected JSON"
-    if not checks:
+        raise ValueError(f"GitHub query failed: {exc}") from exc
+    if result.returncode:
         detail = (result.stderr or result.stdout).strip()
-        if "no checks reported" in detail.lower() or not detail:
-            return "pending", {"pending": 0}, [], "No checks reported yet"
-        return "error", {}, [], detail.splitlines()[-1]
+        raise ValueError(f"GitHub query failed: {detail or result.returncode}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("GitHub query returned invalid JSON") from exc
+    if not isinstance(value, dict) or value.get("errors"):
+        raise ValueError("GitHub query returned incomplete or unexpected JSON")
+    return value
 
-    buckets = [
-        str(check.get("bucket") or "unknown").lower()
-        for check in checks
-        if isinstance(check, dict)
-    ]
-    counts = {
-        bucket: buckets.count(bucket)
-        for bucket in ("pass", "fail", "pending", "skipping", "cancel", "unknown")
-        if buckets.count(bucket)
-    }
-    failed_names = [
-        str(check.get("name") or "unnamed check")
-        for check in checks
-        if isinstance(check, dict)
-        and str(check.get("bucket") or "").lower() in {"fail", "cancel"}
-    ]
+
+def _github_pr_identity(*, pr: str, repo: str, cwd: Path) -> dict[str, Any]:
+    requested_repo = _ci_repository(repo) if repo else ""
+    if re.fullmatch(r"[1-9][0-9]*", pr):
+        number = int(pr)
+    else:
+        url_repo, number = _ci_pr_url(pr)
+        if requested_repo and requested_repo != url_repo:
+            raise ValueError("Pull request and requested repository do not match")
+        requested_repo = url_repo
+    command = ["pr", "view", str(number), "--json", "number,url,headRefOid"]
+    if requested_repo:
+        command.extend(["--repo", requested_repo])
+    value = _ci_github_json(command, cwd=cwd)
+    actual_repo, actual_number = _ci_pr_url(str(value.get("url") or ""))
+    head = value.get("headRefOid")
+    if (
+        type(value.get("number")) is not int or value["number"] != number
+        or actual_number != number
+        or (requested_repo and actual_repo != requested_repo)
+        or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head)
+    ):
+        raise ValueError("GitHub pull request identity mismatch")
+    return {"repo": actual_repo, "pr": number, "head": head.lower()}
+
+
+def _github_pr_checks(
+    *, pr: str, repo: str, required: bool, head: str,
+    evidence: list[dict[str, Any]] | None = None, cwd: Path | None = None,
+) -> tuple[str, dict[str, int], list[str], str]:
+    # Query the immutable commit, not a moving PR rollup. Required-check
+    # selection is evaluated by GitHub for this PR on that same evidence.
+    query = """query($owner:String!,$name:String!,$head:GitObjectID!,$pr:Int!){
+      repository(owner:$owner,name:$name){nameWithOwner object(oid:$head){
+        ... on Commit {oid statusCheckRollup {contexts(first:100){
+          totalCount pageInfo{hasNextPage endCursor} nodes{
+            __typename
+            ... on CheckRun {id name status conclusion detailsUrl
+              isRequired(pullRequestNumber:$pr)}
+            ... on StatusContext {id context state targetUrl
+              isRequired(pullRequestNumber:$pr)}
+          }
+        }}}
+      }}
+    }"""
+    try:
+        parts = _ci_repository(repo).split("/")
+        owner, name = parts[-2:]
+        command = [
+            "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+            "-f", f"name={name}", "-f", f"head={head}", "-F", f"pr={pr}",
+        ]
+        if len(parts) == 3:
+            command.extend(["--hostname", parts[0]])
+        value = _ci_github_json(command, cwd=cwd)
+        repository = value["data"]["repository"]
+        commit = repository["object"]
+        if (
+            str(repository["nameWithOwner"]).lower() != f"{owner}/{name}"
+            or commit["oid"] != head
+        ):
+            raise ValueError("GitHub check evidence head/repository mismatch")
+        rollup = commit["statusCheckRollup"]
+        nodes = []
+        if rollup is not None:
+            contexts = rollup["contexts"]
+            nodes = contexts["nodes"]
+            if (
+                not isinstance(nodes, list)
+                or type(contexts["totalCount"]) is not int
+                or contexts["totalCount"] != len(nodes)
+                or contexts["pageInfo"]["hasNextPage"] is not False
+            ):
+                raise ValueError("GitHub check evidence is truncated or malformed")
+        checks = []
+        seen = set()
+        for node in nodes:
+            if (
+                not isinstance(node, dict)
+                or not isinstance(node.get("id"), str) or not node["id"]
+                or node["id"] in seen or type(node.get("isRequired")) is not bool
+            ):
+                raise ValueError("GitHub returned malformed check identity")
+            seen.add(node["id"])
+            kind = node.get("__typename")
+            if kind == "CheckRun":
+                name = node.get("name")
+                link = node.get("detailsUrl")
+                run_status = node.get("status")
+                conclusion = node.get("conclusion")
+                if run_status == "COMPLETED":
+                    state = conclusion
+                    bucket = {
+                        "SUCCESS": "pass", "NEUTRAL": "skipping", "SKIPPED": "skipping",
+                        "FAILURE": "fail", "TIMED_OUT": "fail", "ACTION_REQUIRED": "fail",
+                        "STARTUP_FAILURE": "fail", "STALE": "fail", "CANCELLED": "cancel",
+                    }.get(state)
+                elif run_status in {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED"} and conclusion is None:
+                    state, bucket = run_status, "pending"
+                else:
+                    state, bucket = run_status, None
+            elif kind == "StatusContext":
+                name, link, state = node.get("context"), node.get("targetUrl"), node.get("state")
+                bucket = {
+                    "SUCCESS": "pass", "ERROR": "fail", "FAILURE": "fail",
+                    "EXPECTED": "pending", "PENDING": "pending",
+                }.get(state)
+            else:
+                raise ValueError("GitHub returned an unknown check type")
+            if (
+                not bucket or not isinstance(name, str) or not name.strip()
+                or (link is not None and not isinstance(link, str))
+            ):
+                raise ValueError("GitHub returned an unknown or malformed check state")
+            if not required or node["isRequired"]:
+                checks.append({
+                    "id": node["id"], "type": kind, "name": name, "state": state,
+                    "bucket": bucket, "link": link or "", "required": node["isRequired"],
+                })
+        checks.sort(key=lambda check: check["id"])
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        return "unavailable", {}, [], f"GitHub check evidence unavailable: {exc}"
+    if evidence is not None:
+        evidence.extend(checks)
+    buckets = [check["bucket"] for check in checks]
+    counts = {bucket: buckets.count(bucket) for bucket in sorted(set(buckets))}
+    failed_names = [check["name"] for check in checks if check["bucket"] in {"fail", "cancel"}]
     if any(bucket in {"fail", "cancel"} for bucket in buckets):
         return "failed", counts, failed_names, ""
-    if any(bucket in {"pending", "unknown"} for bucket in buckets):
-        return "pending", counts, [], ""
-    if all(bucket in {"pass", "skipping"} for bucket in buckets):
-        return "passed", counts, [], ""
-    return "pending", counts, [], ""
+    if not checks or "pending" in buckets:
+        return "pending", counts, [], "No checks reported yet" if not checks else ""
+    return "passed", counts, [], ""
+
+
+def _ci_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _ci_store(task_cwd: Path, issue: dict[str, Any], record: dict[str, Any]) -> None:
+    beads_backend.update_agentflow_metadata(
+        task_cwd, str(issue["id"]), {"ci": record}, snapshot=issue,
+    )
+    metadata = issue.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata["agentflow"] = {**_agentflow_metadata(issue), "ci": json.loads(json.dumps(record))}
+    issue["metadata"] = metadata
+
+
+def _ci_finish(record: dict[str, Any], code: int, error: str = "") -> int:
+    print(
+        f"CI {record['status'].upper()} — disposition={record['disposition']} "
+        f"obligation={record['obligation']}"
+    )
+    print("CI_STATE " + json.dumps(record, sort_keys=True))
+    if error:
+        print(error, file=sys.stderr)
+    if code == 0:
+        print("Next request: Continue the workflow stages unblocked by this CI gate.")
+    elif code == 1:
+        print("Next request: Complete the existing CI triage, then observe checks again.")
+    else:
+        print("Next request: Resolve the reported CI obligation before continuing.")
+    return code
+
+
+def _ci_unavailable(
+    disposition: str, error: str, observation: dict[str, Any] | None = None,
+) -> int:
+    record: dict[str, Any] = {
+        "status": "unavailable", "observed_result": "unavailable",
+        "disposition": disposition, "obligation": "blocked", "error": error,
+    }
+    if observation:
+        record["last_valid_observation"] = {
+            key: value for key, value in observation.items()
+            if key not in {"last_valid_observation", "triage_receipts"}
+        }
+    return _ci_finish(record, 2, error)
+
+
+def _ci_receipt_matches(issue: dict[str, Any], record: dict[str, Any]) -> bool:
+    stored = _agentflow_metadata(issue).get("ci")
+    return (
+        issue.get("id") == record["identity"]["gate"]
+        and issue.get("parent") == record["identity"]["parent"]
+        and isinstance(stored, dict)
+        and _ci_digest(stored.get("identity")) == _ci_digest(record["identity"])
+        and _ci_digest(stored.get("checks")) == _ci_digest(record["checks"])
+        and stored.get("status") == stored.get("observed_result") == "passed"
+    )
+
+
+def _ci_failure_identity(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **{key: value for key, value in record["identity"].items() if key != "required_only"},
+        "check_set_sha256": _ci_digest([
+            {key: value for key, value in check.items() if key != "required"}
+            for check in record["checks"] if check["bucket"] in {"fail", "cancel"}
+        ]),
+    }
 
 
 def _ci_failure_bead(
@@ -13280,56 +13458,71 @@ def _ci_failure_bead(
     writer_id: str,
     assignee_override: str,
     failed_names: list[str],
+    ci_record: dict[str, Any],
 ) -> dict[str, Any]:
-    existing_ci = _agentflow_metadata(ci_issue).get("ci")
-    if isinstance(existing_ci, dict) and existing_ci.get("triage_bead"):
-        triage_id = str(existing_ci["triage_bead"])
-        try:
-            existing = beads_backend.get_issue(task_cwd, triage_id)
-            if existing.get("status") != "closed":
-                return existing
-        except beads_backend.BeadsError:
-            pass
+    parent = str(ci_record["identity"]["parent"])
+    failure_identity = _ci_failure_identity(ci_record)
+    key = _ci_digest(failure_identity)
+    receipts = ci_record.setdefault("triage_receipts", {})
+    triage_id = receipts.get(key)
 
-    writer: dict[str, Any] = {}
+    def verify(issue: dict[str, Any]) -> dict[str, Any]:
+        metadata = _agentflow_metadata(issue)
+        if (
+            issue.get("id") != triage_id or issue.get("parent") != parent
+            or metadata.get("ci_bead") != ci_issue["id"]
+            or _ci_digest(metadata.get("failure_identity")) != _ci_digest(failure_identity)
+            or issue.get("status") not in ("open", "in_progress", "blocked", "closed")
+        ):
+            raise beads_backend.BeadsError("CI triage identity mismatch")
+        return issue
+
+    if triage_id:
+        ci_record["triage_bead"] = triage_id
+        return verify(beads_backend.get_issue(task_cwd, triage_id, timeout=10))
     if writer_id:
         writer = beads_backend.get_issue(task_cwd, writer_id)
-    parent = str(ci_issue.get("parent") or writer.get("parent") or "")
-    if not parent:
-        raise beads_backend.BeadsError("CI bead has no parent workflow for failure routing")
+        if writer.get("id") != writer_id or writer.get("parent") != parent:
+            raise beads_backend.BeadsError("Original CI writer identity mismatch")
+    # Persist the intent before creation. Even if either acknowledgement is lost,
+    # the next observation can only read this exact ID, never allocate another.
+    prefix = ci_issue["id"].split(".", 1)[0].rsplit("-", 1)[0]
+    triage_id = f"{prefix}-ci{key[:24]}"
+    receipts[key] = triage_id
+    ci_record["triage_bead"] = triage_id
+    _ci_store(task_cwd, ci_issue, ci_record)
     failure_summary = ", ".join(failed_names[:8]) or "unknown failing check"
     title = f"Triage failing CI for PR #{pr}"
-    return beads_backend.create_issue(
-        task_cwd,
-        title=title,
-        description=(
-            f"Diagnose the failing checks for PR #{pr}"
-            f"{f' in {repo}' if repo else ''}. Failing checks: {failure_summary}. "
-            "Do not edit product code or wait in a model session for reruns. Return the "
-            "exact failure and evidence. If a code correction is required, route a "
-            "bounded fix back to the original writer with `agentflow review route-fix`."
-        ),
-        acceptance=(
-            "The failure is reproduced or authoritatively explained and classified as "
-            "transient, infrastructure, configuration, or code. A required code correction "
-            "is routed to the original writer as a separate fix bead. Pushes and hosted "
-            "reruns still require existing authorization."
-        ),
-        parent=parent,
-        labels=["agentflow", "af:stage:ci-triage", "af:cap:ci", "af:role:ci"],
-        assignee=assignee_override,
-        dependencies=[f"blocks:{ci_issue['id']}"],
-        metadata={
-            "agentflow": {
-                "stage": "ci-triage",
-                "capability": "ci",
-                "ci_bead": ci_issue["id"],
-                "original_writer": writer_id,
-                "pr": pr,
-                "repo": repo,
-            }
-        },
-    )
+    try:
+        beads_backend.create_issue(
+            task_cwd, issue_id=triage_id, title=title,
+            description=(
+                f"Diagnose the failing checks for PR #{pr} in {repo} at "
+                f"{ci_record['identity']['head']}. Failing checks: {failure_summary}. "
+                "Do not edit product code or wait in a model session for reruns. Return "
+                "the exact failure and evidence. Route any required code correction "
+                "back to the original writer with `agentflow review route-fix`."
+            ),
+            acceptance=(
+                "The failure is reproduced or authoritatively explained and classified as "
+                "transient, infrastructure, configuration, or code. A required code correction "
+                "is routed to the original writer as a separate fix bead. Pushes and hosted "
+                "reruns still require existing authorization."
+            ),
+            parent=parent,
+            labels=["agentflow", "af:stage:ci-triage", "af:cap:ci", "af:role:ci"],
+            assignee=assignee_override,
+            dependencies=[f"blocks:{ci_issue['id']}"],
+            metadata={"agentflow": {
+                "stage": "ci-triage", "capability": "ci", "ci_bead": ci_issue["id"],
+                "original_writer": writer_id, "pr": pr, "repo": repo,
+                "ci_identity": ci_record["identity"], "failure_identity": failure_identity,
+            }},
+        )
+    except beads_backend.BeadsError:
+        pass
+    # Creation echoes may omit ancestry; only the persisted record is authoritative.
+    return verify(beads_backend.get_issue(task_cwd, triage_id, timeout=10))
 
 
 def ci_watch(args: argparse.Namespace) -> int:
@@ -13341,124 +13534,164 @@ def ci_watch(args: argparse.Namespace) -> int:
         print("--timeout-seconds cannot be negative.", file=sys.stderr)
         return 2
     try:
-        ci_issue = beads_backend.get_issue(task_cwd, args.bead)
+        ci_issue = beads_backend.get_issue(task_cwd, args.bead, timeout=10)
     except beads_backend.BeadsError as exc:
-        print(f"Cannot watch CI: {exc}", file=sys.stderr)
-        return 2
-    if ci_issue.get("status") == "closed":
-        print(f"CI bead is already closed: {args.bead}", file=sys.stderr)
-        return 2
+        return _ci_unavailable("closure_unresolved", f"Cannot watch CI: {exc}")
+    if ci_issue.get("id") != args.bead:
+        return _ci_unavailable("closure_unresolved", "CI gate identity mismatch")
+    closed = ci_issue.get("status") == "closed"
+    disposition = "closed" if closed else "open"
+    previous = _agentflow_metadata(ci_issue).get("ci")
+    previous = previous if isinstance(previous, dict) else {}
     stage = _issue_stage(ci_issue)
-    if stage not in {"ci", "unlabelled"}:
-        print(
-            f"Refusing to use {args.bead} as a CI gate; its stage is {stage}.",
-            file=sys.stderr,
-        )
-        return 2
+    if (
+        stage not in {"ci", "unlabelled"}
+        or not isinstance(ci_issue.get("parent"), str) or not ci_issue["parent"]
+        or ci_issue.get("status") not in ("open", "in_progress", "blocked", "closed")
+    ):
+        return _ci_unavailable(disposition, "CI gate parent, stage or state is unavailable", previous)
+    previous_identity = previous.get("identity")
+    if closed and not isinstance(previous_identity, dict):
+        return _ci_unavailable("closed", "Closed CI gate has no bound receipt", previous)
+    try:
+        pinned = _github_pr_identity(pr=args.pr, repo=args.repo, cwd=task_cwd)
+    except ValueError as exc:
+        return _ci_unavailable(disposition, str(exc), previous)
+    if previous_identity is not None and (
+        not isinstance(previous_identity, dict)
+        or previous_identity.get("gate") != args.bead
+        or previous_identity.get("parent") != ci_issue["parent"]
+        or previous_identity.get("repo") != pinned["repo"]
+        or type(previous_identity.get("pr")) is not int
+        or previous_identity.get("pr") != pinned["pr"]
+        or type(previous_identity.get("required_only")) is not bool
+        or not isinstance(previous_identity.get("head"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", previous_identity["head"])
+        or not isinstance(previous_identity.get("check_set_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", previous_identity["check_set_sha256"])
+    ):
+        return _ci_unavailable(disposition, "Persisted CI gate identity mismatch", previous)
+    receipts = previous.get("triage_receipts", {})
+    if (
+        not isinstance(receipts, dict)
+        or any(not isinstance(key, str) or not isinstance(value, str) or not value
+               for key, value in receipts.items())
+        or (previous.get("triage_bead") and not receipts)
+    ):
+        return _ci_unavailable(disposition, "CI triage receipt is unbound or malformed", previous)
 
     deadline = time.monotonic() + args.timeout_seconds
     previous_signature = ""
     while True:
+        checks: list[dict[str, Any]] = []
         status, counts, failed_names, error = _github_pr_checks(
-            pr=args.pr,
-            repo=args.repo,
-            required=args.required,
+            pr=str(pinned["pr"]), repo=pinned["repo"], required=args.required,
+            head=pinned["head"], evidence=checks, cwd=task_cwd,
         )
-        if status == "error":
-            print(f"CI query failed: {error}", file=sys.stderr)
-            return 2
-
-        signature = json.dumps(
-            {"status": status, "counts": counts, "failed": failed_names},
-            sort_keys=True,
-        )
+        if status not in {"passed", "failed", "pending"} or (status == "passed" and not checks):
+            return _ci_unavailable(disposition, error or "CI check evidence unavailable", previous)
+        try:
+            if _github_pr_identity(pr=str(pinned["pr"]), repo=pinned["repo"], cwd=task_cwd) != pinned:
+                raise ValueError("Pull request head drifted during CI observation")
+        except ValueError as exc:
+            return _ci_unavailable(disposition, str(exc), previous)
         ci_record = {
-            "status": status,
-            "pr": args.pr,
-            "repo": args.repo,
+            "status": status, "observed_result": status,
+            "disposition": disposition, "obligation": "required",
+            "identity": {
+                "gate": args.bead, "parent": ci_issue["parent"], **pinned,
+                "required_only": args.required, "check_set_sha256": _ci_digest(checks),
+            },
+            "checks": checks, "pr": str(pinned["pr"]), "repo": pinned["repo"],
             "required_only": args.required,
             "check_counts": counts,
             "failed_checks": failed_names,
             "observed_at": _now(),
+            "triage_receipts": dict(receipts),
         }
+        if status == "failed":
+            triage_id = receipts.get(_ci_digest(_ci_failure_identity(ci_record)))
+            if triage_id:
+                ci_record["triage_bead"] = triage_id
+        if closed:
+            if status == "passed" and _ci_receipt_matches(ci_issue, ci_record):
+                ci_record["obligation"] = "accepted"
+                return _ci_finish(ci_record, 0)
+            return _ci_unavailable("closed", "Closed CI receipt does not match this observation", previous)
+
+        signature = _ci_digest({"identity": ci_record["identity"], "status": status})
         if signature != previous_signature:
             try:
-                beads_backend.update_agentflow_metadata(
-                    task_cwd, args.bead, {"ci": ci_record}
-                )
+                _ci_store(task_cwd, ci_issue, ci_record)
             except beads_backend.BeadsError as exc:
-                print(f"Cannot record CI state: {exc}", file=sys.stderr)
-                return 2
+                ci_record["obligation"] = "blocked"
+                return _ci_finish(ci_record, 2, f"Cannot record CI state: {exc}")
             previous_signature = signature
+            previous = ci_record
 
-        count_text = ", ".join(f"{key}={value}" for key, value in counts.items()) or error
-        print(f"CI {status.upper()} — {count_text}")
+        count_text = ", ".join(f"{key}={value}" for key, value in counts.items())
         if status == "passed":
             try:
                 beads_backend.add_comment(
-                    task_cwd,
-                    args.bead,
-                    f"Agentflow CI passed for PR #{args.pr}: {count_text}.",
-                )
-                beads_backend.close_issue(
-                    task_cwd,
-                    args.bead,
-                    f"GitHub checks passed for PR #{args.pr}: {count_text}",
+                    task_cwd, args.bead,
+                    f"Agentflow CI passed for {pinned['repo']} PR #{pinned['pr']} "
+                    f"at {pinned['head']}: {count_text}.",
                 )
             except beads_backend.BeadsError as exc:
-                print(f"Cannot close CI gate: {exc}", file=sys.stderr)
-                return 2
-            print(
-                f"Next request: Continue the workflow stages unblocked by "
-                f"{ci_issue.get('title') or args.bead} ({args.bead})."
-            )
-            return 0
+                ci_record["obligation"] = "blocked"
+                return _ci_finish(ci_record, 2, f"Cannot record CI evidence: {exc}")
+            try:
+                beads_backend.close_issue(
+                    task_cwd, args.bead,
+                    f"GitHub checks passed for {pinned['repo']} PR #{pinned['pr']} "
+                    f"at {pinned['head']}; check set {ci_record['identity']['check_set_sha256']}",
+                )
+            except beads_backend.BeadsError as exc:
+                try:
+                    readback = beads_backend.get_issue(task_cwd, args.bead, timeout=10)
+                except beads_backend.BeadsError as read_error:
+                    ci_record.update(disposition="closure_unresolved", obligation="blocked")
+                    return _ci_finish(ci_record, 2, f"CI closure read-back unavailable: {read_error}")
+                if not _ci_receipt_matches(readback, ci_record):
+                    return _ci_unavailable("closure_unresolved", "CI closure read-back identity mismatch", ci_record)
+                if readback.get("status") in ("open", "in_progress", "blocked"):
+                    return _ci_finish(ci_record, 2, f"CI gate remains open: {exc}")
+                if readback.get("status") != "closed":
+                    return _ci_unavailable("closure_unresolved", "CI closure state unavailable", ci_record)
+                ci_issue = readback
+            ci_record.update(disposition="closed", obligation="accepted")
+            try:
+                _ci_store(task_cwd, ci_issue, ci_record)
+            except beads_backend.BeadsError as exc:
+                # The exact passed receipt and native closed state already prove
+                # completion. Do not retry closure if its projection cannot refresh.
+                print(f"CI closed; disposition metadata refresh unavailable: {exc}", file=sys.stderr)
+            return _ci_finish(ci_record, 0)
 
         if status == "failed":
             try:
                 triage = _ci_failure_bead(
                     task_cwd=task_cwd,
                     ci_issue=ci_issue,
-                    pr=args.pr,
-                    repo=args.repo,
+                    pr=str(pinned["pr"]),
+                    repo=pinned["repo"],
                     writer_id=args.writer,
                     assignee_override=args.assignee,
                     failed_names=failed_names,
+                    ci_record=ci_record,
                 )
                 triage_id = str(triage["id"])
                 ci_record["triage_bead"] = triage_id
-                beads_backend.update_agentflow_metadata(
-                    task_cwd, args.bead, {"ci": ci_record}
-                )
-                beads_backend.update_issue(
-                    task_cwd, args.bead, status="open", assignee=""
-                )
-                beads_backend.add_comment(
-                    task_cwd,
-                    args.bead,
-                    (
-                        f"Agentflow CI failed for PR #{args.pr}; routed to "
-                        f"{triage.get('title') or triage_id} ({triage_id})."
-                    ),
-                )
+                if ci_issue.get("status") != "open" or ci_issue.get("assignee"):
+                    beads_backend.update_issue(task_cwd, args.bead, status="open", assignee="")
             except beads_backend.BeadsError as exc:
-                print(f"Cannot route CI failure: {exc}", file=sys.stderr)
-                return 2
-            print(
-                f"ROUTED {triage.get('title') or triage_id} ({triage_id})"
-            )
-            print(
-                f'Next request: Complete "{triage.get("title") or triage_id}" '
-                f"({triage_id}), then rerun this CI watcher."
-            )
-            return 1
+                ci_record["obligation"] = "blocked"
+                return _ci_finish(ci_record, 2, f"Cannot route CI failure: {exc}")
+            print(f"ROUTED {triage.get('title') or triage_id} ({triage_id})")
+            return _ci_finish(ci_record, 1)
 
         if args.once or time.monotonic() >= deadline:
-            print(
-                f"Next request: No agent action yet. Re-run `agentflow ci watch "
-                f"--bead {args.bead} --pr {args.pr}` after checks advance."
-            )
-            return 8
+            return _ci_finish(ci_record, 2, error)
         time.sleep(args.interval_seconds)
 
 
