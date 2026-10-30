@@ -58,6 +58,19 @@ def option(name):
 if tool != "bd":
     finish(code=90, error="unexpected external tool")
 issues = state["issues"]
+
+def after(event):
+    # Deterministic interleaving: apply a concurrent write after the Nth event.
+    counts = state.setdefault("event_counts", {})
+    counts[event] = counts.get(event, 0) + 1
+    for hook in state.get("hooks", []):
+        if hook["on"] == event and hook["count"] == counts[event]:
+            for keys, value in hook["set"]:
+                target = issues
+                for part in keys[:-1]:
+                    target = target[part]
+                target[keys[-1]] = value
+
 if args[:1] == ["list"]:
     gates = "--include-gates" in args
     mode = state.get("list_mode", "") if gates else ""
@@ -77,7 +90,9 @@ if args[:1] == ["show"]:
         state.setdefault("readbacks", {})[key] = state.setdefault("readbacks", {}).get(key, 0) + 1
     if key in state.get("show_fail", []) or key not in issues:
         finish(code=1, error="issue not found")
-    finish([issues[key]])
+    shown = json.loads(json.dumps([issues[key]]))
+    after("show:" + key)
+    finish(shown)
 if args[:1] == ["update"]:
     key = args[1]
     if key in state.get("update_fail", []):
@@ -86,6 +101,7 @@ if args[:1] == ["update"]:
         issues[key]["metadata"] = json.loads(option("--metadata"))
     if "--status" in args:
         issues[key]["status"] = option("--status")
+    after("update:" + key)
     finish()
 if args[:1] == ["close"]:
     key = args[1]
@@ -279,6 +295,11 @@ class CompletionFixture(unittest.TestCase):
     def metadata(self, identifier):
         return self.state["issues"][identifier]["metadata"]
 
+    def hook(self, event, count, *changes):
+        self.state.setdefault("hooks", []).append(
+            {"on": event, "count": count, "set": [[list(keys), value] for keys, value in changes]}
+        )
+
 
 class CompletionAuditStatusTests(CompletionFixture):
     """V2a: complete enumeration under a terminal root."""
@@ -407,6 +428,25 @@ class CompletionAuditUnavailableTests(CompletionFixture):
                 self.state = {"calls": [], "issues": graph()}
                 self.all_closed()
                 self.state.update(settings)
+                self.assert_unavailable(self.status()["completion_audit"])
+                self.assertEqual(self.writes(), [])
+
+    def test_malformed_nested_fields_are_unavailable(self):
+        cases = {
+            "dependencies-not-list": ("zz-citriage", "dependencies", 7),
+            "dependency-entry-not-object": ("wf-root.1", "dependencies", [7]),
+            "root-dependencies-object": ("wf-root", "dependencies", {"depends_on_id": "ext-1"}),
+            "metadata-not-object": ("wf-ci-new", "metadata", "agentflow"),
+            "status-not-text": ("wf-root.1", "status", 5),
+            "status-missing": ("wf-ci-new", "status", None),
+            "parent-not-text": ("zz-ci-old", "parent", ["wf-root.1"]),
+            "parent-id-not-text": ("wf-ci-new", "parent_id", {"id": "wf-root.1"}),
+        }
+        for name, (identifier, field, value) in cases.items():
+            with self.subTest(name):
+                self.state = {"calls": [], "issues": graph()}
+                self.all_closed()
+                self.state["issues"][identifier][field] = value
                 self.assert_unavailable(self.status()["completion_audit"])
                 self.assertEqual(self.writes(), [])
 
@@ -577,6 +617,23 @@ class CISupersedeTests(CompletionFixture):
                 state["issues"]["zz-ci-old"]["metadata"]["agentflow"]["ci"].update(fields)
             return apply
 
+        def successor_checks(*buckets):
+            # Self-consistent digest, so only the bucket evidence is wrong.
+            def apply(state):
+                ci = state["issues"]["wf-ci-new"]["metadata"]["agentflow"]["ci"]
+                checks = [
+                    dict(ci["checks"][0], bucket=bucket, id=f"run-{index}")
+                    for index, bucket in enumerate(buckets)
+                ]
+                ci["checks"] = checks
+                ci["identity"]["check_set_sha256"] = digest(checks)
+            return apply
+
+        def drop_new_identity(field):
+            def apply(state):
+                state["issues"]["wf-ci-new"]["metadata"]["agentflow"]["ci"]["identity"].pop(field)
+            return apply
+
         def set_status(identifier, status):
             def apply(state):
                 state["issues"][identifier]["status"] = status
@@ -613,6 +670,14 @@ class CISupersedeTests(CompletionFixture):
             "successor-parent-mismatch": (mutate_new_identity(parent="wf-root"), {}),
             "different-repo": (mutate_new_identity(repo="other/project"), {}),
             "same-head": (mutate_new_identity(head=OLD_HEAD), {}),
+            "successor-empty-checks": (successor_checks(), {}),
+            "successor-failing-check": (successor_checks("pass", "fail"), {}),
+            "successor-cancelled-check": (successor_checks("cancel"), {}),
+            "successor-pending-check": (successor_checks("pass", "pending"), {}),
+            "successor-check-digest-mismatch": (mutate_new_identity(check_set_sha256="0" * 64), {}),
+            "successor-missing-check-set": (drop_new_identity("check_set_sha256"), {}),
+            "successor-missing-pr": (drop_new_identity("pr"), {}),
+            "successor-required-only-not-bool": (mutate_new_identity(required_only="false"), {}),
             "empty-reason": (None, {"reason": "  "}),
             "empty-decision-ref": (None, {"decision_ref": ""}),
             "self-successor": (None, {"successor": "zz-ci-old"}),
@@ -657,6 +722,13 @@ class CISupersedeTests(CompletionFixture):
         self.assertFalse(audit["complete"])
         gate = next(item for item in audit["ci"] if item["id"] == "zz-ci-old")
         self.assertEqual(gate["disposition"], "closure_unresolved")
+        self.assertIn("zz-ci-old", [item["id"] for item in audit["open_descendants"]])
+        self.assertEqual(
+            [item for item in audit["findings"]
+             if item["id"] == "superseded" and item["task"] == "zz-ci-old"],
+            [],
+        )
+        self.assertEqual(audit["counts"]["superseded"], 0)
 
         self.state["close_mode"] = {}
         self.state["closed_attempts"] = []
@@ -692,6 +764,78 @@ class CISupersedeTests(CompletionFixture):
         self.assertIn("zz-citriage", payload["unresolved"])
         self.assertEqual(self.state["closed_attempts"], ["zz-citriage"])
         self.assertEqual(self.state["readbacks"], {"zz-citriage": 1})
+
+    def test_audit_rejects_supersession_whose_successor_receipt_lost_passing_evidence(self):
+        first, _ = self.supersede()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        ci = self.metadata("wf-ci-new")["agentflow"]["ci"]
+        # Identity (and so the recorded identity digest) is unchanged; only evidence fails.
+        ci["checks"] = [dict(ci["checks"][0], bucket="fail")]
+        audit = self.status()["completion_audit"]
+        self.assertFalse(audit["complete"])
+        gate = next(item for item in audit["ci"] if item["id"] == "zz-ci-old")
+        self.assertEqual(gate["disposition"], "closed")
+        self.assertFalse(gate["supersession"]["valid"])
+        unaccepted = [item for item in audit["findings"]
+                      if item["id"] == "ci-result-unaccepted" and item["task"] == "zz-ci-old"]
+        self.assertEqual(len(unaccepted), 1)
+        self.assertEqual(unaccepted[0]["severity"], "high")
+        self.assertEqual(audit["counts"]["superseded"], 0)
+
+    def assert_rejected_without_writes(self, result, payload):
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["error"])
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_old_ci_written_after_validation_is_not_overwritten(self):
+        newer = "2026-10-30T01:00:00+00:00"
+        self.hook("show:zz-ci-old", 1, (("zz-ci-old", "metadata", "agentflow", "ci", "observed_at"), newer))
+        result, payload = self.supersede()
+        self.assert_rejected_without_writes(result, payload)
+        self.assertEqual(self.metadata("zz-ci-old")["agentflow"]["ci"]["observed_at"], newer)
+        self.assertNotIn("supersession", self.metadata("zz-ci-old")["agentflow"])
+        self.assertEqual(self.state["issues"]["zz-ci-old"]["status"], "open")
+
+    def test_old_gate_reparented_after_validation_is_rejected(self):
+        self.hook("show:zz-ci-old", 1, (("zz-ci-old", "parent"), "other-root"))
+        result, payload = self.supersede()
+        self.assert_rejected_without_writes(result, payload)
+        self.assertEqual(self.state["issues"]["zz-ci-old"]["parent"], "other-root")
+        self.assertNotIn("supersession", self.metadata("zz-ci-old")["agentflow"])
+
+    def test_successor_failing_after_validation_is_rejected(self):
+        ci = ("wf-ci-new", "metadata", "agentflow", "ci")
+        self.hook("show:wf-ci-new", 1, ((*ci, "status"), "failed"), ((*ci, "observed_result"), "failed"))
+        result, payload = self.supersede()
+        self.assert_rejected_without_writes(result, payload)
+        self.assertEqual(self.metadata("wf-ci-new")["agentflow"]["ci"]["observed_result"], "failed")
+        self.assertNotIn("supersession", self.metadata("zz-ci-old")["agentflow"])
+
+    def test_triage_identity_changed_after_validation_is_not_overwritten(self):
+        changed = {"gate": "zz-ci-old", "check_set_sha256": "1" * 64}
+        self.hook("show:zz-citriage", 1, (("zz-citriage", "metadata", "agentflow", "failure_identity"), changed))
+        result, payload = self.supersede()
+        self.assert_rejected_without_writes(result, payload)
+        self.assertEqual(self.metadata("zz-citriage")["agentflow"]["failure_identity"], changed)
+        self.assertEqual(self.state["issues"]["zz-citriage"]["status"], "open")
+
+    def test_old_ci_drift_after_first_write_leaves_gate_open_and_unresolved(self):
+        newer = "2026-10-30T02:00:00+00:00"
+        self.hook("update:zz-ci-old", 1, (("zz-ci-old", "metadata", "agentflow", "ci", "observed_at"), newer))
+        result, payload = self.supersede()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["disposition"], "closure_unresolved")
+        self.assertIn("zz-ci-old", payload["unresolved"])
+        self.assertNotIn("zz-ci-old", self.state.get("closed_attempts", []))
+        self.assertEqual(self.state["issues"]["zz-ci-old"]["status"], "open")
+        self.assertEqual(self.metadata("zz-ci-old")["agentflow"]["ci"]["observed_at"], newer)
+        self.assertEqual(
+            [call[2] for call in self.state["calls"] if call[:2] == ["bd", "update"]].count("zz-ci-old"), 1,
+        )
+        self.assertEqual(self.gh_calls(), [])
 
 
 class TerminalRotationTests(CompletionFixture):

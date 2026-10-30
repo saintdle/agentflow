@@ -501,6 +501,25 @@ def _audit_parent(item: Mapping[str, Any]) -> str:
     return ""
 
 
+def _audit_malformed_field(item: Mapping[str, Any]) -> str:
+    """Name the first nested field the completion audit cannot safely read."""
+
+    if not isinstance(item.get("status"), str) or not item["status"]:
+        return "status"
+    for field in ("parent", "parent_id", "root_id", "workflow_root"):
+        if item.get(field) is not None and not isinstance(item[field], str):
+            return field
+    if item.get("metadata") is not None and not isinstance(item["metadata"], dict):
+        return "metadata"
+    dependencies = item.get("dependencies")
+    if dependencies is not None and (
+        not isinstance(dependencies, list)
+        or any(not isinstance(entry, (str, dict)) for entry in dependencies)
+    ):
+        return "dependencies"
+    return ""
+
+
 def audit_root_descendants(cwd: Path, root: str) -> dict[str, Any]:
     """Enumerate every descendant of *root* for the completion audit only.
 
@@ -535,6 +554,10 @@ def audit_root_descendants(cwd: Path, root: str) -> dict[str, Any]:
         for item in value
     ):
         return unavailable(f"{operation} returned an unexpected JSON shape")
+    for item in value:
+        field = _audit_malformed_field(item)
+        if field:
+            return unavailable(f"{operation} returned a malformed {field} on {item['id']}")
     by_id: dict[str, dict[str, Any]] = {}
     for item in value:
         if item["id"] in by_id:

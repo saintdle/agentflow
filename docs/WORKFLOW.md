@@ -286,6 +286,13 @@ exit `2` with `closure_unresolved`; rerun the same command to resume. An
 identical rerun writes nothing, and a different decision for the same gate is
 rejected without writes.
 
+The successor's stored checks must be non-empty, all passing, and match its
+recorded check set. Beads has no compare-and-swap, so the command re-reads each
+task immediately before writing it. This narrows the race window but does not
+remove it. A task that changed after validation is never overwritten. Before
+any write the command rejects the run; after one it reports
+`closure_unresolved`.
+
 ## Hooks
 
 Agentflow hooks are small and advisory. They may record lifecycle events or

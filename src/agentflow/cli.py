@@ -13733,7 +13733,8 @@ def ci_supersede(args: argparse.Namespace) -> int:
     enumeration = beads_backend.audit_root_descendants(task_cwd, args.workflow_root)
     if not enumeration.get("available"):
         return reject(f"Workflow root enumeration is unavailable: {enumeration.get('error')}")
-    descendants = {str(item.get("id")) for item in enumeration.get("descendants") or []}
+    listed = {str(item.get("id")): item for item in enumeration.get("descendants") or []}
+    descendants = set(listed)
     if args.bead not in descendants:
         return reject(f"{args.bead} is not a descendant of {args.workflow_root}")
     if args.successor not in descendants:
@@ -13743,8 +13744,11 @@ def ci_supersede(args: argparse.Namespace) -> int:
         new = beads_backend.get_issue(task_cwd, args.successor, timeout=10)
     except beads_backend.BeadsError as exc:
         return reject(f"Cannot read CI gates: {exc}")
-    if old.get("id") != args.bead or new.get("id") != args.successor:
-        return reject("CI gate identity mismatch")
+    if any(
+        issue.get("id") != issue_id or issue.get("parent") != listed[issue_id].get("parent")
+        for issue_id, issue in ((args.bead, old), (args.successor, new))
+    ):
+        return reject("CI gate identity or parent changed since the root was listed")
     problem = reconciliation_backend.ci_successor_error(old, new)
     if problem:
         return reject(problem)
@@ -13767,6 +13771,7 @@ def ci_supersede(args: argparse.Namespace) -> int:
         if (
             item.get("id") != triage_id or metadata.get("stage") != "ci-triage"
             or metadata.get("ci_bead") != args.bead
+            or item.get("parent") != listed[triage_id].get("parent")
         ):
             return reject(f"CI triage {triage_id} does not belong to {args.bead}")
         triage.append(item)
@@ -13795,6 +13800,8 @@ def ci_supersede(args: argparse.Namespace) -> int:
     unresolved = [str(item["id"]) for item in triage if item.get("status") != "closed"]
     if old.get("status") != "closed":
         unresolved.append(args.bead)
+    snapshots = {args.bead: old, **{str(item["id"]): item for item in triage}}
+    wrote = False
 
     def unresolved_result(error: str) -> int:
         return finish({
@@ -13802,6 +13809,49 @@ def ci_supersede(args: argparse.Namespace) -> int:
             "observed_result": old_ci.get("observed_result"), "obligation": "blocked",
             "unresolved": unresolved, "supersession": record, "error": error,
         }, 2)
+
+    def stop(error: str) -> int:
+        return unresolved_result(error) if wrote else reject(error)
+
+    def revalidate(issue_id: str) -> tuple[dict[str, Any] | None, str]:
+        # Beads has no compare-and-swap: re-read immediately before each write.
+        try:
+            fresh = beads_backend.get_issue(task_cwd, issue_id, timeout=10)
+        except beads_backend.BeadsError as exc:
+            return None, f"Cannot re-read {issue_id} before writing: {exc}"
+        snapshot = snapshots[issue_id]
+        before, after = _agentflow_metadata(snapshot), _agentflow_metadata(fresh)
+        fields = ("ci",) if issue_id == args.bead else ("stage", "ci_bead", "failure_identity")
+        current = after.get("supersession")
+        if (
+            fresh.get("id") != issue_id
+            or fresh.get("parent") != listed[issue_id].get("parent")
+            or fresh.get("status") != snapshot.get("status")
+            or any(
+                reconciliation_backend.digest(after.get(field))
+                != reconciliation_backend.digest(before.get(field))
+                for field in fields
+            )
+            or (current is not None and _supersession_key(current) != key)
+        ):
+            return None, f"{issue_id} changed after validation; nothing was overwritten"
+        return fresh, ""
+
+    def successor_drift() -> str:
+        try:
+            successor = beads_backend.get_issue(task_cwd, args.successor, timeout=10)
+        except beads_backend.BeadsError as exc:
+            return f"Cannot re-read successor {args.successor}: {exc}"
+        problem = reconciliation_backend.ci_successor_error(old, successor)
+        if problem:
+            return f"successor changed after validation: {problem}"
+        identity = _agentflow_metadata(successor)["ci"]["identity"]
+        if (
+            successor.get("parent") != listed[args.successor].get("parent")
+            or reconciliation_backend.digest(identity) != record["successor_identity_sha256"]
+        ):
+            return f"successor {args.successor} changed after validation"
+        return ""
 
     def confirmed(issue_id: str) -> bool:
         try:
@@ -13818,39 +13868,48 @@ def ci_supersede(args: argparse.Namespace) -> int:
             )
         )
 
+    to_record = ([args.bead] if existing is None else []) + [
+        str(item["id"]) for item in triage
+        if item.get("status") != "closed" and _agentflow_metadata(item).get("supersession") is None
+    ]
+    to_close = [str(item["id"]) for item in triage if item.get("status") != "closed"]
+    if old.get("status") != "closed":
+        to_close.append(args.bead)
+    if to_record or to_close:
+        # Drift seen before the first write is rejected with nothing changed.
+        problem = successor_drift()
+        for issue_id in dict.fromkeys([*to_record, *to_close]):
+            if problem:
+                break
+            problem = revalidate(issue_id)[1]
+        if problem:
+            return reject(problem)
     actor = str(getattr(args, "actor", "") or "")
     close_reason = f"Superseded by passing CI on a newer commit ({args.successor}): {reason}"
-    try:
-        if existing is None:
+    for issue_id in to_record:
+        fresh, problem = revalidate(issue_id)
+        if fresh is None:
+            return stop(problem)
+        wrote = True
+        try:
             beads_backend.update_agentflow_metadata(
-                task_cwd, args.bead, {"supersession": record}, snapshot=old,
+                task_cwd, issue_id, {"supersession": record}, snapshot=fresh,
             )
-        for item in triage:
-            if item.get("status") != "closed" and _agentflow_metadata(item).get("supersession") is None:
-                beads_backend.update_agentflow_metadata(
-                    task_cwd, str(item["id"]), {"supersession": record}, snapshot=item,
-                )
-    except beads_backend.BeadsError as exc:
-        return unresolved_result(f"Cannot record supersession: {exc}")
-    for item in triage:
-        triage_id = str(item["id"])
-        if item.get("status") == "closed":
-            continue
+        except beads_backend.BeadsError as exc:
+            return unresolved_result(f"Cannot record supersession on {issue_id}: {exc}")
+    for issue_id in to_close:
+        fresh, problem = revalidate(issue_id)
+        if fresh is None:
+            return stop(problem)
+        wrote = True
         try:
-            beads_backend.close_issue(task_cwd, triage_id, close_reason, actor=actor)
+            beads_backend.close_issue(task_cwd, issue_id, close_reason, actor=actor)
         except beads_backend.BeadsError:
             pass
-        if not confirmed(triage_id):
-            return unresolved_result(f"Closure of CI triage {triage_id} is not confirmed")
-        unresolved.remove(triage_id)
-    if old.get("status") != "closed":
-        try:
-            beads_backend.close_issue(task_cwd, args.bead, close_reason, actor=actor)
-        except beads_backend.BeadsError:
-            pass
-        if not confirmed(args.bead):
-            return unresolved_result(f"Closure of CI gate {args.bead} is not confirmed")
-        unresolved.remove(args.bead)
+        if not confirmed(issue_id):
+            kind = "CI gate" if issue_id == args.bead else "CI triage"
+            return unresolved_result(f"Closure of {kind} {issue_id} is not confirmed")
+        unresolved.remove(issue_id)
     return finish({
         "ok": True, "disposition": "superseded",
         "observed_result": old_ci.get("observed_result"), "obligation": "accepted",

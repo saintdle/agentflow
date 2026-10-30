@@ -63,6 +63,7 @@ def reconcile(
 AUDIT_SCHEMA = "agentflow.completion-audit@1"
 SUPERSESSION_SCHEMA = "agentflow.ci-supersession@1"
 OBSERVED_RESULTS = frozenset({"passed", "failed", "pending", "unavailable"})
+UNPASSED_BUCKETS = frozenset({"fail", "cancel", "pending"})
 _SUPERSESSION_TEXT = (
     "successor", "successor_head", "successor_identity_sha256", "reason",
     "decision_ref", "original_ci_sha256",
@@ -94,8 +95,9 @@ def _parent(issue: Mapping[str, Any]) -> str:
 
 def _observed(ci: Mapping[str, Any]) -> str:
     for field in ("observed_result", "status"):
-        if ci.get(field) in OBSERVED_RESULTS:
-            return str(ci[field])
+        value = ci.get(field)
+        if isinstance(value, str) and value in OBSERVED_RESULTS:
+            return value
     return "unavailable"
 
 
@@ -103,20 +105,70 @@ def _head(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
 
 
+def ci_identity_error(issue: Mapping[str, Any]) -> str:
+    """Return why *issue* lacks a stored CI identity bound to it, or ``""``."""
+
+    issue_id = str(issue.get("id") or "")
+    ci = _agentflow(issue).get("ci")
+    if not isinstance(ci, Mapping):
+        return f"{issue_id} has no recorded CI result"
+    identity = ci.get("identity")
+    if not (
+        isinstance(identity, Mapping) and identity.get("gate") == issue_id
+        and isinstance(identity.get("parent"), str) and identity["parent"]
+        and identity["parent"] == issue.get("parent")
+        and isinstance(identity.get("repo"), str) and identity["repo"]
+        and type(identity.get("pr")) is int and _head(identity.get("head"))
+        and type(identity.get("required_only")) is bool
+        and isinstance(identity.get("check_set_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", identity["check_set_sha256"]) is not None
+    ):
+        return f"{issue_id} has no bound CI identity"
+    return ""
+
+
+def passed_ci_receipt_error(issue: Mapping[str, Any]) -> str:
+    """Return why *issue* lacks a stored receipt of an accepted CI pass, or ``""``.
+
+    Mirrors what ``ci watch`` persists for a pass: a bound identity, non-empty
+    checks with no failing, cancelled or pending bucket, and a check set whose
+    digest is the identity's ``check_set_sha256``.
+    """
+
+    issue_id = str(issue.get("id") or "")
+    problem = ci_identity_error(issue)
+    if problem:
+        return problem
+    ci = _agentflow(issue)["ci"]
+    checks = ci.get("checks")
+    if not isinstance(checks, list) or not checks or any(
+        not isinstance(check, Mapping) or not isinstance(check.get("bucket"), str)
+        or not check["bucket"]
+        for check in checks
+    ):
+        return f"{issue_id} has no stored check evidence"
+    if any(check["bucket"] in UNPASSED_BUCKETS for check in checks):
+        return f"{issue_id} stored checks include a failing, cancelled or pending check"
+    if digest(checks) != ci["identity"]["check_set_sha256"]:
+        return f"{issue_id} stored checks do not match its CI identity"
+    if (
+        not ci.get("status") == ci.get("observed_result") == "passed"
+        or ci.get("disposition") != "closed" or ci.get("obligation") != "accepted"
+    ):
+        return f"{issue_id} has no closed, accepted, passed CI receipt"
+    return ""
+
+
 def ci_successor_error(old: Mapping[str, Any], new: Mapping[str, Any] | None) -> str:
     """Return why *new* cannot supersede the CI result on *old*, or ``""``."""
 
     old_id = str(old.get("id") or "")
-    old_ci = _agentflow(old).get("ci")
-    if not isinstance(old_ci, Mapping):
-        return f"{old_id} has no recorded CI result"
-    old_identity = old_ci.get("identity")
-    if (
-        not isinstance(old_identity, Mapping) or old_identity.get("gate") != old_id
-        or old_identity.get("parent") != old.get("parent") or not _head(old_identity.get("head"))
-    ):
-        return f"{old_id} has no bound CI identity"
-    if old_ci.get("observed_result") == "passed":
+    problem = ci_identity_error(old)
+    if problem:
+        return problem
+    old_ci = _agentflow(old)["ci"]
+    old_identity = old_ci["identity"]
+    if _observed(old_ci) == "passed":
         return f"{old_id} already passed; there is nothing to supersede"
     if not isinstance(new, Mapping):
         return "successor is not a descendant of the workflow root"
@@ -125,22 +177,13 @@ def ci_successor_error(old: Mapping[str, Any], new: Mapping[str, Any] | None) ->
         return "a CI gate cannot supersede itself"
     if _status(new) != "closed":
         return f"successor {new_id} is not closed"
-    new_ci = _agentflow(new).get("ci")
-    if (
-        not isinstance(new_ci, Mapping)
-        or not new_ci.get("status") == new_ci.get("observed_result") == "passed"
-        or new_ci.get("disposition") != "closed" or new_ci.get("obligation") != "accepted"
-    ):
-        return f"successor {new_id} has no closed, accepted, passed CI receipt"
-    new_identity = new_ci.get("identity")
-    if (
-        not isinstance(new_identity, Mapping) or new_identity.get("gate") != new_id
-        or new_identity.get("parent") != new.get("parent")
-    ):
-        return f"successor {new_id} CI identity does not match the gate"
-    if not old_identity.get("repo") or new_identity.get("repo") != old_identity.get("repo"):
+    problem = passed_ci_receipt_error(new)
+    if problem:
+        return f"successor {problem}"
+    new_identity = _agentflow(new)["ci"]["identity"]
+    if new_identity["repo"] != old_identity["repo"]:
         return "successor CI result is for a different repository"
-    if not _head(new_identity.get("head")) or new_identity["head"] == old_identity["head"]:
+    if new_identity["head"] == old_identity["head"]:
         return "successor CI result must be for a different commit"
     return ""
 
@@ -289,7 +332,7 @@ def audit_completion(enumeration: Mapping[str, Any]) -> dict[str, Any]:
                 "observed_result": observed,
                 "message": "CI record has no bound gate identity",
             })
-        if valid:
+        if disposition == "superseded":
             findings.append({
                 "id": "superseded", "severity": "info", "task": item_id,
                 "observed_result": observed, "head": head,
@@ -331,5 +374,6 @@ def audit_completion(enumeration: Mapping[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "ACTIVE", "AUDIT_SCHEMA", "OBSERVED_RESULTS", "SUPERSESSION_SCHEMA", "TERMINAL",
-    "audit_completion", "ci_successor_error", "digest", "reconcile",
+    "UNPASSED_BUCKETS", "audit_completion", "ci_identity_error", "ci_successor_error",
+    "digest", "passed_ci_receipt_error", "reconcile",
 ]
