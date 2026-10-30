@@ -257,6 +257,33 @@ head/check set creates a new obligation. An ambiguous creation is read back,
 not retried with a new task ID. If that reserved task cannot be verified, the
 watcher stops for controller attention without creating duplicate work.
 
+`agentflow controller status --root . --workflow-root <root-id> --json` adds a
+read-only `completion_audit`. It reads every task under the root, including CI
+gates and tasks with other ID prefixes, from one complete Beads listing. Open
+work under a closed parent or root, and any CI gate without an accepted passing
+result, are high findings that keep the root incomplete. A failed, truncated or
+inconsistent listing makes the audit unavailable; it never reports zero open
+work it could not see.
+
+When a newer commit has passed CI, retire the failed gate for the older commit
+with a recorded decision:
+
+```sh
+agentflow ci supersede --bead <failed-gate> --successor <passed-gate> \
+  --workflow-root <root-id> --reason "<why>" --decision-ref <issue-or-decision>
+```
+
+The successor must be a closed gate under the same root with an accepted
+passing receipt for the same repository and a different commit. The command
+records the decision beside the original CI record and on its open triage
+tasks, closes those tasks and then the old gate. It never rewrites the failed
+result, check set, head or triage failure identity, and it never calls GitHub.
+Each close is attempted once and read back once. An unconfirmed close returns
+exit `2` with `closure_unresolved`; rerun the same command to resume. An
+identical rerun writes nothing, and a different decision for the same gate is
+rejected without writes. The audit then reports the gate as `superseded` while
+keeping its original failed result and head.
+
 ## Hooks
 
 Agentflow hooks are small and advisory. They may record lifecycle events or

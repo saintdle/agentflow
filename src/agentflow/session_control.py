@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import datetime as dt
 from typing import Any, Iterable, Mapping
 
+from agentflow.reconciliation import TERMINAL
+
 
 SCHEMA = "agentflow.controller-session@1"
 PACKET_SCHEMA = "agentflow.controller-handoff@1"
@@ -210,8 +212,14 @@ def build_handoff_packet(
     checkpoint: Mapping[str, Any] | None,
     ready_tasks: Iterable[Mapping[str, Any]],
     ledger: Mapping[str, Any] | None,
+    completion: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a public-safe packet: identifiers and distilled state, no secrets."""
+    """Build a public-safe packet: identifiers and distilled state, no secrets.
+
+    With a ``completion`` audit, a terminal root whose audit is complete gets
+    a terminal packet with no active work; any other root keeps the active
+    packet and lists its open obligations.
+    """
 
     current = dict(checkpoint or {})
     tasks = []
@@ -233,7 +241,7 @@ def build_handoff_packet(
                 "stage": stage,
             }
         )
-    return {
+    packet = {
         "schema": PACKET_SCHEMA,
         "created_at": _now(),
         "workspace_root": workspace_root,
@@ -258,12 +266,78 @@ def build_handoff_packet(
             "Preserve the root's model policy, permissions, acceptance, and halt conditions.",
         ],
     }
+    if completion is None:
+        return packet
+    root = completion.get("root") if isinstance(completion.get("root"), Mapping) else {}
+    packet["completion"] = {
+        "schema": completion.get("schema"),
+        "available": bool(completion.get("available")),
+        "complete": bool(completion.get("complete")),
+        "root": dict(root),
+        "counts": completion.get("counts"),
+        "error": str(completion.get("error") or ""),
+    }
+    terminal = bool(
+        completion.get("available") and completion.get("complete")
+        and str(root.get("status") or "").lower() in TERMINAL
+    )
+    packet["terminal"] = terminal
+    if not terminal:
+        packet["next_actions"] = [packet["checkpoint"]["next_action"]]
+        packet["obligations"] = _completion_obligations(completion)
+        return packet
+    packet["historical_checkpoint"] = {**packet["checkpoint"], "historical": True}
+    packet["checkpoint"] = {"task": "", "phase": "", "state": "complete", "next_action": ""}
+    packet["next_actions"] = []
+    packet["obligations"] = []
+    packet["ready_tasks"] = []
+    packet["instructions"] = [
+        "This root is complete; do not resume a controller, relaunch workers, or create tasks for it.",
+        "Treat the historical checkpoint as context only, not as a next action.",
+        "Start a new approved goal for any further work.",
+    ]
+    return packet
+
+
+def _completion_obligations(completion: Mapping[str, Any]) -> list[dict[str, Any]]:
+    root = completion.get("root") if isinstance(completion.get("root"), Mapping) else {}
+    root_id = str(root.get("id") or "")
+    if not completion.get("available"):
+        return [{
+            "kind": "completion-audit-unavailable", "task": root_id,
+            "detail": str(completion.get("error") or ""),
+        }]
+    obligations: list[dict[str, Any]] = sorted(
+        (
+            {"kind": str(item.get("id") or ""), "task": str(item.get("task") or "")}
+            for item in completion.get("findings") or []
+            if isinstance(item, Mapping) and item.get("severity") == "high"
+        ),
+        key=lambda item: (item["kind"], item["task"]),
+    )
+    named = {item["task"] for item in obligations}
+    obligations.extend(
+        {"kind": "open-descendant", "task": str(item.get("id") or ""), "status": str(item.get("status") or "")}
+        for item in completion.get("open_descendants") or []
+        if isinstance(item, Mapping) and str(item.get("id") or "") not in named
+    )
+    status = str(root.get("status") or "").lower()
+    if status not in TERMINAL:
+        obligations.append({"kind": "root-not-terminal", "task": root_id, "status": status})
+    return obligations
 
 
 def render_resume_prompt(packet: Mapping[str, Any]) -> str:
     root = str(packet.get("workflow_root") or "")
     workspace = str(packet.get("workspace_root") or "")
-    return (
+    if packet.get("terminal"):
+        return (
+            f"Agentflow root {root} in {workspace} is complete: the root is closed and its "
+            "completion audit found no open work or unaccepted CI results. There is nothing to "
+            "continue. Do not resume a controller, relaunch workers, or create tasks for this "
+            "root; start a new approved goal for any further work."
+        )
+    prompt = (
         f"Resume existing Agentflow root {root} in {workspace}. Do not create a new root, "
         "graph, controller identity, or replacement tasks. Inspect its durable Beads, "
         "controller, Herdr, acceptance, and repository state; use linked files and distilled "
@@ -271,6 +345,21 @@ def render_resume_prompt(packet: Mapping[str, Any]) -> str:
         "persistent controller until GOAL_COMPLETE or a genuine USER_ACTION_REQUIRED halt. "
         "Preserve the persisted model policy, permissions, budgets, and hosted-action boundaries."
     )
+    completion = packet.get("completion")
+    if not isinstance(completion, Mapping):
+        return prompt
+    if not completion.get("available"):
+        return prompt + (
+            " The completion audit is unavailable; do not treat the root as complete until "
+            "it can be read."
+        )
+    count = len(packet.get("obligations") or [])
+    if count:
+        prompt += (
+            f" Completion audit: {count} open obligation(s) are listed in the handoff packet; "
+            "resolve them before GOAL_COMPLETE."
+        )
+    return prompt
 
 
 __all__ = [

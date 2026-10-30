@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Audit root completion in `controller status`: every task under the root,
+  including CI gates, is read from one complete listing, and open work or
+  unaccepted CI results keep the root incomplete. `ci supersede` records that a
+  passing CI result on a newer commit replaces a failed gate without rewriting
+  the original evidence. `controller rotate` writes a terminal packet with
+  nothing to continue once a closed root's audit is complete. See
+  [#57](https://github.com/saintdle/agentflow/issues/57).
+
 ### Changed
 
 - Run macOS CI on the pinned `macos-15` ARM64 runner image because GitHub
