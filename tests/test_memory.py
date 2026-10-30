@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +18,7 @@ from agentflow.search import KnowledgeDocument, KnowledgeIndex, SearchError
 
 class MemoryRecallTests(unittest.TestCase):
     NOW = dt.datetime(2026, 9, 22, tzinfo=dt.timezone.utc)
+    CLOCK_DATES = (NOW.replace(year=2000), NOW.replace(year=2100))
 
     def test_find_first_requires_approval_freshness_and_scope(self) -> None:
         with KnowledgeIndex() as index:
@@ -83,52 +85,93 @@ class MemoryRecallTests(unittest.TestCase):
         self.assertIn('"source_digest":"' + item.source_digest + '"', rendered)
 
     def test_hook_context_contains_bounded_untrusted_json_recall(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            config = project_config.default_data()
-            config["memory"].update(
-                enabled=True, on_prompt=True, startup_query="memory", max_chars=900,
-            )
-            config_path = project_config.config_path(root)
-            config_path.parent.mkdir(parents=True)
-            config_path.write_text(json.dumps(config), encoding="utf-8")
-            settings = project_config.memory_settings(config)
-            state = root / "state"
-            payload = {"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "session"}
-            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
-                runtime = MemoryRuntime(root, settings)
-                source = "docs/known.md"
-                summary = "Memory: remember the checked local build command"
-                timestamp = self.NOW.isoformat()
-                with KnowledgeIndex(runtime.database) as index:
+        for now in self.CLOCK_DATES:
+            with self.subTest(now=now.isoformat()), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                config = project_config.default_data()
+                config["memory"].update(
+                    enabled=True, on_prompt=True, startup_query="memory", max_chars=900,
+                )
+                config_path = project_config.config_path(root)
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                settings = project_config.memory_settings(config)
+                state = root / "state"
+                payload = {"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "session"}
+                with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(state), "XDG_STATE_HOME": ""}):
+                    runtime = MemoryRuntime(root, settings)
+                    source = "docs/known.md"
+                    summary = "Memory: remember the checked local build command"
+                    timestamp = now.isoformat()
+                    with KnowledgeIndex(runtime.database) as index:
+                        index.add(KnowledgeDocument(
+                            "known", "Build note", summary, source, authority=90,
+                            last_verified_at=timestamp,
+                        ))
+                        index.approve(
+                            "known", approval_by="controller:root", approval_ref="review-1",
+                            approved_at=timestamp,
+                        )
+
+                    with mock.patch(
+                        "sys.stdin", io.StringIO(json.dumps(payload)),
+                    ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch.object(
+                        cli.beads_backend, "prime", return_value="",
+                    ), mock.patch(
+                        "agentflow.memory_runtime.find_first",
+                        side_effect=partial(find_first, now=now),
+                    ) as recall:
+                        self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
+                        recall.assert_called_once()
+
+                response = json.loads(stdout.getvalue())
+                context = response["hookSpecificOutput"]["additionalContext"]
+                self.assertIn(_UNTRUSTED_HEADER, context)
+                self.assertIn('"title":"Build note"', context)
+                self.assertIn('"summary":"Memory: remember the checked local build command"', context)
+                self.assertIn('"source":"docs/known.md"', context)
+                self.assertIn("Approval permits local recall only", context)
+                expected_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                self.assertIn(f'"source_digest":"{expected_digest}"', context)
+                self.assertLessEqual(len(_UNTRUSTED_HEADER) + 1 + len(
+                    context.split(_UNTRUSTED_HEADER + "\n", 1)[1]
+                ), settings["max_chars"])
+
+    def test_find_first_freshness_boundaries(self) -> None:
+        max_age_days = 7
+        max_age = dt.timedelta(days=max_age_days)
+        fresh_age = dt.timedelta(days=1)
+        microsecond = dt.timedelta(microseconds=1)
+        cases = (
+            ("fresh", fresh_age, None, True),
+            ("exact_max_age", max_age, None, True),
+            ("stale", max_age + microsecond, None, False),
+            ("expires_after_now", fresh_age, microsecond, True),
+            ("expires_at_now", fresh_age, dt.timedelta(0), False),
+            ("expired", fresh_age, -microsecond, False),
+        )
+        for now in self.CLOCK_DATES:
+            for name, age, expiry_offset, eligible in cases:
+                with self.subTest(now=now.isoformat(), case=name), KnowledgeIndex() as index:
+                    timestamp = (now - age).isoformat()
+                    expiry = (now + expiry_offset).isoformat() if expiry_offset is not None else ""
                     index.add(KnowledgeDocument(
-                        "known", "Build note", summary, source, authority=90,
-                        last_verified_at=timestamp,
+                        "approved", "Runbook", "recover a stale worker", "runbook.md",
+                        authority=90, last_verified_at=timestamp, expires_at=expiry,
                     ))
                     index.approve(
-                        "known", approval_by="controller:root", approval_ref="review-1",
+                        "approved", approval_by="controller:root", approval_ref="review-1",
                         approved_at=timestamp,
                     )
-
-                with mock.patch(
-                    "sys.stdin", io.StringIO(json.dumps(payload)),
-                ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch.object(
-                    cli.beads_backend, "prime", return_value="",
-                ):
-                    self.assertEqual(cli.hook(argparse.Namespace(provider="codex", event="")), 0)
-
-            response = json.loads(stdout.getvalue())
-            context = response["hookSpecificOutput"]["additionalContext"]
-            self.assertIn(_UNTRUSTED_HEADER, context)
-            self.assertIn('"title":"Build note"', context)
-            self.assertIn('"summary":"Memory: remember the checked local build command"', context)
-            self.assertIn('"source":"docs/known.md"', context)
-            self.assertIn("Approval permits local recall only", context)
-            expected_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-            self.assertIn(f'"source_digest":"{expected_digest}"', context)
-            self.assertLessEqual(len(_UNTRUSTED_HEADER) + 1 + len(
-                context.split(_UNTRUSTED_HEADER + "\n", 1)[1]
-            ), settings["max_chars"])
+                    plan = find_first(
+                        index, "stale worker", max_age_days=max_age_days, now=now,
+                    )
+                    self.assertEqual(
+                        [item.document_id for item in plan.items],
+                        ["approved"] if eligible else [],
+                    )
+                    self.assertEqual(bool(plan.text), eligible)
+                    self.assertEqual(index.get("approved").injection_count, int(eligible))  # type: ignore[union-attr]
 
     def test_unapproved_matches_do_not_starve_approved_recall(self) -> None:
         with KnowledgeIndex() as index:
