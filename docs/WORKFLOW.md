@@ -278,11 +278,13 @@ passing receipt for the same repository and a different commit. The command
 records the decision beside the original CI record and on its open triage
 tasks, closes those tasks and then the old gate. It never rewrites the failed
 result, check set, head or triage failure identity, and it never calls GitHub.
+The audit then reports the gate as `superseded` while keeping its original
+failed result and head.
+
 Each close is attempted once and read back once. An unconfirmed close returns
 exit `2` with `closure_unresolved`; rerun the same command to resume. An
 identical rerun writes nothing, and a different decision for the same gate is
-rejected without writes. The audit then reports the gate as `superseded` while
-keeping its original failed result and head.
+rejected without writes.
 
 ## Hooks
 
