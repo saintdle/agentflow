@@ -21,6 +21,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing to continue once a closed root's audit is complete. See
   [#57](https://github.com/saintdle/agentflow/issues/57).
 
+- Add `agentflow ci watch-commit` for read-only, paginated observation of an
+  explicit workflow set on one exact commit SHA. It reports missing, pending,
+  failed, duplicate, drifted, unavailable, and deadline states without writing
+  Beads state or rerunning workflows. See
+  [#63](https://github.com/saintdle/agentflow/issues/63).
+
 ### Changed
 
 - Run macOS CI on the pinned `macos-15` ARM64 runner image because GitHub

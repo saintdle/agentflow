@@ -271,6 +271,32 @@ Missing checks remain pending; malformed, failed or truncated queries cannot
 establish success. Observations exceeding the bounded 100-check query require
 operator attention rather than accepting a partial check set.
 
+### Watch workflows for a fixed commit
+
+Use `agentflow ci watch-commit` to observe automatic workflows for one full
+commit SHA and an explicit set of numeric workflow IDs:
+
+```sh
+agentflow ci watch-commit --repo "$REPOSITORY" --sha "$COMMIT_SHA" \
+  --workflow-id "$WORKFLOW_ID_CI" --workflow-id "$WORKFLOW_ID_SECURITY"
+```
+
+The observer uses the GitHub Actions API with complete pagination and reports
+the repository, pinned SHA, expected workflow IDs, all observed runs, and a
+`CI_COMMIT_STATE` JSON record. Its `status` and `observed_result` describe the
+run evidence; `disposition` separates observation from a polling deadline, and
+`rerun_authorized` is always false. Each expected workflow must have exactly
+one run whose head SHA matches and whose conclusion is `success`. Missing,
+pending, failed/cancelled, drifted, duplicate, and unavailable results are
+non-success. A deadline disposition preserves the last missing or pending
+result. `--once` returns the current missing or pending state without waiting.
+
+Exit `0` means every expected workflow passed, exit `1` means a workflow failed,
+and exit `2` means evidence is incomplete or otherwise cannot establish success.
+The command is read-only: it does not write Beads state, dispatch workflows, or
+rerun them. Its `record_result` obligation means callers may persist the emitted
+JSON as post-merge evidence; a passing observation does not close a CI gate.
+
 Failure routing reserves an exact triage identity before creation. Repeated
 observations reuse it even after the triage task closes; a different failed
 head/check set creates a new obligation. An ambiguous creation is read back,
