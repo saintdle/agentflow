@@ -247,6 +247,11 @@ return: outcome, revision, checks, risks, and references
 If blocked, the worker stops and returns one decision or dependency, what was
 tried, available options, a recommendation, and preserved state.
 
+Preflight measures the exact outbound package (handoff, manifest, context, and
+pinned skill files) and checks it against any owner-declared byte limit for the
+task class and provider. See
+[Outbound package limits](CONFIGURATION.md#outbound-package-limits).
+
 ## Review and integration
 
 Reviews should distinguish correctness, security, regression, and missing-test
@@ -254,6 +259,28 @@ findings from preferences. High- and medium-severity findings require exact
 evidence and deterministic reproduction before they are routed as corrections.
 The original writer owns fix rounds when practical; reviewers do not silently
 rewrite another worker's scope.
+
+An external review handoff (`--return-type review`) requires an explicit
+verdict. The text return ends with `VERDICT: APPROVE` or
+`VERDICT: CHANGES-REQUESTED`, and the authenticated result carries a `review`
+object:
+
+```json
+{
+  "verdict": "approve",
+  "subject": "<base from the signed contract>",
+  "handoff_sha256": "<handoff_sha256 from AGENTFLOW_RESULT_CONTRACT>"
+}
+```
+
+The subject is the handoff's exact `branch@SHA` base, or `unversioned` for a
+non-Git directory. Result ingestion rejects a completed review whose verdict is
+missing, malformed, stale (a different subject), or mismatched (a different
+handoff). The return channel stays open, and the controller reports the verdict
+as unavailable. A clean exit or `completed` outcome is not approval.
+
+A failed or blocked review may omit the verdict. External review handoffs
+generated before this requirement fail preflight and must be regenerated.
 
 Workers do not merge their own pull requests. Integrate one completed branch at
 a time, verify its recorded base, and rerun affected checks after integration.
@@ -430,3 +457,21 @@ identity, task class, provider, model, and effort. Duplicate and unmatched
 cases remain visible; missing and invalid metrics are reported separately.
 Recording and comparison make no model calls and do not establish causal model
 efficacy. Provider quota sources remain separate from these local observations.
+
+## Allowance and actual usage
+
+Record a configured allowance or soft cap, provider-reported usage, and a local
+estimate as separate values:
+
+```sh
+agentflow usage record copilot --source dashboard \
+  --allowance-credits 30 --actual-credits 42.5 --estimated-credits 25
+```
+
+`--actual-credits` requires a provider-authoritative `--source` such as
+`/usage`, `/status`, `api`, or `dashboard`; record local figures with
+`--estimated-credits`. The record reports `allowance_overshoot_credits` and an
+`allowance_status` of `within-allowance`, `soft-cap-overshoot`,
+`allowance-unconfigured`, or `actual-unavailable`. Overshoot is computed only
+from actual usage, never from an estimate. Every new usage record carries these
+fields; values that were not supplied are `null`.

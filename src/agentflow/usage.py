@@ -15,6 +15,43 @@ def measurement_authority(source: str) -> str:
     return "provider-authoritative" if source in PROVIDER_AUTHORITATIVE_SOURCES or source.startswith("provider:") else "local-estimate"
 
 
+def allowance_reconciliation(
+    *,
+    allowance: float | None,
+    actual: float | None,
+    estimate: float | None,
+    source: str,
+) -> dict[str, Any]:
+    """Keep configured allowance, provider usage, and local estimates distinct.
+
+    Overshoot is computed only from provider-reported actual usage. A local
+    estimate never becomes actual usage or overshoot.
+    """
+    for name, value in (("allowance", allowance), ("actual", actual), ("estimate", estimate)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} credits must be a finite non-negative number")
+    if actual is not None and measurement_authority(source) != "provider-authoritative":
+        raise ValueError("actual credits require a provider-authoritative --source; record local figures as estimates")
+    if actual is None:
+        status = "actual-unavailable"
+        overshoot = None
+    elif allowance is None:
+        status = "allowance-unconfigured"
+        overshoot = None
+    else:
+        overshoot = max(0.0, float(actual) - float(allowance))
+        status = "soft-cap-overshoot" if overshoot > 0 else "within-allowance"
+    return {
+        "allowance_credits": allowance,
+        "actual_credits": actual,
+        "estimated_credits": estimate,
+        "allowance_overshoot_credits": overshoot,
+        "allowance_status": status,
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class YieldBucket:
     task_class: str

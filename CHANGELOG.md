@@ -8,6 +8,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Measure the exact outbound package in `handoff preflight`: handoff, manifest,
+  context, and pinned skill files, with file count, total and duplicate bytes,
+  and a package digest. Owners can declare byte limits per task class and
+  provider in `package_limits`. Agentflow ships none, so an undeclared limit is
+  reported as uncalibrated. A package over its declared limit fails preflight
+  unless an owner approves that exact digest with `--package-exception` and
+  `--decision-ref`. See [#67](https://github.com/saintdle/agentflow/issues/67).
+
+- Require an explicit review verdict from external review handoffs. The
+  authenticated result must carry `approve` or `changes-requested`, bound to the
+  reviewed base and the exact handoff. A missing, malformed, stale, or
+  mismatched verdict is rejected as unavailable; a clean exit is never
+  approval. External review handoffs created earlier must be regenerated. See
+  [#67](https://github.com/saintdle/agentflow/issues/67).
+
+- Add `--allowance-credits`, `--actual-credits`, and `--estimated-credits` to
+  `usage record`. Actual usage requires a provider-authoritative source, and
+  allowance overshoot is computed only from actual usage, never from an
+  estimate. See [#67](https://github.com/saintdle/agentflow/issues/67).
+
 - Add `agentflow budget freeze|revise|approach|status`. A root can freeze its
   approved graph size and launch cap at execution approval, so added tasks,
   retries, and context rotation no longer raise the cap. Reaching the cap blocks

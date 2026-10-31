@@ -278,6 +278,44 @@ custom agents during profile migration.
 Skill sources are configured separately from workflow policy so teams can
 bring domain expertise without modifying Agentflow. See [SKILLS.md](SKILLS.md).
 
+## Outbound package limits
+
+`agentflow handoff preflight` measures the exact package an external worker
+would receive: the handoff, its sidecar manifest, each declared context file,
+and every file in the pinned skill closure. It reports the file count, total
+bytes, duplicate bytes, and a package digest. A task-linked handoff also records
+the digest, size, and limit status on its task bead. An input listed twice
+counts twice. A missing or unreadable input fails preflight.
+
+Agentflow ships no byte limit. Without a declared limit for the task class and
+provider, the package is reported as `uncalibrated`, never as within a limit.
+An owner who has calibrated a limit can declare it per `<task-class>/<provider>`
+key in either layer; local keys override shared keys one at a time:
+
+```json
+{
+  "package_limits": {
+    "focused-review/claude": 120000
+  }
+}
+```
+
+Task classes are `scan`, `focused-review`, `source-heavy-review`,
+`media-review`, and `implementation`. A package at or under the limit passes;
+one byte over fails preflight with the measured size, the excess, and the
+package digest. An owner can approve one exact oversized package on a manual
+preflight:
+
+```sh
+agentflow handoff preflight handoff.md \
+  --package-exception <package-digest> --decision-ref <decision-reference>
+```
+
+The exception needs both values and applies only to that digest; any change to
+the package invalidates it. Controller dispatch rebuilds the handoff, so it has
+no exception path. An oversized dispatch must shrink its context or skill
+closure, or the owner must raise the declared limit.
+
 ## Controller context budgets
 
 Controller context budgets measure durable workflow evidence rather than
