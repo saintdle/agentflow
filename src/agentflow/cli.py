@@ -42,6 +42,7 @@ from agentflow import feedback as feedback_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
+from agentflow import outbound_package as outbound_package_backend
 from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import events as events_backend
 from agentflow import preflight as preflight_backend
@@ -54,6 +55,7 @@ from agentflow import launch_budget as launch_budget_backend
 from agentflow import launch_recovery as launch_recovery_backend
 from agentflow import readiness as readiness_backend
 from agentflow import reconciliation as reconciliation_backend
+from agentflow import review_verdict as review_verdict_backend
 from agentflow import search as search_backend
 from agentflow import session_control as session_control_backend
 from agentflow import usage as usage_backend
@@ -76,7 +78,7 @@ ACCEPTANCE_LANES = (
     "manual-ui",
     "approved-untested",
 )
-TASK_CLASSES = ("scan", "focused-review", "source-heavy-review", "media-review", "implementation")
+TASK_CLASSES = project_config_backend.TASK_CLASSES
 WORKFLOW_STAGES = (
     "plan",
     "spec",
@@ -1878,6 +1880,12 @@ def _controller_step_serial(
                     {"actor": lease.controller, "approved_waivers": return_channel.get("approved_waivers", [])},
                     beads_cwd=cwd, task_id=in_flight_task,
                 )
+                review_binding = return_channel.get("contract_binding")
+                review = _validate_review_return(
+                    task_result,
+                    review_binding if isinstance(review_binding, Mapping) else {},
+                    outcome,
+                )
             except ValueError as exc:
                 result = controller.halt(
                     "blocked", f"task {in_flight_task} acceptance disposition rejected: {exc}", lease=lease,
@@ -1895,6 +1903,7 @@ def _controller_step_serial(
                     cwd, in_flight_task,
                     {"disposition": {
                         "outcome": outcome, "acceptance_results": acceptance_results,
+                        **({"review_verdict": review} if review is not None else {}),
                         "session_id": str(task_result.get("session_id") or ""),
                         "recorded_at": _now(),
                     }},
@@ -2428,6 +2437,12 @@ def _controller_step_parallel(
                 {"actor": lease.controller, "approved_waivers": channel.get("approved_waivers", [])},
                 beads_cwd=cwd, task_id=task_id,
             )
+            review_binding = channel.get("contract_binding")
+            review = _validate_review_return(
+                task_result,
+                review_binding if isinstance(review_binding, Mapping) else {},
+                outcome,
+            )
         except ValueError as exc:
             reason = f"task {task_id} acceptance disposition rejected: {exc}"
             beads_backend.add_comment(cwd, task_id, f"agentflow: {reason}")
@@ -2446,6 +2461,7 @@ def _controller_step_parallel(
                 cwd, task_id,
                 {"disposition": {
                     "outcome": outcome, "acceptance_results": acceptance_results,
+                    **({"review_verdict": review} if review is not None else {}),
                     "session_id": str(task_result.get("session_id") or ""), "recorded_at": _now(),
                 }},
             )
@@ -6741,6 +6757,13 @@ def _mint_return_channel(
             "attempt": attempt,
             "max_attempts": max_attempts,
         })
+    manifest_contract = handoff.manifest.get("machine_return_contract")
+    review_requirement = review_verdict_backend.parse_requirement(
+        manifest_contract.get("review") if isinstance(manifest_contract, Mapping) else None
+    )
+    if review_requirement is not None:
+        contract["review"] = review_requirement
+        contract["required_result_fields"] = ["outcome", "acceptance_results", "review"]
     contract["authority_key_id"] = hashlib.sha256(
         authority_secret.encode("utf-8")
     ).hexdigest()[:24]
@@ -7025,6 +7048,25 @@ def _durable_waiver_approval(
     if approver and approver != approved_by:
         return False
     return True
+
+
+def _validate_review_return(
+    raw: Mapping[str, Any], contract: Mapping[str, Any], outcome: str,
+) -> dict[str, str] | None:
+    """Bind a review return to its signed subject and handoff, or reject it.
+
+    A completed review without a valid verdict is unavailable rather than
+    approval. Failed or blocked returns may omit the verdict.
+    """
+    requirement = review_verdict_backend.parse_requirement(contract.get("review"))
+    if requirement is None:
+        return None
+    value = raw.get("review")
+    if outcome != "completed" and value is None:
+        return None
+    return review_verdict_backend.validate(
+        value, requirement, handoff_sha256=str(contract.get("handoff_sha256") or ""),
+    )
 
 
 def _validate_acceptance_results(
@@ -7571,8 +7613,13 @@ def _require_herdr_provider_integration(herdr: str, provider: str) -> None:
                          "and install it with `herdr integration install codex` before launching")
 
 
-def _codex_result_schema(acceptance_ids: tuple[str, ...]) -> dict[str, Any]:
-    return {
+def _codex_result_schema(
+    acceptance_ids: tuple[str, ...],
+    review: Mapping[str, Any] | None = None,
+    *,
+    handoff_sha256: str = "",
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
         "type": "object", "additionalProperties": False,
         "required": ["outcome", "acceptance_results"],
         "properties": {
@@ -7594,6 +7641,28 @@ def _codex_result_schema(acceptance_ids: tuple[str, ...]) -> dict[str, Any]:
             "evidence": {"type": "array", "items": {"type": "object"}},
         },
     }
+    if review is not None:
+        schema["required"] = ["outcome", "acceptance_results", "review"]
+        schema["properties"]["review"] = review_verdict_backend.json_schema(
+            review, handoff_sha256=handoff_sha256,
+        )
+    return schema
+
+
+def _codex_result_candidate(output: str) -> dict[str, Any] | None:
+    try:
+        candidate = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if (
+        isinstance(candidate, dict)
+        and set(candidate).issubset({"outcome", "acceptance_results", "evidence", "review"})
+        and candidate.get("outcome") == "completed"
+        and isinstance(candidate.get("acceptance_results"), list)
+        and isinstance(candidate.get("evidence", []), list)
+    ):
+        return candidate
+    return None
 
 
 def _codex_skill_inputs(root: Path, manifest: Mapping[str, Any]) -> list[tuple[str, str]]:
@@ -7759,18 +7828,7 @@ def _collect_codex_app_server_result(
     )
     parsed: dict[str, Any] | None = None
     if output is not None and not observation.rerouted:
-        try:
-            candidate = json.loads(output)
-            if (
-                isinstance(candidate, dict)
-                and set(candidate).issubset({"outcome", "acceptance_results", "evidence"})
-                and candidate.get("outcome") == "completed"
-                and isinstance(candidate.get("acceptance_results"), list)
-                and isinstance(candidate.get("evidence", []), list)
-            ):
-                parsed = candidate
-        except (json.JSONDecodeError, TypeError):
-            pass
+        parsed = _codex_result_candidate(output)
     if parsed is None:
         observation = codex_app_server_backend.TurnObservation(
             "failed", reason_code="structured_result_invalid",
@@ -7935,18 +7993,7 @@ def _start_codex_app_server_launch(
         parsed: dict[str, Any] | None = None
         final_observation = observation
         if observation.status == "completed" and not observation.rerouted:
-            try:
-                candidate = json.loads(output)
-                if (
-                    isinstance(candidate, dict)
-                    and set(candidate).issubset({"outcome", "acceptance_results", "evidence"})
-                    and candidate.get("outcome") == "completed"
-                    and isinstance(candidate.get("acceptance_results"), list)
-                    and isinstance(candidate.get("evidence", []), list)
-                ):
-                    parsed = candidate
-            except (json.JSONDecodeError, TypeError):
-                parsed = None
+            parsed = _codex_result_candidate(output)
             if parsed is None:
                 final_observation = codex_app_server_backend.TurnObservation(
                     "failed", reason_code="structured_result_invalid",
@@ -8014,12 +8061,22 @@ def _start_codex_app_server_launch(
             cwd=str(cwd.resolve()), model=model, effort=effort,
             instruction=(typed_handoff.instruction + "\n\nReturn only the exact structured "
                          "Agentflow acceptance result. Do not write or submit result files; "
-                         "the controller collects and validates your final response."),
+                         "the controller collects and validates your final response."
+                         + (
+                             "\n\nInclude the review verdict bound to handoff_sha256 "
+                             f"{contract.get('handoff_sha256')} and subject "
+                             f"{contract['review'].get('subject')}."
+                             if isinstance(contract.get("review"), Mapping) else ""
+                         )),
             skills=skills,
             skill_manifest=skill_manifest,
             tool_profile=str(typed_handoff.manifest.get("tool_profile") or ""),
             output_boundary=str(typed_handoff.manifest.get("output_boundary") or ""),
-            sterile=False, output_schema=_codex_result_schema(acceptance_ids),
+            sterile=False, output_schema=_codex_result_schema(
+                acceptance_ids,
+                contract.get("review") if isinstance(contract.get("review"), Mapping) else None,
+                handoff_sha256=str(contract.get("handoff_sha256") or ""),
+            ),
             on_thread=lambda value: save_identity("thread_id", value),
             on_turn=lambda value: save_identity("turn_id", value),
             timeout_seconds=int(getattr(args, "codex_worker_timeout_seconds", 1800)),
@@ -8903,6 +8960,7 @@ def _verify_return_contract_binding(
         raise ValueError("durable acceptance binding does not match the launch contract")
     if list(channel.get("approved_waivers") or []) != approved_waivers:
         raise ValueError("durable waiver binding does not match the launch contract")
+    review_verdict_backend.parse_requirement(binding.get("review"))
     lease_id = str(binding.get("lease_id") or "")
     lease_digest = str(binding.get("lease_token_sha256") or "")
     if not lease_id or not hmac.compare_digest(
@@ -9128,6 +9186,7 @@ def herdr_result(args: argparse.Namespace) -> int:
             outcome = str(raw.get("outcome") or "")
             if outcome not in herdr_backend.HERDR_OUTCOMES:
                 raise ValueError("provider result outcome is invalid")
+            review = _validate_review_return(raw, contract, outcome)
             workflow_root = str(contract.get("workflow_root") or "")
             provider = str(contract.get("provider") or "")
             lease_id = str(contract.get("lease_id") or "")
@@ -9266,6 +9325,8 @@ def herdr_result(args: argparse.Namespace) -> int:
                         "acceptance_results": acceptance_results,
                         "evidence": [dict(item) for item in evidence],
                     }
+                    if review is not None:
+                        canonical["review"] = review
                     result_sha256 = _canonical_json_digest(canonical)
                     outcome_disposition = _consumed_outcome_disposition(
                         current_contract, binding_data, canonical,
@@ -9289,6 +9350,7 @@ def herdr_result(args: argparse.Namespace) -> int:
             payload = {
                 "operation": "result", "ok": True, "task_id": task_id,
                 "status": outcome, "acceptance_results": acceptance_results,
+                **({"review": review} if review is not None else {}),
             }
             _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="HERDR RESULT")
             return 0
@@ -10952,6 +11014,16 @@ def usage_record(args: argparse.Namespace) -> int:
     except privacy_backend.PrivacyError as exc:
         print(f"usage record: {exc}", file=sys.stderr)
         return 2
+    try:
+        allowance = usage_backend.allowance_reconciliation(
+            allowance=getattr(args, "allowance_credits", None),
+            actual=getattr(args, "actual_credits", None),
+            estimate=getattr(args, "estimated_credits", None),
+            source=str(args.source or ""),
+        )
+    except ValueError as exc:
+        print(f"usage record: {exc}", file=sys.stderr)
+        return 2
     record = {
         "timestamp": _now(),
         "provider": args.provider,
@@ -10971,6 +11043,7 @@ def usage_record(args: argparse.Namespace) -> int:
         "remaining_before_percent": getattr(args, "remaining_before", None),
         "remaining_after_percent": remaining_after,
         "credits_used": getattr(args, "credits_used", None),
+        **allowance,
         "window": args.window,
         "reset_at": args.reset_at,
         "elapsed_seconds": elapsed_seconds,
@@ -11994,6 +12067,67 @@ def _resolve_required_skills(
     return resolved, errors
 
 
+def _skill_closure_files(entrypoint: Path) -> list[Path]:
+    """List every file in a pinned skill's transitive package closure."""
+    files: list[Path] = []
+    visited: set[Path] = set()
+
+    def visit(candidate: Path) -> None:
+        resolved = candidate.resolve()
+        if resolved in visited:
+            return
+        visited.add(resolved)
+        content = resolved.read_text(encoding="utf-8")
+        for reference in sorted({match.group("path") for match in SKILL_REFERENCE_PATTERN.finditer(content)}):
+            visit(resolved.parent / reference)
+        package_root = resolved.parent
+        files.extend(
+            path for path in sorted(
+                package_root.rglob("*"), key=lambda item: item.relative_to(package_root).as_posix(),
+            )
+            if path.is_file()
+        )
+
+    visit(entrypoint)
+    return files
+
+
+def _measure_outbound_package(
+    handoff_path: Path, root: Path, manifest: Mapping[str, Any],
+    local_context_values: list[str], resolved_skills: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Measure what a worker is sent: handoff, generated sidecar, context, and skill closures."""
+    # The preflight block records this measurement, so the measured sidecar
+    # excludes it; it otherwise matches the pins the worker reads.
+    generated = {key: value for key, value in manifest.items() if key != "preflight"}
+    generated["resolved_skills"] = resolved_skills
+    inputs = [
+        outbound_package_backend.PackageInput("handoff", handoff_path.name, path=handoff_path),
+        outbound_package_backend.PackageInput(
+            "manifest", handoff_path.with_suffix(".json").name,
+            content=(json.dumps(generated, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        ),
+    ]
+    for value in local_context_values:
+        candidate = Path(value).expanduser()
+        inputs.append(outbound_package_backend.PackageInput(
+            "context", value, path=candidate if candidate.is_absolute() else root / candidate,
+        ))
+    for skill in resolved_skills:
+        entrypoint = Path(str(skill.get("source") or ""))
+        try:
+            closure = _skill_closure_files(entrypoint)
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, [f"required skill closure cannot be measured: {skill.get('name')}: {exc}"]
+        inputs.extend(
+            outbound_package_backend.PackageInput(
+                "skill", f"{skill.get('name')}:{os.path.relpath(item, entrypoint.parent)}", path=item,
+            )
+            for item in closure
+        )
+    return outbound_package_backend.measure(inputs)
+
+
 def _prose_print(report: prose_backend.ProseReport | prose_backend.VerificationReport) -> None:
     data = report.to_dict()
     print(f"{'PASS' if data['passed'] else 'NEEDS_EDIT'} {data['profile']}: {data.get('path', data.get('edited'))}")
@@ -12369,7 +12503,8 @@ def handoff_create(args: argparse.Namespace) -> int:
     if return_type == "review":
         return_contract = """- Start with `REVIEW`.
 - Give each finding a stable ID, severity, class, exact evidence, reproduction, expected and actual behavior, proposed correction, authoritative gate, and confidence.
-- Return `APPROVE` when no material finding remains.
+- End with exactly one verdict line: `VERDICT: APPROVE` when no material finding remains, otherwise `VERDICT: CHANGES-REQUESTED`.
+- A missing, malformed, or stale verdict is unavailable, never approval; exiting successfully is not a verdict.
 - Do not edit files or return raw logs."""
     else:
         return_contract = """- Outcome in at most five bullets.
@@ -12378,6 +12513,13 @@ def handoff_create(args: argparse.Namespace) -> int:
     acceptance_ids = (
         [str(row.get("id")) for row in acceptance_data.get("rows", []) if row.get("id")]
         if acceptance_data else []
+    )
+    review_requirement = (
+        review_verdict_backend.requirement(
+            review_verdict_backend.subject_for({"workspace_kind": workspace_kind, "base": base})
+        )
+        if return_type == "review" and lane == "external"
+        else None
     )
     machine_return_contract = (
         {
@@ -12389,19 +12531,24 @@ def handoff_create(args: argparse.Namespace) -> int:
                 for row in (acceptance_data.get("rows", []) if acceptance_data else [])
                 if isinstance(row, Mapping) and row.get("status") == "waived" and row.get("approval_ref")
             ],
-            "required_result_fields": ["outcome", "acceptance_results"],
+            "required_result_fields": (
+                ["outcome", "acceptance_results", "review"]
+                if review_requirement is not None
+                else ["outcome", "acceptance_results"]
+            ),
             "protected_paths": [
                 "$AGENTFLOW_RESULT_CONTRACT",
                 "$AGENTFLOW_RESULT_FILE",
             ],
             "submit_command": provider_argv_backend.fixed_submit_command(),
+            **({"review": review_requirement} if review_requirement is not None else {}),
         }
         if lane == "external"
         else None
     )
     machine_return_section = ""
     if machine_return_contract is not None:
-        example_result = {
+        example_result: dict[str, Any] = {
             "outcome": "completed",
             "acceptance_results": [
                 {"acceptance_id": criterion_id, "status": "passed",
@@ -12409,6 +12556,20 @@ def handoff_create(args: argparse.Namespace) -> int:
                 for criterion_id in acceptance_ids
             ],
         }
+        review_instructions = ""
+        if review_requirement is not None:
+            example_result["review"] = {
+                "verdict": "changes-requested",
+                "subject": review_requirement["subject"],
+                "handoff_sha256": "<handoff_sha256 from AGENTFLOW_RESULT_CONTRACT>",
+            }
+            review_instructions = f"""
+This is a review return. Include one `review` object with exactly `verdict`
+(`approve` or `changes-requested`), `subject` (exactly
+`{review_requirement['subject']}`), and `handoff_sha256` copied from the
+result contract. The controller treats a missing, malformed, stale, or
+mismatched verdict as unavailable, never as approval.
+"""
         machine_return_section = f"""## Machine return contract
 
 ```json
@@ -12422,7 +12583,7 @@ schema, not your prose summary. Set `outcome` to exactly `completed`, `failed`,
 or `blocked` (never a sentence). For each required acceptance ID, include one
 `acceptance_results` object with `acceptance_id`, `status: "passed"`, and a
 short string `evidence`; if the criterion cannot pass, stop and report the
-blocker instead of inventing evidence. For example:
+blocker instead of inventing evidence.{review_instructions} For example:
 
 ```json
 {json.dumps(example_result, separators=(',', ':'))}
@@ -12889,6 +13050,27 @@ def handoff_preflight(args: argparse.Namespace) -> int:
         errors.append("no-shell profile cannot preflight local context files; use a colocated shell-readable package")
     if manifest.get("return_type") == "review" and manifest.get("delegation_allowed"):
         errors.append("direct review handoffs must keep delegation disabled")
+    manifest_machine_contract = manifest.get("machine_return_contract")
+    machine_review = (
+        manifest_machine_contract.get("review")
+        if isinstance(manifest_machine_contract, Mapping) else None
+    )
+    if lane == "external" and manifest.get("return_type") == "review":
+        try:
+            review_requirement = review_verdict_backend.parse_requirement(machine_review)
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            required_fields = (
+                manifest_machine_contract.get("required_result_fields", [])
+                if isinstance(manifest_machine_contract, Mapping) else []
+            )
+            if review_requirement is None or "review" not in required_fields:
+                errors.append("external review handoff requires an explicit review verdict in its return contract")
+            elif review_requirement["subject"] != review_verdict_backend.subject_for(manifest):
+                errors.append("review verdict subject does not match the exact handoff base")
+    elif machine_review is not None:
+        errors.append("only external review handoffs may require a review verdict")
     for value in context_values:
         if not isinstance(value, str) or value.startswith(("http://", "https://")):
             continue
@@ -12978,6 +13160,42 @@ def handoff_preflight(args: argparse.Namespace) -> int:
         if not any(error.startswith("required asset") or error.startswith("cannot read asset") for error in errors):
             checks.append(f"assets={len(required_assets)}-verified")
 
+    outbound_package: dict[str, Any] | None = None
+    package_limit: dict[str, Any] | None = None
+    try:
+        package_exception = outbound_package_backend.parse_exception(
+            getattr(args, "package_exception", None), getattr(args, "decision_ref", None),
+        )
+    except outbound_package_backend.PackageError as exc:
+        package_exception = None
+        errors.append(str(exc))
+    if not errors:
+        outbound_package, package_errors = _measure_outbound_package(
+            path, root, manifest, local_context_values, resolved_skills,
+        )
+        errors.extend(package_errors)
+    if outbound_package is not None:
+        contract = manifest.get("workspace_contract")
+        config_root = (
+            Path(str(contract.get("root")))
+            if isinstance(contract, Mapping) and Path(str(contract.get("root") or "")).is_absolute()
+            else root
+        )
+        task_class = str(manifest.get("task_class") or "")
+        try:
+            limit = project_config_backend.package_limit(
+                project_config_backend.load_for_dispatch(config_root), task_class, provider,
+            )
+        except project_config_backend.ConfigError as exc:
+            errors.append(f"package limit configuration is unreadable: {exc}")
+        else:
+            package_limit = outbound_package_backend.evaluate(
+                outbound_package, key=outbound_package_backend.limit_key(task_class, provider),
+                limit=limit, exception=package_exception,
+            )
+            if package_limit["status"] == "over-limit":
+                errors.append(outbound_package_backend.over_limit_message(package_limit))
+
     if not errors:
         report = {
             "schema": "agentflow.handoff-preflight@1",
@@ -12994,6 +13212,8 @@ def handoff_preflight(args: argparse.Namespace) -> int:
             "acceptance_matrix": acceptance_value,
             "execution_limits": handoff_limits.to_dict() if handoff_limits else None,
             "execution_limit_capabilities": limit_capabilities,
+            "outbound_package": outbound_package,
+            "package_limit": package_limit,
             "errors": [],
         }
         report_sha256 = hashlib.sha256(
@@ -13031,6 +13251,14 @@ def handoff_preflight(args: argparse.Namespace) -> int:
             ],
             "errors": errors[:20],
         }
+        if outbound_package is not None:
+            preflight_record["outbound_package"] = {
+                field: outbound_package[field] for field in ("digest", "file_count", "total_bytes")
+            }
+        if package_limit is not None:
+            preflight_record["package_limit"] = {
+                field: package_limit[field] for field in ("status", "key", "limit_bytes", "exception")
+            }
         try:
             beads_backend.update_agentflow_metadata(
                 beads_cwd, bead_id, {"preflight": preflight_record}
@@ -13052,6 +13280,16 @@ def handoff_preflight(args: argparse.Namespace) -> int:
     print(f"delegation: {'allowed' if manifest.get('delegation_allowed') else 'disabled'}")
     print(f"context: {context_files} files / {context_bytes} bytes")
     print(f"skills: {len(resolved_skills)} resolved")
+    if outbound_package is not None:
+        print(
+            f"package: {outbound_package['file_count']} files / {outbound_package['total_bytes']} bytes "
+            f"digest={outbound_package['digest']}"
+        )
+    if package_limit is not None:
+        print(
+            f"package-limit: {package_limit['status']} key={package_limit['key']} "
+            f"limit={package_limit['limit_bytes'] if package_limit['limit_bytes'] is not None else 'undeclared'}"
+        )
     print(f"budget: {'; '.join(str(value) for value in budgets) if budgets else 'missing'}")
     print(f"execution-limits: {json.dumps(limit_capabilities, sort_keys=True)}")
     for skill in resolved_skills:
@@ -16743,6 +16981,9 @@ def build_parser() -> argparse.ArgumentParser:
     record_parser.add_argument("--remaining-before", type=float)
     record_parser.add_argument("--remaining-after", type=float)
     record_parser.add_argument("--credits-used", type=float)
+    record_parser.add_argument("--allowance-credits", type=float, help="Configured allowance or soft cap for this run")
+    record_parser.add_argument("--actual-credits", type=float, help="Provider-reported usage; requires a provider-authoritative --source")
+    record_parser.add_argument("--estimated-credits", type=float, help="Local estimate; never treated as actual usage")
     record_parser.add_argument("--window", default="")
     record_parser.add_argument("--reset-at", default="")
     record_parser.add_argument("--elapsed-seconds", type=float)
@@ -16937,6 +17178,11 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument("--cwd", default="")
     preflight_parser.add_argument("--transport", choices=("herdr", "app-server"), default="herdr")
     preflight_parser.add_argument("--require-matrix", action="store_true")
+    preflight_parser.add_argument(
+        "--package-exception", default=None, metavar="DIGEST",
+        help="approve one over-limit outbound package by its exact digest; requires --decision-ref",
+    )
+    preflight_parser.add_argument("--decision-ref", default=None, help="owner decision approving the package exception")
     preflight_parser.set_defaults(func=handoff_preflight)
     package_parser = handoff_sub.add_parser(
         "package", help="Build a hash-verified sterile external-launch workspace"

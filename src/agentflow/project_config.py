@@ -18,6 +18,7 @@ LOCAL_SCHEMA = "agentflow.project-local@1"
 MANAGED_LINKS_SCHEMA = "agentflow.managed-skill-links@1"
 VERSION = 1
 PROVIDERS = ("codex", "claude", "copilot")
+TASK_CLASSES = ("scan", "focused-review", "source-heavy-review", "media-review", "implementation")
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 EFFORT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
@@ -121,7 +122,10 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Keep the public schema limited to values consumed by runtime code.
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
-    allowed = {"schema", "version", "model_policy", "prose", "execution", "codex", "guidance", "memory", "skills"}
+    allowed = {
+        "schema", "version", "model_policy", "prose", "execution", "codex", "guidance", "memory",
+        "package_limits", "skills",
+    }
     unknown = sorted(set(data) - allowed)
     if unknown:
         errors.append(f"unknown field(s): {', '.join(unknown)}")
@@ -243,6 +247,20 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
             startup_query = memory.get("startup_query")
             if not isinstance(startup_query, str) or len(startup_query) > 400 or any(ord(c) < 32 for c in startup_query):
                 errors.append("memory.startup_query must be bounded text")
+    if "package_limits" in data:
+        limits = data.get("package_limits")
+        if not isinstance(limits, dict):
+            errors.append("package_limits must map <task-class>/<provider> to a byte limit")
+        else:
+            for key, value in limits.items():
+                task_class, _, provider = str(key).partition("/")
+                if task_class not in TASK_CLASSES or provider not in PROVIDERS:
+                    errors.append(
+                        f"package_limits key {key!r} must be <task-class>/<provider> using "
+                        f"{', '.join(TASK_CLASSES)} and {', '.join(PROVIDERS)}"
+                    )
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    errors.append(f"package_limits[{key!r}] must be a positive byte count")
     entries = data.get("skills")
     if not isinstance(entries, list):
         errors.append("skills must be a list")
@@ -319,6 +337,8 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
         result["guidance"] = local["guidance"]
     if "memory" in local:
         result["memory"] = local["memory"]
+    if "package_limits" in local:
+        result["package_limits"] = {**dict(shared.get("package_limits", {})), **local["package_limits"]}
     merged_skills: dict[str, dict[str, Any]] = {}
     for entry in shared.get("skills", []):
         merged_skills[entry["name"]] = dict(entry)
@@ -379,6 +399,13 @@ def codex_worker_timeout_seconds(data: dict[str, Any]) -> int:
 def guidance_settings(data: dict[str, Any]) -> dict[str, Any]:
     value = data.get("guidance")
     return dict(value) if isinstance(value, dict) else dict(DEFAULT_GUIDANCE)
+
+
+def package_limit(data: dict[str, Any], task_class: str, provider: str) -> int | None:
+    """Return the owner-declared byte limit; no limit ships by default."""
+    limits = data.get("package_limits")
+    value = limits.get(f"{task_class}/{provider}") if isinstance(limits, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def memory_settings(data: dict[str, Any]) -> dict[str, Any]:
