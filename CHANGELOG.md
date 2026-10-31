@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add a conditional controller-observed native-return lane with visibility
+  reporting, claim-bound session observations, and acceptance on a separate
+  owner-approved task. It does not authenticate managed results or grant
+  publication authority. See [#59](https://github.com/saintdle/agentflow/issues/59).
+
 - Audit root completion in `controller status`: every task under the root,
   including CI gates, is read from one complete listing, and open work or
   unaccepted CI results keep the root incomplete. `ci supersede` records that a

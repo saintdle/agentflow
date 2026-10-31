@@ -7,6 +7,7 @@ consume a valid result or stop for a human decision.
 
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 import re
@@ -84,6 +85,11 @@ def _agentflow(issue: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _status(issue: Mapping[str, Any]) -> str:
     return str(issue.get("status") or "").lower()
+
+
+def is_native_claimed(issue: Mapping[str, Any]) -> bool:
+    """Return whether a Bead is in the native lane's claimed state."""
+    return _status(issue) == "in_progress"
 
 
 def _parent(issue: Mapping[str, Any]) -> str:
@@ -372,8 +378,149 @@ def audit_completion(enumeration: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+NATIVE_VISIBILITY_SCHEMA = "agentflow.native-visibility@1"
+NATIVE_OBSERVATION_SCHEMA = "agentflow.native-observation@1"
+NATIVE_AUTHORITY_SCHEMA = "agentflow.native-return-authority@1"
+NATIVE_RESULT_SCHEMA = "agentflow.native-return@1"
+NATIVE_RECEIPT_SCHEMA = "agentflow.native-return-receipt@1"
+NATIVE_OBSERVATION_SOURCE = "exact-session-query"
+NATIVE_OBSERVATION_STATES = frozenset({"present", "absent", "unavailable"})
+NATIVE_STALE_AFTER_SECONDS = 300
+NATIVE_VISIBILITY_STATES = ("confirmed_native", "stale", "unobservable", "absent")
+
+
+def _observed_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _native_task(
+    task_id: str, observation: Any, generation: Any, now: datetime,
+) -> dict[str, Any]:
+    entry = {
+        "task_id": task_id, "claim": "claimed", "observation": "missing",
+        "state": "unobservable", "reason": "", "provider": "", "session_id": "", "observed_at": "",
+    }
+
+    def unobservable(kind: str, reason: str) -> dict[str, Any]:
+        entry.update(observation=kind, state="unobservable", reason=reason)
+        return entry
+
+    if observation is None:
+        return unobservable("missing", "no exact native session observation is recorded")
+    if not isinstance(observation, Mapping):
+        return unobservable("invalid", "native observation is malformed")
+    for field in ("provider", "session_id", "observed_at"):
+        if isinstance(observation.get(field), str):
+            entry[field] = observation[field]
+    state = observation.get("state")
+    if (
+        observation.get("schema") != NATIVE_OBSERVATION_SCHEMA
+        or state not in NATIVE_OBSERVATION_STATES
+        or any(
+            not isinstance(observation.get(field), str)
+            for field in ("provider", "session_id", "observer", "claim_generation")
+        )
+    ):
+        return unobservable("invalid", "native observation is malformed")
+    if observation.get("source") != NATIVE_OBSERVATION_SOURCE:
+        return unobservable("invalid", "observation did not come from an exact session query")
+    observed = _observed_time(observation.get("observed_at"))
+    if observed is None:
+        return unobservable("invalid", "observation time is unparseable")
+    if not isinstance(generation, str) or not generation:
+        return unobservable("mismatched", "current claim generation is unavailable")
+    if observation["claim_generation"] != generation:
+        return unobservable("mismatched", "observation is bound to a different claim generation")
+    if state == "unavailable":
+        return unobservable("unavailable", "exact session query was unavailable")
+    required = ("session_id", "observer") if state == "absent" else ("provider", "session_id", "observer")
+    if any(not observation[field].strip() for field in required):
+        return unobservable("invalid", "observation lacks a provider, session or observer")
+    if state == "absent":
+        entry.update(observation="absent", state="absent",
+                     reason="exact session query reported the session absent")
+        return entry
+    age = (now - observed).total_seconds()
+    if age < 0:
+        return unobservable("invalid", "observation time is in the future")
+    entry["observation"] = "present"
+    if age > NATIVE_STALE_AFTER_SECONDS:
+        entry.update(
+            state="stale",
+            reason=f"observation is older than {NATIVE_STALE_AFTER_SECONDS} seconds",
+        )
+    else:
+        entry.update(state="confirmed_native", reason="exact session query observed the session")
+    return entry
+
+
+def classify_native_visibility(
+    enumeration: Mapping[str, Any],
+    sessions: Mapping[str, Any] | None,
+    claim_generations: Mapping[str, str | None],
+    *,
+    now: datetime,
+    sessions_error: str = "",
+) -> dict[str, Any]:
+    """Classify claimed native tasks without a Herdr record from recorded observations.
+
+    ``enumeration`` is the ``beads.audit_root_descendants`` snapshot,
+    ``sessions`` the Herdr session mapping (``None`` when unreadable) and
+    ``claim_generations`` each candidate's current claim generation (``None``
+    when unavailable). Visibility is a report only: it never authorizes a
+    result, a claim change or managed recovery.
+    """
+
+    report: dict[str, Any] = {
+        "schema": NATIVE_VISIBILITY_SCHEMA,
+        "stale_after_seconds": NATIVE_STALE_AFTER_SECONDS,
+    }
+    error = ""
+    if not enumeration.get("available") or not isinstance(enumeration.get("root"), Mapping):
+        error = str(enumeration.get("error") or "Beads enumeration is unavailable")
+    elif not isinstance(sessions, Mapping):
+        error = sessions_error or "Herdr session state is unavailable"
+    if error:
+        return {**report, "available": False, "error": error, "counts": None,
+                "tasks": [], "managed_excluded": []}
+    tasks: list[dict[str, Any]] = []
+    managed: list[str] = []
+    rows = sorted(
+        (item for item in enumeration.get("descendants") or []
+         if isinstance(item, Mapping) and item.get("id")),
+        key=lambda item: str(item["id"]),
+    )
+    for item in rows:
+        task_id = str(item["id"])
+        if not is_native_claimed(item):
+            continue
+        if task_id in sessions:
+            managed.append(task_id)
+            continue
+        tasks.append(_native_task(
+            task_id, _agentflow(item).get("native_observation"),
+            claim_generations.get(task_id), now,
+        ))
+    return {
+        **report, "available": True,
+        "counts": {state: sum(item["state"] == state for item in tasks)
+                   for state in NATIVE_VISIBILITY_STATES},
+        "tasks": tasks, "managed_excluded": managed,
+    }
+
+
 __all__ = [
-    "ACTIVE", "AUDIT_SCHEMA", "OBSERVED_RESULTS", "SUPERSESSION_SCHEMA", "TERMINAL",
+    "ACTIVE", "AUDIT_SCHEMA", "NATIVE_AUTHORITY_SCHEMA", "NATIVE_OBSERVATION_SCHEMA",
+    "NATIVE_OBSERVATION_SOURCE", "NATIVE_OBSERVATION_STATES", "NATIVE_RECEIPT_SCHEMA",
+    "NATIVE_RESULT_SCHEMA", "NATIVE_STALE_AFTER_SECONDS", "NATIVE_VISIBILITY_SCHEMA",
+    "NATIVE_VISIBILITY_STATES", "OBSERVED_RESULTS", "SUPERSESSION_SCHEMA", "TERMINAL",
     "UNPASSED_BUCKETS", "audit_completion", "ci_identity_error", "ci_successor_error",
-    "digest", "passed_ci_receipt_error", "reconcile",
+    "classify_native_visibility", "digest", "passed_ci_receipt_error", "reconcile",
+    "is_native_claimed",
 ]

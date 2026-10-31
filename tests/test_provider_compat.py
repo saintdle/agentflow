@@ -49,6 +49,32 @@ class ProviderCapabilityContractTests(unittest.TestCase):
         self.assertEqual(by_provider["claude"].persistent_herdr, CapabilityState.CONDITIONAL)
         self.assertEqual(by_provider["claude"].herdr_minimum_version, "2.1.251")
         self.assertEqual(by_provider["copilot"].persistent_herdr, CapabilityState.DISABLED)
+        for provider in by_provider.values():
+            self.assertEqual(provider.controller_observed_return, CapabilityState.CONDITIONAL)
+            self.assertEqual(
+                provider.lane_state("controller-observed-return"), CapabilityState.CONDITIONAL
+            )
+
+    def test_provider_document_matrix_lists_the_controller_observed_return_lane(self) -> None:
+        lines = [
+            line for line in PROVIDERS_DOC.read_text(encoding="utf-8").splitlines()
+            if line.startswith("| ")
+        ]
+        header = [cell.strip() for cell in lines[0].strip("|").split("|")]
+        column = header.index("Controller-observed native return")
+        labels = {"Codex": "codex", "Claude Code": "claude", "GitHub Copilot": "copilot"}
+        seen = set()
+        for line in lines[2:]:
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if cells[0] not in labels:
+                break
+            seen.add(labels[cells[0]])
+            self.assertTrue(cells[column].startswith("Conditional"), cells[column])
+            self.assertEqual(
+                capability_for(labels[cells[0]]).controller_observed_return,
+                CapabilityState.CONDITIONAL,
+            )
+        self.assertEqual(seen, set(labels.values()))
 
     def test_unknown_provider_and_lane_fail_closed(self) -> None:
         with self.assertRaisesRegex(ProviderCapabilityError, "unsupported provider"):
