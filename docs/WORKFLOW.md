@@ -473,4 +473,5 @@ agentflow usage record copilot --source dashboard \
 `--estimated-credits`. The record reports `allowance_overshoot_credits` and an
 `allowance_status` of `within-allowance`, `soft-cap-overshoot`,
 `allowance-unconfigured`, or `actual-unavailable`. Overshoot is computed only
-from actual usage, never from an estimate.
+from actual usage, never from an estimate. Every new usage record carries these
+fields; values that were not supplied are `null`.

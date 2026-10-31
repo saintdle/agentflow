@@ -219,6 +219,33 @@ class PreflightPackageLimitTests(unittest.TestCase):
             code, _, _ = self._preflight(output, root)
             self.assertEqual(code, 2)
 
+    def test_nested_and_shared_skill_closures_count_each_delivered_file_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            parent = root / "parent"
+            (parent / "sub").mkdir(parents=True)
+            (parent / "SKILL.md").write_text("Use ./sub/SKILL.md\n", encoding="utf-8")
+            (parent / "sub/SKILL.md").write_text("nested\n", encoding="utf-8")
+            (parent / "sub/data.txt").write_text("data\n", encoding="utf-8")
+            closure = cli._skill_closure_files(parent / "SKILL.md")
+            self.assertEqual(
+                sorted(path.relative_to(parent).as_posix() for path in closure),
+                ["SKILL.md", "sub/SKILL.md", "sub/data.txt"],
+            )
+            seen: set[Path] = set()
+            first = cli._skill_closure_files(parent / "SKILL.md", seen)
+            shared = cli._skill_closure_files(parent / "sub/SKILL.md", seen)
+            self.assertEqual(len(first), 3)
+            self.assertEqual(shared, [])
+            (root / "handoff.md").write_text("h\n", encoding="utf-8")
+            package, errors = cli._measure_outbound_package(
+                root / "handoff.md", root, {}, [],
+                [{"name": "parent", "source": str(parent / "SKILL.md")},
+                 {"name": "nested", "source": str(parent / "sub/SKILL.md")}],
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual([entry["kind"] for entry in package["entries"]].count("skill"), 3)
+
 
 class ReviewVerdictTests(unittest.TestCase):
     SUBJECT = "main@" + "1" * 40
@@ -335,6 +362,28 @@ class ReviewHandoffContractTests(unittest.TestCase):
 
 class ReviewResultIngestionTests(unittest.TestCase):
     """A real signed review launch: exit status alone never approves."""
+
+    def test_mint_refuses_review_manifest_altered_after_preflight(self) -> None:
+        subject = "main@" + "5" * 40
+        requirement = review_verdict.requirement(subject)
+        cases = (
+            ({"return_type": "review", "base": subject, "machine_return_contract": {}}, "requires an explicit"),
+            ({"return_type": "review", "base": "main@" + "6" * 40,
+              "machine_return_contract": {"review": requirement}}, "subject does not match"),
+            ({"return_type": "result", "base": subject,
+              "machine_return_contract": {"review": requirement}}, "only external review"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            for manifest, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    cli._mint_return_channel(
+                        root, "root-1", task_id="task-1", actor="a", claim_token="c", lease_id="l",
+                        launch_id="launch-1", provider="claude", model="m", effort="e",
+                        handoff=mock.Mock(manifest=manifest), acceptance_ids=("R1",),
+                        state_path=root / "sessions.json", authority_secret="s",
+                    )
+            self.assertFalse((root / ".agentflow").exists())
 
     def test_result_ingestion_rejects_unavailable_verdicts_and_binds_a_valid_one(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

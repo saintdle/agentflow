@@ -6707,6 +6707,19 @@ def _mint_return_channel(
     claim_id: str = "",
 ) -> dict[str, Any]:
     """Create a signed per-launch contract without persisting its signing key."""
+    manifest_contract = handoff.manifest.get("machine_return_contract")
+    review_requirement = review_verdict_backend.parse_requirement(
+        manifest_contract.get("review") if isinstance(manifest_contract, Mapping) else None
+    )
+    # Repeat the preflight gate so a manifest altered after preflight cannot
+    # mint a review channel that accepts a verdict-less result.
+    if handoff.manifest.get("return_type") == "review":
+        if review_requirement is None:
+            raise ValueError("external review handoff requires an explicit review verdict in its return contract")
+        if review_requirement["subject"] != review_verdict_backend.subject_for(handoff.manifest):
+            raise ValueError("review verdict subject does not match the exact handoff base")
+    elif review_requirement is not None:
+        raise ValueError("only external review handoffs may require a review verdict")
     launch_dir = _runtime_launch_dir(root, workflow_root, launch_id)
     capability_path = launch_dir / "return.cap"
     contract_path = launch_dir / "return.contract.json"
@@ -6757,10 +6770,6 @@ def _mint_return_channel(
             "attempt": attempt,
             "max_attempts": max_attempts,
         })
-    manifest_contract = handoff.manifest.get("machine_return_contract")
-    review_requirement = review_verdict_backend.parse_requirement(
-        manifest_contract.get("review") if isinstance(manifest_contract, Mapping) else None
-    )
     if review_requirement is not None:
         contract["review"] = review_requirement
         contract["required_result_fields"] = ["outcome", "acceptance_results", "review"]
@@ -12067,10 +12076,15 @@ def _resolve_required_skills(
     return resolved, errors
 
 
-def _skill_closure_files(entrypoint: Path) -> list[Path]:
-    """List every file in a pinned skill's transitive package closure."""
+def _skill_closure_files(entrypoint: Path, seen: set[Path] | None = None) -> list[Path]:
+    """List every file in a pinned skill's transitive package closure once.
+
+    Nested or shared skill directories are walked more than once; ``seen``
+    keeps each delivered file to a single entry across all pinned skills.
+    """
     files: list[Path] = []
     visited: set[Path] = set()
+    delivered = seen if seen is not None else set()
 
     def visit(candidate: Path) -> None:
         resolved = candidate.resolve()
@@ -12081,12 +12095,12 @@ def _skill_closure_files(entrypoint: Path) -> list[Path]:
         for reference in sorted({match.group("path") for match in SKILL_REFERENCE_PATTERN.finditer(content)}):
             visit(resolved.parent / reference)
         package_root = resolved.parent
-        files.extend(
-            path for path in sorted(
-                package_root.rglob("*"), key=lambda item: item.relative_to(package_root).as_posix(),
-            )
-            if path.is_file()
-        )
+        for path in sorted(
+            package_root.rglob("*"), key=lambda item: item.relative_to(package_root).as_posix(),
+        ):
+            if path.is_file() and path.resolve() not in delivered:
+                delivered.add(path.resolve())
+                files.append(path)
 
     visit(entrypoint)
     return files
@@ -12113,10 +12127,11 @@ def _measure_outbound_package(
         inputs.append(outbound_package_backend.PackageInput(
             "context", value, path=candidate if candidate.is_absolute() else root / candidate,
         ))
+    delivered_skill_files: set[Path] = set()
     for skill in resolved_skills:
         entrypoint = Path(str(skill.get("source") or ""))
         try:
-            closure = _skill_closure_files(entrypoint)
+            closure = _skill_closure_files(entrypoint, delivered_skill_files)
         except (OSError, UnicodeDecodeError) as exc:
             return None, [f"required skill closure cannot be measured: {skill.get('name')}: {exc}"]
         inputs.extend(
