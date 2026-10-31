@@ -28,6 +28,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allowance overshoot is computed only from actual usage, never from an
   estimate. See [#67](https://github.com/saintdle/agentflow/issues/67).
 
+- Pass `hosted-runtime` and `architecture-specific` acceptance rows only with
+  `acceptance set --evidence-lane` naming the same lane, and mark rows that
+  need end-to-end proof with `acceptance create --whole-chain`, which pass only
+  with `--evidence-scope whole-chain`. New matrices record
+  `evidence_boundary`, so validation, root completion, and native acceptance
+  reject a hand-edited cross-lane pass. Older matrices keep validating. The
+  planning and diagnosis skills now state that a settings API response or
+  component receipt is not executable readiness. See
+  [#69](https://github.com/saintdle/agentflow/issues/69).
+
 - Add `agentflow budget freeze|revise|approach|status`. A root can freeze its
   approved graph size and launch cap at execution approval, so added tasks,
   retries, and context rotation no longer raise the cap. Reaching the cap blocks

@@ -32,6 +32,14 @@ add only material `af:cap:<name>` requirements. Keep every pull scoped to its
 approved parent root. Label the root `af:kind:workflow` without a stage, role,
 or capability. Use `--no-inherit-labels` when creating dynamic children.
 
+Keep each ticket's acceptance rows on their authoritative lanes. A settings API
+response or component receipt is not executable readiness: a `hosted-runtime`
+or `architecture-specific` row passes only with `acceptance set --evidence-lane
+<lane>` from that environment, and a row created with `--whole-chain <ID>`
+passes only with `--evidence-scope whole-chain`. If no ticket can reach that
+environment, leave the row planned and make the missing environment a visible
+blocker. Do not fold it into a waiver.
+
 Do not copy transient prompts or chat transcripts into the graph.
 
 ## Publish to GitHub
