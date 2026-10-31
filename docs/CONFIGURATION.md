@@ -184,6 +184,8 @@ fork so it cannot silently inherit an expensive Sol controller context.
 Launch admission uses the `execution` values above. The root launch budget is
 the number of planned launchable tasks multiplied by
 `launch_budget_multiplier`; retries consume the same budget as first attempts.
+After `agentflow budget freeze`, the root uses its frozen cap instead, so adding
+tasks no longer raises the budget; only `agentflow budget revise` can raise it.
 The parallel-worker, delegation-depth, per-task retry, and expensive execution
 caps are also enforced before Herdr spawn.
 

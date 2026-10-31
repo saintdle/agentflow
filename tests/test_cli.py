@@ -9496,6 +9496,133 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             self.assertIn("task attempt 3 exceeds limit 2", add_comment.call_args.args[2])
             launch.assert_not_called()
 
+    def _dispatch_with_launch_baseline(
+        self, baseline: Any, *, prior_attempts: int, approach: str = "",
+    ) -> tuple[Mapping[str, Any], mock.Mock, mock.Mock, mock.Mock]:
+        """Run one dispatch admission with a 10-task graph and a generous policy.
+
+        The graph-derived legacy budget is 10 x 10 = 100, so any block below
+        comes from the frozen baseline rather than the growing graph.
+        """
+        from agentflow import launch_budget
+
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            fixture = ValidLaunch(base / "workspace", seed_lease=False)
+            task = json.loads(json.dumps(fixture.task_issue))
+            if approach:
+                task["metadata"]["agentflow"]["launch"]["approach"] = approach
+            fixture.task_issue = task
+            if baseline is not None:
+                fixture.root_issue["metadata"]["agentflow"][launch_budget.METADATA_KEY] = baseline
+            sessions: dict[str, Any] = {}
+            if prior_attempts:
+                sessions[str(task["id"])] = {
+                    "root": str(fixture.root), "workflow_root": fixture.workflow_root,
+                    "task_id": str(task["id"]), "launch_id": f"launch-{prior_attempts}",
+                    "status": "failed", "model": fixture.model, "role": fixture.role,
+                    "attempts": [
+                        {"attempt": number, "launch_id": f"launch-{number}", "status": "failed"}
+                        for number in range(1, prior_attempts + 1)
+                    ],
+                }
+            cli._private_atomic_json(
+                fixture.root / ".agentflow/herdr/sessions.json",
+                {"schema": "agentflow.herdr", "version": 1, "sessions": sessions},
+            )
+            controller = cli.controller_backend.RootController(
+                str(fixture.root), fixture.controller,
+                state_path=cli._controller_state_dir(fixture.root, fixture.workflow_root) / "state.json",
+            )
+            lease = controller.acquire()
+            policy = cli.execution_backend.ExecutionPolicy(
+                max_parallel_workers=2, max_attempts_per_task=10,
+                launch_budget_multiplier=10, max_expensive_execution_children=0,
+            )
+            args = argparse.Namespace(workflow_root=fixture.workflow_root)
+            with mock.patch.object(cli.beads_backend, "get_issue", side_effect=fixture.get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[task] * 10), \
+                 mock.patch.object(cli.beads_backend, "add_comment") as add_comment, \
+                 mock.patch.object(cli, "_controller_execution_policy", return_value=policy), \
+                 mock.patch.object(
+                     cli, "_materialize_launch_handoff", side_effect=ValueError("stop after admission"),
+                 ) as materialize, \
+                 mock.patch.object(cli, "herdr_launch") as launch:
+                result = cli._dispatch_via_herdr(
+                    args, fixture.root, fixture.root, fixture.workflow_root, lease,
+                )(task)
+        return result, add_comment, materialize, launch
+
+    def test_frozen_baseline_cap_ignores_graph_growth(self) -> None:
+        from agentflow import launch_budget
+
+        baseline = launch_budget.freeze(planned_tasks=1, multiplier=2, now="2026-01-01T00:00:00Z")
+        result, add_comment, materialize, launch = self._dispatch_with_launch_baseline(
+            baseline.to_dict(), prior_attempts=2,
+        )
+        self.assertEqual(result["state"], "blocked", result)
+        add_comment.assert_called_once()
+        message = add_comment.call_args.args[2]
+        self.assertIn("reaching its current cap 2", message)
+        self.assertNotIn("budget 100", message)
+        materialize.assert_not_called()
+        launch.assert_not_called()
+
+    def test_legacy_root_without_baseline_keeps_graph_derived_budget(self) -> None:
+        result, add_comment, materialize, launch = self._dispatch_with_launch_baseline(
+            None, prior_attempts=2,
+        )
+        self.assertEqual(result["state"], "blocked", result)
+        add_comment.assert_not_called()
+        materialize.assert_called_once()
+        launch.assert_not_called()
+
+    def test_recorded_revision_admits_the_next_launch(self) -> None:
+        from agentflow import launch_budget
+
+        baseline = launch_budget.revise(
+            launch_budget.freeze(planned_tasks=1, multiplier=2, now="2026-01-01T00:00:00Z"),
+            new_cap=3, decision_ref="owner-decision-1", reason="one correction task",
+            consumed=2, now="2026-01-02T00:00:00Z",
+        )
+        result, add_comment, materialize, _launch = self._dispatch_with_launch_baseline(
+            baseline.to_dict(), prior_attempts=2,
+        )
+        add_comment.assert_not_called()
+        materialize.assert_called_once()
+        self.assertEqual(result["state"], "blocked", result)
+
+    def test_stopped_approach_blocks_a_replacement_task(self) -> None:
+        from agentflow import launch_budget
+
+        baseline = launch_budget.freeze(planned_tasks=5, multiplier=2, now="2026-01-01T00:00:00Z")
+        for task_id in ("task-1", "task-1-replacement"):
+            baseline = launch_budget.record_approach(
+                baseline, approach="patch-parser", outcome="failure", task=task_id,
+                now="2026-01-01T01:00:00Z",
+            )
+        result, add_comment, materialize, launch = self._dispatch_with_launch_baseline(
+            baseline.to_dict(), prior_attempts=0, approach="patch-parser",
+        )
+        self.assertEqual(result["state"], "blocked", result)
+        add_comment.assert_called_once()
+        self.assertIn("approach 'patch-parser' has failed 2 times", add_comment.call_args.args[2])
+        materialize.assert_not_called()
+        launch.assert_not_called()
+
+    def test_malformed_baseline_blocks_as_accounting_indeterminate(self) -> None:
+        from agentflow import launch_budget
+
+        baseline = launch_budget.freeze(planned_tasks=1, multiplier=2, now="2026-01-01T00:00:00Z").to_dict()
+        baseline["original_launch_budget"] = 50
+        result, add_comment, materialize, launch = self._dispatch_with_launch_baseline(
+            baseline, prior_attempts=0,
+        )
+        self.assertTrue(result.get("accounting_indeterminate"), result)
+        self.assertIn("root launch baseline is malformed", add_comment.call_args.args[2])
+        materialize.assert_not_called()
+        launch.assert_not_called()
+
     def test_accounting_key_lookup_rejects_workspace_local_state_home(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp).resolve()

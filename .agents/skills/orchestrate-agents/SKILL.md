@@ -92,6 +92,14 @@ supported systems; detached descendants can outlive it. Older handoffs without
 provider spending caps. Keep provider quota provenance separate from local
 task outcomes and timing when recording or comparing usage.
 
+Freeze the root's launch baseline with `agentflow budget freeze` when execution
+is approved. Adding correction tasks does not raise a frozen cap. At the cap,
+review `agentflow budget status` and append an approved increase with
+`agentflow budget revise` before launching again. Name a repeated technique in
+`metadata.agentflow.launch.approach` and record each failure with `agentflow
+budget approach`; after two failures, stop that approach until the owner records
+a decision, even on a replacement task.
+
 For substantial work, validate the approved acceptance-to-evidence matrix before assigning a writer. Give every row one owner and keep lower validation lanes from claiming evidence that only a higher lane can prove.
 
 ## Write each assignment
