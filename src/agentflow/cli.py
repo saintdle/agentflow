@@ -46,6 +46,7 @@ from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import events as events_backend
 from agentflow import preflight as preflight_backend
 from agentflow import provider_argv as provider_argv_backend
+from agentflow import provider_capabilities as provider_capabilities_backend
 from agentflow import history as history_backend
 from agentflow import installation as installation_backend
 from agentflow import isolation as isolation_backend
@@ -4498,9 +4499,9 @@ def controller_status(args: argparse.Namespace) -> int:
                     "error": str(exc),
                     "findings": [],
                 }
-            payload["completion_audit"] = reconciliation_backend.audit_completion(
-                beads_backend.audit_root_descendants(root, workflow_root)
-            )
+            enumeration = beads_backend.audit_root_descendants(root, workflow_root)
+            payload["completion_audit"] = reconciliation_backend.audit_completion(enumeration)
+            payload["native_visibility"] = _native_visibility(root, enumeration)
         _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="CONTROLLER STATUS")
         return 0
     except (
@@ -13917,6 +13918,551 @@ def ci_supersede(args: argparse.Namespace) -> int:
     }, 0)
 
 
+_NATIVE_RETURN_LANE = "controller-observed-return"
+_NATIVE_INELIGIBLE_REQUIREMENTS = frozenset({
+    "trusted-model-identity", "protected-recovery", "state-migration",
+    "managed-causal-proof", "credential-use", "publication",
+})
+_NATIVE_ATTESTATION = (
+    "controller-validated native return; not managed causal-result authentication "
+    "or resolved-model attestation"
+)
+_NATIVE_GUARDED_FIELDS = (
+    "acceptance", "requirements", "native_return_authority", "native_observation",
+)
+
+
+def _native_herdr_sessions(root: Path) -> dict[str, Any]:
+    """Read Herdr sessions without chmod, locking or any other write."""
+    path = root / ".agentflow/herdr/sessions.json"
+    if path.is_symlink():
+        raise ValueError("Herdr session state must not be a symlink")
+    if not path.exists():
+        return {}
+    if not path.is_file() or path.stat().st_size > 5 * 1024 * 1024:
+        raise ValueError("Herdr session state is not a regular file or is too large")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    sessions = value.get("sessions") if isinstance(value, dict) else None
+    if not isinstance(sessions, dict):
+        raise ValueError("Herdr state must contain a sessions object")
+    return sessions
+
+
+def _native_visibility(root: Path, enumeration: Mapping[str, Any]) -> dict[str, Any]:
+    """Report native visibility for status; reads only, never writes Beads."""
+    sessions: dict[str, Any] | None
+    try:
+        sessions, error = _native_herdr_sessions(root), ""
+    except (OSError, ValueError) as exc:
+        sessions, error = None, f"Herdr session state is unavailable: {exc}"
+    generations: dict[str, str | None] = {}
+    if enumeration.get("available") and sessions is not None:
+        for item in enumeration.get("descendants") or []:
+            task_id = str(item.get("id") or "")
+            if (
+                not reconciliation_backend.is_native_claimed(item) or task_id in sessions
+                or _agentflow_metadata(item).get("native_observation") is None
+            ):
+                continue
+            try:
+                generations[task_id] = beads_backend.claim_generation(root, task_id)
+            except beads_backend.BeadsError:
+                generations[task_id] = None
+    return reconciliation_backend.classify_native_visibility(
+        enumeration, sessions, generations,
+        now=dt.datetime.now(dt.timezone.utc), sessions_error=error,
+    )
+
+
+def _native_sha40(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def _native_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _native_text(value: Any, option: str) -> str:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{option} must be text")
+    text = (value or "").strip()
+    if not text:
+        raise ValueError(f"{option} must be non-empty")
+    if len(text.encode("utf-8")) > _MAX_ACCEPTANCE_FIELD_BYTES or any(ord(char) < 32 for char in text):
+        raise ValueError(f"{option} is malformed or too large")
+    if _rejects_secret(text):
+        raise ValueError(f"{option} contains secret-like content")
+    return text
+
+
+def _native_key(value: Any, ignored: set[str]) -> dict[str, Any] | None:
+    # Replays compare the decision, not who repeated it or when.
+    if not isinstance(value, Mapping):
+        return None
+    return {key: item for key, item in value.items() if key not in ignored}
+
+
+def _native_lane_error(provider: str) -> str:
+    try:
+        state = provider_capabilities_backend.capability_for(provider).lane_state(_NATIVE_RETURN_LANE)
+    except provider_capabilities_backend.ProviderCapabilityError as exc:
+        return str(exc)
+    if state == provider_capabilities_backend.CapabilityState.DISABLED:
+        return f"the controller-observed native return lane is disabled for {provider}"
+    return ""
+
+
+def _native_requirements_error(issue: dict[str, Any]) -> str:
+    requirements = _agentflow_metadata(issue).get("requirements", [])
+    if not isinstance(requirements, list) or any(not isinstance(item, str) for item in requirements):
+        return "metadata.agentflow.requirements must be a list of strings"
+    labels = issue.get("labels") or []
+    if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+        return "task labels are malformed"
+    names = {item.strip().lower() for item in requirements} | {
+        label.removeprefix("af:requires:").strip().lower()
+        for label in labels if label.startswith("af:requires:")
+    }
+    blocked = sorted(names & _NATIVE_INELIGIBLE_REQUIREMENTS)
+    if blocked:
+        return "task class is ineligible for controller-observed native return: " + ", ".join(blocked)
+    return ""
+
+
+def _native_target(args: argparse.Namespace) -> tuple[Path, dict[str, Any], str]:
+    """Validate a native-return target without writing; return (cwd, issue, error)."""
+    task_cwd = _task_cwd(args)
+    task = str(args.task or "")
+    enumeration = beads_backend.audit_root_descendants(task_cwd, args.workflow_root)
+    if not enumeration.get("available"):
+        return task_cwd, {}, f"Workflow root enumeration is unavailable: {enumeration.get('error')}"
+    listed = {str(item.get("id")): item for item in enumeration.get("descendants") or []}
+    if task not in listed:
+        return task_cwd, {}, f"{task} is not a descendant of {args.workflow_root}"
+    try:
+        sessions = _native_herdr_sessions(task_cwd)
+    except (OSError, ValueError) as exc:
+        return task_cwd, {}, f"Herdr session state is unreadable: {exc}"
+    if task in sessions:
+        return task_cwd, {}, (
+            f"{task} has a Herdr session record; managed results return only through "
+            "the controller's authenticated channel"
+        )
+    try:
+        issue = beads_backend.get_issue(task_cwd, task, timeout=10)
+    except beads_backend.BeadsError as exc:
+        return task_cwd, {}, f"Cannot read {task}: {exc}"
+    if issue.get("id") != task or issue.get("parent") != listed[task].get("parent"):
+        return task_cwd, {}, f"{task} identity or parent changed since the root was listed"
+    return task_cwd, issue, ""
+
+
+def _native_reread(
+    task_cwd: Path, task: str, snapshot: dict[str, Any], fields: tuple[str, ...],
+) -> tuple[dict[str, Any] | None, str]:
+    # Beads has no compare-and-swap: re-read immediately before each write.
+    try:
+        fresh = beads_backend.get_issue(task_cwd, task, timeout=10)
+    except beads_backend.BeadsError as exc:
+        return None, f"Cannot re-read {task} before writing: {exc}"
+    before, after = _agentflow_metadata(snapshot), _agentflow_metadata(fresh)
+    if any(
+        fresh.get(key) != snapshot.get(key) for key in ("id", "parent", "status", "assignee", "labels")
+    ) or any(
+        reconciliation_backend.digest(after.get(field)) != reconciliation_backend.digest(before.get(field))
+        for field in fields
+    ):
+        return None, f"{task} changed after validation; nothing was overwritten"
+    return fresh, ""
+
+
+def _native_readback(task_cwd: Path, task: str) -> dict[str, Any]:
+    try:
+        issue = beads_backend.get_issue(task_cwd, task, timeout=10)
+    except beads_backend.BeadsError:
+        return {}
+    return issue if issue.get("id") == task else {}
+
+
+def _native_actor(args: argparse.Namespace) -> str:
+    return str(getattr(args, "actor", "") or os.environ.get("BD_ACTOR") or "agentflow")
+
+
+def _native_finish(args: argparse.Namespace, title: str, payload: dict[str, Any], code: int) -> int:
+    _json_or_status(
+        {"task": args.task, "workflow_root": args.workflow_root, **payload},
+        as_json=bool(getattr(args, "json", False)), title=title,
+    )
+    return code
+
+
+def _native_reject(args: argparse.Namespace, title: str, error: str) -> int:
+    return _native_finish(args, title, {"ok": False, "disposition": "rejected", "error": error}, 2)
+
+
+def native_approve(args: argparse.Namespace) -> int:
+    """Record an owner's approval to accept a controller-observed native return."""
+    title = "NATIVE APPROVE"
+    provider = str(args.provider or "")
+    problem = _native_lane_error(provider)
+    if problem:
+        return _native_reject(args, title, problem)
+    if not _native_sha40(args.base):
+        return _native_reject(args, title, "--base must be a full 40-character lowercase commit SHA")
+    try:
+        approval_ref = _native_text(args.approval_ref, "--approval-ref")
+        approved_by = _native_text(args.approved_by, "--approved-by")
+    except ValueError as exc:
+        return _native_reject(args, title, str(exc))
+    task_cwd, issue, problem = _native_target(args)
+    if problem:
+        return _native_reject(args, title, problem)
+    task = args.task
+    status = str(issue.get("status") or "").lower()
+    if not reconciliation_backend.is_native_claimed(issue) or not str(issue.get("assignee") or ""):
+        return _native_reject(
+            args, title,
+            f"{task} is {status or 'unknown'}; native approval requires an in_progress claim holder",
+        )
+    if approved_by == str(issue.get("assignee") or ""):
+        return _native_reject(args, title, "self-approval: --approved-by must differ from the task assignee")
+    acceptance_ids = _bound_acceptance_ids(issue, task)
+    if not acceptance_ids:
+        return _native_reject(args, title, f"{task} has no acceptance matrix bound to it")
+    problem = _native_requirements_error(issue)
+    if problem:
+        return _native_reject(args, title, problem)
+    try:
+        generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return _native_reject(args, title, f"current claim generation is unavailable: {exc}")
+    if not _native_sha256(generation):
+        return _native_reject(args, title, "current claim generation is malformed")
+    record = {
+        "schema": reconciliation_backend.NATIVE_AUTHORITY_SCHEMA,
+        "workflow_root": args.workflow_root, "task_id": task, "provider": provider,
+        "base": args.base, "acceptance_ids": list(acceptance_ids),
+        "claim_generation": generation,
+        "approval_ref": approval_ref, "approved_by": approved_by,
+        "actor": _native_actor(args), "recorded_at": _now(),
+    }
+    ignored = {"actor", "recorded_at"}
+    existing = _agentflow_metadata(issue).get("native_return_authority")
+    if existing is not None:
+        if _native_key(existing, ignored) != _native_key(record, ignored):
+            return _native_reject(args, title, f"{task} already records a different native return approval")
+        return _native_finish(args, title, {
+            "ok": True, "disposition": "approved", "replayed": True, "authority": existing,
+        }, 0)
+    fresh, problem = _native_reread(task_cwd, task, issue, _NATIVE_GUARDED_FIELDS)
+    if fresh is None:
+        return _native_reject(args, title, problem)
+    try:
+        current_generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return _native_reject(args, title, f"current claim generation is unavailable: {exc}")
+    if current_generation != generation:
+        return _native_reject(args, title, "claim generation changed after validation; nothing was written")
+    try:
+        beads_backend.update_agentflow_metadata(
+            task_cwd, task, {"native_return_authority": record}, snapshot=fresh,
+        )
+    except beads_backend.BeadsError as exc:
+        return _native_finish(args, title, {"ok": False, "disposition": "unconfirmed", "error": str(exc)}, 2)
+    if _agentflow_metadata(_native_readback(task_cwd, task)).get("native_return_authority") != record:
+        return _native_finish(args, title, {
+            "ok": False, "disposition": "unconfirmed", "error": "approval write is not confirmed",
+        }, 2)
+    return _native_finish(args, title, {
+        "ok": True, "disposition": "approved", "replayed": False, "authority": record,
+    }, 0)
+
+
+def native_observe(args: argparse.Namespace) -> int:
+    """Record one exact-session observation bound to the task's current claim."""
+    title = "NATIVE OBSERVE"
+    provider = str(args.provider or "")
+    problem = _native_lane_error(provider)
+    if problem:
+        return _native_reject(args, title, problem)
+    state = str(args.state or "")
+    if state not in reconciliation_backend.NATIVE_OBSERVATION_STATES:
+        return _native_reject(args, title, "--state must be present, absent or unavailable")
+    try:
+        observer = _native_text(args.observer, "--observer")
+        session_id = (
+            _native_text(args.session_id, "--session-id")
+            if state != "unavailable" or str(args.session_id or "").strip() else ""
+        )
+    except ValueError as exc:
+        return _native_reject(args, title, str(exc))
+    task_cwd, issue, problem = _native_target(args)
+    if problem:
+        return _native_reject(args, title, problem)
+    task = args.task
+    status = str(issue.get("status") or "").lower()
+    if not reconciliation_backend.is_native_claimed(issue) or not str(issue.get("assignee") or ""):
+        return _native_reject(
+            args, title,
+            f"{task} is {status or 'unknown'}; native observation requires an in_progress claim holder",
+        )
+    try:
+        generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return _native_reject(args, title, f"current claim generation is unavailable: {exc}")
+    record = {
+        "schema": reconciliation_backend.NATIVE_OBSERVATION_SCHEMA, "provider": provider,
+        "session_id": session_id, "state": state,
+        "source": reconciliation_backend.NATIVE_OBSERVATION_SOURCE, "observer": observer,
+        "observed_at": _now(), "claim_generation": generation,
+    }
+    fresh, problem = _native_reread(task_cwd, task, issue, ())
+    if fresh is None:
+        return _native_reject(args, title, problem)
+    try:
+        current_generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return _native_reject(args, title, f"current claim generation is unavailable: {exc}")
+    if current_generation != generation:
+        return _native_reject(args, title, "claim generation changed after validation; nothing was written")
+    try:
+        beads_backend.update_agentflow_metadata(
+            task_cwd, task, {"native_observation": record}, snapshot=fresh,
+        )
+    except beads_backend.BeadsError as exc:
+        return _native_finish(args, title, {"ok": False, "disposition": "unconfirmed", "error": str(exc)}, 2)
+    if _agentflow_metadata(_native_readback(task_cwd, task)).get("native_observation") != record:
+        return _native_finish(args, title, {
+            "ok": False, "disposition": "unconfirmed", "error": "observation write is not confirmed",
+        }, 2)
+    return _native_finish(args, title, {"ok": True, "disposition": "observed", "observation": record}, 0)
+
+
+def _native_results_error(results: Any, approved: list[str]) -> str:
+    if not isinstance(results, list) or not results:
+        return "native result acceptance_results must be a non-empty list"
+    seen: list[str] = []
+    for row in results:
+        if not isinstance(row, Mapping) or set(row) != {"acceptance_id", "status", "evidence"}:
+            return "each acceptance result must contain exactly acceptance_id, status and evidence"
+        row_id = row["acceptance_id"]
+        if not isinstance(row_id, str) or not row_id:
+            return "acceptance result acceptance_id must be non-empty"
+        if row["status"] != "passed":
+            return f"acceptance result {row_id} must have status passed; waivers are not accepted"
+        try:
+            _native_text(row["evidence"], f"acceptance result {row_id} evidence")
+        except ValueError as exc:
+            return str(exc)
+        if row_id in seen:
+            return f"duplicate acceptance result {row_id}"
+        seen.append(row_id)
+    if set(seen) != set(approved):
+        return "acceptance results do not match the approved acceptance IDs"
+    return ""
+
+
+def _native_receipt(
+    args: argparse.Namespace, task_cwd: Path, issue: dict[str, Any], result: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str]:
+    """Validate a native result completely; return the receipt to record or an error."""
+    task = args.task
+    agentflow = _agentflow_metadata(issue)
+    status = str(issue.get("status") or "").lower()
+    assignee = str(issue.get("assignee") or "")
+    if not reconciliation_backend.is_native_claimed(issue) or not assignee:
+        return None, f"{task} is {status or 'unknown'}; native acceptance requires an in_progress claim holder"
+    problem = _native_requirements_error(issue)
+    if problem:
+        return None, problem
+    authority = agentflow.get("native_return_authority")
+    if authority is None:
+        return None, f"{task} has no native return approval; run `agentflow native approve` first"
+    ids = authority.get("acceptance_ids") if isinstance(authority, Mapping) else None
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("schema") != reconciliation_backend.NATIVE_AUTHORITY_SCHEMA
+        or not isinstance(ids, list) or not ids
+        or any(not isinstance(item, str) or not item for item in ids) or len(set(ids)) != len(ids)
+        or not _native_sha40(authority.get("base"))
+        or not _native_sha256(authority.get("claim_generation"))
+        or any(
+            not isinstance(authority.get(field), str) or not authority[field].strip()
+            for field in ("provider", "approval_ref", "approved_by")
+        )
+    ):
+        return None, "native return approval is malformed"
+    if authority.get("workflow_root") != args.workflow_root or authority.get("task_id") != task:
+        return None, "native return approval is bound to a different task"
+    if authority["approved_by"] == assignee:
+        return None, "self-approval: the native return approval names the task assignee"
+    for field in ("provider", "session_id", "claim_generation", "base", "head", "verdict"):
+        if not isinstance(result.get(field), str):
+            return None, f"native result {field} must be a string"
+    provider = result["provider"]
+    if provider != authority["provider"]:
+        return None, "native result provider does not match the approval"
+    problem = _native_lane_error(provider)
+    if problem:
+        return None, problem
+    if result["base"] != authority["base"]:
+        return None, "native result base does not match the approved base"
+    if result["claim_generation"] != authority["claim_generation"]:
+        return None, "native result claim generation does not match the approved claim"
+    if not _native_sha40(result["head"]):
+        return None, "native result head must be a full 40-character lowercase commit SHA"
+    try:
+        generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return None, f"current claim generation is unavailable: {exc}"
+    if result["claim_generation"] != generation:
+        return None, "native result claim generation does not match the current claim"
+    problem = _native_results_error(result.get("acceptance_results"), ids)
+    if problem:
+        return None, problem
+    bound = _bound_acceptance_ids(issue, task)
+    if not bound:
+        return None, f"{task} has no acceptance matrix bound to it"
+    if set(bound) != set(ids):
+        return None, "the task acceptance matrix changed after approval"
+    rows = {str(row.get("id")): row for row in agentflow["acceptance"]["rows"]}
+    for row_id in ids:
+        if rows[row_id].get("status") != "passed" or not rows[row_id].get("actual_evidence"):
+            return None, f"acceptance row {row_id} has not passed controller validation"
+    if result["verdict"] != "usable":
+        return None, 'native result verdict must be "usable"'
+    observation = agentflow.get("native_observation")
+    observation_sha256 = None
+    if observation is not None:
+        if (
+            not isinstance(observation, Mapping)
+            or observation.get("schema") != reconciliation_backend.NATIVE_OBSERVATION_SCHEMA
+        ):
+            return None, "native observation is malformed"
+        if observation.get("provider") != provider:
+            return None, "native observation provider does not match the result"
+        if observation.get("claim_generation") != generation:
+            return None, "native observation is bound to a different claim generation"
+        if result["session_id"] and observation.get("session_id") != result["session_id"]:
+            return None, "native result session does not match the recorded observation"
+        observation_sha256 = _canonical_json_digest(observation)
+    return {
+        "schema": reconciliation_backend.NATIVE_RECEIPT_SCHEMA,
+        "workflow_root": args.workflow_root, "task_id": task, "provider": provider,
+        "session_id": result["session_id"], "claim_generation": generation,
+        "base": result["base"], "head": result["head"], "acceptance_ids": list(ids),
+        "verdict": result["verdict"], "result_sha256": _canonical_json_digest(result),
+        "approval_ref": authority["approval_ref"], "observation_sha256": observation_sha256,
+        "accepted_by": _native_actor(args), "accepted_at": _now(),
+        "attestation": _NATIVE_ATTESTATION,
+    }, ""
+
+
+def native_accept(args: argparse.Namespace) -> int:
+    """Accept a validated native return on an approved task and close it once."""
+    title = "NATIVE ACCEPT"
+    task_cwd, issue, problem = _native_target(args)
+    if problem:
+        return _native_reject(args, title, problem)
+    task = args.task
+    result_path = Path(args.result).expanduser()
+    try:
+        if result_path.is_symlink() or not result_path.is_file():
+            return _native_reject(args, title, "native result must be a regular non-symlink file")
+        if result_path.stat().st_size > 64 * 1024:
+            return _native_reject(args, title, "native result file is too large")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _native_reject(args, title, f"Cannot read native result file: {exc}")
+    if not isinstance(result, dict):
+        return _native_reject(args, title, "native result must be a JSON object")
+    if result.get("schema") != reconciliation_backend.NATIVE_RESULT_SCHEMA:
+        return _native_reject(
+            args, title, f"native result schema must be {reconciliation_backend.NATIVE_RESULT_SCHEMA}",
+        )
+    if result.get("workflow_root") != args.workflow_root:
+        return _native_reject(args, title, "native result workflow_root does not match --workflow-root")
+    if result.get("task_id") != task:
+        return _native_reject(args, title, "native result task_id does not match --task")
+    existing = _agentflow_metadata(issue).get("native_return_receipt")
+    matching = (
+        isinstance(existing, Mapping)
+        and existing.get("schema") == reconciliation_backend.NATIVE_RECEIPT_SCHEMA
+        and existing.get("workflow_root") == args.workflow_root and existing.get("task_id") == task
+        and existing.get("result_sha256") == _canonical_json_digest(result)
+    )
+    status = str(issue.get("status") or "").lower()
+    if status in reconciliation_backend.TERMINAL and status == "closed" and matching:
+        return _native_finish(args, title, {
+            "ok": True, "disposition": "accepted", "replayed": True, "receipt": existing,
+        }, 0)
+    if existing is not None and not matching:
+        return _native_reject(args, title, f"{task} already records a different native return receipt")
+    if status in reconciliation_backend.TERMINAL:
+        return _native_reject(args, title, f"{task} is {status}; native acceptance requires an open claim")
+    receipt, problem = _native_receipt(args, task_cwd, issue, result)
+    if receipt is None:
+        return _native_reject(args, title, problem)
+    ignored = {"accepted_by", "accepted_at"}
+    if existing is not None:
+        # A matching receipt whose closure was unresolved: retry only the close.
+        if _native_key(existing, ignored) != _native_key(receipt, ignored):
+            return _native_reject(args, title, f"{task} already records a different native return receipt")
+        receipt = dict(existing)
+    wrote = existing is None
+
+    def unresolved(error: str) -> int:
+        return _native_finish(args, title, {
+            "ok": False, "disposition": "closure_unresolved", "receipt": receipt, "error": error,
+        }, 2)
+
+    if existing is None:
+        fresh, problem = _native_reread(
+            task_cwd, task, issue, (*_NATIVE_GUARDED_FIELDS, "native_return_receipt"),
+        )
+        if fresh is None:
+            return _native_reject(args, title, problem)
+        try:
+            current_generation = beads_backend.claim_generation(task_cwd, task)
+        except beads_backend.BeadsError as exc:
+            return _native_reject(args, title, f"current claim generation is unavailable: {exc}")
+        if current_generation != receipt["claim_generation"]:
+            return _native_reject(args, title, "claim generation changed after validation; nothing was written")
+        try:
+            beads_backend.update_agentflow_metadata(
+                task_cwd, task, {"native_return_receipt": receipt}, snapshot=fresh,
+            )
+        except beads_backend.BeadsError as exc:
+            return unresolved(f"Cannot record the native return receipt: {exc}")
+    fresh, problem = _native_reread(task_cwd, task, issue, _NATIVE_GUARDED_FIELDS)
+    if fresh is None or _agentflow_metadata(fresh).get("native_return_receipt") != receipt:
+        problem = problem or f"{task} receipt is not confirmed before closing"
+        return unresolved(problem) if wrote else _native_reject(args, title, problem)
+    try:
+        current_generation = beads_backend.claim_generation(task_cwd, task)
+    except beads_backend.BeadsError as exc:
+        return unresolved(f"Current claim generation is unavailable before close: {exc}")
+    if current_generation != receipt["claim_generation"]:
+        return unresolved("Claim generation changed before close")
+    try:
+        # Beads lets only the claim holder close; never force or reclaim.
+        beads_backend.close_issue(
+            task_cwd, task, f"Controller-validated native return accepted at {receipt['head']}",
+            actor=str(issue.get("assignee") or ""),
+        )
+    except beads_backend.BeadsError:
+        pass
+    current = _native_readback(task_cwd, task)
+    if (
+        str(current.get("status") or "").lower() != "closed"
+        or _agentflow_metadata(current).get("native_return_receipt") != receipt
+    ):
+        return unresolved(f"Closure of {task} is not confirmed")
+    return _native_finish(args, title, {
+        "ok": True, "disposition": "accepted", "replayed": False, "receipt": receipt,
+    }, 0)
+
+
 def _require_supported_launch_isolation(
     handoff: provider_argv_backend.ConfinedHandoff, *, transport: str
 ) -> None:
@@ -15688,6 +16234,49 @@ def build_parser() -> argparse.ArgumentParser:
     ci_supersede_parser.add_argument("--cwd", default="")
     ci_supersede_parser.add_argument("--json", action="store_true")
     ci_supersede_parser.set_defaults(func=ci_supersede)
+
+    native_parser = sub.add_parser(
+        "native", help="Record controller-observed native returns on approved distinct tasks"
+    )
+    native_sub = native_parser.add_subparsers(dest="native_command", required=True)
+    native_approve_parser = native_sub.add_parser(
+        "approve", help="Record owner approval for a controller-observed native return"
+    )
+    native_approve_parser.add_argument("--workflow-root", required=True)
+    native_approve_parser.add_argument("--task", required=True)
+    native_approve_parser.add_argument("--provider", required=True)
+    native_approve_parser.add_argument("--base", required=True)
+    native_approve_parser.add_argument("--approval-ref", required=True)
+    native_approve_parser.add_argument("--approved-by", required=True)
+    native_approve_parser.add_argument("--actor", default="")
+    native_approve_parser.add_argument("--cwd", default="")
+    native_approve_parser.add_argument("--json", action="store_true")
+    native_approve_parser.set_defaults(func=native_approve)
+
+    native_observe_parser = native_sub.add_parser(
+        "observe", help="Record an exact native-session query for a current claim"
+    )
+    native_observe_parser.add_argument("--workflow-root", required=True)
+    native_observe_parser.add_argument("--task", required=True)
+    native_observe_parser.add_argument("--provider", required=True)
+    native_observe_parser.add_argument("--session-id", default="")
+    native_observe_parser.add_argument("--state", required=True)
+    native_observe_parser.add_argument("--observer", required=True)
+    native_observe_parser.add_argument("--actor", default="")
+    native_observe_parser.add_argument("--cwd", default="")
+    native_observe_parser.add_argument("--json", action="store_true")
+    native_observe_parser.set_defaults(func=native_observe)
+
+    native_accept_parser = native_sub.add_parser(
+        "accept", help="Validate and accept a native return on an approved task"
+    )
+    native_accept_parser.add_argument("--workflow-root", required=True)
+    native_accept_parser.add_argument("--task", required=True)
+    native_accept_parser.add_argument("--result", required=True)
+    native_accept_parser.add_argument("--actor", default="")
+    native_accept_parser.add_argument("--cwd", default="")
+    native_accept_parser.add_argument("--json", action="store_true")
+    native_accept_parser.set_defaults(func=native_accept)
 
     usage_parser = sub.add_parser("usage", help="Show authoritative checks and locally saved quota snapshots")
     usage_sub = usage_parser.add_subparsers(dest="usage_command")

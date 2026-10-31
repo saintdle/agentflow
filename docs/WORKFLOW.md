@@ -138,6 +138,26 @@ Native Codex workers use a dedicated Luna profile with no inherited controller
 conversation (`fork_turns="none"`) or the smallest context slice that contains
 the task contract.
 
+For an owner-approved native return, `agentflow native approve` records the
+provider, base, approval reference, and acceptance IDs on the distinct task.
+`agentflow native observe` records an exact-session query bound to the current
+claim generation; `agentflow native accept` validates the worker's result
+against the approved acceptance matrix before recording a receipt and closing
+as the claim holder. `agentflow controller status` reports native visibility
+separately for `in_progress` tasks:
+
+- `confirmed_native`: an exact-session query recently observed the session;
+- `stale`: a present-session observation is older than 300 seconds;
+- `absent`: an exact-session query reported the session absent;
+- `unobservable`: evidence is missing, malformed, unavailable, or bound to a
+  different claim generation. A missing Herdr record alone is not proof of
+  absence.
+
+The native lane refuses tasks requiring trusted-model-identity,
+protected-recovery, state-migration, managed-causal-proof, credential-use, or
+publication. These commands do not authenticate managed results, resume old
+work, or grant publication authority.
+
 External workers always return through the controller-minted authenticated
 channel. Do not launch their generated handoffs with `agentflow handoff launch`;
 resume the root controller. When outbound context must be restricted, persist

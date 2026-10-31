@@ -31,9 +31,11 @@ class ProviderCapability:
     direct_cli: CapabilityState
     persistent_herdr: CapabilityState
     persistent_app_server: CapabilityState = CapabilityState.DISABLED
+    controller_observed_return: CapabilityState = CapabilityState.DISABLED
     herdr_minimum_version: str | None = None
     herdr_note: str = ""
     app_server_note: str = ""
+    observed_return_note: str = ""
 
     def lane_state(self, lane: str) -> CapabilityState:
         """Return one named lane's state; reject unknown lanes fail-closed."""
@@ -45,12 +47,20 @@ class ProviderCapability:
             "direct-cli": "direct_cli",
             "persistent-herdr": "persistent_herdr",
             "persistent-app-server": "persistent_app_server",
+            "controller-observed-return": "controller_observed_return",
         }
         field = field_by_lane.get(lane)
         if field is None:
             raise ProviderCapabilityError(f"unknown provider lane: {lane!r}")
         return getattr(self, field)
 
+
+_OBSERVED_RETURN_NOTE = (
+    "Controller-validated evidence on an owner-approved distinct task; not managed "
+    "causal-result attestation or resolved-model attestation. Trusted-model-identity, "
+    "protected-recovery, state-migration, managed-causal-proof, credential-use and "
+    "publication task classes are ineligible."
+)
 
 _CAPABILITIES = (
     ProviderCapability(
@@ -60,6 +70,8 @@ _CAPABILITIES = (
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.SUPPORTED,
         persistent_app_server=CapabilityState.CONDITIONAL,
+        controller_observed_return=CapabilityState.CONDITIONAL,
+        observed_return_note=_OBSERVED_RETURN_NOTE,
         herdr_note="Install and verify the Codex Herdr integration before dispatch.",
         app_server_note=(
             "Optional openai-codex 0.160.1 extra; only shell-readonly handoffs, pinned to "
@@ -75,6 +87,8 @@ _CAPABILITIES = (
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.CONDITIONAL,
         persistent_app_server=CapabilityState.DISABLED,
+        controller_observed_return=CapabilityState.CONDITIONAL,
+        observed_return_note=_OBSERVED_RETURN_NOTE,
         herdr_minimum_version="2.1.251",
         herdr_note=(
             "Requires Claude Code 2.1.251+, controlled SessionStart and "
@@ -88,6 +102,8 @@ _CAPABILITIES = (
         direct_cli=CapabilityState.SUPPORTED,
         persistent_herdr=CapabilityState.DISABLED,
         persistent_app_server=CapabilityState.DISABLED,
+        controller_observed_return=CapabilityState.CONDITIONAL,
+        observed_return_note=_OBSERVED_RETURN_NOTE,
         herdr_note=(
             "Persistent worker launch fails closed because Agentflow cannot "
             "attest Copilot's resolved model from a protected source."

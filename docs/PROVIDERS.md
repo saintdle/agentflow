@@ -6,11 +6,11 @@ the [local model policy](CONFIGURATION.md#model-policy) is only an Agentflow
 allowlist entry; the provider may still reject that model for a particular
 account. Unknown provider/model/role/effort combinations fail closed.
 
-| Provider | Chat + Agentflow controller | Provider-native agents | Direct provider CLI | Persistent Herdr worker |
-| --- | --- | --- | --- | --- |
-| Codex | Supported from a workspace chat with terminal access | Supported by Codex multi-agent/subagent mode | Supported for manual provider use | Supported through the leased root controller; install and verify the Codex Herdr integration first |
-| Claude Code | Supported from a repository session with terminal access | Supported by Claude Code subagents | Supported for manual provider use | Conditional: Claude Code 2.1.251 or newer, controlled lifecycle hooks, and the primary/fallback model pin described below |
-| GitHub Copilot | Supported from Copilot Chat Agent mode or Copilot CLI with workspace/terminal access | Supported by IDE agent mode and Copilot CLI `/fleet` | Supported for manual provider use | Disabled and fail-closed: Copilot remains usable for chat/controller and native work, but Agentflow cannot verify the resolved model for a persistent Copilot worker |
+| Provider | Chat + Agentflow controller | Provider-native agents | Direct provider CLI | Persistent Herdr worker | Controller-observed native return |
+| --- | --- | --- | --- | --- | --- |
+| Codex | Supported from a workspace chat with terminal access | Supported by Codex multi-agent/subagent mode | Supported for manual provider use | Supported through the leased root controller; install and verify the Codex Herdr integration first | Conditional: controller-validated evidence on an owner-approved distinct task; not managed-result or resolved-model attestation |
+| Claude Code | Supported from a repository session with terminal access | Supported by Claude Code subagents | Supported for manual provider use | Conditional: Claude Code 2.1.251 or newer, controlled lifecycle hooks, and the primary/fallback model pin described below | Conditional: controller-validated evidence on an owner-approved distinct task; not managed-result or resolved-model attestation |
+| GitHub Copilot | Supported from Copilot Chat Agent mode or Copilot CLI with workspace/terminal access | Supported by IDE agent mode and Copilot CLI `/fleet` | Supported for manual provider use | Disabled and fail-closed: Copilot remains usable for chat/controller and native work, but Agentflow cannot verify the resolved model for a persistent Copilot worker | Conditional: controller-validated evidence on an owner-approved distinct task; not managed-result or resolved-model attestation |
 
 “Chat + controller” means a capable coding-agent chat may ask Agentflow to
 inspect and operate one approved workflow root. A separate native agent is
@@ -19,6 +19,11 @@ not an external Agentflow handoff and does not carry the controller's
 authenticated result channel. Persistent external workers are launched only by
 the leased root controller through Herdr. Agentflow does not substitute a
 direct provider command or `tmux` when that lane is unavailable.
+
+The controller-observed native-return lane records exact-session observations
+and accepts a usable result only on a distinct, approved task with a current
+claim. It does not authenticate managed causal results, attest the resolved
+provider model, revive prior work, or grant publication authority.
 
 The provider command contracts are intentionally not one shared flag template:
 
