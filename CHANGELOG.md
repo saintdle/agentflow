@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.12] - 2026-10-31
+
 ### Added
 
 - Measure the exact outbound package in `handoff preflight`: handoff, manifest,
@@ -28,9 +30,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allowance overshoot is computed only from actual usage, never from an
   estimate. See [#67](https://github.com/saintdle/agentflow/issues/67).
 
-- Pass `hosted-runtime` and `architecture-specific` acceptance rows only with
-  `acceptance set --evidence-lane` naming the same lane, and mark rows that
-  need end-to-end proof with `acceptance create --whole-chain`, which pass only
+- Pass `hosted-runtime` and `architecture-specific` acceptance rows only when
+  `acceptance set --evidence-lane` names the same lane. Mark rows that need
+  end-to-end proof with `acceptance create --whole-chain`. Those rows pass only
   with `--evidence-scope whole-chain`. New matrices record
   `evidence_boundary`, so validation, root completion, and native acceptance
   reject a hand-edited cross-lane pass. Older matrices keep validating. The
@@ -40,8 +42,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add `agentflow budget freeze|revise|approach|status`. A root can freeze its
   approved graph size and launch cap at execution approval, so added tasks,
-  retries, and context rotation no longer raise the cap. Reaching the cap blocks
-  dispatch until an approved revision is appended; earlier caps and the
+  retries, and context rotation cannot raise the cap. Reaching the cap blocks
+  dispatch until an approved revision is appended. Earlier caps and the
   consumption at each revision are kept. A named approach stops after two
   recorded failures, including on replacement tasks, until an owner decision is
   recorded. Roots without a frozen baseline are unchanged. See
@@ -52,8 +54,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   owner-approved task. It does not authenticate managed results or grant
   publication authority. See [#59](https://github.com/saintdle/agentflow/issues/59).
 
-- Audit root completion in `controller status`: every task under the root,
-  including CI gates, is read from one complete listing, and open work or
+- Audit root completion in `controller status`. Every task under the root,
+  including CI gates, is read from one complete listing. Open work or
   unaccepted CI results keep the root incomplete. `ci supersede` records that a
   passing CI result on a newer commit replaces a failed gate without rewriting
   the original evidence. `controller rotate` writes a terminal packet with
@@ -426,7 +428,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.10...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/saintdle/agentflow/compare/v0.0.11...v0.0.12
+[0.0.11]: https://github.com/saintdle/agentflow/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/saintdle/agentflow/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/saintdle/agentflow/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/saintdle/agentflow/compare/v0.0.7...v0.0.8
