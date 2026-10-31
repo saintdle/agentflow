@@ -34,6 +34,8 @@ The loop must be:
 
 Run it and capture the command plus concise observed evidence. If no trustworthy loop can be built, stop with the missing environment, artifact, access, or user action needed. Do not replace reproduction with speculation.
 
+Evidence from one lane does not prove another. A settings API response or component receipt is not executable readiness. A fix for a `hosted-runtime` or `architecture-specific` failure passes its acceptance row only with `acceptance set --evidence-lane <lane>` after a run in that environment. A whole-chain row needs `--evidence-scope whole-chain`. While the environment is unavailable, report the row as planned or blocked.
+
 ## Minimize and explain
 
 1. Reduce the input, configuration, callers, and environment while preserving the failure.

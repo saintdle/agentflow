@@ -57,6 +57,8 @@ For substantial, security-sensitive, visual, or environment-dependent work, appe
 
 Give every row one owner and one authoritative validation lane. Use `approved-untested` only with an explicit user-approved exception. After goal approval, persist the table with `agentflow acceptance create`; block the first writable assignment until the matrix validates. Skip the matrix for a small task whose exit conditions and proof are already complete in the compact contract.
 
+A row passes only on evidence from its own lane. A settings API response, a configuration readback, or a component receipt is not executable readiness for a `hosted-runtime` or `architecture-specific` row; pass those rows with `agentflow acceptance set --evidence-lane <lane>` after that environment actually ran. Mark rows that need an end-to-end result with `acceptance create --whole-chain <ID>`; they pass only with `--evidence-scope whole-chain`. When the environment is missing, keep the row planned or record it failed. Never waive it without the user's approval.
+
 ## Approval gate
 
 Ask for one final correction or approval. Do not transition to tickets, planning, or implementation until the user approves. After approval, change `Status` to `approved`. When `bd where --json` succeeds, persist the contract and acceptance rows on a parent bead; otherwise preserve it in the repository's approved planning artifact. Do not store interview transcripts.

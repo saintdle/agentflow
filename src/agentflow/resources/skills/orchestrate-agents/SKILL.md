@@ -167,7 +167,7 @@ state: <branch/worktree or gitless output boundary, last completed check, and re
 
 ## Finish
 
-Map returned evidence to every goal exit condition. For attached matrices, use `agentflow acceptance set` to mark each row `passed`, `failed`, or `waived`, attach actual evidence, and validate the completed matrix. State gaps. If the work uses PR mode, hand ready PRs to `gatekeep-prs`; workers never merge their own PRs.
+Map returned evidence to every goal exit condition. For attached matrices, use `agentflow acceptance set` to mark each row `passed`, `failed`, or `waived`, attach actual evidence, and validate the completed matrix. Pass `hosted-runtime` and `architecture-specific` rows only with `--evidence-lane` from that environment, and whole-chain rows only with `--evidence-scope whole-chain`. State gaps. If the work uses PR mode, hand ready PRs to `gatekeep-prs`; workers never merge their own PRs.
 
 Before a user-facing status, resolve referenced items with `agentflow beads
 explain <id...>`. Write each as `<human title> (<id>)`, state its workflow

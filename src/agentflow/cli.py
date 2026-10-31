@@ -78,6 +78,10 @@ ACCEPTANCE_LANES = (
     "manual-ui",
     "approved-untested",
 )
+# Rows on these lanes pass only on evidence observed in that same lane.
+LIVE_EVIDENCE_LANES = ("architecture-specific", "hosted-runtime")
+ACCEPTANCE_SCOPES = ("component", "whole-chain")
+EVIDENCE_BOUNDARY = "lane-and-scope@1"
 TASK_CLASSES = project_config_backend.TASK_CLASSES
 WORKFLOW_STAGES = (
     "plan",
@@ -10517,6 +10521,34 @@ def _parse_acceptance_row(value: str) -> dict[str, str]:
     }
 
 
+def _evidence_boundary_problems(row: Mapping[str, Any], status: Any, *, enforce_live: bool) -> list[str]:
+    """Check that passing evidence came from the row's lane and scope.
+
+    Matrices created before the evidence boundary keep validating; for them a
+    live-lane row without a recorded evidence lane is not rejected here.
+    """
+    problems: list[str] = []
+    lane = row.get("lane")
+    scope = row.get("scope")
+    evidence_lane = row.get("evidence_lane")
+    evidence_scope = row.get("evidence_scope")
+    if scope is not None and scope not in ACCEPTANCE_SCOPES:
+        problems.append(f"has unsupported scope: {scope}")
+    if evidence_lane is not None and evidence_lane not in ACCEPTANCE_LANES:
+        problems.append(f"has unsupported evidence_lane: {evidence_lane}")
+    if evidence_scope is not None and evidence_scope not in ACCEPTANCE_SCOPES:
+        problems.append(f"has unsupported evidence_scope: {evidence_scope}")
+    if status != "passed":
+        return problems
+    if evidence_lane is not None and evidence_lane != lane:
+        problems.append(f"cannot pass on {evidence_lane} evidence; its authoritative lane is {lane}")
+    elif evidence_lane is None and enforce_live and lane in LIVE_EVIDENCE_LANES:
+        problems.append(f"requires evidence recorded from the {lane} lane to pass")
+    if scope == "whole-chain" and evidence_scope != "whole-chain":
+        problems.append("is whole-chain and cannot pass on component or unscoped evidence")
+    return problems
+
+
 def _validate_acceptance_data(data: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
@@ -10529,6 +10561,9 @@ def _validate_acceptance_data(data: Any) -> list[str]:
     if not isinstance(rows, list) or not rows:
         errors.append("at least one acceptance row is required")
         return errors
+    boundary = data.get("evidence_boundary")
+    if boundary is not None and boundary != EVIDENCE_BOUNDARY:
+        errors.append(f"evidence_boundary must be {EVIDENCE_BOUNDARY}")
     seen: set[str] = set()
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
@@ -10552,6 +10587,10 @@ def _validate_acceptance_data(data: Any) -> list[str]:
         if row.get("lane") not in ACCEPTANCE_LANES:
             errors.append(f"row {row_id or index} has unsupported lane: {row.get('lane')}")
         status = row.get("status")
+        errors.extend(
+            f"row {row_id or index} {problem}"
+            for problem in _evidence_boundary_problems(row, status, enforce_live=boundary is not None)
+        )
         if status not in {"planned", "passed", "failed", "waived"}:
             errors.append(f"row {row_id or index} has unsupported status: {row.get('status')}")
         elif status in {"passed", "failed"} and not row.get("actual_evidence"):
@@ -10623,6 +10662,14 @@ def acceptance_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"Invalid acceptance row: {exc}", file=sys.stderr)
         return 2
+    row_ids = {row["id"] for row in rows}
+    for whole_chain_id in getattr(args, "whole_chain", None) or []:
+        if whole_chain_id not in row_ids:
+            print(f"--whole-chain names an unknown row: {whole_chain_id}", file=sys.stderr)
+            return 2
+        for row in rows:
+            if row["id"] == whole_chain_id:
+                row["scope"] = "whole-chain"
     bead = getattr(args, "bead", "")
     if bead and args.out:
         print("Use either --bead or --out, not both.", file=sys.stderr)
@@ -10642,6 +10689,7 @@ def acceptance_create(args: argparse.Namespace) -> int:
         "version": 1,
         "task_id": args.task,
         "created_at": _now(),
+        "evidence_boundary": EVIDENCE_BOUNDARY,
         "rows": rows,
     }
     errors = _validate_acceptance_data(data)
@@ -10687,9 +10735,40 @@ def acceptance_set(args: argparse.Namespace) -> int:
         print("Waived rows require --note with the approved exception.", file=sys.stderr)
         return 2
     row = matching[0]
+    evidence_lane = str(getattr(args, "evidence_lane", "") or "")
+    evidence_scope = str(getattr(args, "evidence_scope", "") or "")
+    if args.status == "passed":
+        lane = row.get("lane")
+        if evidence_lane and evidence_lane != lane:
+            print(
+                f"Row {args.id} has authoritative lane {lane}; evidence from {evidence_lane} "
+                "cannot pass it. Leave it planned or record failed until that lane runs.",
+                file=sys.stderr,
+            )
+            return 2
+        if lane in LIVE_EVIDENCE_LANES and not evidence_lane:
+            print(
+                f"Row {args.id} uses the {lane} lane; pass it only with "
+                f"--evidence-lane {lane} after that environment ran. Settings, receipts, "
+                "and other lanes do not count; leave it planned while the environment is missing.",
+                file=sys.stderr,
+            )
+            return 2
+        if row.get("scope") == "whole-chain" and evidence_scope != "whole-chain":
+            print(
+                f"Row {args.id} covers the whole chain; pass it only with "
+                "--evidence-scope whole-chain from an end-to-end run. Component evidence does not count.",
+                file=sys.stderr,
+            )
+            return 2
     row["status"] = args.status
     row["actual_evidence"] = args.evidence
     row["note"] = args.note
+    for field, value in (("evidence_lane", evidence_lane), ("evidence_scope", evidence_scope)):
+        if value:
+            row[field] = value
+        else:
+            row.pop(field, None)
     row["updated_at"] = _now()
     try:
         _save_acceptance_target(args.file, _task_cwd(args), data)
@@ -17233,6 +17312,13 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_create_parser.add_argument("--out", default="")
     acceptance_create_parser.add_argument("--bead", default="")
     acceptance_create_parser.add_argument("--cwd", default="")
+    acceptance_create_parser.add_argument(
+        "--whole-chain",
+        action="append",
+        default=[],
+        metavar="ROW_ID",
+        help="Mark a row as whole-chain; it passes only on end-to-end evidence",
+    )
     acceptance_create_parser.set_defaults(func=acceptance_create)
     acceptance_validate_parser = acceptance_sub.add_parser("validate")
     acceptance_validate_parser.add_argument("file")
@@ -17244,6 +17330,18 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance_set_parser.add_argument("--status", choices=("passed", "failed", "waived"), required=True)
     acceptance_set_parser.add_argument("--evidence", default="")
     acceptance_set_parser.add_argument("--note", default="")
+    acceptance_set_parser.add_argument(
+        "--evidence-lane",
+        choices=ACCEPTANCE_LANES,
+        default="",
+        help="Lane the evidence was observed in; required to pass hosted-runtime or architecture-specific rows",
+    )
+    acceptance_set_parser.add_argument(
+        "--evidence-scope",
+        choices=ACCEPTANCE_SCOPES,
+        default="",
+        help="Scope of the evidence; whole-chain rows pass only on whole-chain evidence",
+    )
     acceptance_set_parser.add_argument("--cwd", default="")
     acceptance_set_parser.set_defaults(func=acceptance_set)
 

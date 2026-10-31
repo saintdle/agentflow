@@ -414,6 +414,27 @@ component hashes, sizes, counts, and event metadata; they do not store prompt,
 prime, or memory text. Installed-client acceptance and exact model-input
 delivery remain unvalidated.
 
+## Acceptance evidence lanes
+
+Each acceptance row names one authoritative lane, and the row passes only on
+evidence observed in that lane. A settings API response, a configuration
+readback, or a component receipt is not executable readiness.
+
+- Rows on the `hosted-runtime` or `architecture-specific` lane pass only with
+  `agentflow acceptance set --status passed --evidence-lane <lane>`, and the
+  lane must match the row. Other lanes may record `--evidence-lane`. When they
+  do, it must match too.
+- `agentflow acceptance create --whole-chain <ID>` marks a row that needs an
+  end-to-end result. That row passes only with `--evidence-scope whole-chain`.
+- Failed rows and approved waivers keep their existing rules. While the
+  environment is missing, a row stays planned or is recorded failed. It is
+  never waived without approval.
+
+New matrices record `evidence_boundary: "lane-and-scope@1"`. For them,
+`acceptance validate`, root completion, and native acceptance reject a passed
+live-lane row without a matching recorded lane. Matrices created earlier keep
+validating, but any recorded evidence lane or scope must still match the row.
+
 ## Evidence and privacy
 
 Record commands, revisions, test results, and links that substantiate the goal.
