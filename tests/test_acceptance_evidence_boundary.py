@@ -152,6 +152,39 @@ class AcceptanceEvidenceBoundaryTests(unittest.TestCase):
         self.assertNotIn("evidence_scope", self._row("W1"))
         self.assertTrue(self._valid())
 
+    def test_lane_and_scope_are_recorded_only_on_passed_rows(self) -> None:
+        self._create("--whole-chain", "W1")
+        code, err = self._set(
+            "H1", "failed", "--evidence", "hosted run failed", "--evidence-lane", "hosted-runtime"
+        )
+        self.assertEqual(code, 0, err)
+        code, err = self._set(
+            "W1", "waived", "--note", "approved exception", "--evidence-scope", "whole-chain"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("evidence_lane", self._row("H1"))
+        self.assertNotIn("evidence_scope", self._row("W1"))
+
+    def test_live_whole_chain_row_needs_both_lane_and_scope(self) -> None:
+        self._create("--whole-chain", "H1")
+        code, err = self._set(
+            "H1", "passed", "--evidence", "hosted trace", "--evidence-lane", "hosted-runtime"
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--evidence-scope whole-chain", err)
+        code, err = self._set(
+            "H1", "passed", "--evidence", "hosted trace", "--evidence-scope", "whole-chain"
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--evidence-lane hosted-runtime", err)
+        self.assertEqual(self._row("H1")["status"], "planned")
+        code, err = self._set(
+            "H1", "passed", "--evidence", "hosted end-to-end trace",
+            "--evidence-lane", "hosted-runtime", "--evidence-scope", "whole-chain",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self._valid())
+
     def test_bead_matrix_rejects_cross_lane_pass_without_writing(self) -> None:
         data = {
             "version": 1,
@@ -261,6 +294,14 @@ class AcceptanceEvidenceValidatorTests(unittest.TestCase):
         self.assertFalse(cli._root_acceptance_passed(issue))
         issue["metadata"]["agentflow"]["acceptance"]["rows"][0]["evidence_lane"] = "hosted-runtime"
         self.assertTrue(cli._root_acceptance_passed(issue))
+
+    def test_native_acceptance_binding_rejects_unrecorded_live_pass(self) -> None:
+        matrix = _matrix(_row(), boundary=True)
+        matrix["task_id"] = "TASK"
+        issue = {"id": "TASK", "metadata": {"agentflow": {"acceptance": matrix}}}
+        self.assertEqual(cli._bound_acceptance_ids(issue, "TASK"), ())
+        matrix["rows"][0]["evidence_lane"] = "hosted-runtime"
+        self.assertEqual(cli._bound_acceptance_ids(issue, "TASK"), ("A1",))
 
 
 class AcceptanceEvidenceSkillGuidanceTests(unittest.TestCase):

@@ -10765,7 +10765,7 @@ def acceptance_set(args: argparse.Namespace) -> int:
     row["actual_evidence"] = args.evidence
     row["note"] = args.note
     for field, value in (("evidence_lane", evidence_lane), ("evidence_scope", evidence_scope)):
-        if value:
+        if value and args.status == "passed":
             row[field] = value
         else:
             row.pop(field, None)
