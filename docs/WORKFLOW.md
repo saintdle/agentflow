@@ -118,6 +118,28 @@ children. Luna and Sonnet are the normal coding/exploration routes. Sol and Opus
 remain controller/judgment/review routes. Terra is available only through an
 explicitly selected exact route with a persisted rationale.
 
+At execution approval, freeze the approved graph with `agentflow budget freeze
+--workflow-root <root>`. The frozen baseline records the original launchable
+task count and cap. Graph growth, retries, correction tasks, fallback, and
+context rotation never reset it.
+
+When cumulative launches reach the current cap, dispatch blocks until
+`agentflow budget status` has been reviewed and an approved increase is appended
+with `agentflow budget revise --new-cap <n> --decision-ref <ref> --reason
+<text>`. Each revision keeps the earlier caps and the consumption observed at
+the time.
+
+`budget status` reports cumulative launches, active concurrency, open tasks, the
+remaining serial path, and external waits separately. It gives no delivery ETA.
+Launches are counted from this root's managed launch records; native subagent
+sessions are not counted.
+
+A launch that declares `metadata.agentflow.launch.approach` follows a stop rule.
+After two recorded failures of that approach (`agentflow budget approach
+--outcome failure`), every further launch using it is blocked, including on a
+replacement task, until an owner decision is recorded with `--outcome decision`.
+Roots without a frozen baseline keep the graph-derived budget.
+
 ## Execution lanes
 
 Use native subagents for bounded, fire-and-forget work. Use Herdr for

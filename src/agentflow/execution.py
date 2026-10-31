@@ -139,16 +139,19 @@ def evaluate_launch(
     delegation_depth: int = 0,
     selective_model: bool = False,
     expensive_execution_children: int = 0,
+    launch_cap: int | None = None,
 ) -> AdmissionReport:
     """Return a fail-closed launch admission decision.
 
     The launch budget is derived from the approved graph size instead of an
     arbitrary global child limit.  A retry consumes the same budget as a first
-    launch, making repeated relaunches visible and bounded.
+    launch, making repeated relaunches visible and bounded.  When the root has
+    a frozen launch baseline, ``launch_cap`` is its current cap and graph
+    growth no longer raises the budget.
     """
 
     findings: list[AdmissionFinding] = []
-    budget = policy.root_launch_budget(planned_tasks)
+    budget = policy.root_launch_budget(planned_tasks) if launch_cap is None else launch_cap
     if policy.controller_only and role == "controller":
         findings.append(AdmissionFinding(
             "controller-child-forbidden",
@@ -173,7 +176,14 @@ def evaluate_launch(
             f"task attempt {task_attempt} exceeds limit {policy.max_attempts_per_task}",
             "Record a blocker or change approach instead of relaunching the same task.",
         ))
-    if total_attempts >= budget:
+    if total_attempts >= budget and launch_cap is not None:
+        findings.append(AdmissionFinding(
+            "launch-reforecast-required",
+            f"root has consumed {total_attempts} launches, reaching its current cap {budget}",
+            "Review agentflow budget status and record an approved revision with "
+            "agentflow budget revise before launching again.",
+        ))
+    elif total_attempts >= budget:
         findings.append(AdmissionFinding(
             "root-launch-budget-exhausted",
             f"root has consumed {total_attempts} launches (budget {budget})",

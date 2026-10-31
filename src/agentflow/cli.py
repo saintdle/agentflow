@@ -50,6 +50,7 @@ from agentflow import provider_capabilities as provider_capabilities_backend
 from agentflow import history as history_backend
 from agentflow import installation as installation_backend
 from agentflow import isolation as isolation_backend
+from agentflow import launch_budget as launch_budget_backend
 from agentflow import launch_recovery as launch_recovery_backend
 from agentflow import readiness as readiness_backend
 from agentflow import reconciliation as reconciliation_backend
@@ -1040,6 +1041,7 @@ def _launch_task_metadata(issue: Mapping[str, Any]) -> dict[str, Any]:
         "selective_model": launch.get("selective_model") is True,
         "delegation_depth": int(launch.get("delegation_depth") or 0),
         "fork_context": str(launch.get("fork_context") or ""),
+        "approach": str(launch.get("approach") or ""),
         "sterile": launch.get("sterile") is True or str(launch.get("outbound_context") or "") == "restricted",
         "execution_limits": launch.get(
             "execution_limits", agentflow.get("execution_limits") if isinstance(agentflow, Mapping) else None,
@@ -1497,6 +1499,15 @@ def _dispatch_via_herdr(
             )
             descendants = beads_backend.root_descendants(cwd, workflow_root)
             planned_tasks = sum(bool(_launch_task_metadata(item)) for item in descendants)
+            root_agentflow = _agentflow_metadata(root_issue)
+            try:
+                baseline = launch_budget_backend.parse(
+                    root_agentflow.get(launch_budget_backend.METADATA_KEY)
+                )
+            except launch_budget_backend.LaunchBaselineError as exc:
+                raise _accounting_indeterminate(
+                    f"root launch baseline is malformed: {exc}"
+                ) from exc
             admission = execution_backend.evaluate_launch(
                 policy=launch_policy, model=launch_meta["model"], role=launch_meta["role"],
                 task_attempt=task_attempt, total_attempts=total_attempts,
@@ -1504,12 +1515,18 @@ def _dispatch_via_herdr(
                 delegation_depth=int(launch_meta.get("delegation_depth") or 0),
                 selective_model=bool(launch_meta.get("selective_model")),
                 expensive_execution_children=expensive_children,
+                launch_cap=baseline.current_cap if baseline else None,
             )
-            if not admission.allowed:
+            admission_findings = list(admission.findings)
+            if baseline is not None:
+                admission_findings.extend(launch_budget_backend.admission_findings(
+                    baseline, approach=str(launch_meta.get("approach") or ""),
+                ))
+            if admission_findings:
                 beads_backend.add_comment(
                     cwd, task_id,
                     "agentflow execution admission blocked: "
-                    + "; ".join(finding.message for finding in admission.findings),
+                    + "; ".join(finding.message for finding in admission_findings),
                 )
                 return {"state": "blocked", "session_id": ""}
         except execution_backend.AccountingIndeterminate as exc:
@@ -13121,6 +13138,151 @@ def _agentflow_metadata(issue: dict[str, Any]) -> dict[str, Any]:
     return dict(agentflow) if isinstance(agentflow, dict) else {}
 
 
+def _budget_reject(args: argparse.Namespace, message: str) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": False, "error": message}, sort_keys=True))
+    else:
+        print(f"BUDGET REJECTED: {message}", file=sys.stderr)
+    return 2
+
+
+def _budget_consumption(cwd: Path, workflow_root: str) -> tuple[int, int]:
+    """Count this root's managed launches exactly as dispatch admission does."""
+    state_path = cwd / ".agentflow/herdr/sessions.json"
+    if not state_path.exists() and not (cwd / ".agentflow").is_dir():
+        raise _accounting_indeterminate(
+            f"{cwd} has no Agentflow workspace state, so launches cannot be counted; "
+            "pass --cwd with the workspace root that dispatches this workflow"
+        )
+    try:
+        state = _load_herdr_state(state_path)
+    except (OSError, ValueError) as exc:
+        raise _accounting_indeterminate(
+            f"Herdr session history is corrupt; root launch accounting is unavailable: {exc}"
+        ) from exc
+    records = _workflow_session_records(cwd, cwd, workflow_root, state.get("sessions", {}))
+    total, active, _expensive = execution_backend.summarize_attempts(records)
+    return total, active
+
+
+def _budget_write(
+    cwd: Path, workflow_root: str, issue: dict[str, Any],
+    baseline: launch_budget_backend.LaunchBaseline,
+) -> None:
+    # Beads has no compare-and-swap, so refuse a changed root before writing and
+    # verify the whole Agentflow map afterwards; other root keys must survive.
+    current = beads_backend.get_issue(cwd, workflow_root)
+    if current.get("metadata") != issue.get("metadata"):
+        raise beads_backend.BeadsError(
+            "root metadata changed while the budget command ran; rerun the command"
+        )
+    value = baseline.to_dict()
+    beads_backend.update_agentflow_metadata(
+        cwd, workflow_root, {launch_budget_backend.METADATA_KEY: value}, snapshot=current,
+    )
+    expected = {**_agentflow_metadata(current), launch_budget_backend.METADATA_KEY: value}
+    if _agentflow_metadata(beads_backend.get_issue(cwd, workflow_root)) != expected:
+        raise beads_backend.BeadsError(
+            "root metadata read-back does not match the launch baseline write; "
+            "another writer may have changed the root"
+        )
+
+
+def _budget_emit(args: argparse.Namespace, payload: Mapping[str, Any], text: str) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, **payload}, indent=2, sort_keys=True))
+    else:
+        print(text)
+    return 0
+
+
+def budget_command(args: argparse.Namespace) -> int:
+    """Freeze, revise, or report a root's original launch baseline."""
+    cwd = _task_cwd(args)
+    workflow_root = str(args.workflow_root or "")
+    action = str(args.budget_command)
+    try:
+        issue = beads_backend.get_issue(cwd, workflow_root)
+        agentflow = _agentflow_metadata(issue)
+        baseline = launch_budget_backend.parse(agentflow.get(launch_budget_backend.METADATA_KEY))
+        if action == "freeze":
+            if baseline is not None:
+                return _budget_reject(
+                    args, f"{workflow_root} already has a frozen baseline; use agentflow budget revise"
+                )
+            planned = getattr(args, "planned_tasks", None)
+            if planned is None:
+                descendants = beads_backend.root_descendants(cwd, workflow_root)
+                planned = sum(bool(_launch_task_metadata(item)) for item in descendants)
+                if planned < 1:
+                    return _budget_reject(
+                        args, "no launchable tasks found; pass --planned-tasks with the approved graph size"
+                    )
+            policy = _controller_execution_policy(cwd, cwd, workflow_root, root_issue=issue)
+            baseline = launch_budget_backend.freeze(
+                planned_tasks=planned, multiplier=policy.launch_budget_multiplier, now=_now(),
+            )
+            _budget_write(cwd, workflow_root, issue, baseline)
+            return _budget_emit(args, {"action": "freeze", "baseline": baseline.to_dict()}, (
+                f"BUDGET FROZEN {workflow_root}: {baseline.original_tasks} tasks x "
+                f"{baseline.launch_budget_multiplier} = original cap {baseline.original_launch_budget}"
+            ))
+        if baseline is None and action != "status":
+            return _budget_reject(
+                args, f"{workflow_root} has no frozen baseline; run agentflow budget freeze first"
+            )
+        if action == "revise":
+            consumed, _active = _budget_consumption(cwd, workflow_root)
+            previous = baseline.current_cap
+            baseline = launch_budget_backend.revise(
+                baseline, new_cap=args.new_cap, decision_ref=args.decision_ref,
+                reason=args.reason, consumed=consumed, now=_now(),
+            )
+            _budget_write(cwd, workflow_root, issue, baseline)
+            revision = baseline.revisions[-1]
+            return _budget_emit(args, {"action": "revise", "revision": revision.to_dict()}, (
+                f"BUDGET REVISED {workflow_root}: cap {previous} -> {revision.new_cap} "
+                f"(revision {revision.revision}, consumed {consumed}, original cap "
+                f"{baseline.original_launch_budget} unchanged)"
+            ))
+        if action == "approach":
+            baseline = launch_budget_backend.record_approach(
+                baseline, approach=args.approach, outcome=args.outcome,
+                task=args.task or "", reference=args.decision_ref or "", now=_now(),
+            )
+            _budget_write(cwd, workflow_root, issue, baseline)
+            state = baseline.approach_state(args.approach)
+            return _budget_emit(args, {"action": "approach", "approach": state.to_dict()}, (
+                f"BUDGET APPROACH {workflow_root}: {state.approach!r} "
+                f"{state.failures_since_decision} failure(s) since last decision; "
+                + ("STOPPED pending an owner decision" if state.blocked else "may continue")
+            ))
+        consumed, active = _budget_consumption(cwd, workflow_root)
+        report = launch_budget_backend.reforecast(
+            baseline, root=workflow_root, consumed=consumed, active=active,
+            descendants=beads_backend.root_descendants(cwd, workflow_root),
+        )
+        cap_text = (
+            f"cap {report['current_cap']} (original {report['original_launch_budget']}, "
+            f"{report['original_threshold']} original threshold)"
+            if baseline is not None else "no frozen baseline"
+        )
+        serial = report["remaining_serial_path"]
+        return _budget_emit(args, {"action": "status", "reforecast": report}, (
+            f"BUDGET STATUS {workflow_root}: consumed {consumed} launches; {cap_text}; "
+            f"active {active}; open tasks {report['remaining_open_tasks']}; serial path "
+            f"{serial if serial is not None else 'unavailable'}; external waits "
+            f"{report['external_waits']}\n{report['recommendation']}"
+        ))
+    except launch_budget_backend.LaunchBaselineError as exc:
+        return _budget_reject(args, str(exc))
+    except execution_backend.AccountingIndeterminate as exc:
+        return _budget_reject(args, f"{exc.finding.message} {exc.finding.recommendation}")
+    except (beads_backend.BeadsError, project_config_backend.ConfigError,
+            execution_backend.ExecutionPolicyError) as exc:
+        return _budget_reject(args, str(exc))
+
+
 def review_route_fix(args: argparse.Namespace) -> int:
     task_cwd = _task_cwd(args)
     try:
@@ -16518,6 +16680,46 @@ def build_parser() -> argparse.ArgumentParser:
     native_accept_parser.add_argument("--cwd", default="")
     native_accept_parser.add_argument("--json", action="store_true")
     native_accept_parser.set_defaults(func=native_accept)
+
+    budget_parser = sub.add_parser(
+        "budget", help="Freeze, revise, and report a root's original launch baseline"
+    )
+    budget_sub = budget_parser.add_subparsers(dest="budget_command", required=True)
+    budget_freeze_parser = budget_sub.add_parser(
+        "freeze", help="Freeze the approved graph size and launch cap at execution approval"
+    )
+    budget_freeze_parser.add_argument("--workflow-root", required=True)
+    budget_freeze_parser.add_argument(
+        "--planned-tasks", type=int, default=None,
+        help="approved launchable task count; defaults to the root's current launchable tasks",
+    )
+    budget_revise_parser = budget_sub.add_parser(
+        "revise", help="Append an approved cap increase; the original baseline never changes"
+    )
+    budget_revise_parser.add_argument("--workflow-root", required=True)
+    budget_revise_parser.add_argument("--new-cap", type=int, required=True)
+    budget_revise_parser.add_argument("--decision-ref", required=True)
+    budget_revise_parser.add_argument("--reason", required=True)
+    budget_approach_parser = budget_sub.add_parser(
+        "approach", help="Record a failed attempt or the owner decision for a named approach"
+    )
+    budget_approach_parser.add_argument("--workflow-root", required=True)
+    budget_approach_parser.add_argument("--approach", required=True)
+    budget_approach_parser.add_argument("--outcome", choices=("failure", "decision"), required=True)
+    budget_approach_parser.add_argument("--task", default="", help="failed task; required for failures")
+    budget_approach_parser.add_argument(
+        "--decision-ref", default="", help="owner decision reference; required for decisions"
+    )
+    budget_status_parser = budget_sub.add_parser(
+        "status", help="Report cumulative launches against the original and current caps"
+    )
+    budget_status_parser.add_argument("--workflow-root", required=True)
+    for budget_child in (
+        budget_freeze_parser, budget_revise_parser, budget_approach_parser, budget_status_parser,
+    ):
+        budget_child.add_argument("--cwd", default="")
+        budget_child.add_argument("--json", action="store_true")
+        budget_child.set_defaults(func=budget_command)
 
     usage_parser = sub.add_parser("usage", help="Show authoritative checks and locally saved quota snapshots")
     usage_sub = usage_parser.add_subparsers(dest="usage_command")

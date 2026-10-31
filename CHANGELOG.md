@@ -8,6 +8,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Add `agentflow budget freeze|revise|approach|status`. A root can freeze its
+  approved graph size and launch cap at execution approval, so added tasks,
+  retries, and context rotation no longer raise the cap. Reaching the cap blocks
+  dispatch until an approved revision is appended; earlier caps and the
+  consumption at each revision are kept. A named approach stops after two
+  recorded failures, including on replacement tasks, until an owner decision is
+  recorded. Roots without a frozen baseline are unchanged. See
+  [#65](https://github.com/saintdle/agentflow/issues/65).
+
 - Add a conditional controller-observed native-return lane with visibility
   reporting, claim-bound session observations, and acceptance on a separate
   owner-approved task. It does not authenticate managed results or grant
