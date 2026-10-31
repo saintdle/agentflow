@@ -86,6 +86,20 @@ class BoundExecutionExpiryTests(unittest.TestCase):
             self.assertTrue(result.terminal)
             yield fixture, args, controller, lease, record
 
+    def _continuation_artifact_hashes(self, fixture, args, controller, record) -> dict[str, str]:
+        contract_path = Path(record["return_channel"]["contract_binding"]["contract_path"])
+        paths = (
+            controller.state_path,
+            controller.checkpoint_path,
+            cli._resume_key_path(args),
+            fixture.root / ".agentflow/herdr/sessions.json",
+            contract_path,
+        )
+        return {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in paths
+        }
+
     def test_predeadline_submission_stays_on_normal_ingestion_path(self) -> None:
         with self._launched_budgeted_execution() as (fixture, args, controller, lease, record):
             channel = record["return_channel"]
@@ -644,6 +658,9 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                     ),
                     ready["id"],
                 )
+                protected_before = self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                )
                 with self.assertRaisesRegex(cli.controller_backend.ControllerError, "does not match"):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
@@ -652,12 +669,18 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         expected_retirement_kind="cancelled_preidentity",
                         resolution_authorization=resolution_authorization_out["authorization"],
                     )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                ))
                 checkpoint = controller._load_checkpoint()
                 self.assertEqual(checkpoint["drain_causes"], [])
                 state = json.loads(controller.state_path.read_text(encoding="utf-8"))
                 signed_archive = json.loads(json.dumps(state["drain_audit"][0]))
                 state["drain_audit"][0]["cause_ids"] = ["forged-cause-id"]
                 cli._private_atomic_json(controller.state_path, state)
+                protected_before = self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                )
                 with self.assertRaisesRegex(
                     cli.controller_backend.ControllerError,
                     "current checkpoint drain causes differ from the signed expiry receipt",
@@ -669,6 +692,9 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         expected_retirement_kind="expired_execution",
                         resolution_authorization=resolution_authorization_out["authorization"],
                     )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                ))
                 legacy_archive = {
                     key: value for key, value in signed_archive.items()
                     if key not in {"intent_id", "resolution_authorization", "authority_hmac"}
@@ -682,6 +708,9 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                 state = json.loads(controller.state_path.read_text(encoding="utf-8"))
                 state["drain_audit"] = [legacy_archive]
                 cli._private_atomic_json(controller.state_path, state)
+                protected_before = self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                )
                 with self.assertRaisesRegex(
                     cli.controller_backend.ControllerError,
                     "current checkpoint drain causes differ from the signed expiry receipt",
@@ -693,6 +722,9 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                         expected_retirement_kind="expired_execution",
                         resolution_authorization=resolution_authorization_out["authorization"],
                     )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                ))
 
             with cli._herdr_transaction(fixture.root / ".agentflow/herdr/sessions.json") as state:
                 current = state["sessions"][fixture.task_id]
@@ -946,7 +978,7 @@ class BoundExecutionExpiryTests(unittest.TestCase):
         for case in ("stale-lease", "foreign-root"):
             with self.subTest(case=case), self._expired_draining_execution(
                 "ordinary open checkpoint",
-            ) as (fixture, args, controller, lease, _record):
+            ) as (fixture, args, controller, lease, record):
                 if case == "stale-lease":
                     credentials = cli._read_controller_credentials(cli._resume_key_path(args))
                     replacement = cli.controller_backend.RootController(
@@ -965,11 +997,79 @@ class BoundExecutionExpiryTests(unittest.TestCase):
                     "id": "ready-task", "status": "open", "assignee": "",
                     "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
                 }
+                protected_before = self._continuation_artifact_hashes(
+                fixture, args, controller, record,
+                )
                 with self.assertRaisesRegex(
-                    cli.controller_backend.ControllerError, expected_error,
+                cli.controller_backend.ControllerError, expected_error,
                 ):
                     cli._verify_cancelled_preidentity_continuation(
                         fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
                         controller, lease, authority_secret=args._authority_secret,
                         expected_retirement_kind="expired_execution",
                     )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                ))
+
+    def test_expired_bound_continuation_rejects_claim_target_and_authority_without_writes(self) -> None:
+        no_ready_reason = (
+            "USER_ACTION_REQUIRED: NO_READY_WORK: nonterminal descendant(s) remain with no ready work: "
+            "ready-task (ready-task)"
+        )
+        for case in ("wrong-claim", "wrong-target", "stale-authority"):
+            with self.subTest(case=case), self._expired_draining_execution(
+                no_ready_reason, cause_kind="no_ready_work",
+                cause_provenance="scheduler_no_ready_work",
+            ) as (fixture, args, controller, lease, record):
+                ready = {
+                    "id": "ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                if case == "wrong-claim":
+                    fixture.task_issue["metadata"]["agentflow"]["claim_id"] = "foreign-claim"
+                    requested_ready = ready["id"]
+                    authority_secret = args._authority_secret
+                    expected_error = "exact signed Beads claim"
+                elif case == "wrong-target":
+                    requested_ready = "foreign-ready-task"
+                    authority_secret = args._authority_secret
+                    expected_error = "descendants of this root"
+                else:
+                    requested_ready = ready["id"]
+                    authority_secret = "stale-authority"
+                    expected_error = "authenticated bound execution retirement"
+
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    fixture.task_id: fixture.task_issue,
+                }
+
+                def get_issue(_root, issue_id):
+                    return issues[issue_id]
+
+                def ready_command(_root, *_argv):
+                    rows = [] if "--assignee" in _argv else [{"id": ready["id"]}]
+                    return subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+
+                protected_before = self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                )
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(
+                         cli.beads_backend, "root_descendants",
+                         return_value=[fixture.task_issue, ready],
+                     ), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=ready_command):
+                    with self.assertRaisesRegex(
+                        cli.controller_backend.ControllerError, expected_error,
+                    ):
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id,
+                            requested_ready, controller, lease,
+                            authority_secret=authority_secret,
+                            expected_retirement_kind="expired_execution",
+                        )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, args, controller, record,
+                ))

@@ -2908,6 +2908,22 @@ def _expired_preidentity_fixture(
 
 
 class PreidentityRecoveryCommandTests(unittest.TestCase):
+    def _continuation_artifact_hashes(
+        self, fixture: ValidLaunch, controller, baseline: dict,
+        contract_paths: tuple[Path, ...] = (),
+    ) -> dict[str, str]:
+        paths = (
+            controller.state_path,
+            controller.checkpoint_path,
+            cli._resume_key_path(self._args(fixture)),
+            baseline["state_path"],
+            *contract_paths,
+        )
+        return {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in paths
+        }
+
     def _rewrite_deadline(self, fixture: ValidLaunch, contract: dict, ledger_path: Path, deadline: float) -> None:
         contract["deadline_epoch"] = deadline
         contract["authority_hmac"] = cli._authority_mac(
@@ -3412,6 +3428,7 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                 )
                 prior_contract_path = Path(prior_contract["contract_path"])
                 prior_contract_before = prior_contract_path.read_bytes()
+                current_contract_path = Path(current_contract["contract_path"])
 
                 def verify():
                     return cli._verify_cancelled_preidentity_continuation(
@@ -3486,8 +3503,10 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                             self._rewrite_signed_legacy_sibling(
                                 fixture, baseline, record_updates={"result": {"outcome": "completed"}},
                             )
-                        protected_before = baseline["state_path"].read_bytes()
-                        checkpoint_before_case = controller.checkpoint_path.read_bytes()
+                        protected_before = self._continuation_artifact_hashes(
+                            fixture, controller, baseline,
+                            (prior_contract_path, current_contract_path),
+                        )
                         with mock.patch.object(cli.beads_backend, "get_issue", side_effect=lambda _cwd, key: issues[key]), \
                              mock.patch.object(cli.beads_backend, "root_descendants", return_value=[
                                  fixture.task_issue, prior_issue, ready,
@@ -3495,8 +3514,239 @@ class PreidentityRecoveryCommandTests(unittest.TestCase):
                              mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
                             with self.assertRaises(cli.controller_backend.ControllerError):
                                 verify()
-                        self.assertEqual(baseline["state_path"].read_bytes(), protected_before)
-                        self.assertEqual(controller.checkpoint_path.read_bytes(), checkpoint_before_case)
+                        self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                            fixture, controller, baseline,
+                            (prior_contract_path, current_contract_path),
+                        ))
+
+    def test_legacy_continuation_replays_the_staged_target_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                retired, _ = self._run_recovery(fixture, self._args(fixture), legacy_scope=True)
+                self.assertTrue(retired["ok"], retired)
+                ready = {
+                    "id": "ready-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                issues = {fixture.workflow_root: fixture.root_issue, fixture.task_id: fixture.task_issue,
+                          ready["id"]: ready}
+
+                def get_issue(_root, issue_id):
+                    return issues[issue_id]
+
+                def run_beads(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": ready["id"]}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+
+                args = self._args(fixture)
+                lease = controller._current_lease()
+                authorization_out: dict[str, Any] = {}
+                with mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", return_value=[
+                         fixture.task_issue, ready,
+                     ]), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_beads):
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                            controller, lease, authority_secret=fixture.authority_secret,
+                            resolution_authorization_out=authorization_out,
+                        ),
+                        ready["id"],
+                    )
+                    candidate = controller.reattach_for_explicit_continuation(
+                        workflow_root=fixture.workflow_root,
+                        cancelled_task=fixture.task_id, ready_task=ready["id"],
+                        checkpoint_epoch=lease.epoch, authority_secret=fixture.authority_secret,
+                        resume_proof=cli._read_controller_credentials(
+                            cli._resume_key_path(args),
+                        )["resume_secret"],
+                        drain_resolution_authorization=authorization_out["authorization"],
+                        readiness_verifier=lambda _current: ready["id"],
+                        persist_credentials=lambda _candidate: None,
+                    )
+                    controller.acknowledge_cancelled_preidentity_halt(
+                        fixture.workflow_root, fixture.task_id, ready["id"],
+                        authority_secret=fixture.authority_secret,
+                        resolution_authorization=authorization_out["authorization"],
+                        lease=candidate,
+                        readiness_verifier=lambda _current: ready["id"],
+                    )
+                    protected_before = self._continuation_artifact_hashes(
+                        fixture, controller, baseline,
+                        (Path(fixture.contract["contract_path"]),),
+                    )
+                    self.assertEqual(
+                        cli._verify_cancelled_preidentity_continuation(
+                            fixture.root, fixture.workflow_root, fixture.task_id, ready["id"],
+                            controller, candidate, authority_secret=fixture.authority_secret,
+                            allow_staged_selection=True,
+                            resolution_authorization=authorization_out["authorization"],
+                        ),
+                        ready["id"],
+                    )
+                self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                    fixture, controller, baseline,
+                    (Path(fixture.contract["contract_path"]),),
+                ))
+
+    def test_public_cli_preserves_first_retired_descendant_across_successive_continuations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            with mock.patch.dict(os.environ, {"AGENTFLOW_STATE_HOME": str(base / "state-home")}):
+                fixture, controller, _contract, _ledger, baseline = self._legacy_fixture(base)
+                retired, _ = self._run_recovery(fixture, self._args(fixture), legacy_scope=True)
+                self.assertTrue(retired["ok"], retired)
+                first_issue = fixture.task_issue
+                second_ready = {
+                    "id": "second-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                third_ready = {
+                    "id": "third-task", "status": "open", "assignee": "",
+                    "parent": fixture.workflow_root, "metadata": {"agentflow": {}},
+                }
+                issues = {
+                    fixture.workflow_root: fixture.root_issue,
+                    first_issue["id"]: first_issue,
+                    second_ready["id"]: second_ready,
+                    third_ready["id"]: third_ready,
+                }
+                descendants = [first_issue, second_ready]
+                ready_task = second_ready["id"]
+                descendant_snapshots: list[tuple[str, ...]] = []
+
+                def get_issue(_root, issue_id):
+                    return issues[issue_id]
+
+                def root_descendants(_root, _workflow_root):
+                    descendant_snapshots.append(tuple(str(row["id"]) for row in descendants))
+                    return descendants
+
+                def run_beads(_cwd, *argv):
+                    rows = [] if "--assignee" in argv else [{"id": ready_task}]
+                    return subprocess.CompletedProcess(["bd", *argv], 0, json.dumps(rows), "")
+
+                def one_step(args, _controller, root, _lease, *, operation):
+                    return ({
+                        "operation": operation,
+                        "ok": True,
+                        "root": str(root),
+                        "task": str(getattr(args, "_continuation_task", "")),
+                    }, True)
+
+                def invoke(
+                    cancelled_task: str, next_task: str, *, expect_success: bool = True,
+                ) -> dict:
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        status = cli.main([
+                            "controller", "resume",
+                            "--root", str(fixture.root),
+                            "--controller", fixture.controller,
+                            "--workflow-root", fixture.workflow_root,
+                            "--continue-after-cancelled-preidentity", cancelled_task,
+                            "--continue-task", next_task,
+                            "--once", "--json",
+                        ])
+                    self.assertEqual(status, 0 if expect_success else 2, output.getvalue())
+                    result = json.loads(output.getvalue())
+                    self.assertEqual(result["ok"], expect_success, result)
+                    if expect_success:
+                        self.assertEqual(result["task"], next_task)
+                    return result
+
+                with mock.patch.object(
+                    cli, "_controller_supervisor_lock_path",
+                    return_value=fixture.root / ".agentflow/test-controller-locks/continuation.lock",
+                ), mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                     mock.patch.object(cli.beads_backend, "root_descendants", side_effect=root_descendants), \
+                     mock.patch.object(cli.beads_backend, "run", side_effect=run_beads), \
+                     mock.patch.object(cli, "_bind_current_controller_sessions"), \
+                     mock.patch.object(cli, "_controller_step", side_effect=one_step):
+                    first_contract = json.loads(
+                        baseline["state_path"].read_text(encoding="utf-8")
+                    )["sessions"][first_issue["id"]]["return_channel"]["contract_binding"]
+                    first_contract_path = Path(first_contract["contract_path"])
+                    first_contract_before = hashlib.sha256(first_contract_path.read_bytes()).hexdigest()
+                    invoke(first_issue["id"], second_ready["id"])
+
+                    current_lease = controller._current_lease()
+                    second_issue = self._install_signed_legacy_retirement(
+                        fixture, baseline,
+                        task_id=second_ready["id"],
+                        claim_id="claim-second",
+                        claim_token="opaque-second-claim-token-0123456789abcdef",
+                        lease_epoch=current_lease.epoch,
+                        owner_abandoned_epoch=False,
+                    )
+                    issues[second_issue["id"]] = second_issue
+                    descendants = [first_issue, second_issue, third_ready]
+                    ready_task = third_ready["id"]
+                    second_contract = cli._herdr_session_record(
+                        fixture.root, second_issue["id"],
+                    )["return_channel"]["contract_binding"]
+                    second_contract_path = Path(second_contract["contract_path"])
+                    second_marker = (
+                        f"cancelled superseded_legacy_scope preidentity launch "
+                        f"{second_contract['launch_id']} for {second_issue['id']}"
+                    )
+                    checkpoint = controller._load_checkpoint()
+                    checkpoint["last_check"] = second_marker
+                    cli.checkpoint_backend.write_checkpoint(controller.checkpoint_path, checkpoint)
+                    first_record = cli._herdr_session_record(fixture.root, first_issue["id"])
+                    controller.halt(
+                        "blocked", second_marker,
+                        drain_cause_kind="managed_task_failure",
+                        drain_cause_provenance="signed_negative_retirement",
+                        drain_cause_task=first_issue["id"],
+                        drain_cause_launch=str(first_record["launch_id"]),
+                        lease=current_lease,
+                    )
+                    with mock.patch.object(
+                        cli, "_authenticated_causal_preidentity_retirement",
+                        wraps=cli._authenticated_causal_preidentity_retirement,
+                    ) as authenticate_first:
+                        invoke(second_issue["id"], third_ready["id"])
+                    self.assertNotIn(
+                        "continuation_reattach",
+                        json.loads(controller.state_path.read_text(encoding="utf-8")),
+                    )
+                    self.assertEqual(
+                        controller._load_checkpoint()["pending_continuation_task"],
+                        third_ready["id"],
+                    )
+                    protected_before = self._continuation_artifact_hashes(
+                        fixture, controller, baseline,
+                        (first_contract_path, second_contract_path),
+                    )
+                    denied_replay = invoke(
+                        second_issue["id"], third_ready["id"], expect_success=False,
+                    )
+                    self.assertIn(
+                        "checkpoint is not the exact safely retired preidentity halt",
+                        denied_replay["error"],
+                    )
+                    self.assertEqual(protected_before, self._continuation_artifact_hashes(
+                        fixture, controller, baseline,
+                        (first_contract_path, second_contract_path),
+                    ))
+
+                self.assertIn((first_issue["id"], second_issue["id"], third_ready["id"]), descendant_snapshots)
+                self.assertTrue(any(
+                    call.args[2] == first_issue["id"]
+                    for call in authenticate_first.call_args_list
+                ))
+                self.assertEqual(
+                    hashlib.sha256(first_contract_path.read_bytes()).hexdigest(),
+                    first_contract_before,
+                )
+                self.assertTrue(cli._authenticated_cancelled_preidentity(
+                    fixture.root, fixture.workflow_root, first_issue["id"],
+                    authority_secret=fixture.authority_secret,
+                ))
 
     def _run_owner_epoch_repair(self, fixture: ValidLaunch, args: argparse.Namespace,
                                 *, pane_response: str | None = None,
