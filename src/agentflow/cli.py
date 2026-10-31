@@ -13225,7 +13225,7 @@ def _ci_pr_url(value: str) -> tuple[str, int]:
     return _ci_repository(match[1]), int(match[2])
 
 
-def _ci_github_json(arguments: list[str], *, cwd: Path | None = None) -> Any:
+def _ci_github_value(arguments: list[str], *, cwd: Path | None = None) -> Any:
     gh = shutil.which("gh")
     if not gh:
         raise ValueError("GitHub CLI is unavailable")
@@ -13248,7 +13248,21 @@ def _ci_github_json(arguments: list[str], *, cwd: Path | None = None) -> Any:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ValueError("GitHub query returned invalid JSON") from exc
-    if not isinstance(value, dict) or value.get("errors"):
+    if isinstance(value, dict) and value.get("errors"):
+        raise ValueError("GitHub query returned incomplete or unexpected JSON")
+    return value
+
+
+def _ci_github_json(arguments: list[str], *, cwd: Path | None = None) -> Any:
+    value = _ci_github_value(arguments, cwd=cwd)
+    if not isinstance(value, dict):
+        raise ValueError("GitHub query returned incomplete or unexpected JSON")
+    return value
+
+
+def _ci_github_pages(arguments: list[str], *, cwd: Path | None = None) -> list[Any]:
+    value = _ci_github_value(arguments, cwd=cwd)
+    if not isinstance(value, list):
         raise ValueError("GitHub query returned incomplete or unexpected JSON")
     return value
 
@@ -13432,6 +13446,219 @@ def _ci_unavailable(
             if key not in {"last_valid_observation", "triage_receipts"}
         }
     return _ci_finish(record, 2, error)
+
+
+def _github_commit_workflow_runs(
+    *, repo: str, head: str, cwd: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    parts = repo.split("/")
+    owner, name = parts[-2:]
+    command = [
+        "api", "--paginate", "--slurp", "--method", "GET",
+        f"repos/{owner}/{name}/actions/runs",
+        "-f", f"head_sha={head}", "-F", "per_page=100",
+    ]
+    if len(parts) == 3:
+        command.extend(["--hostname", parts[0]])
+    pages = _ci_github_pages(command, cwd=cwd)
+    if not pages:
+        raise ValueError("GitHub query returned no pagination pages")
+
+    total_count: int | None = None
+    runs: list[dict[str, Any]] = []
+    seen_run_ids: set[int] = set()
+    for page in pages:
+        if not isinstance(page, dict):
+            raise ValueError("GitHub query returned a malformed pagination page")
+        page_total = page.get("total_count")
+        page_runs = page.get("workflow_runs")
+        if (
+            type(page_total) is not int or page_total < 0
+            or not isinstance(page_runs, list)
+            or (total_count is not None and total_count != page_total)
+        ):
+            raise ValueError("GitHub query returned incomplete or inconsistent pages")
+        total_count = page_total
+        for run in page_runs:
+            if not isinstance(run, dict):
+                raise ValueError("GitHub query returned a malformed workflow run")
+            run_id = run.get("id")
+            workflow_id = run.get("workflow_id")
+            head_sha = run.get("head_sha")
+            status = run.get("status")
+            conclusion = run.get("conclusion")
+            if (
+                type(run_id) is not int or run_id < 1
+                or type(workflow_id) is not int or workflow_id < 1
+                or not isinstance(head_sha, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)
+                or not isinstance(status, str)
+                or status not in {
+                    "queued", "in_progress", "waiting", "requested", "pending",
+                    "completed",
+                }
+                or (
+                    status == "completed"
+                    and (not isinstance(conclusion, str) or not conclusion)
+                )
+                or (status != "completed" and conclusion is not None)
+            ):
+                raise ValueError("GitHub query returned a malformed workflow run")
+            if run_id in seen_run_ids:
+                raise ValueError("GitHub pagination returned a duplicate run ID")
+            seen_run_ids.add(run_id)
+            runs.append({
+                "run_id": run_id,
+                "workflow_id": workflow_id,
+                "name": run.get("name") if isinstance(run.get("name"), str) else "",
+                "head_sha": head_sha.lower(),
+                "status": status,
+                "conclusion": conclusion,
+                "url": run.get("html_url") if isinstance(run.get("html_url"), str) else "",
+            })
+    if total_count is None or len(runs) != total_count:
+        raise ValueError("GitHub query returned truncated workflow-run evidence")
+    return sorted(runs, key=lambda run: run["run_id"]), total_count
+
+
+def _ci_commit_observation(
+    *, repo: str, head: str, expected_workflow_ids: list[int],
+    runs: list[dict[str, Any]], total_count: int,
+) -> dict[str, Any]:
+    workflows: list[dict[str, Any]] = []
+    for workflow_id in expected_workflow_ids:
+        matching = [run for run in runs if run["workflow_id"] == workflow_id]
+        if not matching:
+            status = "missing"
+        elif len(matching) > 1:
+            status = "duplicate"
+        else:
+            run_status = matching[0]["status"]
+            conclusion = matching[0]["conclusion"]
+            if any(run["head_sha"] != head for run in matching):
+                status = "drift"
+            elif run_status in {
+                "queued", "in_progress", "waiting", "requested", "pending",
+            }:
+                status = "pending"
+            elif run_status == "completed" and isinstance(conclusion, str):
+                status = "passed" if conclusion == "success" else "failed"
+            else:
+                status = "unavailable"
+        workflows.append({
+            "workflow_id": workflow_id,
+            "status": status,
+            "runs": matching,
+        })
+
+    statuses = {workflow["status"] for workflow in workflows}
+    if any(run["head_sha"] != head for run in runs):
+        statuses.add("drift")
+    overall = next(
+        (status for status in (
+            "drift", "unavailable", "duplicate", "failed", "missing", "pending",
+        ) if status in statuses),
+        "passed",
+    )
+    return {
+        "status": overall,
+        "observed_result": overall,
+        "disposition": "observed",
+        "obligation": "record_result",
+        "rerun_authorized": False,
+        "repo": repo,
+        "head": head,
+        "expected_workflow_ids": expected_workflow_ids,
+        "total_count": total_count,
+        "observed_run_count": len(runs),
+        "runs": runs,
+        "workflows": workflows,
+        "observed_at": _now(),
+    }
+
+
+def _ci_commit_finish(record: dict[str, Any], code: int, error: str = "") -> int:
+    result = record.get("disposition")
+    label = "DEADLINE" if result == "deadline" else record["status"].upper()
+    print(f"CI COMMIT {label} result={record['status'].upper()} {record['repo']}@{record['head']}")
+    print("CI_COMMIT_STATE " + json.dumps(record, sort_keys=True))
+    if error:
+        print(error, file=sys.stderr)
+    return code
+
+
+def ci_watch_commit(args: argparse.Namespace) -> int:
+    if args.interval_seconds < 5 or args.interval_seconds > 300:
+        print("--interval-seconds must be between 5 and 300.", file=sys.stderr)
+        return 2
+    if args.timeout_seconds < 0:
+        print("--timeout-seconds cannot be negative.", file=sys.stderr)
+        return 2
+    try:
+        repo = _ci_repository(args.repo)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    head = args.sha.lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        print("--sha must be a full 40-character commit SHA.", file=sys.stderr)
+        return 2
+    workflow_ids = args.workflow_ids
+    if (
+        not workflow_ids
+        or any(type(workflow_id) is not int or workflow_id < 1 for workflow_id in workflow_ids)
+        or len(set(workflow_ids)) != len(workflow_ids)
+    ):
+        print("--workflow-id values must be unique positive integers.", file=sys.stderr)
+        return 2
+    workflow_ids = sorted(workflow_ids)
+    parts = repo.split("/")
+    if len(parts) not in (2, 3):
+        print("--repo must be [HOST/]OWNER/REPO.", file=sys.stderr)
+        return 2
+
+    cwd = _task_cwd(args)
+    deadline = time.monotonic() + args.timeout_seconds
+    while True:
+        try:
+            runs, total_count = _github_commit_workflow_runs(
+                repo=repo, head=head, cwd=cwd,
+            )
+            record = _ci_commit_observation(
+                repo=repo, head=head, expected_workflow_ids=workflow_ids,
+                runs=runs, total_count=total_count,
+            )
+        except ValueError as exc:
+            record = {
+                "status": "unavailable",
+                "observed_result": "unavailable",
+                "disposition": "observed",
+                "obligation": "record_result",
+                "rerun_authorized": False,
+                "repo": repo,
+                "head": head,
+                "expected_workflow_ids": workflow_ids,
+                "error": str(exc),
+                "observed_at": _now(),
+            }
+            return _ci_commit_finish(record, 2, str(exc))
+
+        if record["status"] in {
+            "passed", "failed", "drift", "duplicate", "unavailable",
+        }:
+            return _ci_commit_finish(
+                record, 0 if record["status"] == "passed" else
+                1 if record["status"] == "failed" else 2,
+            )
+        if args.once:
+            return _ci_commit_finish(record, 2)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            record["last_status"] = record["status"]
+            record["disposition"] = "deadline"
+            return _ci_commit_finish(record, 2)
+        time.sleep(min(args.interval_seconds, remaining))
 
 
 def _ci_receipt_matches(issue: dict[str, Any], record: dict[str, Any]) -> bool:
@@ -16221,6 +16448,20 @@ def build_parser() -> argparse.ArgumentParser:
     ci_watch_parser.add_argument("--timeout-seconds", type=int, default=3600)
     ci_watch_parser.add_argument("--cwd", default="")
     ci_watch_parser.set_defaults(func=ci_watch)
+    ci_commit_parser = ci_sub.add_parser(
+        "watch-commit",
+        help="Observe expected workflow runs for one exact commit without rerunning them",
+    )
+    ci_commit_parser.add_argument("--repo", required=True)
+    ci_commit_parser.add_argument("--sha", required=True)
+    ci_commit_parser.add_argument(
+        "--workflow-id", dest="workflow_ids", type=int, action="append", required=True,
+    )
+    ci_commit_parser.add_argument("--once", action="store_true")
+    ci_commit_parser.add_argument("--interval-seconds", type=int, default=30)
+    ci_commit_parser.add_argument("--timeout-seconds", type=int, default=3600)
+    ci_commit_parser.add_argument("--cwd", default="")
+    ci_commit_parser.set_defaults(func=ci_watch_commit)
     ci_supersede_parser = ci_sub.add_parser(
         "supersede",
         help="Record that a passing CI result on a newer commit supersedes a failed CI gate",
