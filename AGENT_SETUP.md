@@ -17,8 +17,16 @@ indexes are unrelated projects and must not be installed.
    by the Agentflow controller, but not for planning-only or native-subagent
    workflows. Report other optional tools separately.
 2. Inspect the latest reviewed GitHub release and its changelog. Install an
-   explicit Agentflow tag into an isolated `uv tool`, `pipx`, or virtual
-   environment. Never install an unqualified similarly named package.
+   explicit Agentflow tag into an isolated environment. Prefer `uv tool` with
+   `--managed-python --python 3.11` so routine Homebrew or system Python
+   upgrades do not remove the interpreter backing the tool. With `pipx` or a
+   manually managed virtual environment, select and retain a stable Python
+   interpreter. Never install an unqualified similarly named package. If
+   repairing a launcher that fails before Python starts, verify the exact
+   command and release, preserve the old versioned environment, stage and test
+   the managed-Python replacement, and use `--force` only to replace that
+   confirmed broken Agentflow launcher. Never delete or relink the old
+   runtime until verification passes.
 3. Run `agentflow --version` and `agentflow doctor` without displaying
    credentials, environment variables, provider configuration, or transcript
    content.

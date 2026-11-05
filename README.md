@@ -137,7 +137,8 @@ For manual installation, continue below.
 The cleanest installation uses an isolated Python tool environment:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+uv tool install --managed-python --python 3.11 \
+  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 # or
 pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 ```

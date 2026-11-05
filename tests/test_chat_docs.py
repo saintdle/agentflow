@@ -77,7 +77,12 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertNotIn("Until the repository is public", readme)
         self.assertNotIn("while it remains private", installation)
         for required in (
-            "uv tool install --reinstall",
+            "uv tool install --managed-python --python 3.11 --reinstall",
+            "--managed-python",
+            "--python 3.11",
+            "Repair a broken Python runtime",
+            "before-python-repair",
+            "ln -sfn",
             "pipx install --force",
             "@v0.0.12",
             "Herdr is required",
