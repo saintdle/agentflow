@@ -40,7 +40,8 @@ reports missing optional integrations without reading their credential stores.
 Install a tagged release with `uv`:
 
 ```sh
-uv tool install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+uv tool install --managed-python --python 3.11 \
+  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 ```
 
 Or with `pipx`:
@@ -48,6 +49,11 @@ Or with `pipx`:
 ```sh
 pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 ```
+
+For `pipx`, select a Python installation that will remain available for the
+life of the environment. Both `uv tool` and `pipx` create isolated package
+environments, but isolation alone does not make an environment independent of
+the Python interpreter it was created from.
 
 For a local checkout:
 
@@ -128,7 +134,8 @@ tag; replace it with the exact reviewed release you intend to install. Plain
 not specify a new tag; use the install command with the selected tag to advance.
 
 ```sh
-uv tool install --reinstall "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+uv tool install --managed-python --python 3.11 --reinstall \
+  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 # or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.12"
 agentflow --version
 agentflow install --dry-run
@@ -183,6 +190,43 @@ uv tool uninstall saintdle-agentflow
 Project configuration, Beads state, and Agentflow runtime data are not deleted
 automatically. Remove them only after reviewing the exact project-local paths
 and retaining any evidence you need.
+
+## Repair a broken Python runtime
+
+If `agentflow` exits with a macOS `dyld` or missing-framework error before it
+prints its version, Python cannot start and `agentflow doctor` cannot run.
+This usually means the isolated environment still references a base Python
+installation that was upgraded or removed; it is not repaired by changing
+project configuration or Beads state.
+
+First confirm which command will be replaced and choose an explicit reviewed
+release tag. Keep the old versioned environment in place until the replacement
+passes verification. For a known broken Agentflow launcher, reinstall it with
+a uv-managed Python:
+
+```sh
+launcher="$(command -v agentflow)"
+test -L "$launcher" || { echo "Agentflow launcher is not a symlink; stop and inspect it." >&2; exit 2; }
+backup="${launcher}.before-python-repair"
+test ! -e "$backup" && test ! -L "$backup" || { echo "Backup path already exists; stop and inspect it." >&2; exit 2; }
+ln -s "$(readlink "$launcher")" "$backup"
+uv tool install --force --managed-python --python 3.11 \
+  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+agentflow --version
+agentflow doctor
+```
+
+`--force` is appropriate here only after verifying that the conflicting
+`agentflow` command is the broken installation being replaced. Do not remove
+the old environment or create symlinks into a missing Homebrew framework;
+retain the old version directory for rollback until the new command and
+workflow health checks pass. If the command belongs to another installation
+or its ownership is unclear, stop rather than overwrite it. If verification
+fails, restore the saved launcher with:
+
+```sh
+ln -sfn "$(readlink "$backup")" "$launcher"
+```
 
 ## Build from source
 
