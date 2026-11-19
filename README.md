@@ -20,7 +20,7 @@ unrelated projects.
 > permissions, diffs, and backups as though untrusted automation may fail.
 
 > [!IMPORTANT]
-> Agentflow `0.0.12` is a public preview. Its commands, configuration schema,
+> Agentflow `0.0.13` is a public preview. Its commands, configuration schema,
 > and compatibility guarantees may change before `1.0`.
 
 ## What it provides
@@ -138,9 +138,9 @@ The cleanest installation uses an isolated Python tool environment:
 
 ```sh
 uv tool install --managed-python --python 3.11 \
-  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+  "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 # or
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 ```
 
 The source repository is public, so direct GitHub installs do not require an
@@ -148,7 +148,7 @@ authenticated checkout. If your network blocks GitHub, install from a downloaded
 release wheel:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.12-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.13-py3-none-any.whl
 ```
 
 Verify the installation and prerequisites without exposing credentials:
@@ -282,12 +282,12 @@ locations, and team-safe setup patterns.
 | Platform | Core CLI | Hardened isolation |
 | --- | --- | --- |
 | macOS | Supported | Available through `sandbox-exec`; probes fail closed |
-| Linux | Supported | Not available in `0.0.12`; requests fail closed |
-| Windows | Not supported in `0.0.12` | Not available |
+| Linux | Supported | Not available in `0.0.13`; requests fail closed |
+| Windows | Not supported in `0.0.13` | Not available |
 
 Core coordination can run on macOS and Linux. Hardened isolation is a distinct,
 macOS-only security control; ordinary execution on Linux is not equivalent
-confinement. In `0.0.12`, `agentflow isolation launch` provides synchronous
+confinement. In `0.0.13`, `agentflow isolation launch` provides synchronous
 hardened execution. Direct handoff and persistent Herdr/controller launches
 reject hardened profiles rather than treating a successful probe as confinement.
 
@@ -310,7 +310,7 @@ reject hardened profiles rather than treating a successful probe as confinement.
 
 ## Project status and releases
 
-`0.0.12` is intended for development/testing and feedback. Pull requests run validation
+`0.0.13` is intended for development/testing and feedback. Pull requests run validation
 and package-build checks. Merges to `main` build the CLI distribution artifacts;
 tagged releases are the versioned distribution boundary. See
 [the changelog](CHANGELOG.md) and [release process](CONTRIBUTING.md#releases).
