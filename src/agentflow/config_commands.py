@@ -13,6 +13,7 @@ from agentflow import installation as installation_backend
 from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import project_config as project_config_backend
 from agentflow import resources as packaged_resources
+from agentflow import model_policy
 
 
 Handler = Callable[[argparse.Namespace], int]
@@ -157,6 +158,76 @@ def _read_hook_target(path: Path) -> tuple[dict[str, Any], bytes | None]:
     return value, raw
 
 
+def modelrouter_migrate(args: argparse.Namespace) -> int:
+    root = Path(args.root).expanduser().resolve()
+    try:
+        shared, local = project_config_backend.load_layers(root)
+        if not args.local and ({"model_policy", "modelrouter"} & set(local)):
+            raise project_config_backend.ConfigError(
+                "local model routing shadows shared configuration; use --local to migrate "
+                "that override, or remove the override before migrating shared configuration"
+            )
+        path = (
+            project_config_backend.local_config_path(root) if args.local
+            else project_config_backend.config_path(root)
+        )
+        original = path.read_bytes()
+        data = json.loads(original)
+        errors = project_config_backend.validate(data, root, local=args.local)
+        if errors:
+            raise project_config_backend.ConfigError("; ".join(errors))
+        router = model_policy.default_router()
+        legacy_path = data.get("model_policy")
+        implicit_editor = bool(
+            legacy_path and "prose" not in project_config_backend.merge(shared, local)
+        )
+        if legacy_path:
+            policy_path = Path(legacy_path).expanduser()
+            policy_path = policy_path if policy_path.is_absolute() else root / policy_path
+            if policy_path.is_symlink():
+                raise project_config_backend.ConfigError("legacy policy must not be a symlink")
+            policy = model_policy.load_policy(policy_path)
+            for route in policy.routes:
+                for effort in route.efforts:
+                    router["routes"].append({
+                        "provider": route.provider, "model": route.model, "effort": effort,
+                        "when": "Previously approved for " + ", ".join(route.roles),
+                    })
+            data.pop("model_policy")
+        if implicit_editor:
+            data["prose"] = {"editor": None}
+        if "modelrouter" not in data:
+            data["modelrouter"] = router
+        model_policy.parse_router(data["modelrouter"])
+        payload = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
+        changed = json.loads(original) != data
+        backup = None
+        if changed and args.apply:
+            backup = project_config_backend.write_private_file(
+                path, payload, expected_original=original,
+                state_home=memory_runtime_backend.state_home(),
+            )
+        value = {
+            "status": "updated" if changed and args.apply else "would-update" if changed else "unchanged",
+            "target": str(path), "backup": str(backup) if backup else None,
+            "diff": _render_diff(path, original, payload) if changed else "",
+            "notice": (
+                "Legacy model restrictions become advisory preferences. Exact route selection, "
+                "provider capability checks, budgets and authenticated results remain required. "
+                "Legacy policy files and custom profiles are preserved."
+                + (
+                    " The implicit legacy prose editor is disabled; configure prose.editor explicitly."
+                    if implicit_editor else ""
+                )
+            ),
+        }
+    except (OSError, ValueError, project_config_backend.ConfigError) as exc:
+        print(f"config modelrouter migrate: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0
+
+
 def _previous_hook_ownership(
     provider: str, target: Path, installation: Any
 ) -> dict[str, list[dict[str, Any]]] | None:
@@ -288,6 +359,14 @@ def register_parser(
     show_parser = config_sub.add_parser("show", help="Validate and print the active configuration")
     show_parser.add_argument("path", nargs="?", default=".")
     show_parser.set_defaults(func=config_show_handler)
+
+    router_parser = config_sub.add_parser("modelrouter", help="Configure controller-selected model routing")
+    router_sub = router_parser.add_subparsers(dest="modelrouter_command", required=True)
+    migrate_parser = router_sub.add_parser("migrate", help="Preview explicit migration from a legacy model policy")
+    migrate_parser.add_argument("--root", default=".")
+    migrate_parser.add_argument("--local", action="store_true")
+    migrate_parser.add_argument("--apply", action="store_true", help="Apply the previewed migration with a private backup")
+    migrate_parser.set_defaults(func=modelrouter_migrate)
 
     memory_config_parser = config_sub.add_parser("memory", help="Enable or disable governed memory")
     memory_config_sub = memory_config_parser.add_subparsers(dest="config_memory_command", required=True)

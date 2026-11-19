@@ -292,7 +292,7 @@ class StructuredLimitTests(unittest.TestCase):
             fixture_herdr_run = fixture.herdr_run(capture=capture)
 
             def herdr_run(argv, **kwargs):
-                if argv and Path(str(argv[0])).name == "herdr" and "start" in argv:
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["workspace", "create"]:
                     starts["count"] += 1
                     result = fixture_herdr_run(argv, **kwargs)
                     if starts["count"] == 1:

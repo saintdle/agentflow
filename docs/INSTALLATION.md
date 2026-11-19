@@ -35,6 +35,15 @@ GitHub CLI and `tmux` are optional; `tmux` is for manually managed terminal
 sessions, not a controller-managed persistent worker transport. Agentflow
 reports missing optional integrations without reading their credential stores.
 
+For the managed Herdr lane, use Herdr 0.9.5 (protocol 22) or an interface-compatible
+newer version. `agentflow doctor` and dispatch inspect actual CLI help and API
+schema rather than assuming a command works from a version string. The tested
+provider CLI baseline is Codex 0.170.0, Claude Code 2.1.327 and Copilot CLI 1.0.114.
+Use the updater belonging to your installation (`codex update`, `claude update`,
+or `copilot update stable` for native installations), then rerun `agentflow doctor`.
+Do not upgrade a shared Beads store without its maintenance procedure; test a
+new Beads executable against a disposable store first.
+
 ## Install an isolated CLI
 
 Install a tagged release with `uv`:

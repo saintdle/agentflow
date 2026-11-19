@@ -2,8 +2,8 @@
 
 These capabilities describe Agentflow's integration surface, not provider
 account access, subscription entitlements, or current model availability.
-Exact external model routes remain governed by :mod:`agentflow.model_policy`
-and are checked again by the controller before dispatch.
+Exact external model selections are checked by the active controller-selected
+router or explicitly retained legacy policy before dispatch.
 """
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ _CAPABILITIES = (
         observed_return_note=_OBSERVED_RETURN_NOTE,
         herdr_note="Install and verify the Codex Herdr integration before dispatch.",
         app_server_note=(
-            "Optional openai-codex 0.160.1 extra; only shell-readonly handoffs, pinned to "
+            "Optional openai-codex 0.170.0 extra; only shell-readonly handoffs, pinned to "
             "read-only sandbox and never approval with network and native subdelegation off. "
             "Thread/model evidence is cooperative local protocol provenance, not attestation. "
             "Herdr remains the default; sterile/restricted launches are unsupported."

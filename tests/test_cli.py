@@ -34,15 +34,21 @@ from tests import _state_home  # noqa: F401  # external controller authority
 _native_generation_patch = mock.patch.object(cli.beads_backend, "claim_generation", return_value="a" * 64)
 _native_heartbeat_patch = mock.patch.object(cli.beads_backend, "heartbeat_issue")
 _supported_beads_patch = mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1")
+_provider_compat_patch = mock.patch.object(cli.cli_compat_backend, "probe_provider", return_value={"compatible": True})
+_herdr_compat_patch = mock.patch.object(cli.cli_compat_backend, "probe_herdr", return_value={"compatible": True, "protocol": 22})
 
 
 def setUpModule():
     _native_generation_patch.start()
     _native_heartbeat_patch.start()
     _supported_beads_patch.start()
+    _provider_compat_patch.start()
+    _herdr_compat_patch.start()
 
 
 def tearDownModule():
+    _herdr_compat_patch.stop()
+    _provider_compat_patch.stop()
     _supported_beads_patch.stop()
     _native_heartbeat_patch.stop()
     _native_generation_patch.stop()
@@ -103,15 +109,58 @@ def _signed_resolution_authorization(
     return payload
 
 
-# A real Herdr 0.7.4 agent_started response body (pane + provider session id).
+# Current Herdr 0.9.5 success_response schema: AgentInfo plus agent_started argv.
 def _agent_started_stdout(provider: str, *, session_id: str = "sess-1", pane_id: str = "pane-1",
                           agent_session: object = "__default__") -> str:
-    agent: dict = {"pane_id": pane_id, "agent": provider}
+    agent: dict = {
+        "pane_id": pane_id, "agent": provider, "agent_status": "idle",
+        "workspace_id": "w1", "tab_id": "w1:t1", "terminal_id": "w1:x1",
+        "focused": False, "revision": 1, "interactive_ready": True,
+        "launch_pending": False,
+    }
     if agent_session == "__default__":
         agent["agent_session"] = {"source": "herdr", "agent": provider, "kind": "id", "value": session_id}
     else:
         agent["agent_session"] = agent_session
-    return json.dumps({"id": "cli:agent:start", "result": {"type": "agent_started", "agent": agent}})
+    return json.dumps({
+        "id": "cli:agent:start",
+        "result": {"type": "agent_started", "agent": agent, "argv": [provider]},
+    })
+
+
+def _agent_info_stdout(provider: str, *, session_id: str = "sess-1", pane_id: str = "pane-1",
+                       agent_session: object = "__default__") -> str:
+    started = json.loads(_agent_started_stdout(
+        provider, session_id=session_id, pane_id=pane_id, agent_session=agent_session,
+    ))
+    agent = started["result"]["agent"]
+    return json.dumps({
+        "id": "cli:agent:get", "result": {"type": "agent_info", "agent": agent},
+    })
+
+
+def _workspace_created_stdout(pane_id: str = "pane-1") -> str:
+    pane = {
+        "pane_id": pane_id, "terminal_id": "w1:x1", "workspace_id": "w1",
+        "tab_id": "w1:t1", "focused": False, "agent_status": "idle", "revision": 1,
+    }
+    tab = {
+        "tab_id": "w1:t1", "workspace_id": "w1", "number": 1,
+        "label": "agentflow-test", "focused": False, "pane_count": 1,
+        "agent_status": "idle",
+    }
+    workspace = {
+        "workspace_id": "w1", "number": 1, "label": "agentflow-test",
+        "focused": False, "pane_count": 1, "tab_count": 1,
+        "active_tab_id": "w1:t1", "agent_status": "idle",
+    }
+    return json.dumps({
+        "id": "cli:workspace:create",
+        "result": {
+            "type": "workspace_created", "workspace": workspace, "tab": tab,
+            "root_pane": pane,
+        },
+    })
 
 
 class ValidLaunch:
@@ -242,6 +291,8 @@ class ValidLaunch:
              mock.patch.object(cli.beads_backend, "require_supported_version", return_value="bd version 1.3.1"), \
              mock.patch.object(cli.beads_backend, "root_descendants", return_value=[self.task_issue]), \
              mock.patch.object(cli.beads_backend, "verify_task_ancestry_and_ownership", return_value=None), \
+             mock.patch.object(cli.cli_compat_backend, "probe_provider", return_value={"compatible": True}), \
+             mock.patch.object(cli.cli_compat_backend, "probe_herdr", return_value={"compatible": True, "protocol": 22}), \
              mock.patch.object(cli.beads_backend, "update_agentflow_metadata"):
             yield
 
@@ -288,24 +339,35 @@ class ValidLaunch:
             return "/usr/bin/" + self.provider
         return None
 
-    def herdr_run(self, *, stdout: str | None = None, returncode: int = 0, stderr: str = "",
-                  capture: dict | None = None, on_spawn=None,
+    def herdr_run(self, *, stdout: str | None = None, agent_info_stdout: str | None = None,
+                  returncode: int = 0, stderr: str = "", capture: dict | None = None, on_spawn=None,
                   claude_version: str = "2.1.281 (Claude Code)\n"):
-        """A subprocess.run side_effect that intercepts ONLY the herdr spawn.
+        """A subprocess.run side_effect that mocks Herdr workspace and agent calls.
 
         Real git subprocesses (used by the handoff pipeline and preflight) pass
-        through untouched; the `herdr agent start ...` invocation returns a
-        canned agent_started body so no real Herdr binary is required. This is
-        the exact argv production passes to Herdr, so `capture` records it.
+        through untouched; no real Herdr pane or provider is launched. The
+        exact argv for workspace creation, pane execution, and identity lookup is captured.
         """
         real_run = subprocess.run
         body = stdout if stdout is not None else _agent_started_stdout(self.provider)
+        try:
+            fixture_pane_id = str(json.loads(body)["result"]["agent"]["pane_id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            fixture_pane_id = "pane-1"
+        workspace_argv_seen: list[str] = []
 
         def _run(argv, **kwargs):
             if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["status", "server"]:
                 return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
             if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
                 return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
+            if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["workspace", "create"]:
+                workspace_argv_seen[:] = list(argv)
+                if capture is not None:
+                    capture["workspace_argv"] = list(argv)
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=_workspace_created_stdout(fixture_pane_id), stderr="",
+                )
             if (
                 argv
                 and Path(str(argv[0])).name == "claude"
@@ -314,19 +376,44 @@ class ValidLaunch:
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=claude_version, stderr=""
                 )
-            if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
+            if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["pane", "run"]:
+                decoded = shlex.split(argv[4])
+                if decoded[0] == "/bin/sh":
+                    decoded = shlex.split(Path(decoded[1]).read_text().splitlines()[1].removeprefix("exec "))
+                provider_tail = decoded[1:]
+                while provider_tail and "=" in provider_tail[0]:
+                    provider_tail = provider_tail[1:]
                 if capture is not None:
-                    capture["argv"] = list(argv)
+                    capture["pane_run_argv"] = list(argv)
+                    capture["argv"] = [*argv[:4], "--", *provider_tail]
                 # A real provider hook emits native lifecycle metadata before
                 # Agentflow accepts its result. Mirror that process boundary
                 # instead of bypassing the production model-fidelity gate.
+                if on_spawn is not None:
+                    # The environment is now attached to the created
+                    # workspace; expose it with the command vector to tests
+                    # that simulate the provider inheriting that environment.
+                    on_spawn([
+                        *workspace_argv_seen, "--target-pane", str(argv[3]),
+                        "--", *provider_tail,
+                    ])
+                return subprocess.CompletedProcess(
+                    argv, returncode, stdout="command accepted\n", stderr=stderr,
+                )
+            if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["agent", "get"]:
+                if capture is not None:
+                    capture["agent_get_argv"] = list(argv)
                 try:
-                    payload = json.loads(body)
-                    session_id = str(
-                        payload["result"]["agent"]["agent_session"]["value"]
-                    )
+                    agent = json.loads(body)["result"]["agent"]
+                    session_info = agent.get("agent_session")
+                    session_id = str(session_info.get("value") or "") if isinstance(session_info, dict) else ""
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    agent = {}
                     session_id = ""
+                output = agent_info_stdout or json.dumps({
+                    "id": "cli:agent:get",
+                    "result": {"type": "agent_info", "agent": agent},
+                })
                 if session_id:
                     cli.events_backend.record_event_safely(
                         cli.events_backend.EventSpool(cli._state_dir() / "events.jsonl"),
@@ -336,15 +423,146 @@ class ValidLaunch:
                             event_id=f"fixture-model-{self.root}-{session_id}",
                         ),
                     )
-                if on_spawn is not None:
-                    on_spawn(list(argv))
-                return subprocess.CompletedProcess(argv, returncode, stdout=body, stderr=stderr)
+                return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
             return real_run(argv, **kwargs)
 
         return _run
 
 
 class AgentflowTests(unittest.TestCase):
+    def test_signed_before_spawn_rejection_can_authorize_only_distinct_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            fixture.task_issue["status"] = "in_progress"
+            backend = fixture.herdr_run()
+            def reject(argv, **kwargs):
+                if list(argv[1:3]) == ["workspace", "create"]:
+                    return subprocess.CompletedProcess(argv, 2, stdout="", stderr="unknown option: --cwd\n")
+                return backend(argv, **kwargs)
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=reject), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+            state_path = fixture.root / ".agentflow/herdr/sessions.json"
+            record = json.loads(state_path.read_text())["sessions"][fixture.task_id]
+            self.assertEqual(record["status"], "rejected_launch")
+            self.assertTrue(cli._authenticated_rejected_launch(
+                fixture.root, fixture.workflow_root, fixture.task_id,
+                authority_secret=fixture.authority_secret,
+            ))
+            controller, _ = cli._controller_instance(
+                _controller_args(fixture.root, workflow_root=fixture.workflow_root),
+            )
+            controller.begin_draining(
+                "provider launch rejected", failed_task=fixture.task_id,
+                cause_kind="managed_task_failure", cause_provenance="signed_negative_retirement",
+                cause_task=fixture.task_id, cause_launch=record["launch_id"], lease=fixture.lease,
+                last_check=f"rejected prelaunch {record['launch_id']} for {fixture.task_id}",
+            )
+            controller.finalize_draining("provider launch rejected", lease=fixture.lease)
+            ready = json.loads(json.dumps(fixture.task_issue))
+            ready.update(id="task-2", status="open", assignee="")
+            ready["metadata"]["agentflow"]["task"] = "task-2"
+            ready["metadata"]["agentflow"]["acceptance"]["task_id"] = "task-2"
+            ready["metadata"]["agentflow"]["claim_token"] = "opaque-distinct-task-claim-token-9999999999"
+            def get_issue(cwd, issue_id):
+                return ready if issue_id == "task-2" else fixture.get_issue(cwd, issue_id)
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                 mock.patch.object(cli.beads_backend, "run", return_value=subprocess.CompletedProcess(
+                     [], 0, stdout=json.dumps([ready]), stderr="",
+                 )):
+                proof = {}
+                self.assertEqual(cli._verify_cancelled_preidentity_continuation(
+                    fixture.root, fixture.workflow_root, fixture.task_id, "task-2",
+                    controller, fixture.lease, authority_secret=fixture.authority_secret,
+                    expected_retirement_kind="rejected_launch", resolution_authorization_out=proof,
+                ), "task-2")
+                self.assertIn("authority_hmac", proof["authorization"])
+                with self.assertRaises(cli.controller_backend.ControllerError):
+                    cli._verify_cancelled_preidentity_continuation(
+                        fixture.root, fixture.workflow_root, fixture.task_id, fixture.task_id,
+                        controller, fixture.lease, authority_secret=fixture.authority_secret,
+                        expected_retirement_kind="rejected_launch",
+                    )
+            cli._private_atomic_json(
+                cli._native_claim_generation_path(fixture.root, fixture.workflow_root, "task-2"),
+                cli._claim_generation_binding(ready["metadata"]["agentflow"], "a" * 64),
+            )
+            args = _controller_args(
+                fixture.root, workflow_root=fixture.workflow_root,
+                continue_after_rejected_launch=fixture.task_id, continue_task="task-2",
+            )
+            def claim_exact(*_args, **_kwargs):
+                ready.update(status="in_progress", assignee=fixture.controller)
+                metadata = ready["metadata"]["agentflow"]
+                return cli.beads_backend.ExactClaim(cli.beads_backend.ClaimIdentity(
+                    fixture.workflow_root, "task-2", fixture.controller,
+                    metadata["claim_id"], metadata["claim_token"],
+                ), ready)
+            def ready_rows(_cwd, *argv):
+                rows = [] if "--assignee" in argv else [ready]
+                return subprocess.CompletedProcess([], 0, stdout=json.dumps(rows), stderr="")
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli.beads_backend, "get_issue", side_effect=get_issue), \
+                 mock.patch.object(cli.beads_backend, "root_descendants", return_value=[fixture.task_issue, ready]), \
+                 mock.patch.object(cli.beads_backend, "run", side_effect=ready_rows), \
+                 mock.patch.object(cli.beads_backend, "claim_issue_exact", side_effect=claim_exact), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run()):
+                payload = _run_controller_json(cli.controller_resume, args)
+            self.assertTrue(payload["ok"], payload)
+            self.assertEqual(payload["result"]["task"], "task-2", payload)
+            self.assertEqual(payload["result"]["state"], "running", payload)
+            self.assertEqual(
+                json.loads(state_path.read_text())["sessions"][fixture.task_id], record,
+                "continuation must not rewrite the rejected launch",
+            )
+            state = json.loads(state_path.read_text())
+            state["sessions"][fixture.task_id]["error"]["exit_code"] = 0
+            cli._private_atomic_json(state_path, state)
+            self.assertFalse(cli._authenticated_rejected_launch(
+                fixture.root, fixture.workflow_root, fixture.task_id,
+                authority_secret=fixture.authority_secret,
+            ))
+
+    def test_nonzero_pane_submission_is_ambiguous_and_keeps_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            capture = {}
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(
+                     capture=capture, returncode=1, stderr="connection lost API_TOKEN=private",
+                 )), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                capture.clear()
+                self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+            self.assertNotIn("pane_run_argv", capture)
+            record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text())["sessions"][fixture.task_id]
+            self.assertEqual(record["launch_outcome"], "ambiguous")
+            self.assertEqual(record["launch_observation"]["pane_id"], "pane-1")
+            self.assertIn("connection lost", record["error"]["diagnostic"]["stderr"])
+            self.assertNotIn("private", record["error"]["diagnostic"]["stderr"])
+
+    def test_incompatible_cli_consumes_no_attempt_and_creates_no_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = ValidLaunch(Path(temp).resolve())
+            capture: dict = {}
+            with fixture.beads_patches(), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                 mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)), \
+                 mock.patch.object(cli.cli_compat_backend, "probe_herdr",
+                                   side_effect=cli.cli_compat_backend.CliCompatibilityError("incompatible CLI")), \
+                 mock.patch.object(cli, "_reserve_execution_attempt") as reserve, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+            reserve.assert_not_called()
+            self.assertNotIn("workspace_argv", capture)
+            self.assertFalse((fixture.root / ".agentflow/herdr/sessions.json").exists())
+
     def test_removed_legacy_cutover_command_keeps_policy_migration(self) -> None:
         parser = cli.build_parser()
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -363,31 +581,48 @@ class AgentflowTests(unittest.TestCase):
             )
 
     def test_valid_typed_launch_reaches_herdr_with_supported_argv(self) -> None:
-        """Fix #1/#2: a fully valid authenticated launch reaches the Herdr
-        spawn (no NameError crash at the return-channel mint) and passes the
-        exact supported `herdr agent start <agent-name> ... -- <provider>`
-        argv -- never the unsupported `herdr --session <name> ...` selector."""
+        """A valid launch uses current workspace, pane, and agent-get syntax."""
         with tempfile.TemporaryDirectory() as temp:
-            fixture = ValidLaunch(Path(temp).resolve())
+            fixture = ValidLaunch((Path(temp) / "root with space ; literal $()" ).resolve())
             capture: dict = {}
             with fixture.beads_patches(), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
                 self.assertEqual(cli.herdr_launch(fixture.launch_args()), 0)
+            self.assertIn("workspace_argv", capture)
+            pane_argv = capture["workspace_argv"]
+            self.assertEqual(pane_argv[:3], ["/usr/bin/herdr", "workspace", "create"])
+            self.assertEqual(pane_argv[pane_argv.index("--cwd") + 1], str(fixture.root))
+            self.assertIn("--no-focus", pane_argv)
             argv = capture["argv"]
-            # Supported API: `herdr agent start <agent-name> ...`. No --session.
-            self.assertEqual(argv[:4], ["/usr/bin/herdr", "agent", "start", "task-1"])
-            self.assertNotIn("--session", argv)
-            self.assertIn("--", argv)
+            pane_run_argv = capture["pane_run_argv"]
+            self.assertEqual(pane_run_argv[:4], [
+                "/usr/bin/herdr", "pane", "run", "pane-1",
+            ])
             provider_tail = argv[argv.index("--") + 1:]
+            self.assertEqual(len(pane_run_argv), 5)
+            launcher = shlex.split(pane_run_argv[4])
+            self.assertEqual(launcher[0], "/bin/sh")
+            self.assertEqual(Path(launcher[1]).stat().st_mode & 0o777, 0o600)
+            self.assertEqual(shlex.split(Path(launcher[1]).read_text().splitlines()[1].removeprefix("exec ")), [
+                "env", *(pane_argv[index + 1] for index, value in enumerate(pane_argv[:-1]) if value == "--env"),
+                *provider_tail,
+            ])
+            self.assertTrue(any("root with space ; literal $()" in item for item in provider_tail))
+            agent_name = cli._herdr_agent_name(fixture.task_id, fixture.task_id)
+            env = {
+                pane_argv[index + 1].partition("=")[0]: pane_argv[index + 1].partition("=")[2]
+                for index, item in enumerate(pane_argv[:-1]) if item == "--env"
+            }
+            self.assertEqual(env["AGENTFLOW_HERDR_AGENT_NAME"], agent_name)
+            self.assertEqual(capture["agent_get_argv"], ["/usr/bin/herdr", "agent", "get", "pane-1"])
+            self.assertNotIn("--kind", pane_run_argv)
             self.assertEqual(provider_tail[:1], ["/usr/bin/claude"])
             self.assertEqual(
                 provider_tail[provider_tail.index("--fallback-model") + 1],
                 fixture.model,
             )
             self.assertEqual(provider_tail.count("--fallback-model"), 1)
-            self.assertIn("--cwd", argv)
-            self.assertIn("--no-focus", argv)
             # The durable Agentflow session name lives in Agentflow state,
             # not in Herdr's argv.
             state = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))
@@ -404,6 +639,14 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(contract["model"], fixture.model)
             self.assertEqual(contract["effort"], fixture.effort)
 
+    def test_herdr_agent_names_are_valid_stable_and_collision_resistant(self) -> None:
+        task_id = "osv-open-shift-research-root.5"
+        name = cli._herdr_agent_name(task_id, task_id)
+        self.assertRegex(name, r"^[a-z][a-z0-9_-]{0,31}$")
+        self.assertLessEqual(len(name), 32)
+        self.assertEqual(name, cli._herdr_agent_name(task_id, task_id))
+        self.assertNotEqual(name, cli._herdr_agent_name("osv-open-shift-research-root.6", "osv-open-shift-research-root.6"))
+
     def test_herdr_provider_receives_controller_state_home_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -418,7 +661,7 @@ class AgentflowTests(unittest.TestCase):
                      mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
                     self.assertEqual(cli.herdr_launch(fixture.launch_args()), 0)
 
-                argv = capture["argv"]
+                argv = capture["workspace_argv"]
                 herdr_env: dict[str, str] = {}
                 for index, argument in enumerate(argv[:-1]):
                     if argument == "--env":
@@ -776,15 +1019,13 @@ class AgentflowTests(unittest.TestCase):
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.subprocess, "run", side_effect=fixture.herdr_run(capture=capture)):
                 self.assertEqual(cli.herdr_launch(args), 0)
-            argv = capture["argv"]
+            argv = capture["workspace_argv"]
             self.assertEqual(argv[argv.index("--cwd") + 1], str(stage))
             state = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text())
             self.assertEqual(state["sessions"][fixture.task_id]["execution_root"], str(stage))
 
-    def test_failed_spawn_is_private_and_retryable_with_actual_identity(self) -> None:
-        """A failing Herdr spawn must persist a private, retryable failure (no
-        provider stdout/stderr leaked into state), and a retry over the failed
-        reservation must succeed with a real bound identity."""
+    def test_failed_spawn_preserves_scrubbed_diagnostic_and_is_retryable(self) -> None:
+        """A failed start keeps useful bounded diagnostics without secrets."""
         with tempfile.TemporaryDirectory() as temp:
             fixture = ValidLaunch(Path(temp).resolve())
             state_file = fixture.root / ".agentflow/herdr/sessions.json"
@@ -796,16 +1037,29 @@ class AgentflowTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
                 if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
                     return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["workspace", "create"]:
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        return subprocess.CompletedProcess(
+                            argv, 9,
+                            stdout=("start failed: unknown argument --cwd; API_SECRET=STDOUTTOKEN "
+                                    + "x" * (cli.HERDR_DIAGNOSTIC_LIMIT + 200)),
+                            stderr=(
+                                "Herdr rejected --cwd; API_TOKEN=TOKENVALUE; "
+                                "\"api_key\": \"JSONVALUE\"; 'password': 'QUOTEDVALUE'"
+                            ),
+                        )
+                    return subprocess.CompletedProcess(argv, 0, stdout=_workspace_created_stdout(), stderr="")
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(
                         argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
                     )
-                if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
-                    calls["n"] += 1
-                    if calls["n"] == 1:
-                        return subprocess.CompletedProcess(
-                            argv, 9, stdout="secret output SECRETVALUE", stderr="private token TOKENVALUE")
-                    return subprocess.CompletedProcess(argv, 0, stdout=_agent_started_stdout(fixture.provider), stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["pane", "run"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout="command accepted\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["agent", "get"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=_agent_info_stdout(fixture.provider), stderr="",
+                    )
                 return real_run(argv, **kwargs)
 
             with fixture.beads_patches(), \
@@ -815,8 +1069,17 @@ class AgentflowTests(unittest.TestCase):
                 first = json.loads(state_file.read_text(encoding="utf-8"))
                 self.assertEqual(first["sessions"]["task-1"]["status"], "failed")
                 raw = state_file.read_text(encoding="utf-8")
-                self.assertNotIn("SECRETVALUE", raw)
                 self.assertNotIn("TOKENVALUE", raw)
+                self.assertNotIn("STDOUTTOKEN", raw)
+                self.assertNotIn("JSONVALUE", raw)
+                self.assertNotIn("QUOTEDVALUE", raw)
+                diagnostic = first["sessions"]["task-1"]["error"]["diagnostic"]
+                self.assertIn("unknown argument --cwd", diagnostic["stdout"])
+                self.assertIn("API_SECRET=<redacted>", diagnostic["stdout"])
+                self.assertTrue(diagnostic["stdout"].endswith("...[truncated]"))
+                self.assertLessEqual(len(diagnostic["stdout"]), cli.HERDR_DIAGNOSTIC_LIMIT)
+                self.assertIn("<redacted>", diagnostic["stderr"])
+                self.assertLessEqual(len(diagnostic["stderr"]), cli.HERDR_DIAGNOSTIC_LIMIT)
                 # Model a version-skewed history that retained both numbered
                 # launches but omitted the optional top-level attempt field.
                 # The next reservation must use the normalized highwater.
@@ -937,14 +1200,20 @@ class AgentflowTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
                 if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
                     return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["workspace", "create"]:
+                    return subprocess.CompletedProcess(argv, 0, stdout=_workspace_created_stdout(), stderr="")
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(
                         argv, 0, stdout="2.1.281 (Claude Code)\n", stderr=""
                     )
-                if argv and Path(str(argv[0])).name == "herdr" and "agent" in argv and "start" in argv:
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["pane", "run"]:
                     entered.set()
                     release.wait(timeout=5)
-                    return subprocess.CompletedProcess(argv, 0, stdout=_agent_started_stdout(fixture.provider), stderr="")
+                    return subprocess.CompletedProcess(argv, 0, stdout="command accepted\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["agent", "get"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=_agent_info_stdout(fixture.provider), stderr="",
+                    )
                 return real_run(argv, **kwargs)
 
             takeover_done = threading.Event()
@@ -988,7 +1257,8 @@ class AgentflowTests(unittest.TestCase):
                 self.assertEqual(record["status"], "launched")
                 self.assertIsNotNone(record["binding"])
             else:
-                self.assertEqual(record["status"], "failed")
+                self.assertEqual(record["status"], "launching")
+                self.assertEqual(record["launch_outcome"], "ambiguous")
                 self.assertIsNone(record["binding"])
 
     def test_launch_persists_identity_pending_for_nullable_agent_session(self) -> None:
@@ -1018,6 +1288,71 @@ class AgentflowTests(unittest.TestCase):
             for call in run.call_args_list:
                 argv = call.args[0] if call.args else []
                 self.assertNotEqual(Path(str(argv[0])).name if argv else "", "herdr")
+
+    def test_accepted_pane_identity_mismatch_is_ambiguous_and_never_retryable(self) -> None:
+        mismatched_responses = {
+            "wrong-pane": _agent_info_stdout(
+                "claude", session_id="foreign-pane-session", pane_id="different-pane",
+            ),
+            "wrong-provider": _agent_info_stdout(
+                "codex", session_id="foreign-provider-session", pane_id="pane-1",
+            ),
+            "wrong-session-provider": _agent_info_stdout(
+                "claude", pane_id="pane-1",
+                agent_session={
+                    "source": "herdr", "agent": "codex", "kind": "id",
+                    "value": "foreign-session",
+                },
+            ),
+        }
+        for case, agent_info in mismatched_responses.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve())
+                payloads: list[dict] = []
+                patches = [
+                    fixture.beads_patches(),
+                    mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command),
+                    mock.patch.object(
+                        cli.subprocess, "run",
+                        side_effect=fixture.herdr_run(agent_info_stdout=agent_info),
+                    ),
+                    mock.patch.object(
+                        cli, "_json_or_status",
+                        side_effect=lambda value, **_kwargs: payloads.append(value),
+                    ),
+                ]
+                if case == "wrong-pane":
+                    patches.extend([
+                        mock.patch.object(cli, "HERDR_AGENT_OBSERVE_TIMEOUT", 0.003),
+                        mock.patch.object(cli, "HERDR_AGENT_POLL_INTERVAL", 0.001),
+                    ])
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                payload = payloads[-1]
+                self.assertEqual(payload["status"], "ambiguous")
+                self.assertFalse(payload["retryable"])
+                expected_code = "herdr_start_ambiguous" if case == "wrong-pane" else "herdr_identity_ambiguous"
+                self.assertEqual(payload["error"]["code"], expected_code)
+                record = json.loads(
+                    (fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8")
+                )["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "launching")
+                self.assertEqual(record["launch_outcome"], "ambiguous")
+                self.assertIsNone(record["binding"])
+                self.assertEqual(record["return_channel"]["state"], "issued")
+                self.assertEqual(record["attempts"][-1]["status"], "ambiguous")
+
+                second_capture: dict = {}
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(
+                         cli.subprocess, "run",
+                         side_effect=fixture.herdr_run(capture=second_capture),
+                     ):
+                    self.assertEqual(cli.herdr_launch(fixture.launch_args()), 2)
+                self.assertNotIn("pane_run_argv", second_capture)
 
     def test_resolve_pending_identity_polls_real_agent_get_schema(self) -> None:
         """AFREL-025: resolution re-queries `herdr agent get` (the real
@@ -1062,6 +1397,40 @@ class AgentflowTests(unittest.TestCase):
             self.assertEqual(record["binding"]["session_id"], "now-resolved-session")
             self.assertEqual(record["binding"]["pane_id"], "pane-real")
             self.assertEqual(cli.execution_backend.summarize_attempts([record])[0], 1)
+
+    def test_resolve_pending_identity_rejects_wrong_pane_or_provider_without_binding(self) -> None:
+        mismatched_sessions = {
+            "wrong-pane": _agent_info_stdout("claude", pane_id="different-pane"),
+            "wrong-provider": _agent_info_stdout("codex", pane_id="pane-real"),
+            "wrong-session-provider": _agent_info_stdout(
+                "claude", pane_id="pane-real",
+                agent_session={
+                    "source": "herdr", "agent": "codex", "kind": "id",
+                    "value": "foreign-session",
+                },
+            ),
+        }
+        for case, output in mismatched_sessions.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                state_path = root / ".agentflow/herdr/sessions.json"
+                cli._private_atomic_json(state_path, {
+                    "schema": "agentflow.herdr", "version": 1,
+                    "sessions": {"task-1": {
+                        "root": str(root), "task_id": "task-1", "claim_id": "claim-1",
+                        "lease_id": "lease-1", "provider": "claude", "launch_id": "launch-1",
+                        "status": "identity_pending", "pane_id": "pane-real",
+                        "result": None, "binding": None, "attempt": 1, "attempts": [],
+                    }},
+                })
+                probe = mock.Mock(returncode=0, stdout=output, stderr="")
+                with mock.patch.object(cli, "_provider_command", return_value="/usr/bin/herdr"), \
+                     mock.patch.object(cli.subprocess, "run", return_value=probe):
+                    changed = cli._resolve_pending_identity(root, "task-1")
+                self.assertFalse(changed)
+                record = json.loads(state_path.read_text(encoding="utf-8"))["sessions"]["task-1"]
+                self.assertEqual(record["status"], "identity_pending")
+                self.assertIsNone(record["binding"])
 
     def test_resolve_pending_identity_stays_pending_when_still_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -6987,6 +7356,44 @@ class ControllerRunTests(unittest.TestCase):
             self.assertGreater(calls["n"], 1)
             self.assertGreater(heartbeat.call_count, 0)
 
+    def test_controller_rejection_keeps_the_signed_cause_in_both_schedulers(self) -> None:
+        for workers in (1, 2):
+            with self.subTest(workers=workers), tempfile.TemporaryDirectory() as temp:
+                fixture = ValidLaunch(Path(temp).resolve(), seed_lease=False)
+                fixture.root_issue["metadata"]["agentflow"]["execution"] = (
+                    cli.execution_backend.ExecutionPolicy(max_parallel_workers=workers).to_dict()
+                )
+                args = _controller_args(fixture.root, workflow_root=fixture.workflow_root)
+                backend = fixture.herdr_run()
+                def reject(argv, **kwargs):
+                    if list(argv[1:3]) == ["workspace", "create"]:
+                        return subprocess.CompletedProcess(argv, 2, stdout="", stderr="unknown option: --cwd\n")
+                    return backend(argv, **kwargs)
+                with fixture.beads_patches(), \
+                     mock.patch.object(cli.beads_backend, "claim_ready", return_value=fixture.task_issue), \
+                     mock.patch.object(cli.beads_backend, "add_comment"), \
+                     mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
+                     mock.patch.object(cli.subprocess, "run", side_effect=reject):
+                    payload = _run_controller_json(cli.controller_resume, args)
+                record = json.loads(
+                    (fixture.root / ".agentflow/herdr/sessions.json").read_text()
+                )["sessions"][fixture.task_id]
+                self.assertEqual(record["status"], "rejected_launch")
+                document = payload["result"]["checkpoint"]
+                self.assertTrue(document["terminal"])
+                self.assertEqual(document["task"], str(fixture.root))
+                self.assertFalse(document.get("active_tasks"))
+                self.assertTrue(document["last_check"])
+                self.assertEqual(len(document["drain_causes"]), 1)
+                expected_cause = {
+                    "kind": "managed_task_failure",
+                    "provenance": "signed_negative_retirement",
+                    "task_id": fixture.task_id, "launch_id": record["launch_id"],
+                }
+                self.assertEqual({
+                    key: document["drain_causes"][0][key] for key in expected_cause
+                }, expected_cause)
+
     def test_controller_run_dispatches_ready_task_via_real_herdr_launch(self) -> None:
         """The controller claims a ready descendant and dispatches it through
         the REAL herdr_launch (real from-bead handoff, real root preflight, real
@@ -7008,9 +7415,10 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(payload["result"]["task"], "task-1")
             self.assertEqual(payload["result"]["state"], "running")
             self.assertEqual(payload["result"]["session_id"], "sess-1")
-            # The dispatch really invoked Herdr with the supported argv.
-            self.assertEqual(capture["argv"][:4], ["/usr/bin/herdr", "agent", "start", "task-1"])
-            self.assertNotIn("--session", capture["argv"])
+            # Herdr receives the explicit pane ID; its live name is not fabricated.
+            self.assertEqual(capture["pane_run_argv"][:4], [
+                "/usr/bin/herdr", "pane", "run", "pane-1",
+            ])
             record = json.loads((fixture.root / ".agentflow/herdr/sessions.json").read_text(encoding="utf-8"))["sessions"]["task-1"]
             self.assertEqual(record["status"], "launched")
             self.assertEqual(record["return_channel"]["state"], "issued")
@@ -7092,9 +7500,10 @@ class ControllerRunTests(unittest.TestCase):
             self.assertEqual(ledger["deadline_epoch"], record["deadline_epoch"])
             self.assertEqual(ledger["max_attempts"], 1)
 
-            argv = capture["argv"]
+            argv = capture["workspace_argv"]
             self.assertEqual(argv[argv.index("--cwd") + 1], str(execution_root))
-            provider_tail = argv[argv.index("--") + 1:]
+            run_argv = capture["pane_run_argv"]
+            provider_tail = capture["argv"][capture["argv"].index("--") + 1:]
             self.assertEqual(Path(provider_tail[1]).name, "execution_limits.py")
             self.assertEqual(provider_tail[2], "--deadline-epoch")
             self.assertEqual(float(provider_tail[3]), record["deadline_epoch"])
@@ -7445,6 +7854,7 @@ class ControllerRunTests(unittest.TestCase):
                  mock.patch.object(cli.beads_backend, "update_agentflow_metadata"), \
                  mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(cli.codex_app_server_backend, "_sdk_modules", side_effect=AssertionError("SDK must not initialize")) as sdk, \
+                 mock.patch.object(cli.beads_backend, "add_comment"), \
                  mock.patch.object(subprocess, "Popen", side_effect=record_popen):
                 payload = _run_controller_json(cli.controller_resume, args)
 
@@ -7546,7 +7956,9 @@ class ControllerRunTests(unittest.TestCase):
 
             self.assertTrue(payload["ok"], payload)
             self.assertEqual(payload["result"]["state"], "running")
-            self.assertEqual(capture["argv"][:4], ["/usr/bin/herdr", "agent", "start", "task-1"])
+            self.assertEqual(capture["pane_run_argv"][:4], [
+                "/usr/bin/herdr", "pane", "run", "pane-1",
+            ])
             manifest_path = fixture.root / ".agentflow/tmp/handoffs/task-1-claude.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["workspace_kind"], "directory")
@@ -10559,6 +10971,7 @@ class ControllerParallelDispatchTests(unittest.TestCase):
             task2_closed = threading.Event()
             provider_done = threading.Event()
             threads: list[threading.Thread] = []
+            pane_to_task: dict[str, str] = {}
 
             def get_issue(_cwd, issue_id):
                 return fixture.root_issue if issue_id == fixture.workflow_root else tasks[issue_id]
@@ -10627,10 +11040,22 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, stdout="status: running\ncompatible: yes\n", stderr="")
                 if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:]) == ["integration", "status"]:
                     return subprocess.CompletedProcess(argv, 0, stdout="codex: current (v1)\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["workspace", "create"]:
+                    task_id = next(
+                        (str(argv[index + 1]).partition("=")[2]
+                         for index, value in enumerate(argv[:-1])
+                         if value == "--env" and str(argv[index + 1]).startswith("AGENTFLOW_TASK_ID=")),
+                        "task-1",
+                    )
+                    pane_id = f"pane-{task_id}"
+                    pane_to_task[pane_id] = task_id
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=_workspace_created_stdout(pane_id), stderr="",
+                    )
                 if argv and Path(str(argv[0])).name == "claude" and list(argv[1:]) == ["--version"]:
                     return subprocess.CompletedProcess(argv, 0, stdout="2.1.281 (Claude Code)\n", stderr="")
-                if argv and Path(str(argv[0])).name == "herdr" and "start" in argv:
-                    task_id = str(argv[3])
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["pane", "run"]:
+                    task_id = pane_to_task[str(argv[3])]
                     session_id = f"session-{task_id}"
                     spawned.append(task_id)
                     cli.events_backend.record_event_safely(
@@ -10645,8 +11070,15 @@ class ControllerParallelDispatchTests(unittest.TestCase):
                         thread = threading.Thread(target=result_order_worker, daemon=True)
                         thread.start()
                         threads.append(thread)
+                    return subprocess.CompletedProcess(argv, 0, stdout="command accepted\n", stderr="")
+                if argv and Path(str(argv[0])).name == "herdr" and list(argv[1:3]) == ["agent", "get"]:
+                    task_id = pane_to_task[str(argv[3])]
                     return subprocess.CompletedProcess(
-                        argv, 0, stdout=_agent_started_stdout("claude", session_id=session_id), stderr=""
+                        argv, 0,
+                        stdout=_agent_info_stdout(
+                            "claude", session_id=f"session-{task_id}", pane_id=str(argv[3]),
+                        ),
+                        stderr="",
                     )
                 return real_subprocess_run(argv, **kwargs)
 
@@ -10682,19 +11114,19 @@ class ControllerParallelDispatchTests(unittest.TestCase):
 
 class LaunchRecoveryLifecycleTests(unittest.TestCase):
     @staticmethod
-    def _is_herdr_start(argv) -> bool:
+    def _is_agent_get(argv) -> bool:
         return bool(
             argv and Path(str(argv[0])).name == "herdr"
-            and "agent" in argv and "start" in argv
+            and list(argv[1:3]) == ["agent", "get"]
         )
 
     def _timeout_after_pane_created(self, fixture: ValidLaunch, spawned: list[list[str]]):
         herdr_run = fixture.herdr_run(on_spawn=lambda argv: spawned.append(argv))
 
         def timeout_run(argv, **kwargs):
-            if self._is_herdr_start(argv):
-                # The fake Herdr has created a pane and emitted its structured
-                # identity, but the CLI process times out before returning.
+            if self._is_agent_get(argv):
+                # The pane command was admitted, and agent-get observed the
+                # exact live identity before the client timed out.
                 started = herdr_run(argv, **kwargs)
                 raise subprocess.TimeoutExpired(
                     argv, kwargs.get("timeout", 30), output=started.stdout,
@@ -10736,6 +11168,8 @@ class LaunchRecoveryLifecycleTests(unittest.TestCase):
                     cli.beads_backend, "claim_ready", claim_ready,
                 ), mock.patch.object(
                     cli.beads_backend, "update_agentflow_metadata",
+                ), mock.patch.object(
+                    cli.beads_backend, "add_comment",
                 ), mock.patch.object(
                     cli, "_provider_command", side_effect=fixture.provider_command,
                 ), mock.patch.object(

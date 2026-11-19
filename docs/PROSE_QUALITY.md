@@ -22,8 +22,8 @@ The lane is conditional:
    to replace the original.
 
 There is no Ollama dependency. Agentflow never silently overwrites the source
-and never launches a second editing pass. Codex Luna at `medium` is the bundled
-default, not a requirement.
+and never launches a second editing pass. New projects require an explicit
+editor route; there is no bundled editing model.
 
 ## Controller use
 
@@ -57,12 +57,9 @@ agentflow prose prepare tracks/example/01-start/assignment.md \
 ```
 
 If the check passes, the command prints `NO_EDIT` and creates nothing. If it
-fails, it prints exact preflight and launch commands. By default the generated
-launch is pinned by the current `models-v2` policy to:
-
-```text
-provider=codex model=gpt-6-luna role=editing effort=medium
-```
+fails and an editor route is configured, it prints exact preflight and launch
+commands for that route. Without a route, it reports `edit-required-no-route`
+without creating a model handoff.
 
 ### Use without OpenAI access
 
@@ -87,9 +84,9 @@ Copilot access:
 ```
 
 Claude Code can use `provider=claude`, `model=claude-sonnet-5`, and
-`effort=medium`. Both alternatives are present in the bundled model policy.
-Custom exact routes work when the project policy explicitly approves the
-model for role `editing`.
+`effort=medium`. These are examples, not current availability guarantees.
+In `modelrouter` mode, any exact provider/model/effort selection is accepted;
+explicit legacy model policies still require an approved `editing` route.
 
 Override configuration for one invocation by supplying the complete tuple:
 
