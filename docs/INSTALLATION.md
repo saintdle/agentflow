@@ -50,13 +50,13 @@ Install a tagged release with `uv`:
 
 ```sh
 uv tool install --managed-python --python 3.11 \
-  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+  "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 ```
 
 Or with `pipx`:
 
 ```sh
-pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+pipx install "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 ```
 
 For `pipx`, select a Python installation that will remain available for the
@@ -77,7 +77,7 @@ authenticated checkout. A release wheel built by GitHub Actions can also be
 installed without a source checkout:
 
 ```sh
-pipx install ./saintdle_agentflow-0.0.12-py3-none-any.whl
+pipx install ./saintdle_agentflow-0.0.13-py3-none-any.whl
 ```
 
 ## Verify
@@ -137,15 +137,15 @@ local override remains effective.
 ## Upgrade
 
 Choose an explicit tag from the [GitHub releases](https://github.com/saintdle/agentflow/releases)
-page, then reinstall from that tag. The commands below show the current `v0.0.12`
+page, then reinstall from that tag. The commands below show the current `v0.0.13`
 tag; replace it with the exact reviewed release you intend to install. Plain
 `uv tool upgrade saintdle-agentflow` or `pipx upgrade saintdle-agentflow` does
 not specify a new tag; use the install command with the selected tag to advance.
 
 ```sh
 uv tool install --managed-python --python 3.11 --reinstall \
-  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
-# or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+  "git+https://github.com/saintdle/agentflow.git@v0.0.13"
+# or: pipx install --force "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 agentflow --version
 agentflow install --dry-run
 # Review each proposed refresh; edited/unknown assets remain untouched.
@@ -220,7 +220,7 @@ backup="${launcher}.before-python-repair"
 test ! -e "$backup" && test ! -L "$backup" || { echo "Backup path already exists; stop and inspect it." >&2; exit 2; }
 ln -s "$(readlink "$launcher")" "$backup"
 uv tool install --force --managed-python --python 3.11 \
-  "git+https://github.com/saintdle/agentflow.git@v0.0.12"
+  "git+https://github.com/saintdle/agentflow.git@v0.0.13"
 agentflow --version
 agentflow doctor
 ```

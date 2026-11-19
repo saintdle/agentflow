@@ -57,8 +57,8 @@ class AgentLedDocumentationTests(unittest.TestCase):
         self.assertIn('GOFLAGS: "-tags=gms_pure_go"', ci)
         self.assertIn('go-version: "1.26.7"', ci)
         self.assertIn("go install github.com/steveyegge/beads/cmd/bd@v1.3.1", ci)
-        self.assertIn("--expected-version 0.0.12", ci)
-        self.assertIn("--expected-version 0.0.12", build_main)
+        self.assertIn("--expected-version 0.0.13", ci)
+        self.assertIn("--expected-version 0.0.13", build_main)
         self.assertIn("scripts/ci/integration_beads.sh", ci)
         self.assertIn('schedule:', integration)
         self.assertIn('workflow_dispatch:', integration)
@@ -84,7 +84,7 @@ class AgentLedDocumentationTests(unittest.TestCase):
             "before-python-repair",
             "ln -sfn",
             "pipx install --force",
-            "@v0.0.12",
+            "@v0.0.13",
             "Herdr is required",
             "Agent mode",
             "terminal access",

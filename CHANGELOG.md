@@ -6,8 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.13] - 2026-11-19
+
 ### Changed
 
+- Recommend uv-managed Python 3.11 for tagged installs and reinstalls, and
+  document recovery from a removed interpreter, launcher backup and rollback,
+  and restricted use of `--force`.
 - Update the optional Codex SDK/runtime pin to 0.170.0; its guarded worker lane
   remains disabled pending the existing permission and isolation evidence.
 - Replace new-project model allowlists and profile pins with controller-selected
@@ -448,7 +453,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hardened-isolation documentation accurately describes its protected-root
   read denylist rather than a global read allowlist.
 
-[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.12...HEAD
+[Unreleased]: https://github.com/saintdle/agentflow/compare/v0.0.13...HEAD
+[0.0.13]: https://github.com/saintdle/agentflow/compare/v0.0.12...v0.0.13
 [0.0.12]: https://github.com/saintdle/agentflow/compare/v0.0.11...v0.0.12
 [0.0.11]: https://github.com/saintdle/agentflow/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/saintdle/agentflow/compare/v0.0.9...v0.0.10
