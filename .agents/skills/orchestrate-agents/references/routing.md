@@ -1,23 +1,16 @@
 # Provider and model routing
 
-Use the versioned `policies/models-v2.json` matrix (`models-v2@1`). Launches
-must carry an exact provider, model, role, effort, and policy version; unlisted
-values fail closed before lease/claim reservation.
+The controlling session selects the exact provider, model and effort. Consult
+the project's optional `modelrouter.routes` preferences and the provider's
+current availability; these preferences are not a model allowlist. Newly
+released models do not need an Agentflow update. Do not silently substitute a
+model if the provider rejects the selected identifier or effort.
 
-| Work | Provider/model | Effort |
-|---|---|---|
-| Goal shaping, architecture, difficult debugging | Codex `gpt-6-sol` | `high` or `xhigh` |
-| Bounded coding workers | Codex `gpt-6-luna` | `max` |
-| File discovery and exploration | Codex `gpt-6-luna` | `medium` or `high` |
-| Selective complex implementation or exploration, only when explicitly recorded | Codex `gpt-5.6-terra` | `medium` or `high` |
-| Conditional plain-language edit (default) | Codex `gpt-6-luna` | `medium` |
-| Conditional edit without OpenAI access | Claude `claude-sonnet-5` or Copilot `claude-sonnet-4.6` | `medium` |
-| Judgment, review, and queue integration (default when Claude or Opus is requested) | Claude `claude-opus-4-8` | `high` |
-| Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Claude `claude-opus-5` | `medium` unless the user states another level |
-| Bounded Claude execution and exploration | Claude `claude-sonnet-5` | `medium` or `high` |
-| Judgment, review, and queue integration (default when Claude or Opus is requested) | Copilot `claude-opus-4.8` | `high` |
-| Judgment, review, and queue integration (only when Opus 5 is explicitly requested) | Copilot `claude-opus-5` | `medium` unless the user states another level |
-| Bounded Copilot execution and exploration | Copilot `claude-sonnet-4.6` | `medium` or `high` |
+Use cost-appropriate models for bounded work and stronger reasoning when the
+task warrants it. Persist the selected provider/model/role/effort with each
+assignment. Generated profiles do not pin these values. Existing explicit
+legacy model policies remain enforced until the owner runs
+`agentflow config modelrouter migrate --apply`.
 
 ## Execution lanes
 
@@ -49,15 +42,10 @@ preflight.
 
 - Keep the root controller controller-only: it shapes, routes, dispositions,
   and judges; product-file edits belong to a bounded execution worker.
-- From a Sol controller, launch the managed `agentflow-worker` or
+- From the controller, launch the managed `agentflow-worker` or
   `agentflow-explorer` profile with `fork_turns="none"` (or the smallest
-  explicitly bounded positive fork). Never omit the model/profile and inherit
-  Sol for coding or exploration.
-- Terra is not banned. It is a selective Codex execution route and requires an
-  explicit per-launch selection recorded with the task; Luna remains the
-  default Codex execution model.
-- GPT-5.6 Sol and Luna remain accepted exact routes for existing project
-  configurations. New bundled profiles use GPT-6 Sol and Luna.
+  explicitly bounded positive fork). Explicitly select model and effort rather
+  than accidentally inheriting the controller's route.
 - Keep worker delegation disabled unless the approved graph records a deeper
   lane. The default maximum depth is one, with two attempts per task and a
   graph-derived total launch budget.

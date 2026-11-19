@@ -2632,6 +2632,7 @@ class RootController:
         cause_provenance: str = "controller_unclassified",
         cause_task: str = "",
         cause_launch: str = "",
+        last_check: str = "",
         lease: Lease | str | None = None,
     ) -> ResumeResult:
         """Persist a failure and stop new launches while active siblings drain."""
@@ -2669,6 +2670,8 @@ class RootController:
                 "next_action": "drain active task results" if rows else "finalize blocked root after draining",
                 "active_tasks": rows,
             })
+            if last_check:
+                document["last_check"] = last_check
             saved = checkpoint.write_checkpoint(self.checkpoint_path, document)
             return self._result(saved, resumed=True)
 
@@ -2954,6 +2957,22 @@ class RootController:
                 )
             if has_active_rows:
                 after_launch["active_tasks"] = []
+            rejected_launch = (
+                str(outcome.get("rejected_launch_id") or "")
+                if isinstance(outcome, Mapping) and launch_state == "blocked" else ""
+            )
+            if rejected_launch:
+                # Only the trusted dispatch callback supplies this field after
+                # verifying its signed, pre-submission rejection receipt.
+                _append_drain_cause(
+                    after_launch, kind="managed_task_failure",
+                    provenance="signed_negative_retirement",
+                    task_id=task_id, launch_id=rejected_launch,
+                )
+                after_launch.update({
+                    "task": self.root, "actor": "", "claim_id": "", "session_id": "",
+                    "last_check": f"rejected prelaunch {rejected_launch} for {task_id}",
+                })
             saved = checkpoint.write_checkpoint(self.checkpoint_path, after_launch)
             return self._result(saved, dispatched=True, task=task_id, session_id=session_id)
 

@@ -283,6 +283,7 @@ class CodexPermissionAndTurnTests(unittest.TestCase):
 
             args = fixture.launch_args(transport="app-server")
             with fixture.beads_patches(), \
+                 mock.patch.object(cli, "_provider_command", side_effect=fixture.provider_command), \
                  mock.patch.object(app_server, "permission_for_profile", return_value={}), \
                  mock.patch.object(cli.codex_app_server_backend, "start_supervised_turn", side_effect=mutate_claim_then_ack):
                 self.assertEqual(cli.herdr_launch(args), 2)
@@ -360,6 +361,8 @@ class CodexControllerBridgeTests(unittest.TestCase):
 
             args = fixture.launch_args(transport="app-server")
             with fixture.beads_patches(), mock.patch.object(
+                cli, "_provider_command", side_effect=fixture.provider_command,
+            ), mock.patch.object(
                 cli.codex_app_server_backend, "start_supervised_turn", side_effect=fake_sdk_worker,
             ), mock.patch.object(
                 app_server, "permission_for_profile", return_value={},

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 
-SUPPORTED_SDK_VERSION = "0.160.1"
+SUPPORTED_SDK_VERSION = "0.170.0"
 RPC_TIMEOUT_SECONDS = 10.0
 DEFAULT_WORKER_TIMEOUT_SECONDS = 1800
 MAX_WORKER_TIMEOUT_SECONDS = 86400
@@ -270,7 +270,7 @@ def permission_for_profile(
 ) -> dict[str, Any]:
     """Fail closed until the pinned SDK runtime proves the required boundary.
 
-    SDK 0.160.1 can pass thread configuration and reports active permission
+    The pinned SDK can pass thread configuration and reports active permission
     profile metadata. Its generated schema does not prove profile enforcement,
     enumerate the complete effective tool inventory, or establish same-user
     isolation from controller authority, so profile metadata alone is not

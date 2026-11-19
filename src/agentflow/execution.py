@@ -140,6 +140,7 @@ def evaluate_launch(
     selective_model: bool = False,
     expensive_execution_children: int = 0,
     launch_cap: int | None = None,
+    controller_selected_model: bool = False,
 ) -> AdmissionReport:
     """Return a fail-closed launch admission decision.
 
@@ -189,13 +190,13 @@ def evaluate_launch(
             f"root has consumed {total_attempts} launches (budget {budget})",
             "Add approved graph work or record a typed budget decision before launching again.",
         ))
-    if model in SELECTIVE_MODELS and not selective_model:
+    if not controller_selected_model and model in SELECTIVE_MODELS and not selective_model:
         findings.append(AdmissionFinding(
             "selective-model-not-approved",
             f"model {model!r} is selective and was not explicitly selected",
             "Persist selective_model=true with the exact launch route and rationale.",
         ))
-    if model in EXPENSIVE_MODELS and role in EXECUTION_ROLES:
+    if not controller_selected_model and model in EXPENSIVE_MODELS and role in EXECUTION_ROLES:
         allowed_expensive = expensive_execution_children < policy.max_expensive_execution_children
         if not allowed_expensive:
             findings.append(AdmissionFinding(

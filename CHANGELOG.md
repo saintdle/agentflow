@@ -6,6 +6,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Update the optional Codex SDK/runtime pin to 0.170.0; its guarded worker lane
+  remains disabled pending the existing permission and isolation evidence.
+- Replace new-project model allowlists and profile pins with controller-selected
+  `modelrouter` preferences. New exact model identifiers do not require a release.
+  Existing policies remain active until an explicit, backed-up migration;
+  budgets, deadlines and runtime model checks remain enforced.
+
+### Fixed
+
+- Probe actual provider and Herdr CLI capabilities before reserving attempts;
+  use Copilot's current `--reasoning-effort` flag.
+- Bootstrap supervised providers through an owned Herdr workspace and short,
+  quoted launch-script command, avoiding canonical terminal line limits while
+  retaining environment, diagnostics and pending session identity.
+  Ambiguous submissions cannot authorize duplicate launches.
+- Allow owner-authenticated continuation to distinct ready work after a signed,
+  proven pre-launch CLI rejection, without resetting execution history.
+
 ## [0.0.12] - 2026-10-31
 
 ### Added

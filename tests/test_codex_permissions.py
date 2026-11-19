@@ -355,7 +355,7 @@ class ProbeBoundaryTests(unittest.TestCase):
 
         def broken_generated_module(name):
             if name == "openai_codex":
-                return SimpleNamespace(__version__="0.160.1")
+                return SimpleNamespace(__version__="0.170.0")
             if name == "openai_codex.client":
                 return SimpleNamespace(CodexClient=object, CodexConfig=object)
             raise ModuleNotFoundError(

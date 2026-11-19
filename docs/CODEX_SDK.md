@@ -137,7 +137,7 @@ runtime result is included in the source-only fake tests.
 
 ## Install and configure
 
-Install the optional `codex` extra (`openai-codex==0.160.1`) only when you
+Install the optional `codex` extra (`openai-codex==0.170.0`) only when you
 intend to use this integration. For a local source checkout, for example:
 
 ```sh
@@ -145,6 +145,9 @@ pipx install '.[codex]'
 ```
 
 Keep the extra out of the default installation if you do not need the SDK.
+Updating this pin does not enable the guarded App Server worker lane. Persisted
+SDK identities bind their SDK version; reconcile old sessions with their
+original runtime rather than rewriting the stored version.
 Merge this setting into the existing top-level config in
 `.agentflow/config.json` or the ignored `.agentflow/config.local.json`; do not
 replace the full config file. Existing configurations continue to use Herdr:

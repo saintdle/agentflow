@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 
-SDK_PIN = "0.160.1"
+SDK_PIN = "0.170.0"
 PROFILE = "agentflow-shell-readonly"
 MODEL = "gpt-6-luna"
 EFFORT = "medium"

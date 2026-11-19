@@ -1,17 +1,13 @@
-"""Versioned exact provider/model/role/effort policy, audit, and migration planning.
+"""Controller-selected routing and explicitly retained legacy model policies.
 
-The policy is a closed, versioned document shipped at
-``agentflow/resources/policies/models-v2.json`` and listing the only approved
-(provider, model, role, effort) routes. Repository-level policy files are
-exports of that packaged runtime resource. Anything not an exact match fails
-closed. A selective route such as Codex Terra also needs an explicit
-per-launch selection; merely naming the model is insufficient. This module
-never writes to disk; the audit and migration-planning primitives are read-only.
+Router preferences never restrict models to a shipped catalog. Existing closed
+policies remain readable and enforceable until an owner explicitly migrates.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import re
 try:
@@ -41,6 +37,8 @@ _TOP_LEVEL_FIELDS = frozenset(
     {"schema", "version", "id", "description", "roles", "routes", "forbidden_models", "selective_models"}
 )
 _ROUTE_FIELDS = frozenset({"provider", "model", "roles", "efforts"})
+ROUTER_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
+ROUTER_ROLES = ("controller", "judgment", "review", "coding", "editing", "exploration")
 
 # Every shipped agentflow profile agentflow itself ships and knows how to
 # safely reason about. A migration plan never proposes a change for a file
@@ -127,6 +125,7 @@ class ModelPolicy:
     routes: tuple[ModelRoute, ...]
     forbidden_models: tuple[str, ...]
     selective_models: tuple[str, ...] = ()
+    controller_selected: bool = False
 
     def approved_models(self, provider: str) -> frozenset[str]:
         return frozenset(route.model for route in self.routes if route.provider == provider)
@@ -147,6 +146,20 @@ class ModelPolicy:
                 return RouteResult(False, f"{field} must be a non-empty exact string")
         if effort is not None and (not isinstance(effort, str) or not effort.strip() or effort != effort.strip()):
             return RouteResult(False, "effort must be a non-empty exact string")
+
+        if self.controller_selected:
+            if provider not in {"codex", "claude", "copilot"}:
+                return RouteResult(False, f"unsupported provider {provider!r}")
+            if not ROUTER_MODEL_PATTERN.fullmatch(model) or model.lower() in {"auto", "default", "latest"}:
+                return RouteResult(False, "model must be an exact identifier, not automatic selection")
+            if role not in self.roles:
+                return RouteResult(False, f"unsupported role {role!r}")
+            if effort is not None and not _EFFORT_PATTERN.fullmatch(effort):
+                return RouteResult(False, "effort has an invalid shape")
+            return RouteResult(
+                True, "controller-selected; provider availability is not asserted",
+                ModelRoute(provider, model, (role,), (effort,) if effort else ()),
+            )
 
         if model in self.forbidden_models:
             return RouteResult(False, f"model {model!r} is forbidden under {self.id}")
@@ -283,12 +296,48 @@ def parse_policy(data: Any) -> ModelPolicy:
 
 
 def load_policy(path: Any = DEFAULT_POLICY_PATH) -> ModelPolicy:
+    if isinstance(path, ModelPolicy):
+        return path
     try:
         source = path if hasattr(path, "read_text") else Path(path)
         raw = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelPolicyError(f"cannot read policy {path}: {exc}") from exc
     return parse_policy(raw)
+
+
+def parse_router(data: Any) -> ModelPolicy:
+    """Validate advisory preferences, never a closed model catalog."""
+    if not isinstance(data, dict) or set(data) != {"mode", "routes"}:
+        raise ModelPolicyError("modelrouter requires exactly mode and routes")
+    if data["mode"] != "controller-selected" or not isinstance(data["routes"], list):
+        raise ModelPolicyError("modelrouter requires controller-selected mode and a routes list")
+    router = ModelPolicy(
+        "agentflow.modelrouter@1", 1, "modelrouter", ROUTER_ROLES, (), (),
+        controller_selected=True,
+    )
+    for preference in data["routes"]:
+        if (
+            not isinstance(preference, dict)
+            or set(preference) != {"provider", "model", "effort", "when"}
+        ):
+            raise ModelPolicyError("each modelrouter route requires provider, model, effort and when")
+        result = router.validate_route(
+            provider=preference["provider"], model=preference["model"],
+            effort=preference["effort"], role="coding",
+        )
+        if not result.ok:
+            raise ModelPolicyError(result.reason)
+        _require_str(preference["effort"], "modelrouter route effort", _EFFORT_PATTERN)
+        when = preference["when"]
+        if not isinstance(when, str) or not when.strip() or len(when) > 2000:
+            raise ModelPolicyError("modelrouter route when must contain 1-2000 characters")
+    digest = hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return dataclasses.replace(router, id=f"modelrouter-{digest[:16]}")
+
+
+def default_router() -> dict[str, Any]:
+    return {"mode": "controller-selected", "routes": []}
 
 
 # --- Profile audit -----------------------------------------------------------
@@ -405,6 +454,8 @@ def audit_profiles(root: Path, policy: ModelPolicy) -> list[ProfileViolation]:
         rel = _relative(path, root)
         model = _profile_model(path, provider)
         if not model:
+            if policy.controller_selected:
+                continue
             violations.append(ProfileViolation(rel, provider, "", f"{rel} declares no model"))
             continue
         role = _role_for_profile(path)
@@ -453,6 +504,11 @@ def _plan_one(path: Path, provider: str | None, root: Path, policy: ModelPolicy)
             f"{rel} is not a tracked agentflow profile; migration never rewrites unmanaged user files",
         )
     model = _profile_model(path, provider) or ""
+    if policy.controller_selected and not model:
+        return MigrationAction(
+            rel, provider, "", None, "skip_compliant",
+            "The controlling session supplies the exact model and effort at dispatch.",
+        )
     role = _role_for_profile(path)
     if role is None:
         return MigrationAction(

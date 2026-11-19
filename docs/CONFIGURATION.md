@@ -1,12 +1,13 @@
 # Configuration
 
-Agentflow uses repository configuration for the model-policy path and custom
+Agentflow uses repository configuration for model-routing preferences and custom
 skill registrations that should be shared by a team. Workflow rules are kept
 in generated provider instructions rather than accepted as unenforced config
 switches. Initialization places the shared project file at
 `.agentflow/config.json`. `.agentflow/config.local.json` is the ignored
 machine-local layer for absolute skill paths or a local model-policy override;
-local values override same-name shared values. Runtime state, credentials,
+local values override same-name shared values. Existing explicit model policies
+remain enforced until migrated. Runtime state, credentials,
 claims, logs, temporary handoffs, and provider sessions must remain ignored.
 `agentflow init` enables metadata-only memory in a newly created shared
 configuration, for both Git and gitless workspaces, while keeping `on_prompt`
@@ -22,7 +23,7 @@ contract.
 - Commit portable policy and relative paths.
 - Keep machine-specific paths and secrets in a local, ignored override.
 - Never put provider credentials or controller authority in project config.
-- Prefer exact provider/model identifiers and versioned policies.
+- Let the controlling session select exact provider/model identifiers and effort.
 - Treat repository-local instructions and skills as authoritative.
 - Review generated changes; configuration migration must be explicit.
 
@@ -32,13 +33,12 @@ An initialized project starts with a schema-versioned configuration like this:
 {
   "schema": "agentflow.project@1",
   "version": 1,
-  "model_policy": ".agentflow/models-v2.json",
+  "modelrouter": {
+    "mode": "controller-selected",
+    "routes": []
+  },
   "prose": {
-    "editor": {
-      "provider": "codex",
-      "model": "gpt-6-luna",
-      "effort": "medium"
-    }
+    "editor": null
   },
   "execution": {
     "controller_only": true,
@@ -140,46 +140,74 @@ to be part of repository history. Select shared-server mode only for a
 Git-backed workspace where multiple actors genuinely need concurrent graph
 writes.
 
-## Model policy
+## Model router
 
-The initialized model policy is a reference safety policy, not an assertion that a
-model is available to every user. Teams can maintain a versioned policy for
-their approved providers, exact model identifiers, roles, and effort levels.
-The bundled `editing` role permits Codex `gpt-6-luna` (and retained
-`gpt-5.6-luna` compatibility), Claude Code
-`claude-sonnet-5`, or Copilot `claude-sonnet-4.6`, each at `medium`. The project
-chooses one exact route under `prose.editor`; Luna is the generated default.
-Unavailable, unapproved, or ambiguous model selection fails preflight.
-The requested route is also bound into the authenticated return contract.
-Agentflow accepts the result only when native provider lifecycle metadata for
-the Herdr-bound session reports the same exact model; missing or mismatched
-runtime evidence fails closed.
+New projects use `modelrouter` with `mode: controller-selected`. The controlling
+session chooses the provider, exact model identifier, role, and effort for
+each task. Agentflow does not make an extra decision-model call, maintain an
+allowlist of released models, or silently pick a fallback. Newly released
+models need no Agentflow catalog update.
 
-The bundled policy keeps Claude Opus 4.8 as the preferred controller, judgment,
-and review route when a user asks generally for Claude or Opus. Claude Opus 5
-is an explicit opt-in route: select the pinned `claude-opus-5` model only when
-the user specifically asks for Opus 5. Its default effort is `medium`; use a
-different permitted level only when the user states one. Keep routine
-implementation on the configured Sonnet or Codex Luna lanes to limit cost.
-Model availability still depends on the user's provider plan, client version,
-and organization policy.
+The optional `routes` list supplies preferences to the controlling session,
+not an exhaustive catalog or an automatically evaluated rules engine:
 
-Codex Terra is permitted, not banned. It is a selective execution route for
-coding or exploration at `medium` or `high`: the approved task must persist the
-exact `gpt-5.6-terra` route, set `selective_model=true`, and explain why Luna is
-not sufficient. An unmarked Terra launch fails closed. Generic, Auto, and Haiku
-routes remain disallowed. New bundled Codex profiles use GPT-6 Sol for
-controller and judgment work and GPT-6 Luna for coding, exploration, and
-editing. GPT-5.6 Sol and Luna remain valid exact routes for projects that have
-not migrated their own model settings.
+```json
+{
+  "mode": "controller-selected",
+  "routes": [
+    {
+      "provider": "codex",
+      "model": "your-exact-model-id",
+      "effort": "medium",
+      "when": "Small implementation tasks and read-only exploration"
+    }
+  ]
+}
+```
+
+An unlisted exact identifier is valid. Missing identifiers, automatic selection
+(`auto`, `default`, `latest`), malformed input and unsupported providers are
+rejected. CLI capability checks do not prove account entitlement; the provider
+can reject a model or effort. Runtime session/model evidence and authenticated
+results are still required for managed workers. Copilot's managed-worker
+restriction is unchanged; model routing does not enable an unsupported transport.
+
+Generated agent profiles no longer pin a model or effort. Supply both when
+dispatching rather than accidentally inheriting the controller's route. New
+projects have no default prose editor; set `prose.editor` explicitly when wanted.
+
+## Legacy model policy and migration
+
+Existing `model_policy` files and explicit `--policy` arguments retain their
+closed-policy behavior. Initialization never rewrites them or custom profiles.
+Preview and then explicitly apply a migration:
+
+```sh
+agentflow config modelrouter migrate --root .
+agentflow config modelrouter migrate --root . --apply
+```
+
+Use `--local` to migrate an ignored local override. To migrate shared routing,
+first remove any local routing override; migrating the override alone does not
+remove its precedence. Each migration validates both layers,
+preserves unrelated settings and policy files, creates a private backup, and
+is idempotent. Former allowed routes become advisory preferences; forbidden and
+selective model lists no longer restrict the migrated project. Legacy
+model-name-based expensive-worker restrictions no longer select models in router
+mode. Task, parallelism, deadline, retry, and global-launch budgets still apply.
+Review the preview before removing a team's intentional model restrictions.
+Explicit prose-editor settings are preserved. When an older configuration omits
+the prose section, the preview adds `prose.editor: null` and warns that its
+implicit bundled editor will be disabled. Configure an exact editor explicitly
+to continue automatic prose editing.
 
 ## Controller-only execution policy
 
 The default controller shapes the root, dispatches work, evaluates returned
 evidence, and integrates accepted results; it does not edit product files.
-Routine coding and exploration use Luna or Sonnet worker profiles. A native
+The controlling session chooses an appropriate model for coding and exploration. A native
 Codex worker should receive `fork_turns="none"` or the smallest bounded context
-fork so it cannot silently inherit an expensive Sol controller context.
+fork so it cannot silently inherit an unintended controller context.
 
 Launch admission uses the `execution` values above. The root launch budget is
 the number of planned launchable tasks multiplied by

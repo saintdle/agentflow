@@ -1,10 +1,11 @@
 # Provider compatibility
 
 This matrix describes Agentflow integration lanes, not provider account
-entitlements, subscription access, or current model availability. A route in
-the [local model policy](CONFIGURATION.md#model-policy) is only an Agentflow
-allowlist entry; the provider may still reject that model for a particular
-account. Unknown provider/model/role/effort combinations fail closed.
+entitlements, subscription access, or current model availability.
+The [model router](CONFIGURATION.md#model-router) accepts the controlling
+session's exact model selection without a bundled allowlist. The provider can
+still reject that model or effort for a particular account. Explicit legacy
+policies remain enforced until migrated.
 
 | Provider | Chat + Agentflow controller | Provider-native agents | Direct provider CLI | Persistent Herdr worker | Controller-observed native return |
 | --- | --- | --- | --- | --- | --- |
@@ -31,12 +32,44 @@ The provider command contracts are intentionally not one shared flag template:
 | --- | --- |
 | Codex | `codex --model MODEL -c model_reasoning_effort=EFFORT PROMPT` |
 | Claude Code | `claude --model MODEL --effort EFFORT PROMPT` |
-| Copilot CLI | `copilot --model MODEL --effort EFFORT --interactive PROMPT` |
+| Copilot CLI | `copilot --model MODEL --reasoning-effort EFFORT --interactive PROMPT` |
 
 These are CLI argument shapes, not proof that a model is available to your
-account. The current tests exercise the real argv builder against routes from
-the packaged policy; controller preflight remains authoritative for an actual
-launch.
+account. `agentflow doctor` checks the installed executables' actual help and
+Herdr schema. Launch repeats capability checks before reserving an attempt.
+The current local interface baseline is Codex 0.170.0, Claude Code 2.1.327,
+Copilot CLI 1.0.114 and Herdr 0.9.5 (protocol 22).
+
+## Herdr bootstrap and recovery
+
+Agentflow creates an explicitly owned, unfocused workspace, persists its exact
+root pane ID, then submits a short POSIX-quoted invocation of a private launch
+script through `herdr pane run`. Long provider arguments and environment values
+stay in the mode-0600 script, avoiding the new terminal's canonical line limit.
+The script preserves the deadline supervisor and reapplies the managed
+environment after shell startup. Herdr's `pane run` types terminal text; it is
+not an argv execution API and accepts no executable separator. Control
+characters are rejected before submission.
+
+Command admission is not provider readiness. Agentflow queries `agent get`
+by exact pane ID and validates the provider and native session identity.
+Pending identity stays pending. Timeouts, connection loss after submission,
+and mismatched identity stay ambiguous and block duplicate launches.
+Diagnostics are bounded and scrubbed.
+
+A newly recorded, signed CLI rejection before workspace creation can be
+acknowledged by the existing controller owner for a distinct ready task:
+
+```sh
+agentflow controller resume --root . --workflow-root ROOT \
+  --continue-after-rejected-launch REJECTED_TASK --continue-task NEW_TASK
+```
+
+This preserves the consumed attempt, original deadline and signed history,
+revokes the old return channel, and never retries the same task. Generic
+historical `herdr_exit` records without a signed rejection receipt cannot be
+reclassified from exit code alone. Unknown causes still require investigation;
+do not clear their checkpoints or ledgers.
 
 ## Claude persistent-worker compatibility
 
@@ -79,7 +112,7 @@ Use a dedicated approved workflow root where the named `$TASK_ID` is the only
 ready nonterminal descendant. Check `agentflow beads explain "$ROOT_ID"
 "$TASK_ID"` and `bd show "$TASK_ID" --json` first. Confirm that the task's
 persisted provider, exact model, role, and effort match `$PROVIDER`, `$MODEL`,
-`$ROLE`, and `$EFFORT`; its model route must be present in the approved policy.
+`$ROLE`, and `$EFFORT`; its model route must satisfy the active router or legacy policy.
 The root launch policy must admit only one attempt (`max_attempts_per_task: 1`)
 and one launch (`launch_budget_multiplier: 1`), with one parallel worker at
 most (`max_parallel_workers: 1`). The task budget must say “three minutes; no

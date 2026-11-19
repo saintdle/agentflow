@@ -22,6 +22,10 @@ class BoundExecutionExpiryTests(unittest.TestCase):
         renewal = mock.patch.object(cli, "_renew_native_task_leases", return_value=[])
         renewal.start()
         self.addCleanup(renewal.stop)
+        for name in ("probe_provider", "probe_herdr"):
+            patch = mock.patch.object(cli.cli_compat_backend, name, return_value={"compatible": True})
+            patch.start()
+            self.addCleanup(patch.stop)
 
     @contextlib.contextmanager
     def _launched_budgeted_execution(self):

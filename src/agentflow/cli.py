@@ -42,6 +42,7 @@ from agentflow import feedback as feedback_backend
 from agentflow import guidance as guidance_backend
 from agentflow import herdr as herdr_backend
 from agentflow import model_policy as model_policy_backend
+from agentflow import cli_compat as cli_compat_backend
 from agentflow import outbound_package as outbound_package_backend
 from agentflow import memory_runtime as memory_runtime_backend
 from agentflow import events as events_backend
@@ -200,7 +201,7 @@ def _root_arg(args: argparse.Namespace) -> Path:
 
 
 def _resolve_model_policy(args: argparse.Namespace, root: Path | None = None) -> Any:
-    """Resolve explicit CLI policy, then project config, then bundled policy."""
+    """Resolve explicit legacy policy, then project routing, then controller selection."""
 
     project_root = (root or _root_arg(args)).resolve()
     explicit = str(getattr(args, "policy", "") or "")
@@ -220,6 +221,8 @@ def _resolve_model_policy(args: argparse.Namespace, root: Path | None = None) ->
     config_path = project_config_backend.config_path(project_root)
     if config_path.exists() or config_path.is_symlink():
         config = project_config_backend.load(project_root)
+        if "modelrouter" in config:
+            return model_policy_backend.parse_router(config["modelrouter"])
         raw = Path(str(config["model_policy"])).expanduser()
         candidate = raw if raw.is_absolute() else project_root / raw
         if candidate.is_symlink():
@@ -231,7 +234,7 @@ def _resolve_model_policy(args: argparse.Namespace, root: Path | None = None) ->
         if not resolved.is_file():
             raise model_policy_backend.ModelPolicyError(f"configured policy is not a regular file: {resolved}")
         return resolved
-    return model_policy_backend.DEFAULT_POLICY_PATH
+    return model_policy_backend.parse_router(model_policy_backend.default_router())
 
 
 def _controller_namespace(workflow_root: str) -> str:
@@ -1522,6 +1525,9 @@ def _dispatch_via_herdr(
                 selective_model=bool(launch_meta.get("selective_model")),
                 expensive_execution_children=expensive_children,
                 launch_cap=baseline.current_cap if baseline else None,
+                controller_selected_model=model_policy_backend.load_policy(
+                    _resolve_model_policy(args, root)
+                ).controller_selected,
             )
             admission_findings = list(admission.findings)
             if baseline is not None:
@@ -1649,13 +1655,29 @@ def _dispatch_via_herdr(
         # output must be the only thing on stdout (same reasoning as
         # _materialize_launch_handoff above) -- dispatch reads the Herdr
         # state file directly afterward, never herdr_launch's own printout.
+        launch_diagnostic = io.StringIO()
         try:
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with redirect_stdout(launch_diagnostic), redirect_stderr(launch_diagnostic):
                 launch_exit_code = herdr_launch(herdr_ns)
         except ValueError as exc:
             beads_backend.add_comment(cwd, task_id, f"agentflow provider startup blocked: {exc}")
             return {"state": "blocked", "session_id": ""}
         if launch_exit_code != 0:
+            beads_backend.add_comment(
+                cwd, task_id,
+                "agentflow provider startup failed: " + _herdr_diagnostic_text(
+                    launch_diagnostic.getvalue(), redact_values=(str(root),),
+                ),
+            )
+            rejected_record = _herdr_session_record(root, task_id)
+            if isinstance(rejected_record, Mapping) and _authenticated_rejected_launch(
+                root, workflow_root, task_id,
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            ):
+                return {
+                    "state": "blocked", "session_id": "",
+                    "rejected_launch_id": rejected_record["launch_id"],
+                }
             return {"state": "blocked", "session_id": ""}
         herdr_state = _load_herdr_state(_herdr_state_path(herdr_ns, root))
         record = herdr_state.get("sessions", {}).get(task_id) or {}
@@ -1975,6 +1997,10 @@ def _controller_step_serial(
             root, workflow_root, str(item.get("id") or ""),
             authority_secret=str(getattr(args, "_authority_secret", "") or ""),
         )
+        and not _authenticated_rejected_launch(
+            root, workflow_root, str(item.get("id") or ""),
+            authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+        )
     ]
     if orphaned:
         if continuation_task and (
@@ -2195,6 +2221,7 @@ def _controller_step_parallel(
         cause_kind = "unknown"
         cause_provenance = "controller_unclassified"
         cause_launch = ""
+        last_check = ""
         if task_id and authenticated_failure and failure_launch_id:
             cause_kind = "managed_task_failure"
             cause_provenance = "authenticated_task_outcome"
@@ -2205,6 +2232,9 @@ def _controller_step_parallel(
             authority_secret = str(getattr(args, "_authority_secret", "") or "")
             signed_retirement = bool(
                 launch_id and authority_secret and (
+                    _authenticated_rejected_launch(
+                        root, workflow_root, task_id, authority_secret=authority_secret,
+                    ) or
                     _authenticated_cancelled_preidentity(
                         root, workflow_root, task_id, authority_secret=authority_secret,
                     ) or _authenticated_expired_bound_execution(
@@ -2216,6 +2246,8 @@ def _controller_step_parallel(
                 cause_kind = "managed_task_failure"
                 cause_provenance = "signed_negative_retirement"
                 cause_launch = launch_id
+                if record.get("status") == "rejected_launch":
+                    last_check = f"rejected prelaunch {launch_id} for {task_id}"
         result = controller.begin_draining(
             reason,
             failed_task=task_id if provider_terminal else "",
@@ -2223,6 +2255,7 @@ def _controller_step_parallel(
             cause_provenance=cause_provenance,
             cause_task=task_id,
             cause_launch=cause_launch,
+            last_check=last_check,
             lease=lease,
         )
         draining = True
@@ -2532,6 +2565,10 @@ def _controller_step_parallel(
                 root, workflow_root, str(item.get("id") or ""),
                 authority_secret=str(getattr(args, "_authority_secret", "") or ""),
             )
+            and not _authenticated_rejected_launch(
+                root, workflow_root, str(item.get("id") or ""),
+                authority_secret=str(getattr(args, "_authority_secret", "") or ""),
+            )
         ]
         if orphaned:
             if continuation_task and (
@@ -2662,7 +2699,7 @@ def _controller_step_parallel(
                     task_id, f"task {task_id} failed preflight or provider launch",
                     provider_terminal=(
                         not launch_record
-                        or launch_status in {"failed", "blocked", "cancelled", "canceled"}
+                        or launch_status in {"failed", "blocked", "cancelled", "canceled", "rejected_launch"}
                     ),
                 )
             break
@@ -3329,8 +3366,11 @@ def _verify_cancelled_preidentity_continuation(
     bound_expired = bool(
         isinstance(record, Mapping) and record.get("status") == "expired_execution"
     )
-    actual_retirement_kind = "expired_execution" if bound_expired else "cancelled_preidentity"
-    if expected_retirement_kind not in {"cancelled_preidentity", "expired_execution"}:
+    rejected_launch = bool(isinstance(record, Mapping) and record.get("status") == "rejected_launch")
+    actual_retirement_kind = (
+        "rejected_launch" if rejected_launch else "expired_execution" if bound_expired else "cancelled_preidentity"
+    )
+    if expected_retirement_kind not in {"cancelled_preidentity", "expired_execution", "rejected_launch"}:
         raise controller_backend.ControllerError("continuation retirement kind is invalid")
     if actual_retirement_kind != expected_retirement_kind:
         raise controller_backend.ControllerError("continuation flag does not match the retired task kind")
@@ -3348,6 +3388,7 @@ def _verify_cancelled_preidentity_continuation(
         "superseded_legacy_scope",
         "owner_abandoned_epoch",
         _BOUND_EXECUTION_EXPIRY_REASON,
+        _REJECTED_LAUNCH_REASON,
     }:
         raise controller_backend.ControllerError("cancelled task has no recognized retirement disposition")
     marker_reason = "expired" if retirement_reason.startswith("expired ") else retirement_reason
@@ -3400,13 +3441,12 @@ def _verify_cancelled_preidentity_continuation(
         or document.get("terminal") is not True
         or (not pending_old_checkpoint and document.get("epoch") != lease.epoch)
         or (not pending_old_checkpoint and document.get("lease_token") != lease.token)
-        or document.get("last_check") != retired_check
+        or (not rejected_launch and document.get("last_check") != retired_check)
         or str(document.get("root") or "") != str(root)
         or str(document.get("controller") or "") != controller.controller
         or str(document.get("task") or "") != controller.root
         or document.get("active_tasks")
         or document.get("actor") or document.get("claim_id") or document.get("session_id")
-        or document.get("last_check") != retired_check
         )
     ) or (
         staged_selection and (
@@ -3481,6 +3521,22 @@ def _verify_cancelled_preidentity_continuation(
             raise controller_backend.ControllerError(
                 "expired task cannot continue while an unknown prior drain cause remains"
             )
+    elif rejected_launch:
+        if not _authenticated_rejected_launch(
+            root, workflow_root, cancelled_task, authority_secret=authority_secret,
+        ):
+            raise controller_backend.ControllerError("launch rejection lacks its signed before-spawn proof")
+        prior_causes = checkpoint_backend._check_drain_causes(document.get("drain_causes"))
+        if not staged_selection and not any(
+            cause["kind"] == "managed_task_failure"
+            and cause["provenance"] == "signed_negative_retirement"
+            and cause["task_id"] == cancelled_task
+            and cause["launch_id"] == record["launch_id"]
+            for cause in prior_causes
+        ):
+            raise controller_backend.ControllerError("checkpoint does not retain the exact rejected launch cause")
+        if any(cause["kind"] == "unknown" for cause in prior_causes):
+            raise controller_backend.ControllerError("rejected-launch continuation has an unknown drain cause")
     elif not _authenticated_cancelled_preidentity(
         root, workflow_root, cancelled_task, authority_secret=authority_secret,
     ):
@@ -3509,7 +3565,7 @@ def _verify_cancelled_preidentity_continuation(
     agentflow = agentflow if isinstance(agentflow, Mapping) else {}
     claim_token = str(agentflow.get("claim_token") or "")
     if (
-        str(cancelled_issue.get("status") or "").lower() != ("in_progress" if bound_expired else "blocked")
+        str(cancelled_issue.get("status") or "").lower() != ("in_progress" if bound_expired or rejected_launch else "blocked")
         or str(cancelled_issue.get("assignee") or "") != lease.controller
         or str(agentflow.get("root") or "") != workflow_root
         or str(agentflow.get("task") or "") != cancelled_task
@@ -3521,7 +3577,7 @@ def _verify_cancelled_preidentity_continuation(
         )
     ):
         raise controller_backend.ControllerError("cancelled task no longer has its exact signed Beads claim")
-    if bound_expired:
+    if bound_expired or rejected_launch:
         beads_backend.verify_task_ancestry_and_ownership(
             root, cancelled_issue, task=cancelled_task, root=workflow_root, actor=lease.controller,
         )
@@ -3555,7 +3611,7 @@ def _verify_cancelled_preidentity_continuation(
             causal_row = by_id.get(causal_task)
             causal_status = str(causal_row.get("status") or "").lower() if causal_row else ""
             blocked_signed_retirement = (
-                causal_status == "blocked"
+                causal_status in {"blocked", "in_progress"}
                 and cause["provenance"] == "signed_negative_retirement"
             )
             if (
@@ -3642,6 +3698,10 @@ def _verify_cancelled_preidentity_continuation(
                     and _authenticated_expired_bound_execution(
                         root, workflow_root, causal_task, authority_secret=authority_secret,
                     )
+                    or exact_record and causal_record.get("status") == "rejected_launch"
+                    and _authenticated_rejected_launch(
+                        root, workflow_root, causal_task, authority_secret=authority_secret,
+                    )
                 )
             )
             if not (authenticated_outcome or authenticated_retirement):
@@ -3649,7 +3709,7 @@ def _verify_cancelled_preidentity_continuation(
                     f"causal failure task lacks its exact authenticated outcome: {causal_task}"
                 )
             resolved_failure_tasks.add(causal_task)
-    expected_cancelled_status = "in_progress" if bound_expired else "blocked"
+    expected_cancelled_status = "in_progress" if bound_expired or rejected_launch else "blocked"
     if str(by_id[cancelled_task].get("status") or "").lower() != expected_cancelled_status:
         raise controller_backend.ControllerError("cancelled Beads claim no longer matches the halted task")
     if not bound_expired and str(by_id[cancelled_task].get("assignee") or "") != lease.controller:
@@ -3660,6 +3720,11 @@ def _verify_cancelled_preidentity_continuation(
         retired_bound = task_id != cancelled_task and _authenticated_expired_bound_execution(
             root, workflow_root, task_id, authority_secret=authority_secret,
         )
+        retired_bound = retired_bound or (
+            task_id != cancelled_task and _authenticated_rejected_launch(
+                root, workflow_root, task_id, authority_secret=authority_secret,
+            )
+        )
         if task_id != cancelled_task and status == "in_progress" and not retired_bound:
             raise controller_backend.ControllerError("another workflow task is still claimed in progress")
         if task_id in resolved_failure_tasks:
@@ -3669,7 +3734,7 @@ def _verify_cancelled_preidentity_continuation(
             continue
         if task_id == cancelled_task:
             continue
-        if str(other.get("status") or "").lower() == "expired_execution" and retired_bound:
+        if str(other.get("status") or "").lower() in {"expired_execution", "rejected_launch"} and retired_bound:
             if str(row.get("status") or "").lower() != "in_progress":
                 raise controller_backend.ControllerError("expired bound task claim changed before continuation")
             continue
@@ -4140,12 +4205,16 @@ def _controller_run(args: argparse.Namespace, *, operation: str) -> int:
         continue_after_expired = str(
             getattr(args, "continue_after_expired_task", "") or ""
         ) if operation == "resume" else ""
-        if continue_after_preidentity and continue_after_expired:
+        continue_after_rejected = str(
+            getattr(args, "continue_after_rejected_launch", "") or ""
+        ) if operation == "resume" else ""
+        if sum(bool(value) for value in (continue_after_preidentity, continue_after_expired, continue_after_rejected)) > 1:
             raise ValueError("choose exactly one explicit continuation kind")
         continuation_kind = (
-            "expired_execution" if continue_after_expired else "cancelled_preidentity"
+            "rejected_launch" if continue_after_rejected
+            else "expired_execution" if continue_after_expired else "cancelled_preidentity"
         )
-        continue_cancelled_task = continue_after_expired or continue_after_preidentity
+        continue_cancelled_task = continue_after_rejected or continue_after_expired or continue_after_preidentity
         continue_ready_task = str(getattr(args, "continue_task", "") or "") if operation == "resume" else ""
         if bool(continue_cancelled_task) != bool(continue_ready_task):
             raise ValueError(
@@ -5782,6 +5851,53 @@ def _commit_preidentity_cancellation(
         channel["revocation"] = disposition
 
 
+_REJECTED_LAUNCH_REASON = "Herdr CLI rejected workspace creation before provider submission"
+
+
+def _authenticated_rejected_launch(
+    root: Path, workflow_root: str, task_id: str, *, authority_secret: str,
+) -> bool:
+    record = _herdr_session_record(root, task_id)
+    if not isinstance(record, Mapping) or record.get("status") != "rejected_launch":
+        return False
+    channel = record.get("return_channel")
+    receipt = record.get("recovery_disposition")
+    if (
+        not isinstance(channel, Mapping) or channel.get("state") != "revoked"
+        or not isinstance(receipt, Mapping) or channel.get("revocation") != receipt
+        or record.get("pane_id") or record.get("binding") or record.get("result")
+        or record.get("launch_observation") or record.get("launch_outcome") == "ambiguous"
+    ):
+        return False
+    contract = channel.get("contract_binding")
+    if not isinstance(contract, Mapping):
+        return False
+    expected = {
+        "schema": "agentflow.launch-rejection@1", "reason": _REJECTED_LAUNCH_REASON,
+        "root": str(root), "workflow_root": workflow_root, "task_id": task_id,
+        "launch_id": record.get("launch_id"), "contract_sha256": _canonical_json_digest(contract),
+        "error_sha256": _canonical_json_digest(record.get("error")),
+    }
+    if (
+        set(receipt) != set(expected) | {"authority_hmac"}
+        or any(receipt.get(key) != value for key, value in expected.items())
+        or not _verify_authority_mac(authority_secret, receipt, domain="launch-rejection-v1")
+    ):
+        return False
+    try:
+        _verify_return_contract_binding(
+            contract, Path(str(channel.get("contract_path") or "")), task_id, record,
+            root=root, authority_secret=authority_secret, require_issued=False,
+        )
+        if contract.get("execution_limits") is not None:
+            _verify_execution_snapshot_against_ledger(
+                root, workflow_root, task_id, contract, authority_secret=authority_secret,
+            )
+    except (OSError, ValueError, controller_backend.ControllerError):
+        return False
+    return True
+
+
 def _authenticated_cancelled_preidentity(
     root: Path,
     workflow_root: str,
@@ -7364,6 +7480,91 @@ def _json_candidates(text: str) -> list[dict[str, Any]]:
     return candidates
 
 
+HERDR_DIAGNOSTIC_LIMIT = 1200
+HERDR_AGENT_OBSERVE_TIMEOUT = 30.0
+HERDR_AGENT_POLL_INTERVAL = 0.25
+
+
+def _herdr_agent_name(preferred_name: str, task_id: str) -> str:
+    """Return a stable Herdr-compatible name, including a collision-resistant suffix."""
+    source = str(preferred_name or task_id).lower()
+    slug = re.sub(r"[^a-z0-9_-]+", "-", source).strip("-_")
+    if not slug or not ("a" <= slug[0] <= "z"):
+        slug = f"agent-{slug}" if slug else "agent"
+    suffix = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:8]
+    prefix = slug[:23].rstrip("-_") or "agent"
+    return f"{prefix}-{suffix}"
+
+
+def _herdr_launch_command(argv: list[str], script: Path) -> str:
+    """Keep terminal input short even while a new shell is in canonical mode."""
+    content = "#!/bin/sh\nexec " + provider_argv_backend.pane_command(argv) + "\n"
+    command = provider_argv_backend.pane_command(["/bin/sh", str(script)])
+    if len(command.encode("utf-8")) >= 1024:
+        raise ValueError("Herdr launcher path exceeds the terminal canonical input limit")
+    _private_text(script, content)
+    return command
+
+
+def _herdr_created_pane_id(output: str) -> str:
+    """Read the pane from Herdr's current workspace-create response schema."""
+    for candidate in reversed(_json_candidates(output)):
+        result = candidate.get("result") if isinstance(candidate.get("result"), dict) else candidate
+        root_pane = result.get("root_pane") if isinstance(result, dict) else None
+        pane_id = str(root_pane.get("pane_id") or "") if isinstance(root_pane, dict) else ""
+        if pane_id and len(pane_id) <= 256 and not any(ch.isspace() or ord(ch) < 32 for ch in pane_id):
+            return pane_id
+    raise ValueError("Herdr workspace create did not return result.root_pane.pane_id")
+
+
+def _herdr_agent_info_present(output: str, *, expected_pane_id: str) -> bool:
+    """Accept only an agent observation for the pane selected at launch."""
+    if not expected_pane_id:
+        return False
+    for candidate in reversed(_json_candidates(output)):
+        result = candidate.get("result") if isinstance(candidate.get("result"), dict) else candidate
+        agent = result.get("agent") if isinstance(result, dict) else None
+        if (
+            isinstance(result, dict)
+            and result.get("type") in {"agent_info", "agent_started"}
+            and isinstance(agent, dict)
+            and str(agent.get("pane_id") or "") == expected_pane_id
+        ):
+            return True
+    return False
+
+
+def _herdr_diagnostic_text(value: Any, *, redact_values: Iterable[str] = ()) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value or "")
+    text = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", text)
+    for secret in sorted({str(item) for item in redact_values if str(item)}, key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
+    text = re.sub(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*", r"\1<redacted>", text)
+    text = re.sub(
+        r"""(?i)(["']?\b[A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD)[A-Z0-9_]*["']?)\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)""",
+        r"\1=<redacted>", text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", text)
+    text = "".join(ch if ch in "\n\t" or ord(ch) >= 32 else " " for ch in text).strip()
+    if len(text) > HERDR_DIAGNOSTIC_LIMIT:
+        marker = "...[truncated]"
+        text = text[:HERDR_DIAGNOSTIC_LIMIT - len(marker)] + marker
+    return text
+
+
+def _herdr_launch_diagnostic(
+    result: subprocess.CompletedProcess[str], *, redact_values: Iterable[str] = (),
+) -> dict[str, str]:
+    diagnostic = {}
+    for name in ("stdout", "stderr"):
+        value = _herdr_diagnostic_text(getattr(result, name, ""), redact_values=redact_values)
+        if value:
+            diagnostic[name] = value
+    return diagnostic
+
+
 class IdentityPending(ValueError):
     """A Herdr pane exists but has not yet reported a provider session identity.
 
@@ -7420,7 +7621,13 @@ def _actual_herdr_binding(
             continue
         if agent_label and agent_label != provider:
             raise ValueError("Herdr agent label does not match the requested provider")
+        session_provider = str(session_info.get("agent") or "")
+        if session_provider and session_provider != provider:
+            raise ValueError("Herdr provider session does not match the requested provider")
         if not session_id:
+            pending_pane_id = pending_pane_id or pane_id
+            continue
+        if not agent_label or not session_provider:
             pending_pane_id = pending_pane_id or pane_id
             continue
         return herdr_backend.HerdrBinding(
@@ -7463,27 +7670,19 @@ def _resolve_pending_identity(root: Path, task_id: str) -> bool:
             return False
         if probe.returncode:
             return False
-        session_id = ""
-        for candidate in _json_candidates(probe.stdout or ""):
-            result = candidate.get("result") if isinstance(candidate.get("result"), dict) else candidate
-            if not isinstance(result, dict) or result.get("type") != "agent_info":
-                continue
-            agent = result.get("agent")
-            if not isinstance(agent, dict):
-                continue
-            session_info = agent.get("agent_session") if isinstance(agent.get("agent_session"), dict) else {}
-            session_id = str(session_info.get("value") or "")
-            if session_id:
-                break
-        if not session_id:
+        try:
+            binding = _actual_herdr_binding(
+                probe.stdout or "", root=root, task_id=task_id,
+                claim_id=str(record.get("claim_id") or ""),
+                lease_id=str(record.get("lease_id") or ""),
+                provider=str(record.get("provider") or ""),
+                launch_id=str(record.get("launch_id") or ""),
+            )
+        except (IdentityPending, herdr_backend.HerdrError, ValueError):
             return False
-        record["binding"] = {
-            "root": record.get("root"), "task_id": record.get("task_id"),
-            "claim_id": record.get("claim_id"), "lease_id": record.get("lease_id"),
-            "launch_id": record.get("launch_id"), "pane_id": pane_id,
-            "provider": record.get("provider"), "session_id": session_id,
-            "created_at": _now(), "launched_at": _now(),
-        }
+        if binding.pane_id != pane_id:
+            return False
+        record["binding"] = binding.to_dict()
         record["status"] = "launched"
         record.pop("startup_attention", None)
         record.setdefault("attempts", []).append({
@@ -7581,7 +7780,9 @@ def _herdr_server_running(herdr: str) -> bool:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"cannot inspect Herdr server readiness: {exc}") from exc
     lines = {line.strip() for line in (status.stdout or "").splitlines()}
-    if status.returncode or "compatible: no" in lines:
+    if status.returncode or lines & {
+        "compatible: no", "endpoint_compatible: no", "private_protocol_compatible: no",
+    }:
         raise ValueError("Herdr server status is unavailable or incompatible; inspect `herdr status server`")
     if "status: running" in lines:
         return True
@@ -8387,29 +8588,48 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 "workflow root controller instead"
             )
         herdr = "" if transport == "app-server" else _provider_command("herdr")
+        resolved_provider = _provider_command(provider)
+        if not resolved_provider:
+            raise ValueError(f"{provider} executable is unavailable; no attempt was reserved")
+        cli_compat_backend.probe_provider(provider, resolved_provider)
+        if transport == "herdr" and not herdr:
+            raise ValueError("Herdr executable is unavailable; no attempt was reserved")
         if herdr:
+            cli_compat_backend.probe_herdr(herdr)
             _require_herdr_provider_integration(herdr, provider)
             _ensure_herdr_server(herdr)
-        agent_name = getattr(args, "agent_name", "") or task_id
+        agent_name = _herdr_agent_name(getattr(args, "agent_name", "") or task_id, task_id)
         launch_id = str(uuid.uuid4())
         attempt = 1
         launch_timeout: subprocess.TimeoutExpired | None = None
+        launch_timeout_code = "herdr_start_ambiguous"
+        launch_timeout_pane_id = ""
+        launch_timeout_phase = "agent_start"
+        herdr_pane_id = ""
+        herdr_submission_started = False
+        diagnostic_redactions: list[str] = []
         return_channel: dict[str, Any] | None = None
 
         def _mark_failed(code: str) -> None:
             with _herdr_transaction(state_path) as state:
                 record = state.get("sessions", {}).get(task_id)
-                if isinstance(record, dict):
-                    record["status"] = "failed"
+                if isinstance(record, dict) and record.get("launch_id") == launch_id:
+                    record["status"] = "launching" if herdr_submission_started else "failed"
                     record["error"] = {"code": code}
+                    if herdr_submission_started:
+                        record["launch_outcome"] = "ambiguous"
+                        record["launch_observation"] = {"state": "uncommitted", "pane_id": herdr_pane_id}
                     record.setdefault("attempts", []).append(
                         {"attempt": attempt, "launch_id": launch_id,
-                         "workflow_root": workflow_root, "status": "failed",
+                         "workflow_root": workflow_root,
+                         "status": "ambiguous" if herdr_submission_started else "failed",
                          "error": record["error"]}
                     )
 
-        def _mark_ambiguous_start(exc: subprocess.TimeoutExpired) -> None:
-            """Keep a timed-out spawn reservation live and record only observed identity."""
+        def _mark_ambiguous_start(
+            exc: subprocess.TimeoutExpired, *, phase: str, pane_id_hint: str = "",
+        ) -> tuple[str, str]:
+            """Keep a timed-out Herdr operation live and record only observed identity."""
             output = getattr(exc, "stdout", None)
             if output is None:
                 output = getattr(exc, "output", None)
@@ -8417,28 +8637,48 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 output = output.decode("utf-8", errors="replace")
             observation: dict[str, str] = {}
             if isinstance(output, str) and output:
-                try:
-                    binding = _actual_herdr_binding(
-                        output, root=root, task_id=task_id,
-                        claim_id=str(identity["claim_id"]), lease_id=lease_id,
-                        provider=provider, launch_id=launch_id,
-                    )
-                except IdentityPending as pending:
-                    observation["pane_id"] = pending.pane_id
-                except (herdr_backend.HerdrError, ValueError):
-                    pass
+                if phase == "workspace_create":
+                    try:
+                        observation["pane_id"] = _herdr_created_pane_id(output)
+                    except ValueError:
+                        pass
                 else:
-                    observation.update({
-                        "pane_id": binding.pane_id,
-                        "session_id": binding.session_id,
-                    })
-            pane_id = observation.get("pane_id", "")
-            message = (
-                "Herdr agent start timed out; inspect the Herdr pane/session and verify whether "
-                "provider work started before any retry. Do not relaunch while the outcome is uncertain."
+                    try:
+                        binding = _actual_herdr_binding(
+                            output, root=root, task_id=task_id,
+                            claim_id=str(identity["claim_id"]), lease_id=lease_id,
+                            provider=provider, launch_id=launch_id,
+                        )
+                    except IdentityPending as pending:
+                        if not pane_id_hint or pending.pane_id == pane_id_hint:
+                            observation["pane_id"] = pending.pane_id
+                    except (herdr_backend.HerdrError, ValueError):
+                        pass
+                    else:
+                        if not pane_id_hint or binding.pane_id == pane_id_hint:
+                            observation.update({
+                                "pane_id": binding.pane_id,
+                                "session_id": binding.session_id,
+                            })
+            pane_id = observation.get("pane_id", "") or pane_id_hint
+            if pane_id and "pane_id" not in observation:
+                observation["pane_id"] = pane_id
+            ambiguous_code = (
+                "herdr_workspace_create_ambiguous"
+                if phase == "workspace_create" else "herdr_start_ambiguous"
             )
+            if phase == "workspace_create":
+                message = (
+                    "Herdr workspace creation timed out; inspect Herdr for a new workspace before "
+                    "retrying. Do not relaunch while the creation outcome is uncertain."
+                )
+            else:
+                message = (
+                    "Herdr agent start timed out; inspect the Herdr pane/session and verify whether "
+                    "provider work started before any retry. Do not relaunch while the outcome is uncertain."
+                )
             attention = {
-                "code": "herdr_start_ambiguous",
+                "code": ambiguous_code,
                 "task_id": task_id,
                 "launch_id": launch_id,
                 "pane_id": pane_id,
@@ -8452,7 +8692,14 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 record["launch_timeout"] = {
                     "timeout_seconds": exc.timeout,
                     "observed_at": _now(),
+                    "phase": phase,
                 }
+                diagnostic = _herdr_launch_diagnostic(
+                    subprocess.CompletedProcess([], 1, stdout=output, stderr=exc.stderr),
+                    redact_values=diagnostic_redactions,
+                )
+                if diagnostic:
+                    record["launch_timeout"]["diagnostic"] = diagnostic
                 if observation:
                     # This is diagnostic evidence only, not a committed
                     # binding and never authority to ingest a provider result.
@@ -8465,8 +8712,69 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     "launch_id": launch_id,
                     "workflow_root": workflow_root,
                     "status": "ambiguous",
-                    "reason": "herdr_start_timeout",
+                    "reason": f"{ambiguous_code}_timeout",
                 })
+            return ambiguous_code, pane_id
+
+        def _mark_ambiguous_identity() -> tuple[str, str]:
+            """Keep an accepted pane non-retryable when its identity is untrusted."""
+            code = "herdr_identity_ambiguous"
+            pane_id = herdr_pane_id
+            attention = {
+                "code": code,
+                "task_id": task_id,
+                "launch_id": launch_id,
+                "pane_id": pane_id,
+                "message": (
+                    "Herdr accepted the pane command but its provider identity could not be verified. "
+                    "Inspect the pane and session before any retry."
+                ),
+            }
+            with _herdr_transaction(state_path) as state:
+                record = state.get("sessions", {}).get(task_id)
+                if not isinstance(record, dict) or record.get("status") != "launching":
+                    raise ValueError("Herdr launch reservation was replaced after identity mismatch")
+                record["launch_outcome"] = "ambiguous"
+                if pane_id:
+                    record["launch_observation"] = {
+                        "state": "uncommitted", "pane_id": pane_id,
+                    }
+                record["startup_attention"] = attention
+                record.setdefault("attempts", []).append({
+                    "attempt": attempt,
+                    "launch_id": launch_id,
+                    "workflow_root": workflow_root,
+                    "status": "ambiguous",
+                    "reason": "herdr_identity_unverified",
+                })
+            return code, pane_id
+
+        def _identity_ambiguous_result(
+            observed: subprocess.CompletedProcess[str] | None = None,
+        ) -> int:
+            code, pane_id = _mark_ambiguous_identity()
+            if observed is not None:
+                with _herdr_transaction(state_path) as state:
+                    state["sessions"][task_id]["error"] = {
+                        "code": code, "phase": launch_timeout_phase,
+                        "exit_code": observed.returncode,
+                        "diagnostic": _herdr_launch_diagnostic(
+                            observed, redact_values=diagnostic_redactions,
+                        ),
+                    }
+            payload = {
+                "operation": "launch", "ok": False, "retryable": False,
+                "state_path": str(state_path), "root": str(root),
+                "task_id": task_id, "status": "ambiguous",
+                "error": {"code": code},
+            }
+            if pane_id:
+                payload["pane_id"] = pane_id
+            _json_or_status(
+                payload, as_json=bool(getattr(args, "json", False)),
+                title="HERDR LAUNCH IDENTITY AMBIGUOUS",
+            )
+            return 2
 
         # AFREL-027/AFREL-016: lock order is always controller-then-Herdr.
         # Holding the controller's own lock (fence()) across each
@@ -8635,7 +8943,6 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 state_path=state_path, authority_secret=authority_secret,
             )
 
-        resolved_provider = _provider_command(provider)
         if not herdr:
             error_code = "herdr_unavailable"
             launched = None
@@ -8708,35 +9015,94 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         # model evidence lands in the spool we verify.
                         f"AGENTFLOW_STATE_HOME={_state_dir().expanduser().resolve()}",
                     ]
-                    launch_env: list[str] = []
-                    # Fix #2: the installed Herdr API is `herdr agent start
-                    # <agent-name> [OPTIONS] -- <provider argv>`. There is no
-                    # `herdr --session <name> ...` global TUI/session selector;
-                    # passing one made every real spawn fail argument parsing.
-                    # The durable Agentflow session name lives in Agentflow
-                    # state (the reservation's ``herdr_session`` field), not in
-                    # Herdr's argv.
-                    argv = [
-                        herdr, "agent", "start", agent_name,
-                        "--cwd", str(execution_root), "--no-focus",
-                        *launch_env,
-                        *sum((["--env", value] for value in safe_env), []),
-                        "--", *provider_tail,
+                    env_args = sum((["--env", value] for value in safe_env), [])
+                    workspace_argv = [
+                        herdr, "workspace", "create", "--cwd", str(execution_root),
+                        "--label", f"agentflow-{agent_name}", "--no-focus", *env_args,
                     ]
+                    diagnostic_redactions = [
+                        str(execution_root),
+                        *(value.partition("=")[2] for value in safe_env),
+                    ]
+                    pane_command = _herdr_launch_command(
+                        ["env", *safe_env, *provider_tail],
+                        Path(return_channel["contract_path"]).with_name("provider-launch.sh"),
+                    )
                     try:
-                        # Root preflight and argv construction can take time.
-                        # Re-read the current Beads claim/policy after those
-                        # checks and immediately before the provider spawn.
+                        # Create a dedicated workspace without focusing it.
+                        # The returned root pane ID is then passed explicitly;
+                        # this avoids targeting whichever pane happens to be
+                        # focused in another Herdr client.
                         _authorize()
-                        launched = subprocess.run(
-                            argv, capture_output=True, text=True, timeout=30, check=False,
+                        launch_timeout_phase = "workspace_create"
+                        workspace_result = subprocess.run(
+                            workspace_argv, capture_output=True, text=True, timeout=30, check=False,
                         )
+                        if workspace_result.returncode:
+                            launched = workspace_result
+                            error_code = "herdr_workspace_create"
+                        else:
+                            try:
+                                pane_id = _herdr_created_pane_id(workspace_result.stdout or "")
+                            except ValueError as exc:
+                                launched = subprocess.CompletedProcess(
+                                    workspace_argv, 2, stdout=workspace_result.stdout,
+                                    stderr=workspace_result.stderr or str(exc),
+                                )
+                                error_code = "herdr_workspace_create_invalid_response"
+                            else:
+                                herdr_pane_id = pane_id
+                                with _herdr_transaction(state_path) as state:
+                                    state["sessions"][task_id]["pane_id"] = pane_id
+                                # `agent start` accepts native arguments and
+                                # always prepends the kind's canonical binary.
+                                # Run the already-pinned command in the new
+                                # pane instead so structured-limit launches
+                                # keep their Python supervisor executable.
+                                run_argv = [
+                                    herdr, "pane", "run", pane_id,
+                                    pane_command,
+                                ]
+                                _authorize()
+                                launch_timeout_phase = "pane_run"
+                                herdr_submission_started = True
+                                pane_run = subprocess.run(
+                                    run_argv, capture_output=True, text=True, timeout=30, check=False,
+                                )
+                                if pane_run.returncode:
+                                    return _identity_ambiguous_result(pane_run)
+                                else:
+                                    launch_timeout_phase = "agent_observation"
+                                    observe_until = time.monotonic() + HERDR_AGENT_OBSERVE_TIMEOUT
+                                    launched = None
+                                    last_probe: subprocess.CompletedProcess[str] | None = None
+                                    while time.monotonic() < observe_until:
+                                        probe = subprocess.run(
+                                            [herdr, "agent", "get", pane_id],
+                                            capture_output=True, text=True, timeout=5, check=False,
+                                        )
+                                        last_probe = probe
+                                        if probe.returncode == 0 and _herdr_agent_info_present(
+                                            probe.stdout or "", expected_pane_id=pane_id,
+                                        ):
+                                            launched = probe
+                                            break
+                                        time.sleep(HERDR_AGENT_POLL_INTERVAL)
+                                    if launched is None:
+                                        raise subprocess.TimeoutExpired(
+                                            [herdr, "agent", "get", pane_id],
+                                            HERDR_AGENT_OBSERVE_TIMEOUT,
+                                            output=(last_probe.stdout if last_probe else pane_run.stdout),
+                                            stderr=(last_probe.stderr if last_probe else pane_run.stderr),
+                                        )
+                                    error_code = ""
                     except subprocess.TimeoutExpired as exc:
-                        # The timeout bounds our wait; it does not prove that
-                        # Herdr failed to create a pane. Persist ambiguity while
-                        # the controller fence is still held, and never mark the
-                        # reserved attempt failed or authorize an automatic retry.
-                        _mark_ambiguous_start(exc)
+                        # A timeout cannot prove that Herdr failed to create the
+                        # workspace or start the provider. Preserve ambiguity;
+                        # neither phase authorizes an automatic retry.
+                        launch_timeout_code, launch_timeout_pane_id = _mark_ambiguous_start(
+                            exc, phase=launch_timeout_phase, pane_id_hint=herdr_pane_id,
+                        )
                         launch_timeout = exc
                         launched = None
             except (ValueError, controller_backend.FencedLease) as exc:
@@ -8747,14 +9113,15 @@ def herdr_launch(args: argparse.Namespace) -> int:
                     "operation": "launch", "ok": False, "retryable": False,
                     "state_path": str(state_path), "root": str(root),
                     "task_id": task_id, "status": "ambiguous",
-                    "error": {"code": "herdr_start_timeout"},
+                    "error": {"code": launch_timeout_code},
                 }
+                if launch_timeout_pane_id:
+                    payload["pane_id"] = launch_timeout_pane_id
                 _json_or_status(
                     payload, as_json=bool(getattr(args, "json", False)),
                     title="HERDR LAUNCH OUTCOME AMBIGUOUS",
                 )
                 return 2
-            error_code = "herdr_exit" if launched.returncode else ""
 
         if launched is None or launched.returncode:
             with _herdr_transaction(state_path) as state:
@@ -8762,15 +9129,47 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 if not isinstance(record, dict) or record.get("status") != "launching":
                     raise ValueError("Herdr launch reservation was replaced")
                 record["status"] = "failed"
-                record["error"] = {"code": error_code, "exit_code": launched.returncode if launched else None}
+                error = {
+                    "code": error_code, "phase": launch_timeout_phase,
+                    "exit_code": launched.returncode if launched else None,
+                }
+                if launched is not None:
+                    diagnostic = _herdr_launch_diagnostic(
+                        launched, redact_values=diagnostic_redactions if herdr else (),
+                    )
+                    if diagnostic:
+                        error["diagnostic"] = diagnostic
+                record["error"] = error
+                rejected = bool(
+                    launched is not None and launched.returncode == 2
+                    and launch_timeout_phase == "workspace_create"
+                    and not herdr_pane_id and not launched.stdout
+                    and re.match(r"\Aunknown option: --[A-Za-z0-9-]+(?:\n|\Z)", launched.stderr or "")
+                )
+                if rejected:
+                    receipt = {
+                        "schema": "agentflow.launch-rejection@1",
+                        "reason": _REJECTED_LAUNCH_REASON,
+                        "root": str(root), "workflow_root": workflow_root,
+                        "task_id": task_id, "launch_id": launch_id,
+                        "contract_sha256": _canonical_json_digest(record["return_channel"]["contract_binding"]),
+                        "error_sha256": _canonical_json_digest(error),
+                    }
+                    receipt["authority_hmac"] = _authority_mac(
+                        authority_secret, receipt, domain="launch-rejection-v1",
+                    )
+                    record["status"] = "rejected_launch"
+                    record["recovery_disposition"] = receipt
+                    record["return_channel"]["state"] = "revoked"
+                    record["return_channel"]["revocation"] = receipt
                 record.setdefault("attempts", []).append({
                     "attempt": attempt, "launch_id": launch_id,
                     "workflow_root": workflow_root, "status": "failed",
                     "error": record["error"],
                 })
-            payload = {"operation": "launch", "ok": False, "retryable": True,
+            payload = {"operation": "launch", "ok": False, "retryable": not rejected,
                        "state_path": str(state_path), "task_id": task_id,
-                       "status": "failed", "error": {"code": error_code}}
+                       "status": "rejected_launch" if rejected else "failed", "error": error}
             _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="HERDR LAUNCH FAILED")
             return 2
 
@@ -8780,7 +9179,11 @@ def herdr_launch(args: argparse.Namespace) -> int:
                 claim_id=str(identity["claim_id"]), lease_id=lease_id, provider=provider,
                 launch_id=launch_id,
             )
+            if binding.pane_id != herdr_pane_id:
+                raise ValueError("Herdr started the agent in a different pane than requested")
         except IdentityPending as exc:
+            if exc.pane_id != herdr_pane_id:
+                return _identity_ambiguous_result()
             # AFREL-025: the pane is live; only the provider session id is
             # outstanding (e.g. Codex, which has no Herdr integration).
             # Persist identity_pending -- not failed -- so the reservation's
@@ -8810,15 +9213,18 @@ def herdr_launch(args: argparse.Namespace) -> int:
             }
             _json_or_status(payload, as_json=bool(getattr(args, "json", False)), title="HERDR LAUNCH PENDING")
             return 0
-        except (herdr_backend.HerdrError, OSError, ValueError) as exc:
-            _mark_failed("structured_identity_missing")
-            raise ValueError(str(exc)) from exc
+        except (herdr_backend.HerdrError, OSError, ValueError):
+            # The pane command was accepted. A missing, mismatched, or
+            # malformed identity cannot safely authorize a retry because the
+            # provider process may already be live in that pane.
+            return _identity_ambiguous_result()
 
         # Binding-commit fencing (AFREL-016/AFREL-027): revalidate once more
         # -- under the controller lock, held across the check AND the
         # commit -- before the durable "launched" commit. A takeover during
         # the (already-started) spawn must not let a stale owner's binding
-        # become the record of truth; mark the reservation failed instead.
+        # become the record of truth. Keep the submitted launch ambiguous so
+        # another owner cannot mistake loss of authority for no live provider.
         authority_failure = ""
         try:
             with _controller_fence(root, workflow_root, lease_id):
@@ -8828,14 +9234,6 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         _authorize()
                     except ValueError as exc:
                         authority_failure = str(exc)
-                        if isinstance(record, dict):
-                            record["status"] = "failed"
-                            record["error"] = {"code": "authority_superseded"}
-                            record.setdefault("attempts", []).append(
-                                {"attempt": attempt, "launch_id": launch_id,
-                                 "workflow_root": workflow_root, "status": "failed",
-                                 "error": record["error"]}
-                            )
                     else:
                         if not isinstance(record, dict) or record.get("status") != "launching":
                             raise ValueError("Herdr launch reservation was replaced")
@@ -8847,8 +9245,8 @@ def herdr_launch(args: argparse.Namespace) -> int:
                         })
         except controller_backend.FencedLease as exc:
             authority_failure = str(exc)
-            _mark_failed("authority_superseded")
         if authority_failure:
+            _mark_failed("authority_superseded")
             raise ValueError(f"launch authority revalidation failed before commit: {authority_failure}")
         payload = {"operation": "launch", "ok": True, "state_path": str(state_path),
                    "root": str(root), "task_id": task_id, "binding": binding.to_dict(),
@@ -10128,6 +10526,14 @@ def doctor(args: argparse.Namespace) -> int:
     for command in ("codex", "claude", "copilot", "gh"):
         status, version = _version(command)
         print(f"  {command:<9} {status:<7} {version}")
+        executable = _provider_command(command)
+        if command in PROVIDERS and executable:
+            try:
+                cli_compat_backend.probe_provider(command, executable)
+                print("    launch interface: compatible")
+            except cli_compat_backend.CliCompatibilityError as exc:
+                print(f"    launch interface: incompatible ({exc})")
+                healthy = False
 
     path_codex = shutil.which("codex")
     preferred_codex = _provider_command("codex")
@@ -10145,6 +10551,12 @@ def doctor(args: argparse.Namespace) -> int:
 
     herdr = _provider_command("herdr")
     if herdr:
+        try:
+            compatibility = cli_compat_backend.probe_herdr(herdr)
+            print(f"  Herdr launch interface: compatible (protocol {compatibility['protocol']})")
+        except cli_compat_backend.CliCompatibilityError as exc:
+            print(f"  Herdr launch interface: incompatible ({exc})")
+            healthy = False
         try:
             result = subprocess.run(
                 [herdr, "integration", "status"], capture_output=True, text=True, timeout=8, check=False
@@ -16000,9 +16412,11 @@ def init_project(args: argparse.Namespace) -> int:
         f"{_copy_resource(config_parts, config_destination, initial_bytes=initial_config_bytes):<8} "
         f"{config_destination}"
     )
-    policy_destination = target / ".agentflow/models-v2.json"
-    policy_parts = ("policies", "models-v2.json")
-    print(f"{_copy_resource(policy_parts, policy_destination):<8} {policy_destination}")
+    existing_config = project_config_backend.load(target)
+    if existing_config.get("model_policy") == ".agentflow/models-v2.json":
+        policy_destination = target / ".agentflow/models-v2.json"
+        policy_parts = ("policies", "models-v2.json")
+        print(f"{_copy_resource(policy_parts, policy_destination):<8} {policy_destination}")
     print(
         "Existing workflow files were preserved. Agentflow uses one user-level Codex hook; custom project hooks are untouched."
     )
@@ -16444,6 +16858,10 @@ def build_parser() -> argparse.ArgumentParser:
     controller_resume_parser.add_argument(
         "--continue-after-expired-task", metavar="EXPIRED_TASK",
         help="explicitly continue a signed expired bound-task halt; requires --continue-task",
+    )
+    controller_resume_parser.add_argument(
+        "--continue-after-rejected-launch", metavar="REJECTED_TASK",
+        help="continue a signed before-spawn rejection with a distinct --continue-task; never reset attempts",
     )
     controller_resume_parser.add_argument(
         "--continue-task", metavar="READY_TASK",

@@ -96,14 +96,15 @@ class PackagingConfigTests(unittest.TestCase):
                     self.assertIn("https://github.com/mattpocock/skills", provenance)
                     self.assertIn("Upstream license: MIT", provenance)
 
-    def test_init_creates_live_valid_config_and_policy(self) -> None:
+    def test_init_creates_live_valid_router_without_fixed_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
             data = project_config.load(root)
             self.assertEqual(data["schema"], project_config.SCHEMA)
-            self.assertEqual(data["prose"]["editor"], project_config.DEFAULT_PROSE_EDITOR)
-            self.assertTrue((root / data["model_policy"]).is_file())
+            self.assertIsNone(data["prose"]["editor"])
+            self.assertTrue(model_policy.parse_router(data["modelrouter"]).controller_selected)
+            self.assertNotIn("model_policy", data)
             ignored = (root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".agentflow/config.local.json", ignored)
             self.assertIn(".agentflow/managed-skill-links.json", ignored)
@@ -367,7 +368,10 @@ class PackagingConfigTests(unittest.TestCase):
         ), mock.patch.object(cli.beads_backend, "workspace", return_value=None) as workspace:
             root = Path(temp)
             self.assertEqual(cli.init_project(argparse.Namespace(path=str(root), beads=False)), 0)
-            (root / ".agentflow/models-v2.json").unlink()
+            data = project_config.load(root)
+            data.pop("modelrouter")
+            data["model_policy"] = ".agentflow/missing-policy.json"
+            project_config.write_layer(root, data, local=False)
             self.assertEqual(cli.doctor(argparse.Namespace(path=str(root))), 2)
             workspace.assert_called_once_with(root.resolve())
 
@@ -403,6 +407,7 @@ class PackagingConfigTests(unittest.TestCase):
             custom_path = root / ".agentflow/custom-policy.json"
             custom_path.write_text(json.dumps(custom), encoding="utf-8")
             config = project_config.default_data()
+            config.pop("modelrouter")
             config["model_policy"] = ".agentflow/custom-policy.json"
             (root / ".agentflow/config.json").write_text(json.dumps(config), encoding="utf-8")
 

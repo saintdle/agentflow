@@ -47,12 +47,12 @@ unrelated projects.
   context.
 - Beads/Herdr lifecycle reconciliation for claims, sessions, results, and
   dispositions.
-- Fail-closed preflight, model policy, imported-asset verification, and
+- Fail-closed preflight, controller-selected model routing, imported-asset verification, and
   macOS-only hardened subprocess isolation.
 - A conditional prose-quality lane for Claude-authored reader content: free
   deterministic checks first, then at most one bounded edit through a
   configurable exact provider route when needed, with source preservation and
-  domain validation. Luna-medium is the default, not a dependency.
+  domain validation. Configure an exact editor route; new projects have no implicit editing model.
 
 Agentflow routes skills; it does not replace domain expertise. A repository's
 own skills and instructions remain authoritative.

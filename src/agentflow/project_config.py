@@ -12,6 +12,7 @@ import stat
 import tempfile
 from pathlib import Path
 from typing import Any
+from agentflow import model_policy
 
 SCHEMA = "agentflow.project@1"
 LOCAL_SCHEMA = "agentflow.project-local@1"
@@ -72,8 +73,8 @@ def default_data() -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "version": VERSION,
-        "model_policy": ".agentflow/models-v2.json",
-        "prose": {"editor": dict(DEFAULT_PROSE_EDITOR)},
+        "modelrouter": model_policy.default_router(),
+        "prose": {"editor": None},
         "execution": dict(DEFAULT_EXECUTION),
         "codex": dict(DEFAULT_CODEX),
         "guidance": dict(DEFAULT_GUIDANCE),
@@ -123,7 +124,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     # Workflow guidance lives in the generated provider instructions; accepting
     # security-looking but unenforced switches here would create false trust.
     allowed = {
-        "schema", "version", "model_policy", "prose", "execution", "codex", "guidance", "memory",
+        "schema", "version", "model_policy", "modelrouter", "prose", "execution", "codex", "guidance", "memory",
         "package_limits", "skills",
     }
     unknown = sorted(set(data) - allowed)
@@ -132,12 +133,19 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
     expected_schema = LOCAL_SCHEMA if local else SCHEMA
     if data.get("schema") != expected_schema or data.get("version") != VERSION:
         errors.append(f"schema/version must be {expected_schema}/{VERSION}")
-    if not local and (not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip()):
-        errors.append("model_policy must be a non-empty path")
-    if local and "model_policy" in data and (
+    if not local and not ({"model_policy", "modelrouter"} & set(data)):
+        errors.append("model_policy or modelrouter is required")
+    if "model_policy" in data and "modelrouter" in data:
+        errors.append("model_policy and modelrouter are mutually exclusive; migrate explicitly")
+    if "model_policy" in data and (
         not isinstance(data.get("model_policy"), str) or not data.get("model_policy", "").strip()
     ):
         errors.append("model_policy must be a non-empty path when present")
+    if "modelrouter" in data:
+        try:
+            model_policy.parse_router(data["modelrouter"])
+        except model_policy.ModelPolicyError as exc:
+            errors.append(str(exc))
     if "prose" in data:
         prose = data.get("prose")
         if not isinstance(prose, dict) or set(prose) != {"editor"}:
@@ -159,7 +167,7 @@ def validate(data: Any, root: Path, *, local: bool = False) -> list[str]:
                     if editor.get("provider") not in PROVIDERS:
                         errors.append(f"prose.editor.provider must be one of {', '.join(PROVIDERS)}")
                     model = editor.get("model")
-                    if not isinstance(model, str) or not MODEL_PATTERN.fullmatch(model):
+                    if not isinstance(model, str) or not model_policy.ROUTER_MODEL_PATTERN.fullmatch(model):
                         errors.append("prose.editor.model has an invalid shape")
                     effort = editor.get("effort")
                     if not isinstance(effort, str) or not EFFORT_PATTERN.fullmatch(effort):
@@ -326,7 +334,11 @@ def merge(shared: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
 
     result = dict(shared)
     if "model_policy" in local:
+        result.pop("modelrouter", None)
         result["model_policy"] = local["model_policy"]
+    if "modelrouter" in local:
+        result.pop("model_policy", None)
+        result["modelrouter"] = copy.deepcopy(local["modelrouter"])
     if "prose" in local:
         result["prose"] = local["prose"]
     if "execution" in local:
@@ -372,7 +384,7 @@ def prose_editor(data: dict[str, Any]) -> dict[str, Any] | None:
 
     prose = data.get("prose")
     if prose is None:
-        return dict(DEFAULT_PROSE_EDITOR)
+        return None if "modelrouter" in data else dict(DEFAULT_PROSE_EDITOR)
     editor = prose.get("editor")
     return dict(editor) if isinstance(editor, dict) else None
 
