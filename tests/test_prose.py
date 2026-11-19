@@ -101,7 +101,7 @@ agentflow doctor
             with self.assertRaises(prose.ProseError):
                 prose.read_markdown(other)
 
-    def test_project_template_mirrors_keep_default_editor_on_gpt6_luna_medium(self) -> None:
+    def test_project_template_mirrors_do_not_select_an_editor(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         paths = (
             repo_root / "templates/project/agentflow.json",
@@ -111,9 +111,7 @@ agentflow doctor
         self.assertEqual(configs[0], configs[1])
         self.assertTrue(configs[0]["memory"]["enabled"])
         self.assertFalse(configs[0]["memory"]["on_prompt"])
-        self.assertEqual(configs[0]["prose"]["editor"], {
-            "provider": "codex", "model": "gpt-6-luna", "effort": "medium",
-        })
+        self.assertIsNone(configs[0]["prose"]["editor"])
 
 
 class ProseCliTests(unittest.TestCase):
@@ -155,6 +153,7 @@ class ProseCliTests(unittest.TestCase):
                 "prose", "prepare", "draft.md", "--cwd", str(root),
                 "--profile", "technical-blog", "--writer-provider", "copilot",
                 "--writer-model", "claude-opus-4.8",
+                "--editor-provider", "codex", "--editor-model", "gpt-6-luna", "--editor-effort", "medium",
                 "--require-skill", "isovalent-ai-tme-skill", "--check", "true", "--json",
             ])
             self.assertEqual(code, 0)
@@ -175,6 +174,7 @@ class ProseCliTests(unittest.TestCase):
             code, output, error = self.run_cli([
                 "prose", "prepare", "draft.md", "--cwd", str(root),
                 "--profile", "technical-blog", "--writer-provider", "claude",
+                "--editor-provider", "codex", "--editor-model", "gpt-6-luna", "--editor-effort", "medium",
                 "--require-skill", "isovalent-ai-tme-skill",
                 "--check", "python3 scripts/check_blog.py draft.edited.md", "--json",
             ])
@@ -189,7 +189,9 @@ class ProseCliTests(unittest.TestCase):
             )
             self.assertEqual(manifest["prose"]["editor"], {
                 "provider": "codex", "model": "gpt-6-luna", "role": "editing",
-                "effort": "medium", "policy": "models-v2",
+                "effort": "medium", "policy": cli.model_policy_backend.parse_router(
+                    cli.model_policy_backend.default_router()
+                ).id,
             })
             self.assertEqual(manifest["prose"]["artifact_kind"], "reader-facing")
             self.assertEqual(manifest["prose"]["max_passes"], 1)
@@ -287,7 +289,7 @@ class ProseCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("requires --editor-provider", error)
             code, _, error = self.run_cli([
-                *common, "--editor-provider", "copilot", "--editor-model", "claude-opus-4.8",
+                *common, "--editor-provider", "copilot", "--editor-model", "auto",
                 "--editor-effort", "high", "--editor-max-ai-credits", "30",
             ])
             self.assertEqual(code, 2)
@@ -300,6 +302,7 @@ class ProseCliTests(unittest.TestCase):
             code, _, error = self.run_cli([
                 "prose", "prepare", "draft.md", "--cwd", str(root),
                 "--profile", "technical-blog", "--writer-provider", "claude",
+                "--editor-provider", "codex", "--editor-model", "gpt-6-luna", "--editor-effort", "medium",
             ])
             self.assertEqual(code, 2)
             self.assertIn("--require-skill", error)

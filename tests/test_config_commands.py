@@ -100,6 +100,7 @@ class ConfigCommandTests(unittest.TestCase):
     def test_memory_enable_materializes_complete_defaults_and_private_backup(self) -> None:
         data = project_config.default_data()
         data.pop("memory")
+        data.pop("modelrouter")
         data["model_policy"] = ".agentflow/custom-policy.json"
         path = _write_config(self.root, data)
         original = path.read_bytes()

@@ -1,13 +1,12 @@
 {
   "schema": "agentflow.project@1",
   "version": 1,
-  "model_policy": ".agentflow/models-v2.json",
+  "modelrouter": {
+    "mode": "controller-selected",
+    "routes": []
+  },
   "prose": {
-    "editor": {
-      "provider": "codex",
-      "model": "gpt-6-luna",
-      "effort": "medium"
-    }
+    "editor": null
   },
   "execution": {
     "controller_only": true,

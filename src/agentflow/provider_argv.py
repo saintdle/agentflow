@@ -3,7 +3,7 @@
 Captured from installed CLI ``--help`` output (Codex, Claude Code, GitHub
 Copilot CLI), not invented: Codex has no ``--effort`` flag at all -- reasoning
 effort is a config override (``-c model_reasoning_effort=<level>``) -- while
-Claude and Copilot both expose ``--model``/``--effort`` directly. Building one
+Claude exposes ``--effort`` and Copilot uses ``--reasoning-effort``. Building one
 shared ``--model --effort --json`` template for all three breaks Codex
 launches (AFREL-013); each provider gets its own exact argv.
 """
@@ -233,7 +233,7 @@ def build_argv(
             argv.append(prompt)
         return argv
     if provider == "copilot":
-        argv = [exe, "--model", model, "--effort", effort]
+        argv = [exe, "--model", model, "--reasoning-effort", effort]
         if prompt:
             argv.extend(["--interactive", prompt])
         return argv
@@ -244,7 +244,16 @@ def build_argv(
     return argv
 
 
+def pane_command(argv: list[str]) -> str:
+    """Encode argv as one POSIX command for Herdr's terminal-input interface."""
+    if not argv or not argv[0]:
+        raise ProviderArgvError("pane command requires an executable")
+    if any(not isinstance(arg, str) or any(ord(ch) < 32 or ord(ch) == 127 for ch in arg) for arg in argv):
+        raise ProviderArgvError("pane command arguments must not contain terminal control characters")
+    return shlex.join(argv)
+
+
 __all__ = [
     "PROVIDERS", "ProviderArgvError", "ConfinedHandoff", "validate_confined_handoff",
-    "build_argv", "build_confined_argv",
+    "build_argv", "build_confined_argv", "pane_command",
 ]

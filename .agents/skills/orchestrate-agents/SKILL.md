@@ -31,9 +31,8 @@ user opts out. Record the classification and writer provider in the handoff.
 After the writer returns, run `agentflow prose prepare` with the matching
 domain profile, required skill, and authoritative domain checks. A passing
 artifact launches no editor. A failing artifact gets exactly one editing pass
-through the exact route configured in `.agentflow/config.json`; the bundled
-default is Codex Luna `medium`, while approved Claude or Copilot routes can be
-selected when OpenAI access is unavailable. Verify the sibling and let the
+through the exact route configured in `.agentflow/config.json`; new projects
+have no implicit editor model. Verify the sibling and let the
 controller choose whether to replace the source. With no configured editor,
 report the deterministic findings without launching anything. Never apply this
 lane to chat, code, research notes, reviews, or internal handoffs.
@@ -64,11 +63,10 @@ for `shell-write` work.
 
 The default root mode is controller-only. The controller must not implement
 product-file changes merely because it can; assign each write to an explicit
-execution task. For native Codex delegation from a Sol controller, select the
-managed Luna worker/explorer profile and use `fork_turns="none"` or the
-smallest bounded positive fork. Never allow an omitted model to inherit Sol
-for coding or exploration. Terra is permitted only as an explicitly recorded
-selective execution route. Keep worker subdelegation disabled by default.
+execution task. For native Codex delegation, select the exact model and effort
+and use `fork_turns="none"` or the smallest bounded positive fork. Never
+accidentally inherit the controller's model in place of its selected route.
+Keep worker subdelegation disabled by default.
 
 A Beads-enabled pull queue must stay inside one approved root. Label work with
 one `af:stage:<name>`, one `af:role:<name>`, and only material

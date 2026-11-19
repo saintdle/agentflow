@@ -114,9 +114,9 @@ After resolving the cause or extending the budget, explicitly rerun
 
 The root execution policy derives its launch budget from graph size and bounds
 parallel workers, delegation depth, per-task attempts, and expensive execution
-children. Luna and Sonnet are the normal coding/exploration routes. Sol and Opus
-remain controller/judgment/review routes. Terra is available only through an
-explicitly selected exact route with a persisted rationale.
+children under legacy policies. With `modelrouter`, the controlling session
+selects the exact model and effort; no bundled model-name restrictions apply.
+Task, deadline, retry, parallelism and total-launch limits remain enforced.
 
 At execution approval, freeze the approved graph with `agentflow budget freeze
 --workflow-root <root>`. The frozen baseline records the original launchable
@@ -156,7 +156,7 @@ leased controller's authenticated return channel.
 
 External launches consume provider allowance and therefore remain explicit
 unless an approved controller is operating within its recorded budget.
-Native Codex workers use a dedicated Luna profile with no inherited controller
+Native Codex workers use an explicitly selected model with no inherited controller
 conversation (`fork_turns="none"`) or the smallest context slice that contains
 the task contract.
 

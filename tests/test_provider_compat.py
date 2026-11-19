@@ -104,7 +104,7 @@ class ProviderCapabilityContractTests(unittest.TestCase):
                 self.assertEqual(argv[3:5], ["--effort", effort])
                 self.assertEqual(argv[-1], "synthetic compatibility probe")
             else:
-                self.assertEqual(argv[3:5], ["--effort", effort])
+                self.assertEqual(argv[3:5], ["--reasoning-effort", effort])
                 self.assertEqual(argv[-2:], ["--interactive", "synthetic compatibility probe"])
 
     def test_unknown_model_fails_closed_before_provider_lookup_or_spawn(self) -> None:

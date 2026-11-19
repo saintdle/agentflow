@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agentflow import provider_argv
 from agentflow.provider_argv import ProviderArgvError, build_argv
 
 
@@ -24,7 +27,7 @@ class ProviderArgvTests(unittest.TestCase):
 
     def test_copilot_uses_native_effort_flag(self) -> None:
         argv = build_argv("copilot", "claude-sonnet-4.6", "medium")
-        self.assertEqual(argv, ["copilot", "--model", "claude-sonnet-4.6", "--effort", "medium"])
+        self.assertEqual(argv, ["copilot", "--model", "claude-sonnet-4.6", "--reasoning-effort", "medium"])
 
     def test_claude_opus_5_uses_pinned_model_and_medium_effort(self) -> None:
         argv = build_argv("claude", "claude-opus-5", "medium")
@@ -32,7 +35,7 @@ class ProviderArgvTests(unittest.TestCase):
 
     def test_copilot_opus_5_uses_pinned_model_and_medium_effort(self) -> None:
         argv = build_argv("copilot", "claude-opus-5", "medium")
-        self.assertEqual(argv, ["copilot", "--model", "claude-opus-5", "--effort", "medium"])
+        self.assertEqual(argv, ["copilot", "--model", "claude-opus-5", "--reasoning-effort", "medium"])
 
     def test_command_override_replaces_argv0(self) -> None:
         argv = build_argv("codex", "gpt-5.6-luna", "high", command="/opt/bin/codex")
@@ -66,7 +69,7 @@ class ProviderArgvTests(unittest.TestCase):
         argv = build_argv("copilot", "claude-sonnet-4.6", "medium", prompt="Read and execute /tmp/handoff.md.")
         self.assertEqual(
             argv,
-            ["copilot", "--model", "claude-sonnet-4.6", "--effort", "medium",
+            ["copilot", "--model", "claude-sonnet-4.6", "--reasoning-effort", "medium",
              "--interactive", "Read and execute /tmp/handoff.md."],
         )
         self.assertNotIn("-p", argv)
@@ -80,6 +83,20 @@ class ProviderArgvTests(unittest.TestCase):
         ):
             argv = build_argv(provider, model, effort)
             self.assertNotIn("--interactive", argv)
+
+    def test_pane_command_preserves_arguments_through_shell(self) -> None:
+        arguments = ["two  spaces", "$HOME", "; echo unwanted", "Bash(git:*)", "it's", ""]
+        command = provider_argv.pane_command(["printf", "%s\\n", *arguments])
+        self.assertEqual(shlex.split(command), ["printf", "%s\\n", *arguments])
+        observed = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(observed.stdout.splitlines(), arguments)
+
+    def test_pane_command_rejects_terminal_controls(self) -> None:
+        for value in ("line\nbreak", "line\rbreak", "\x1b[31m", "\x00", "\x7f"):
+            with self.subTest(value=repr(value)), self.assertRaises(ProviderArgvError):
+                provider_argv.pane_command(["echo", value])
 
 
 if __name__ == "__main__":

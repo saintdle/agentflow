@@ -376,23 +376,13 @@ class ProfileAuditTests(unittest.TestCase):
         )
         self.assertEqual(profiles[".github/agents/agentflow-reviewer.agent.md"], "copilot")
 
-    def test_detects_every_shipped_profile_violation(self) -> None:
-        violations = mp.audit_profiles(REPO_ROOT, self.policy)
-        flagged = {violation.path for violation in violations}
-        # Provider profiles migrated by the integration are compliant.  The
-        # two Codex files remain visible here when the managed workspace is
-        # mounted read-only; audit must still report those exact files rather
-        # than silently treating them as migrated.
-        codex_paths = {
-            mp._relative(path, REPO_ROOT)
-            for path, provider in mp.discover_profiles(REPO_ROOT)
-            if provider == "codex"
-        }
-        self.assertTrue(flagged <= codex_paths)
-        by_path = {violation.path: violation for violation in violations}
-        for rel, violation in by_path.items():
-            self.assertTrue(violation.model)
-            self.assertIn(self.policy.id, violation.reason)
+    def test_shipped_profiles_leave_model_selection_to_controller(self) -> None:
+        router = mp.parse_router(mp.default_router())
+        self.assertEqual(mp.audit_profiles(REPO_ROOT, router), [])
+        for path, provider in mp.discover_profiles(REPO_ROOT):
+            self.assertFalse(mp._profile_model(path, provider))
+        # An explicitly retained closed policy still requires exact pins.
+        self.assertEqual(len(mp.audit_profiles(REPO_ROOT, self.policy)), 15)
 
     def test_compliant_profile_is_not_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -18,11 +18,11 @@ Review the [provider compatibility matrix](PROVIDERS.md) before selecting a
 provider, especially for Claude lifecycle evidence and Copilot persistent-worker
 fail-closed behavior.
 
-The example uses the Codex 5.6 Luna coding route bundled in `models-v2`.
-Check that your signed-in account can use the chosen model; a policy-approved
-route is not proof of account availability. If that route is not available to
-you, first replace all four launch values—provider, model, role, and
-effort—with one exact route approved by your project policy.
+The example uses a specific Codex model for illustration. Have the controlling
+session select a current model available to your signed-in account, then replace
+the provider, model, role, and effort together. New projects use advisory
+`modelrouter` preferences, not a bundled model allowlist. Existing explicit
+legacy policies still apply until migrated.
 
 ## 1. Initialize and discover the workspace
 

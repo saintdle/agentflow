@@ -195,6 +195,10 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 f"#!{private_python}\n"
                 "import json, os, subprocess, sys, time\n"
                 "from pathlib import Path\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    print('codex-cli 0.170.0'); raise SystemExit(0)\n"
+                "if sys.argv[1:] == ['--help']:\n"
+                "    print('--model --config'); raise SystemExit(0)\n"
                 "from agentflow import cli as imported_cli\n"
                 "root = Path(os.environ['AGENTFLOW_HANDOFF_PATH']).parents[3]\n"
                 "agent = os.environ['AGENTFLOW_HERDR_AGENT_NAME']\n"
@@ -241,46 +245,55 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
             # a persistent interactive server and provider-specific session
             # reporting, which a CI provider executable cannot supply. This
             # executable still crosses the real OS subprocess boundary and
-            # returns the same structured agent-start contract.
+            # implements the workspace/pane and structured identity contracts.
             fake_herdr = bin_dir / "herdr"
             fake_herdr.write_text(
                 "#!/usr/bin/env python3\n"
-                "import json, os, subprocess, sys\n"
+                "import json, os, shlex, subprocess, sys\n"
                 "from pathlib import Path\n"
                 "args = sys.argv[1:]\n"
-                "agent = args[2] if len(args) > 2 and args[:2] == ['agent', 'start'] else 'process-boundary-agent'\n"
+                "workspace_file = Path(__file__).with_suffix('.workspace.json')\n"
+                "if args == ['--version']:\n"
+                "    print('herdr 0.9.5'); raise SystemExit(0)\n"
+                "if args[-1:] == ['--help']:\n"
+                "    print('--cwd --env --no-focus --label PANE_ID COMMAND target'); raise SystemExit(0)\n"
+                "if args == ['api', 'schema', '--json']:\n"
+                "    definitions = {'WorkspaceCreateParams': {'properties': dict.fromkeys(('cwd', 'env', 'focus', 'label'))}, 'PaneSendInputParams': {'properties': dict.fromkeys(('pane_id', 'text', 'keys'))}}\n"
+                "    print(json.dumps({'protocol': 22, 'schemas': {'request': {'$defs': definitions}}})); raise SystemExit(0)\n"
                 "if args[:2] == ['integration', 'status']:\n"
                 "    print('codex: current (test)')\n"
                 "    sys.exit(0)\n"
                 "if args[:2] == ['status', 'server']:\n"
                 "    print('status: running\\ncompatible: yes')\n"
                 "    sys.exit(0)\n"
-                "if args[:2] == ['agent', 'start']:\n"
+                "if args[:2] == ['workspace', 'create']:\n"
                 "    child_env = dict(os.environ)\n"
                 f"    child_env['PYTHONPATH'] = {str(daemon_pythonpath)!r}\n"
                 f"    child_env['PYTHONHOME'] = {str(daemon_pythonhome)!r}\n"
-                "    i = 3\n"
-                "    while i < len(args) and args[i] != '--':\n"
+                "    i = 2\n"
+                "    while i < len(args):\n"
                 "        if args[i] == '--env':\n"
                 "            key, _, value = args[i + 1].partition('='); child_env[key] = value; i += 2\n"
                 "        else: i += 1\n"
-                "    handoff_path = child_env.get('AGENTFLOW_HANDOFF_PATH', '')\n"
-                "    if handoff_path:\n"
-                "        root = Path(handoff_path).parents[3]\n"
-                "        snapshot = root / '.process-boundary-snapshots' / child_env['AGENTFLOW_TASK_ID']; snapshot.mkdir(parents=True, exist_ok=True)\n"
-                "        (snapshot / 'agent-start-argv').write_text(json.dumps(args))\n"
-                "        (snapshot / 'effective-python-env').write_text(json.dumps({key: child_env.get(key) for key in ('PYTHONPATH', 'PYTHONHOME', 'PATH')}))\n"
-                "        child_stderr = (snapshot / 'child-stderr').open('w')\n"
-                "    else:\n"
-                "        child_stderr = subprocess.DEVNULL\n"
-                "    child = subprocess.Popen(args[i + 1:], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=child_stderr, start_new_session=True)\n"
-                "    if handoff_path: child_stderr.close()\n"
-                "    if handoff_path:\n"
-                "        try: child_returncode = child.wait(timeout=0.25)\n"
-                "        except subprocess.TimeoutExpired: child_returncode = None\n"
-                "        (snapshot / 'child-returncode').write_text(str(child_returncode))\n"
-                "    agent_data = {'pane_id': 'deterministic-pane', 'agent': 'codex', 'agent_session': {'source': 'process-boundary', 'agent': 'codex', 'kind': 'id', 'value': 'provider-process-session'}}\n"
-                "    print(json.dumps({'id': 'cli:agent:start', 'result': {'type': 'agent_started', 'agent': agent_data}}))\n"
+                "    workspace_file.write_text(json.dumps({'env': child_env, 'cwd': args[args.index('--cwd') + 1]}))\n"
+                "    print(json.dumps({'result': {'root_pane': {'pane_id': 'deterministic-pane'}}}))\n"
+                "    sys.exit(0)\n"
+                "if args[:2] == ['pane', 'run']:\n"
+                "    workspace = json.loads(workspace_file.read_text()); child_env = workspace['env']\n"
+                "    root = Path(child_env['AGENTFLOW_HANDOFF_PATH']).parents[3]\n"
+                "    snapshot = root / '.process-boundary-snapshots' / child_env['AGENTFLOW_TASK_ID']; snapshot.mkdir(parents=True, exist_ok=True)\n"
+                "    launcher = shlex.split(args[3]); assert launcher[0] == '/bin/sh'\n"
+                "    command = shlex.split(Path(launcher[1]).read_text().split('exec ', 1)[1])\n"
+                "    i = 1\n"
+                "    while '=' in command[i]: i += 1\n"
+                "    (snapshot / 'provider-argv').write_text(json.dumps(command[i:]))\n"
+                "    (snapshot / 'effective-python-env').write_text(json.dumps({key: child_env.get(key) for key in ('PYTHONPATH', 'PYTHONHOME', 'PATH')}))\n"
+                "    with (snapshot / 'child-stderr').open('w') as child_stderr:\n"
+                "        child = subprocess.Popen(['/bin/sh', '-c', args[3]], cwd=workspace['cwd'], env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=child_stderr, start_new_session=True)\n"
+                "    try: child_returncode = child.wait(timeout=0.25)\n"
+                "    except subprocess.TimeoutExpired: child_returncode = None\n"
+                "    (snapshot / 'child-returncode').write_text(str(child_returncode))\n"
+                "    print('command accepted')\n"
                 "    sys.exit(0)\n"
                 "if args[:2] == ['agent', 'get']:\n"
                 "    agent_data = {'pane_id': 'deterministic-pane', 'agent': 'codex', 'agent_session': {'source': 'process-boundary', 'agent': 'codex', 'kind': 'id', 'value': 'provider-process-session'}}\n"
@@ -340,8 +353,8 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                 if (first_snapshot / "effective-python-env").exists() else "missing"
             )
             supervisor_argv = (
-                (first_snapshot / "agent-start-argv").read_text(encoding="utf-8")
-                if (first_snapshot / "agent-start-argv").exists() else "missing"
+                (first_snapshot / "provider-argv").read_text(encoding="utf-8")
+                if (first_snapshot / "provider-argv").exists() else "missing"
             )
             child_stderr = (
                 (first_snapshot / "child-stderr").read_text(encoding="utf-8")[-500:]
@@ -394,8 +407,7 @@ class ProcessBoundaryLifecycleTests(unittest.TestCase):
                     session["execution_limit_capabilities"]["deadline"],
                     "process_group_enforced_for_confined_provider_argv",
                 )
-                start_argv = json.loads((snapshot / "agent-start-argv").read_text(encoding="utf-8"))
-                provider_tail = start_argv[start_argv.index("--") + 1:]
+                provider_tail = json.loads((snapshot / "provider-argv").read_text(encoding="utf-8"))
                 self.assertEqual(Path(provider_tail[1]).resolve(), (ROOT / "src/agentflow/execution_limits.py").resolve())
                 deadline_index = provider_tail.index("--deadline-epoch")
                 self.assertEqual(float(provider_tail[deadline_index + 1]), session["deadline_epoch"])
